@@ -12,6 +12,8 @@ pub use agentkit_provider_openrouter as provider_openrouter;
 pub use agentkit_reporting as reporting;
 #[cfg(feature = "tool-fs")]
 pub use agentkit_tool_fs as tool_fs;
+#[cfg(feature = "tool-shell")]
+pub use agentkit_tool_shell as tool_shell;
 #[cfg(feature = "tools")]
 pub use agentkit_tools_core as tools;
 
@@ -30,6 +32,8 @@ pub mod prelude {
     pub use crate::reporting::*;
     #[cfg(feature = "tool-fs")]
     pub use crate::tool_fs::*;
+    #[cfg(feature = "tool-shell")]
+    pub use crate::tool_shell::*;
     #[cfg(feature = "tools")]
     pub use crate::tools::*;
 }

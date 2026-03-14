@@ -13,6 +13,7 @@ agentkit-mcp = { path = "../agentkit-mcp", optional = true }
 agentkit-provider-openrouter = { path = "../agentkit-provider-openrouter", optional = true }
 agentkit-reporting = { path = "../agentkit-reporting", optional = true }
 agentkit-tool-fs = { path = "../agentkit-tool-fs", optional = true }
+agentkit-tool-shell = { path = "../agentkit-tool-shell", optional = true }
 agentkit-tools-core = { path = "../agentkit-tools-core", optional = true }
 
 [features]
@@ -25,3 +26,4 @@ mcp = ["dep:agentkit-mcp", "capabilities", "tools"]
 provider-openrouter = ["dep:agentkit-provider-openrouter", "loop"]
 reporting = ["dep:agentkit-reporting", "loop"]
 tool-fs = ["dep:agentkit-tool-fs", "tools"]
+tool-shell = ["dep:agentkit-tool-shell", "tools"]

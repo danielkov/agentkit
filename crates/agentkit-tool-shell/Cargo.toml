@@ -1,0 +1,18 @@
+[package]
+name = "agentkit-tool-shell"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+agentkit-core = { path = "../agentkit-core" }
+agentkit-tools-core = { path = "../agentkit-tools-core" }
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["process", "time"] }
+
+[dev-dependencies]
+agentkit-capabilities = { path = "../agentkit-capabilities" }

@@ -13,6 +13,7 @@ dependencies = [
  "agentkit-provider-openrouter",
  "agentkit-reporting",
  "agentkit-tool-fs",
+ "agentkit-tool-shell",
  "agentkit-tools-core",
 ]
 
@@ -92,6 +93,20 @@ dependencies = [
 
 [[package]]
 name = "agentkit-tool-fs"
+version = "0.1.0"
+dependencies = [
+ "agentkit-capabilities",
+ "agentkit-core",
+ "agentkit-tools-core",
+ "async-trait",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "agentkit-tool-shell"
 version = "0.1.0"
 dependencies = [
  "agentkit-capabilities",
