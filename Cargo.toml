@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/agentkit-core",
+    "crates/agentkit-context",
     "crates/agentkit-capabilities",
     "crates/agentkit-tools-core",
     "crates/agentkit-loop",
@@ -12,6 +13,7 @@ members = [
     "crates/agentkit-mcp",
     "examples/openrouter-chat",
     "examples/openrouter-coding-agent",
+    "examples/openrouter-context-agent",
 ]
 resolver = "2"
 

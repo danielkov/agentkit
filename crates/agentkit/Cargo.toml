@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 agentkit-capabilities = { path = "../agentkit-capabilities", optional = true }
+agentkit-context = { path = "../agentkit-context", optional = true }
 agentkit-core = { path = "../agentkit-core", optional = true }
 agentkit-loop = { path = "../agentkit-loop", optional = true }
 agentkit-mcp = { path = "../agentkit-mcp", optional = true }
@@ -20,6 +21,7 @@ agentkit-tools-core = { path = "../agentkit-tools-core", optional = true }
 default = ["core", "capabilities", "tools", "loop", "reporting"]
 core = ["dep:agentkit-core"]
 capabilities = ["dep:agentkit-capabilities", "core"]
+context = ["dep:agentkit-context", "core"]
 tools = ["dep:agentkit-tools-core", "capabilities"]
 loop = ["dep:agentkit-loop", "tools"]
 mcp = ["dep:agentkit-mcp", "capabilities", "tools"]

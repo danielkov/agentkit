@@ -1,5 +1,7 @@
 #[cfg(feature = "capabilities")]
 pub use agentkit_capabilities as capabilities;
+#[cfg(feature = "context")]
+pub use agentkit_context as context;
 #[cfg(feature = "core")]
 pub use agentkit_core as core;
 #[cfg(feature = "loop")]
@@ -20,6 +22,8 @@ pub use agentkit_tools_core as tools;
 pub mod prelude {
     #[cfg(feature = "capabilities")]
     pub use crate::capabilities::*;
+    #[cfg(feature = "context")]
+    pub use crate::context::*;
     #[cfg(feature = "core")]
     pub use crate::core::*;
     #[cfg(feature = "loop")]
