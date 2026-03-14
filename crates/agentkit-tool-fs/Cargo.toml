@@ -8,7 +8,9 @@ rust-version.workspace = true
 [dependencies]
 agentkit-core = { path = "../agentkit-core" }
 agentkit-tools-core = { path = "../agentkit-tools-core" }
+async-fs = "2.2.0"
 async-trait.workspace = true
+futures-lite = "2.6.1"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

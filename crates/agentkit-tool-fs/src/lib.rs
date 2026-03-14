@@ -1,4 +1,3 @@
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -8,6 +7,7 @@ use agentkit_tools_core::{
     ToolName, ToolRegistry, ToolRequest, ToolResult, ToolSpec,
 };
 use async_trait::async_trait;
+use futures_lite::StreamExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -85,7 +85,8 @@ impl Tool for ReadFileTool {
     ) -> Result<ToolResult, ToolError> {
         let started = Instant::now();
         let input: ReadFileInput = parse_input(&request.input)?;
-        let contents = fs::read_to_string(&input.path)
+        let contents = async_fs::read_to_string(&input.path)
+            .await
             .map_err(|error| ToolError::ExecutionFailed(format!("failed to read file: {error}")))?;
 
         Ok(ToolResult {
@@ -170,7 +171,7 @@ impl Tool for WriteFileTool {
         if input.create_parents
             && let Some(parent) = input.path.parent()
         {
-            fs::create_dir_all(parent).map_err(|error| {
+            async_fs::create_dir_all(parent).await.map_err(|error| {
                 ToolError::ExecutionFailed(format!(
                     "failed to create parent directories for {}: {error}",
                     input.path.display()
@@ -178,9 +179,11 @@ impl Tool for WriteFileTool {
             })?;
         }
 
-        fs::write(&input.path, input.contents.as_bytes()).map_err(|error| {
-            ToolError::ExecutionFailed(format!("failed to write file: {error}"))
-        })?;
+        async_fs::write(&input.path, input.contents.as_bytes())
+            .await
+            .map_err(|error| {
+                ToolError::ExecutionFailed(format!("failed to write file: {error}"))
+            })?;
 
         Ok(ToolResult {
             result: ToolResultPart {
@@ -258,20 +261,21 @@ impl Tool for ListDirectoryTool {
         let started = Instant::now();
         let input: ListDirectoryInput = parse_input(&request.input)?;
         let mut entries = Vec::new();
-
-        for entry in fs::read_dir(&input.path).map_err(|error| {
+        let mut dir = async_fs::read_dir(&input.path).await.map_err(|error| {
             ToolError::ExecutionFailed(format!(
                 "failed to list directory {}: {error}",
                 input.path.display()
             ))
-        })? {
+        })?;
+
+        while let Some(entry) = dir.next().await {
             let entry = entry.map_err(|error| {
                 ToolError::ExecutionFailed(format!(
                     "failed to read directory entry in {}: {error}",
                     input.path.display()
                 ))
             })?;
-            let file_type = entry.file_type().map_err(|error| {
+            let file_type = entry.file_type().await.map_err(|error| {
                 ToolError::ExecutionFailed(format!(
                     "failed to inspect directory entry in {}: {error}",
                     input.path.display()
@@ -356,12 +360,14 @@ impl Tool for CreateDirectoryTool {
     ) -> Result<ToolResult, ToolError> {
         let started = Instant::now();
         let input: CreateDirectoryInput = parse_input(&request.input)?;
-        fs::create_dir_all(&input.path).map_err(|error| {
-            ToolError::ExecutionFailed(format!(
-                "failed to create directory {}: {error}",
-                input.path.display()
-            ))
-        })?;
+        async_fs::create_dir_all(&input.path)
+            .await
+            .map_err(|error| {
+                ToolError::ExecutionFailed(format!(
+                    "failed to create directory {}: {error}",
+                    input.path.display()
+                ))
+            })?;
 
         Ok(ToolResult {
             result: ToolResultPart {
@@ -404,7 +410,7 @@ fn path_name(path: impl AsRef<Path>) -> Result<String, ToolError> {
     })
 }
 
-fn file_kind_label(file_type: &fs::FileType) -> &'static str {
+fn file_kind_label(file_type: &std::fs::FileType) -> &'static str {
     if file_type.is_dir() {
         "directory"
     } else if file_type.is_symlink() {
@@ -453,7 +459,7 @@ mod tests {
     #[tokio::test]
     async fn write_then_read_roundtrip() {
         let root = temp_dir("fs");
-        fs::create_dir_all(&root).unwrap();
+        async_fs::create_dir_all(&root).await.unwrap();
         let target = root.join("note.txt");
         let session_id = SessionId::new("session-1");
         let turn_id = TurnId::new("turn-1");
@@ -514,6 +520,6 @@ mod tests {
             other => panic!("unexpected outcome: {other:?}"),
         }
 
-        let _ = fs::remove_dir_all(root);
+        let _ = async_fs::remove_dir_all(root).await;
     }
 }
