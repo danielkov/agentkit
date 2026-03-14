@@ -16,12 +16,16 @@ use agentkit_tools_core::{
     Tool, ToolAnnotations, ToolContext, ToolError, ToolName, ToolRequest, ToolResult, ToolSpec,
 };
 use async_trait::async_trait;
+use futures_util::TryStreamExt;
+use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::task::JoinHandle;
+use tokio_util::io::StreamReader;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct McpServerId(pub String);
@@ -72,9 +76,30 @@ impl StdioTransportConfig {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SseTransportConfig {
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+}
+
+impl SseTransportConfig {
+    pub fn new(url: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            headers: Vec::new(),
+        }
+    }
+
+    pub fn with_header(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.push((key.into(), value.into()));
+        self
+    }
+}
+
 #[derive(Clone)]
 pub enum McpTransportBinding {
     Stdio(StdioTransportConfig),
+    Sse(SseTransportConfig),
     Custom(Arc<dyn McpTransportFactory>),
 }
 
@@ -157,10 +182,78 @@ impl McpTransportFactory for StdioTransportFactory {
     }
 }
 
+pub struct SseTransportFactory {
+    config: SseTransportConfig,
+}
+
+impl SseTransportFactory {
+    pub fn new(config: SseTransportConfig) -> Self {
+        Self { config }
+    }
+}
+
+#[async_trait]
+impl McpTransportFactory for SseTransportFactory {
+    async fn connect(&self) -> Result<Box<dyn McpTransport>, McpError> {
+        let client = Client::builder()
+            .user_agent("agentkit-mcp/0.1.0")
+            .build()
+            .map_err(McpError::Http)?;
+
+        let mut request = client
+            .get(&self.config.url)
+            .header("Accept", "text/event-stream")
+            .header("Cache-Control", "no-cache");
+
+        for (key, value) in &self.config.headers {
+            request = request.header(key, value);
+        }
+
+        let response = request.send().await.map_err(McpError::Http)?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "<unreadable response body>".into());
+            return Err(McpError::Transport(format!(
+                "SSE connection failed with status {status}: {body}"
+            )));
+        }
+
+        let response_url = response.url().clone();
+        let stream = response.bytes_stream().map_err(std::io::Error::other);
+        let reader = BufReader::new(StreamReader::new(stream));
+        let (frame_tx, frame_rx) = mpsc::unbounded_channel();
+        let (endpoint_tx, endpoint_rx) = oneshot::channel();
+        let read_task = tokio::spawn(read_sse_stream(reader, response_url, frame_tx, endpoint_tx));
+
+        let endpoint_url = endpoint_rx
+            .await
+            .map_err(|_| McpError::Transport("SSE stream closed before endpoint event".into()))??;
+
+        Ok(Box::new(SseTransport {
+            client,
+            endpoint_url,
+            headers: self.config.headers.clone(),
+            frame_rx,
+            read_task,
+        }))
+    }
+}
+
 struct StdioTransport {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+}
+
+struct SseTransport {
+    client: Client,
+    endpoint_url: Url,
+    headers: Vec<(String, String)>,
+    frame_rx: mpsc::UnboundedReceiver<Result<McpFrame, McpError>>,
+    read_task: JoinHandle<()>,
 }
 
 #[async_trait]
@@ -191,6 +284,51 @@ impl McpTransport for StdioTransport {
     async fn close(&mut self) -> Result<(), McpError> {
         let _ = self.stdin.shutdown().await;
         let _ = self.child.kill().await;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl McpTransport for SseTransport {
+    async fn send(&mut self, message: McpFrame) -> Result<(), McpError> {
+        let mut request = self
+            .client
+            .post(self.endpoint_url.clone())
+            .header("Content-Type", "application/json");
+
+        for (key, value) in &self.headers {
+            request = request.header(key, value);
+        }
+
+        let response = request
+            .json(&message.value)
+            .send()
+            .await
+            .map_err(McpError::Http)?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "<unreadable response body>".into());
+            return Err(McpError::Transport(format!(
+                "SSE POST failed with status {status}: {body}"
+            )));
+        }
+
+        Ok(())
+    }
+
+    async fn recv(&mut self) -> Result<Option<McpFrame>, McpError> {
+        match self.frame_rx.recv().await {
+            Some(Ok(frame)) => Ok(Some(frame)),
+            Some(Err(error)) => Err(error),
+            None => Ok(None),
+        }
+    }
+
+    async fn close(&mut self) -> Result<(), McpError> {
+        self.read_task.abort();
         Ok(())
     }
 }
@@ -241,6 +379,9 @@ impl McpConnection {
         let factory: Arc<dyn McpTransportFactory> = match &config.transport {
             McpTransportBinding::Stdio(binding) => {
                 Arc::new(StdioTransportFactory::new(binding.clone()))
+            }
+            McpTransportBinding::Sse(binding) => {
+                Arc::new(SseTransportFactory::new(binding.clone()))
             }
             McpTransportBinding::Custom(factory) => factory.clone(),
         };
@@ -823,10 +964,115 @@ fn invocable_output_to_tool_output(output: InvocableOutput) -> ToolOutput {
     }
 }
 
+async fn read_sse_stream<R>(
+    mut reader: R,
+    response_url: Url,
+    frame_tx: mpsc::UnboundedSender<Result<McpFrame, McpError>>,
+    endpoint_tx: oneshot::Sender<Result<Url, McpError>>,
+) where
+    R: AsyncBufRead + Unpin,
+{
+    let mut endpoint_tx = Some(endpoint_tx);
+    let mut event_name: Option<String> = None;
+    let mut data_lines = Vec::new();
+
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line).await {
+            Ok(0) => break,
+            Ok(_) => {
+                let line = line.trim_end_matches(['\r', '\n']);
+                if line.is_empty() {
+                    dispatch_sse_event(
+                        &response_url,
+                        &mut endpoint_tx,
+                        &frame_tx,
+                        event_name.take(),
+                        std::mem::take(&mut data_lines),
+                    );
+                    continue;
+                }
+                if line.starts_with(':') {
+                    continue;
+                }
+                if let Some(rest) = line.strip_prefix("event:") {
+                    event_name = Some(rest.trim_start().to_string());
+                    continue;
+                }
+                if let Some(rest) = line.strip_prefix("data:") {
+                    data_lines.push(rest.trim_start().to_string());
+                }
+            }
+            Err(error) => {
+                let error = McpError::Io(error);
+                if let Some(tx) = endpoint_tx.take() {
+                    let _ = tx.send(Err(error));
+                } else {
+                    let _ = frame_tx.send(Err(error));
+                }
+                return;
+            }
+        }
+    }
+
+    if event_name.is_some() || !data_lines.is_empty() {
+        dispatch_sse_event(
+            &response_url,
+            &mut endpoint_tx,
+            &frame_tx,
+            event_name.take(),
+            std::mem::take(&mut data_lines),
+        );
+    }
+
+    if let Some(tx) = endpoint_tx.take() {
+        let _ = tx.send(Err(McpError::Transport(
+            "SSE stream ended before endpoint event".into(),
+        )));
+    }
+}
+
+fn dispatch_sse_event(
+    response_url: &Url,
+    endpoint_tx: &mut Option<oneshot::Sender<Result<Url, McpError>>>,
+    frame_tx: &mpsc::UnboundedSender<Result<McpFrame, McpError>>,
+    event_name: Option<String>,
+    data_lines: Vec<String>,
+) {
+    if data_lines.is_empty() {
+        return;
+    }
+
+    let event_name = event_name.unwrap_or_else(|| "message".into());
+    let data = data_lines.join("\n");
+
+    if event_name == "endpoint" {
+        if let Some(tx) = endpoint_tx.take() {
+            let _ = tx.send(resolve_sse_endpoint(response_url, &data));
+        }
+        return;
+    }
+
+    if event_name != "message" {
+        return;
+    }
+
+    let value = serde_json::from_str(&data).map_err(McpError::Serialize);
+    let _ = frame_tx.send(value.map(|value| McpFrame { value }));
+}
+
+fn resolve_sse_endpoint(response_url: &Url, endpoint: &str) -> Result<Url, McpError> {
+    response_url
+        .join(endpoint.trim())
+        .map_err(|error| McpError::Transport(format!("invalid SSE endpoint URL: {error}")))
+}
+
 #[derive(Debug, Error)]
 pub enum McpError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("http error: {0}")]
+    Http(#[from] reqwest::Error),
     #[error("serialization error: {0}")]
     Serialize(#[from] serde_json::Error),
     #[error("transport error: {0}")]
@@ -840,9 +1086,12 @@ pub enum McpError {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::sync::{Arc as StdArc, Mutex as StdMutex};
 
     use super::*;
     use agentkit_tools_core::{PermissionChecker, PermissionDecision, PermissionRequest};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     struct AllowAll;
 
@@ -940,5 +1189,69 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.result.output, ToolOutput::Text("pong".into()));
+    }
+
+    #[tokio::test]
+    async fn sse_transport_posts_messages_and_receives_frames() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = StdArc::new(StdMutex::new(Vec::new()));
+        let captured = requests.clone();
+
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buffer = vec![0_u8; 4096];
+                let read = socket.read(&mut buffer).await.unwrap();
+                let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+
+                if request.starts_with("GET /sse ") {
+                    let body = concat!(
+                        "event: endpoint\n",
+                        "data: /messages\n\n",
+                        "event: message\n",
+                        "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}\n\n"
+                    );
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                } else {
+                    captured.lock().unwrap().push(request);
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+
+        let factory =
+            SseTransportFactory::new(SseTransportConfig::new(format!("http://{address}/sse")));
+        let mut transport = factory.connect().await.unwrap();
+        transport
+            .send(McpFrame {
+                value: json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/list",
+                    "params": {}
+                }),
+            })
+            .await
+            .unwrap();
+        let frame = transport.recv().await.unwrap().unwrap();
+        transport.close().await.unwrap();
+        server.await.unwrap();
+
+        assert_eq!(frame.value["result"]["tools"], json!([]));
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("POST /messages "));
+        assert!(requests[0].contains("\"method\":\"tools/list\""));
     }
 }

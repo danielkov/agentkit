@@ -10,7 +10,10 @@ agentkit-capabilities = { path = "../agentkit-capabilities" }
 agentkit-core = { path = "../agentkit-core" }
 agentkit-tools-core = { path = "../agentkit-tools-core" }
 async-trait.workspace = true
+futures-util = "0.3.31"
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["io-util", "process", "sync"] }
+tokio = { workspace = true, features = ["io-util", "net", "process", "sync"] }
+tokio-util = { version = "0.7.16", features = ["io"] }
