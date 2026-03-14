@@ -557,6 +557,7 @@ dependencies = [
  "agentkit-provider-openrouter",
  "agentkit-reporting",
  "agentkit-tool-fs",
+ "agentkit-tools-core",
  "dotenvy",
  "tokio",
 ]

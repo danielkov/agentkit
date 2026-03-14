@@ -29,4 +29,4 @@ cargo run -p openrouter-coding-agent -- \
 
 - The example loads environment variables from the workspace `.env`.
 - Filesystem tools operate relative to the current working directory, so run this from the repository root if you use `./Cargo.toml`.
-- The built-in loop currently uses permissive tool execution internally, so this example is for integration testing, not sandboxed execution.
+- The example applies a real `PathPolicy` rooted at the current working directory. Filesystem access outside that root is denied.

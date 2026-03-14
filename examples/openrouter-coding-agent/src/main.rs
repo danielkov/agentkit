@@ -5,6 +5,9 @@ use agentkit_core::{Item, ItemKind, MetadataMap, Part, SessionId, TextPart};
 use agentkit_loop::{Agent, LoopInterrupt, LoopStep, SessionConfig};
 use agentkit_provider_openrouter::{OpenRouterAdapter, OpenRouterConfig};
 use agentkit_reporting::{CompositeReporter, StdoutReporter};
+use agentkit_tools_core::{
+    CompositePermissionChecker, PathPolicy, PermissionCode, PermissionDecision, PermissionDenial,
+};
 
 const SYSTEM_PROMPT: &str = "\
 You are a careful repository assistant.
@@ -25,12 +28,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = OpenRouterConfig::from_env()?;
     let adapter = OpenRouterAdapter::new(config)?;
     let tools = agentkit_tool_fs::registry();
+    let workspace_root = env::current_dir()?;
+    let permissions = CompositePermissionChecker::new(PermissionDecision::Deny(PermissionDenial {
+        code: PermissionCode::UnknownRequest,
+        message: "tool action is not allowed by the coding example policy".into(),
+        metadata: MetadataMap::new(),
+    }))
+    .with_policy(
+        PathPolicy::new()
+            .allow_root(workspace_root)
+            .require_approval_outside_allowed(false),
+    );
     let reporter =
         CompositeReporter::new().with_observer(StdoutReporter::new(io::stderr()).with_usage(false));
 
     let agent = Agent::builder()
         .model(adapter)
         .tools(tools)
+        .permissions(permissions)
         .observer(reporter)
         .build()?;
 
