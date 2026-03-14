@@ -6,8 +6,8 @@ use agentkit_core::{
     ToolResultPart, Usage,
 };
 use agentkit_tools_core::{
-    ApprovalDecision, ApprovalRequest, BasicToolExecutor, ToolContext, ToolError,
-    ToolExecutionOutcome, ToolExecutor, ToolRegistry, ToolRequest, ToolSpec,
+    ApprovalDecision, ApprovalRequest, BasicToolExecutor, PermissionChecker, ToolContext,
+    ToolError, ToolExecutionOutcome, ToolExecutor, ToolRegistry, ToolRequest, ToolSpec,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -142,6 +142,7 @@ where
 {
     model: M,
     tools: ToolRegistry,
+    permissions: Arc<dyn PermissionChecker>,
     observers: Vec<Box<dyn LoopObserver>>,
 }
 
@@ -163,6 +164,7 @@ where
             session: Some(session),
             tool_executor,
             tool_specs,
+            permissions: self.permissions,
             observers: self.observers,
             transcript: Vec::new(),
             pending_input: Vec::new(),
@@ -181,6 +183,7 @@ where
 {
     model: Option<M>,
     tools: ToolRegistry,
+    permissions: Arc<dyn PermissionChecker>,
     observers: Vec<Box<dyn LoopObserver>>,
 }
 
@@ -192,6 +195,7 @@ where
         Self {
             model: None,
             tools: ToolRegistry::new(),
+            permissions: Arc::new(AllowAllPermissions),
             observers: Vec::new(),
         }
     }
@@ -211,6 +215,11 @@ where
         self
     }
 
+    pub fn permissions(mut self, permissions: impl PermissionChecker + 'static) -> Self {
+        self.permissions = Arc::new(permissions);
+        self
+    }
+
     pub fn observer(mut self, observer: impl LoopObserver + 'static) -> Self {
         self.observers.push(Box::new(observer));
         self
@@ -223,6 +232,7 @@ where
         Ok(Agent {
             model,
             tools: self.tools,
+            permissions: self.permissions,
             observers: self.observers,
         })
     }
@@ -236,6 +246,7 @@ where
     session: Option<S>,
     tool_executor: Arc<dyn ToolExecutor>,
     tool_specs: Vec<ToolSpec>,
+    permissions: Arc<dyn PermissionChecker>,
     observers: Vec<Box<dyn LoopObserver>>,
     transcript: Vec<Item>,
     pending_input: Vec<Item>,
@@ -347,7 +358,7 @@ where
                                 turn_id: Some(&turn_id),
                                 metadata: &tool_metadata,
                             },
-                            permissions: &AllowAllPermissions,
+                            permissions: self.permissions.as_ref(),
                             resources: &(),
                         };
 
@@ -439,7 +450,7 @@ where
 
 struct AllowAllPermissions;
 
-impl agentkit_tools_core::PermissionChecker for AllowAllPermissions {
+impl PermissionChecker for AllowAllPermissions {
     fn evaluate(
         &self,
         _request: &dyn agentkit_tools_core::PermissionRequest,
@@ -465,7 +476,10 @@ mod tests {
     use std::collections::VecDeque;
 
     use agentkit_core::{ItemKind, Part, TextPart, ToolCallId, ToolOutput, ToolResultPart};
-    use agentkit_tools_core::{Tool, ToolAnnotations, ToolName, ToolResult, ToolSpec};
+    use agentkit_tools_core::{
+        FileSystemPermissionRequest, PermissionCode, PermissionDecision, PermissionDenial, Tool,
+        ToolAnnotations, ToolName, ToolResult, ToolSpec,
+    };
     use serde_json::{Value, json};
 
     use super::*;
@@ -600,6 +614,19 @@ mod tests {
             &self.spec
         }
 
+        fn proposed_requests(
+            &self,
+            request: &agentkit_tools_core::ToolRequest,
+        ) -> Result<
+            Vec<Box<dyn agentkit_tools_core::PermissionRequest>>,
+            agentkit_tools_core::ToolError,
+        > {
+            Ok(vec![Box::new(FileSystemPermissionRequest::Read {
+                path: "/tmp/echo".into(),
+                metadata: request.metadata.clone(),
+            })])
+        }
+
         async fn invoke(
             &self,
             request: agentkit_tools_core::ToolRequest,
@@ -626,12 +653,32 @@ mod tests {
         }
     }
 
+    struct DenyFsReads;
+
+    impl PermissionChecker for DenyFsReads {
+        fn evaluate(
+            &self,
+            request: &dyn agentkit_tools_core::PermissionRequest,
+        ) -> PermissionDecision {
+            if request.kind() == "filesystem.read" {
+                return PermissionDecision::Deny(PermissionDenial {
+                    code: PermissionCode::PathNotAllowed,
+                    message: "reads denied in test".into(),
+                    metadata: MetadataMap::new(),
+                });
+            }
+
+            PermissionDecision::Allow
+        }
+    }
+
     #[tokio::test]
     async fn loop_continues_after_completed_tool_call() {
         let tools = ToolRegistry::new().with(EchoTool::default());
         let agent = Agent::builder()
             .model(FakeAdapter)
             .tools(tools)
+            .permissions(AllowAllPermissions)
             .build()
             .unwrap();
 
@@ -666,6 +713,47 @@ mod tests {
                     other => panic!("unexpected part: {other:?}"),
                 }
             }
+            other => panic!("unexpected loop step: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn loop_uses_injected_permission_checker() {
+        let tools = ToolRegistry::new().with(EchoTool::default());
+        let agent = Agent::builder()
+            .model(FakeAdapter)
+            .tools(tools)
+            .permissions(DenyFsReads)
+            .build()
+            .unwrap();
+
+        let mut driver = agent
+            .start(SessionConfig {
+                session_id: SessionId::new("session-2"),
+                metadata: MetadataMap::new(),
+            })
+            .await
+            .unwrap();
+
+        driver
+            .submit_input(vec![Item {
+                id: None,
+                kind: ItemKind::User,
+                parts: vec![Part::Text(TextPart {
+                    text: "ping".into(),
+                    metadata: MetadataMap::new(),
+                })],
+                metadata: MetadataMap::new(),
+            }])
+            .unwrap();
+
+        let result = driver.next().await.unwrap();
+
+        match result {
+            LoopStep::Finished(turn) => match &turn.items[0].parts[0] {
+                Part::Text(text) => assert!(text.text.contains("tool permission denied")),
+                other => panic!("unexpected part: {other:?}"),
+            },
             other => panic!("unexpected loop step: {other:?}"),
         }
     }
