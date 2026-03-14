@@ -9,6 +9,7 @@ dependencies = [
  "agentkit-capabilities",
  "agentkit-core",
  "agentkit-loop",
+ "agentkit-mcp",
  "agentkit-provider-openrouter",
  "agentkit-reporting",
  "agentkit-tool-fs",
@@ -37,6 +38,20 @@ dependencies = [
 
 [[package]]
 name = "agentkit-loop"
+version = "0.1.0"
+dependencies = [
+ "agentkit-capabilities",
+ "agentkit-core",
+ "agentkit-tools-core",
+ "async-trait",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "agentkit-mcp"
 version = "0.1.0"
 dependencies = [
  "agentkit-capabilities",
@@ -180,6 +195,16 @@ name = "dotenvy"
 version = "0.15.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
+
+[[package]]
+name = "errno"
+version = "0.3.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
+dependencies = [
+ "libc",
+ "windows-sys 0.52.0",
+]
 
 [[package]]
 name = "find-msvc-tools"
@@ -873,6 +898,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
+name = "signal-hook-registry"
+version = "1.4.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
+dependencies = [
+ "errno",
+ "libc",
+]
+
+[[package]]
 name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -992,6 +1027,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",

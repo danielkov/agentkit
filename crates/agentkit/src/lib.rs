@@ -4,6 +4,8 @@ pub use agentkit_capabilities as capabilities;
 pub use agentkit_core as core;
 #[cfg(feature = "loop")]
 pub use agentkit_loop as loop_;
+#[cfg(feature = "mcp")]
+pub use agentkit_mcp as mcp;
 #[cfg(feature = "provider-openrouter")]
 pub use agentkit_provider_openrouter as provider_openrouter;
 #[cfg(feature = "reporting")]
@@ -20,6 +22,8 @@ pub mod prelude {
     pub use crate::core::*;
     #[cfg(feature = "loop")]
     pub use crate::loop_::*;
+    #[cfg(feature = "mcp")]
+    pub use crate::mcp::*;
     #[cfg(feature = "provider-openrouter")]
     pub use crate::provider_openrouter::*;
     #[cfg(feature = "reporting")]

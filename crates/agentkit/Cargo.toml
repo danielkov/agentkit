@@ -9,6 +9,7 @@ rust-version.workspace = true
 agentkit-capabilities = { path = "../agentkit-capabilities", optional = true }
 agentkit-core = { path = "../agentkit-core", optional = true }
 agentkit-loop = { path = "../agentkit-loop", optional = true }
+agentkit-mcp = { path = "../agentkit-mcp", optional = true }
 agentkit-provider-openrouter = { path = "../agentkit-provider-openrouter", optional = true }
 agentkit-reporting = { path = "../agentkit-reporting", optional = true }
 agentkit-tool-fs = { path = "../agentkit-tool-fs", optional = true }
@@ -20,6 +21,7 @@ core = ["dep:agentkit-core"]
 capabilities = ["dep:agentkit-capabilities", "core"]
 tools = ["dep:agentkit-tools-core", "capabilities"]
 loop = ["dep:agentkit-loop", "tools"]
+mcp = ["dep:agentkit-mcp", "capabilities", "tools"]
 provider-openrouter = ["dep:agentkit-provider-openrouter", "loop"]
 reporting = ["dep:agentkit-reporting", "loop"]
 tool-fs = ["dep:agentkit-tool-fs", "tools"]
