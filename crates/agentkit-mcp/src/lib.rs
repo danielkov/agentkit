@@ -373,11 +373,19 @@ pub struct McpDiscoverySnapshot {
 pub struct McpConnection {
     server_id: McpServerId,
     transport: Mutex<Box<dyn McpTransport>>,
+    auth: Mutex<Option<MetadataMap>>,
     next_id: AtomicU64,
 }
 
 impl McpConnection {
     pub async fn connect(config: &McpServerConfig) -> Result<Self, McpError> {
+        Self::connect_with_auth(config, None).await
+    }
+
+    async fn connect_with_auth(
+        config: &McpServerConfig,
+        auth: Option<&MetadataMap>,
+    ) -> Result<Self, McpError> {
         let factory: Arc<dyn McpTransportFactory> = match &config.transport {
             McpTransportBinding::Stdio(binding) => {
                 Arc::new(StdioTransportFactory::new(binding.clone()))
@@ -389,24 +397,38 @@ impl McpConnection {
         };
 
         let mut transport = factory.connect().await?;
+        let mut params = serde_json::Map::new();
+        params.insert("protocolVersion".into(), Value::String("2024-11-05".into()));
+        params.insert("capabilities".into(), json!({}));
+        params.insert(
+            "clientInfo".into(),
+            json!({
+                "name": "agentkit-mcp",
+                "version": env!("CARGO_PKG_VERSION")
+            }),
+        );
+        if let Some(auth) = auth {
+            params.insert("auth".into(), metadata_to_value(auth));
+        }
         transport
             .send(McpFrame {
                 value: json!({
                     "jsonrpc": "2.0",
                     "id": 0,
                     "method": "initialize",
-                    "params": {
-                        "protocolVersion": "2024-11-05",
-                        "capabilities": {},
-                        "clientInfo": {
-                            "name": "agentkit-mcp",
-                            "version": env!("CARGO_PKG_VERSION")
-                        }
-                    }
+                    "params": Value::Object(params)
                 }),
             })
             .await?;
-        let _ = transport.recv().await?;
+        let init_response = transport.recv().await?.ok_or_else(|| {
+            McpError::Transport("transport closed during MCP initialization".into())
+        })?;
+        if let Some(error) = init_response.value.get("error") {
+            if let Some(auth_request) = parse_auth_request(&config.id, "initialize", error) {
+                return Err(McpError::AuthRequired(auth_request));
+            }
+            return Err(McpError::Invocation(error.to_string()));
+        }
         transport
             .send(McpFrame {
                 value: json!({
@@ -420,6 +442,7 @@ impl McpConnection {
         Ok(Self {
             server_id: config.id.clone(),
             transport: Mutex::new(transport),
+            auth: Mutex::new(auth.cloned()),
             next_id: AtomicU64::new(1),
         })
     }
@@ -431,6 +454,22 @@ impl McpConnection {
     pub async fn close(&self) -> Result<(), McpError> {
         let mut transport = self.transport.lock().await;
         transport.close().await
+    }
+
+    pub async fn resolve_auth(
+        &self,
+        resolution: agentkit_tools_core::AuthResolution,
+    ) -> Result<(), McpError> {
+        let mut auth = self.auth.lock().await;
+        match resolution {
+            agentkit_tools_core::AuthResolution::Provided(details) => {
+                *auth = Some(details);
+            }
+            agentkit_tools_core::AuthResolution::Cancelled => {
+                *auth = None;
+            }
+        }
+        Ok(())
     }
 
     pub async fn discover(&self) -> Result<McpDiscoverySnapshot, McpError> {
@@ -553,6 +592,7 @@ impl McpConnection {
 
     async fn request(&self, method: &str, params: Value) -> Result<Value, McpError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let params = self.enrich_params(params).await;
         let mut transport = self.transport.lock().await;
         transport
             .send(McpFrame {
@@ -588,6 +628,23 @@ impl McpConnection {
                 .get("result")
                 .cloned()
                 .ok_or_else(|| McpError::Protocol("MCP response missing result".into()));
+        }
+    }
+
+    async fn enrich_params(&self, params: Value) -> Value {
+        let auth = self.auth.lock().await;
+        let Some(auth) = auth.as_ref() else {
+            return params;
+        };
+
+        match params {
+            Value::Object(mut object) => {
+                object
+                    .entry("auth")
+                    .or_insert_with(|| metadata_to_value(auth));
+                Value::Object(object)
+            }
+            other => other,
         }
     }
 }
@@ -861,6 +918,7 @@ impl McpServerHandle {
 pub struct McpServerManager {
     configs: BTreeMap<McpServerId, McpServerConfig>,
     connections: BTreeMap<McpServerId, McpServerHandle>,
+    auth: BTreeMap<McpServerId, MetadataMap>,
 }
 
 impl McpServerManager {
@@ -895,7 +953,8 @@ impl McpServerManager {
             .get(server_id)
             .cloned()
             .ok_or_else(|| McpError::UnknownServer(server_id.to_string()))?;
-        let connection = Arc::new(McpConnection::connect(&config).await?);
+        let connection =
+            Arc::new(McpConnection::connect_with_auth(&config, self.auth.get(server_id)).await?);
         let snapshot = connection.discover().await?;
         let handle = McpServerHandle {
             config,
@@ -935,6 +994,32 @@ impl McpServerManager {
             return Err(McpError::UnknownServer(server_id.to_string()));
         };
         handle.connection.close().await
+    }
+
+    pub async fn resolve_auth(
+        &mut self,
+        server_id: &McpServerId,
+        resolution: agentkit_tools_core::AuthResolution,
+    ) -> Result<(), McpError> {
+        match &resolution {
+            agentkit_tools_core::AuthResolution::Provided(details) => {
+                self.auth.insert(server_id.clone(), details.clone());
+            }
+            agentkit_tools_core::AuthResolution::Cancelled => {
+                self.auth.remove(server_id);
+            }
+        }
+
+        if let Some(handle) = self.connections.get(server_id) {
+            handle.connection.resolve_auth(resolution).await?;
+            return Ok(());
+        }
+
+        if self.configs.contains_key(server_id) {
+            Ok(())
+        } else {
+            Err(McpError::UnknownServer(server_id.to_string()))
+        }
     }
 
     pub fn tool_registry(&self) -> ToolRegistry {
@@ -1161,6 +1246,15 @@ fn invocable_output_to_tool_output(output: InvocableOutput) -> ToolOutput {
     }
 }
 
+fn metadata_to_value(metadata: &MetadataMap) -> Value {
+    Value::Object(
+        metadata
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    )
+}
+
 fn parse_auth_request(server_id: &McpServerId, method: &str, error: &Value) -> Option<AuthRequest> {
     let code = error.get("code").and_then(Value::as_i64);
     let message = error.get("message").and_then(Value::as_str);
@@ -1363,6 +1457,7 @@ mod tests {
             transport: Mutex::new(Box::new(FakeTransport {
                 recv: responses.into(),
             })),
+            auth: Mutex::new(None),
             next_id: AtomicU64::new(1),
         }
     }
@@ -1536,6 +1631,131 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    struct RecordingTransport {
+        recv: VecDeque<Value>,
+        sent: StdArc<StdMutex<Vec<Value>>>,
+    }
+
+    #[async_trait]
+    impl McpTransport for RecordingTransport {
+        async fn send(&mut self, message: McpFrame) -> Result<(), McpError> {
+            self.sent.lock().unwrap().push(message.value);
+            Ok(())
+        }
+
+        async fn recv(&mut self) -> Result<Option<McpFrame>, McpError> {
+            Ok(self.recv.pop_front().map(|value| McpFrame { value }))
+        }
+
+        async fn close(&mut self) -> Result<(), McpError> {
+            Ok(())
+        }
+    }
+
+    #[derive(Clone)]
+    struct RecordingTransportFactory {
+        responses: StdArc<StdMutex<VecDeque<Vec<Value>>>>,
+        sent: StdArc<StdMutex<Vec<Value>>>,
+    }
+
+    impl RecordingTransportFactory {
+        fn new(sequences: Vec<Vec<Value>>) -> Self {
+            Self {
+                responses: StdArc::new(StdMutex::new(sequences.into())),
+                sent: StdArc::new(StdMutex::new(Vec::new())),
+            }
+        }
+
+        fn sent(&self) -> Vec<Value> {
+            self.sent.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl McpTransportFactory for RecordingTransportFactory {
+        async fn connect(&self) -> Result<Box<dyn McpTransport>, McpError> {
+            let responses = self.responses.lock().unwrap().pop_front().ok_or_else(|| {
+                McpError::Transport("no recording transport responses left".into())
+            })?;
+            Ok(Box::new(RecordingTransport {
+                recv: responses.into(),
+                sent: self.sent.clone(),
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn connection_includes_resolved_auth_in_future_requests() {
+        let factory = RecordingTransportFactory::new(vec![vec![
+            json!({ "jsonrpc": "2.0", "id": 0, "result": { "capabilities": {} } }),
+            json!({ "jsonrpc": "2.0", "id": 1, "result": { "content": [{ "type": "text", "text": "ok" }] } }),
+        ]]);
+        let config = McpServerConfig::new(
+            "recording",
+            McpTransportBinding::Custom(Arc::new(factory.clone())),
+        );
+        let connection = McpConnection::connect(&config).await.unwrap();
+        let mut auth = MetadataMap::new();
+        auth.insert("token".into(), json!("secret-token"));
+        connection
+            .resolve_auth(agentkit_tools_core::AuthResolution::Provided(auth))
+            .await
+            .unwrap();
+
+        let _ = connection.call_tool("echo", json!({})).await.unwrap();
+        let sent = factory.sent();
+        assert!(
+            sent.iter().any(|value| {
+                value
+                    .get("params")
+                    .and_then(|params| params.get("auth"))
+                    .and_then(|auth| auth.get("token"))
+                    == Some(&json!("secret-token"))
+            }),
+            "expected an MCP request to include the resolved auth payload, saw {:?}",
+            sent
+        );
+    }
+
+    #[tokio::test]
+    async fn manager_reuses_stored_auth_on_connect() {
+        let factory = RecordingTransportFactory::new(vec![vec![
+            json!({ "jsonrpc": "2.0", "id": 0, "result": { "capabilities": {} } }),
+            json!({ "jsonrpc": "2.0", "id": 1, "result": { "tools": [] } }),
+            json!({ "jsonrpc": "2.0", "id": 2, "result": { "resources": [] } }),
+            json!({ "jsonrpc": "2.0", "id": 3, "result": { "prompts": [] } }),
+        ]]);
+        let server_id = McpServerId::new("recording");
+        let mut manager = McpServerManager::new().with_server(McpServerConfig::new(
+            server_id.to_string(),
+            McpTransportBinding::Custom(Arc::new(factory.clone())),
+        ));
+        let mut auth = MetadataMap::new();
+        auth.insert("token".into(), json!("seed-token"));
+        manager
+            .resolve_auth(
+                &server_id,
+                agentkit_tools_core::AuthResolution::Provided(auth),
+            )
+            .await
+            .unwrap();
+
+        manager.connect_server(&server_id).await.unwrap();
+        let sent = factory.sent();
+        assert!(
+            sent.iter().any(|value| {
+                value.get("method").and_then(Value::as_str) == Some("initialize")
+                    && value
+                        .get("params")
+                        .and_then(|params| params.get("auth"))
+                        .and_then(|auth| auth.get("token"))
+                        == Some(&json!("seed-token"))
+            }),
+            "expected initialize to include stored auth, saw {:?}",
+            sent
+        );
     }
 
     #[tokio::test]
