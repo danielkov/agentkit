@@ -14,6 +14,7 @@ members = [
     "examples/openrouter-chat",
     "examples/openrouter-coding-agent",
     "examples/openrouter-context-agent",
+    "examples/openrouter-subagent-tool",
 ]
 resolver = "2"
 

@@ -770,6 +770,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "openrouter-subagent-tool"
+version = "0.1.0"
+dependencies = [
+ "agentkit-core",
+ "agentkit-loop",
+ "agentkit-provider-openrouter",
+ "agentkit-tools-core",
+ "async-trait",
+ "dotenvy",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "parking"
 version = "2.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
