@@ -58,7 +58,7 @@ pub struct Item {
     pub metadata: MetadataMap,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum ItemKind {
     System,
     Developer,

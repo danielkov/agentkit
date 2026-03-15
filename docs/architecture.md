@@ -7,7 +7,7 @@
 - `agentkit-core`
   - normalized transcript, part, delta, usage, and tool-call/result types
 - `agentkit-compaction`
-  - compaction trigger and compactor traits plus basic triggers
+  - compaction trigger, strategy pipeline, backend hooks, and basic built-ins
 - `agentkit-capabilities`
   - lower-level invocable/resource/prompt abstraction
 - `agentkit-tools-core`
@@ -90,8 +90,8 @@ Compaction is optional.
 If configured, the loop asks the compaction trigger whether transcript replacement should happen before a turn. If so:
 
 1. `AgentEvent::CompactionStarted` is emitted
-2. the configured `Compactor` receives the current transcript
+2. the configured compaction strategy or pipeline receives the current transcript
 3. the loop replaces its in-memory transcript with the result
 4. `AgentEvent::CompactionFinished` is emitted
 
-The loop owns when compaction hooks are checked, but not how compaction is performed.
+The loop owns when compaction hooks are checked, but not how compaction is performed. Semantic compaction, if needed, is provided through an injected backend rather than a built-in model client.

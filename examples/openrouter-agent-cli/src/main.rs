@@ -4,8 +4,8 @@ use std::io;
 use std::path::PathBuf;
 
 use agentkit_compaction::{
-    CompactionConfig, CompactionError, CompactionRequest, CompactionResult, Compactor,
-    ItemCountTrigger,
+    CompactionConfig, CompactionPipeline, DropFailedToolResultsStrategy, DropReasoningStrategy,
+    ItemCountTrigger, KeepRecentStrategy,
 };
 use agentkit_context::{AgentsMd, ContextLoader, SkillsDirectory};
 use agentkit_core::{Item, ItemKind, MetadataMap, Part, SessionId, TextPart};
@@ -19,7 +19,6 @@ use agentkit_tools_core::{
     CommandPolicy, CompositePermissionChecker, PathPolicy, PermissionCode, PermissionDecision,
     PermissionDenial, ToolRegistry,
 };
-use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -108,7 +107,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .permissions(permissions)
         .compaction(CompactionConfig::new(
             ItemCountTrigger::new(12),
-            TailCompactor::new(8),
+            CompactionPipeline::new()
+                .with_strategy(DropReasoningStrategy::new())
+                .with_strategy(DropFailedToolResultsStrategy::new())
+                .with_strategy(
+                    KeepRecentStrategy::new(8)
+                        .preserve_kind(ItemKind::System)
+                        .preserve_kind(ItemKind::Context),
+                ),
         ))
         .observer(reporter)
         .build()?;
@@ -174,46 +180,6 @@ impl Args {
             } else {
                 prompt_parts.join(" ")
             },
-        })
-    }
-}
-
-#[derive(Clone)]
-struct TailCompactor {
-    keep_recent_items: usize,
-}
-
-impl TailCompactor {
-    fn new(keep_recent_items: usize) -> Self {
-        Self { keep_recent_items }
-    }
-}
-
-#[async_trait]
-impl Compactor for TailCompactor {
-    async fn compact(
-        &self,
-        request: CompactionRequest,
-    ) -> Result<CompactionResult, CompactionError> {
-        let original_len = request.transcript.len();
-        let mut preserved = Vec::new();
-        let mut recent = Vec::new();
-
-        for item in request.transcript {
-            match item.kind {
-                ItemKind::System | ItemKind::Context => preserved.push(item),
-                _ => recent.push(item),
-            }
-        }
-
-        let keep_from = recent.len().saturating_sub(self.keep_recent_items);
-        preserved.extend(recent.into_iter().skip(keep_from));
-        let replaced_items = original_len.saturating_sub(preserved.len());
-
-        Ok(CompactionResult {
-            replaced_items,
-            transcript: preserved,
-            metadata: MetadataMap::new(),
         })
     }
 }

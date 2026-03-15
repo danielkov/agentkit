@@ -10,7 +10,7 @@ Start here:
 - [`getting-started.md`](/Users/danielkov/projects/agentkit/docs/getting-started.md): entry points, example progression, and minimal assembly shape.
 - [`feature-flags.md`](/Users/danielkov/projects/agentkit/docs/feature-flags.md): umbrella crate feature flags and typical combinations.
 - [`core.md`](/Users/danielkov/projects/agentkit/docs/core.md): the proposed scope and API contract for the `agentkit-core` crate.
-- [`compaction.md`](/Users/danielkov/projects/agentkit/docs/compaction.md): compaction trigger/compactor traits and loop integration.
+- [`compaction.md`](/Users/danielkov/projects/agentkit/docs/compaction.md): compaction triggers, strategy pipelines, backend hooks, and loop integration.
 - [`capabilities.md`](/Users/danielkov/projects/agentkit/docs/capabilities.md): the lower-level capability abstraction shared by tools and MCP.
 - [`context.md`](/Users/danielkov/projects/agentkit/docs/context.md): built-in `AGENTS.md` and skills loading behavior.
 - [`loop.md`](/Users/danielkov/projects/agentkit/docs/loop.md): the proposed operational model and public API for the `agentkit-loop` crate.

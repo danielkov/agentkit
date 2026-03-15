@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use agentkit_capabilities::CapabilityContext;
-use agentkit_compaction::{CompactionConfig, CompactionReason, CompactionResult};
+use agentkit_compaction::{
+    CompactionConfig, CompactionContext, CompactionReason, CompactionResult,
+};
 use agentkit_core::{
     Delta, FinishReason, Item, ItemKind, MetadataMap, Part, SessionId, ToolCallPart, ToolOutput,
     ToolResultPart, Usage,
@@ -336,14 +338,20 @@ where
             replaced_items,
             metadata,
         } = compaction
-            .compactor
-            .compact(agentkit_compaction::CompactionRequest {
-                session_id: self.session_id.clone(),
-                turn_id: turn_id.cloned(),
-                transcript: self.transcript.clone(),
-                reason,
-                metadata: MetadataMap::new(),
-            })
+            .strategy
+            .apply(
+                agentkit_compaction::CompactionRequest {
+                    session_id: self.session_id.clone(),
+                    turn_id: turn_id.cloned(),
+                    transcript: self.transcript.clone(),
+                    reason,
+                    metadata: compaction.metadata.clone(),
+                },
+                &mut CompactionContext {
+                    backend: compaction.backend.as_deref(),
+                    metadata: &compaction.metadata,
+                },
+            )
             .await
             .map_err(|error| LoopError::Compaction(error.to_string()))?;
 
@@ -882,9 +890,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::{Arc as StdArc, Mutex as StdMutex};
 
-    use agentkit_compaction::{
-        CompactionError, CompactionRequest, CompactionResult, CompactionTrigger, Compactor,
-    };
+    use agentkit_compaction::{CompactionPipeline, CompactionTrigger, KeepRecentStrategy};
     use agentkit_core::{ItemKind, Part, TextPart, ToolCallId, ToolOutput, ToolResultPart};
     use agentkit_tools_core::{
         FileSystemPermissionRequest, PermissionCode, PermissionDecision, PermissionDenial, Tool,
@@ -1119,28 +1125,6 @@ mod tests {
         ) -> Option<agentkit_compaction::CompactionReason> {
             (transcript.len() >= 2)
                 .then_some(agentkit_compaction::CompactionReason::TranscriptTooLong)
-        }
-    }
-
-    struct KeepLastCompactor;
-
-    #[async_trait]
-    impl Compactor for KeepLastCompactor {
-        async fn compact(
-            &self,
-            request: CompactionRequest,
-        ) -> Result<CompactionResult, CompactionError> {
-            let transcript = request
-                .transcript
-                .last()
-                .cloned()
-                .into_iter()
-                .collect::<Vec<_>>();
-            Ok(CompactionResult {
-                replaced_items: request.transcript.len().saturating_sub(transcript.len()),
-                transcript,
-                metadata: MetadataMap::new(),
-            })
         }
     }
 
@@ -1397,7 +1381,10 @@ mod tests {
         let events = StdArc::new(StdMutex::new(Vec::new()));
         let agent = Agent::builder()
             .model(FakeAdapter)
-            .compaction(CompactionConfig::new(CountTrigger, KeepLastCompactor))
+            .compaction(CompactionConfig::new(
+                CountTrigger,
+                CompactionPipeline::new().with_strategy(KeepRecentStrategy::new(1)),
+            ))
             .observer(RecordingObserver {
                 events: events.clone(),
             })

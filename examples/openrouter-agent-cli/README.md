@@ -42,3 +42,4 @@ cargo run -p openrouter-agent-cli -- \
 - The example loads environment variables from the workspace `.env`.
 - The shell tool is intentionally constrained to simple read-only commands.
 - `--mcp-mock` starts a local stdio MCP server by re-executing the example binary with `--serve-mock-mcp`.
+- The compaction setup uses a built-in strategy pipeline: drop reasoning, drop failed tool results, then keep recent items while preserving system and context items.
