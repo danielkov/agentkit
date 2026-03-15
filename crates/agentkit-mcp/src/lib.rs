@@ -377,6 +377,14 @@ pub struct McpConnection {
     next_id: AtomicU64,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum McpOperationResult {
+    Connected(McpDiscoverySnapshot),
+    Tool(Value),
+    Resource(ResourceContents),
+    Prompt(PromptContents),
+}
+
 impl McpConnection {
     pub async fn connect(config: &McpServerConfig) -> Result<Self, McpError> {
         Self::connect_with_auth(config, None).await
@@ -647,6 +655,77 @@ impl McpConnection {
                 Value::Object(object)
             }
             other => other,
+        }
+    }
+
+    pub async fn replay_auth_operation(
+        &self,
+        operation: &AuthOperation,
+    ) -> Result<McpOperationResult, McpError> {
+        match operation {
+            AuthOperation::McpToolCall {
+                server_id,
+                tool_name,
+                input,
+                ..
+            } => {
+                self.ensure_server_match(server_id)?;
+                self.call_tool(tool_name, input.clone())
+                    .await
+                    .map(McpOperationResult::Tool)
+            }
+            AuthOperation::McpResourceRead {
+                server_id,
+                resource_id,
+                ..
+            } => {
+                self.ensure_server_match(server_id)?;
+                self.read_resource(resource_id)
+                    .await
+                    .map(McpOperationResult::Resource)
+            }
+            AuthOperation::McpPromptGet {
+                server_id,
+                prompt_id,
+                args,
+                ..
+            } => {
+                self.ensure_server_match(server_id)?;
+                self.get_prompt(prompt_id, args.clone())
+                    .await
+                    .map(McpOperationResult::Prompt)
+            }
+            AuthOperation::ToolCall {
+                tool_name,
+                input,
+                metadata,
+                ..
+            } => {
+                if let Some(server_id) = metadata.get("server_id").and_then(Value::as_str) {
+                    self.ensure_server_match(server_id)?;
+                }
+                let tool_name = normalize_mcp_tool_name(self.server_id(), tool_name);
+                self.call_tool(&tool_name, input.clone())
+                    .await
+                    .map(McpOperationResult::Tool)
+            }
+            AuthOperation::McpConnect { .. } => Err(McpError::AuthResolution(
+                "connect operations must be replayed through the server manager".into(),
+            )),
+            AuthOperation::Custom { kind, .. } => Err(McpError::AuthResolution(format!(
+                "unsupported auth operation for replay: {kind}"
+            ))),
+        }
+    }
+
+    fn ensure_server_match(&self, server_id: &str) -> Result<(), McpError> {
+        if self.server_id.0 == server_id {
+            Ok(())
+        } else {
+            Err(McpError::AuthResolution(format!(
+                "auth operation targets server {server_id}, but connection is for {}",
+                self.server_id
+            )))
         }
     }
 }
@@ -1025,6 +1104,63 @@ impl McpServerManager {
         }
     }
 
+    pub async fn resolve_auth_and_resume(
+        &mut self,
+        resolution: AuthResolution,
+    ) -> Result<McpOperationResult, McpError> {
+        let request = resolution.request().clone();
+        self.resolve_auth(resolution).await?;
+        self.replay_auth_request(&request).await
+    }
+
+    pub async fn replay_auth_request(
+        &mut self,
+        request: &AuthRequest,
+    ) -> Result<McpOperationResult, McpError> {
+        match &request.operation {
+            AuthOperation::McpConnect { server_id, .. } => {
+                let server_id = McpServerId::new(server_id);
+                let handle = self.connect_server(&server_id).await?;
+                Ok(McpOperationResult::Connected(handle.snapshot.clone()))
+            }
+            AuthOperation::McpToolCall { server_id, .. }
+            | AuthOperation::McpResourceRead { server_id, .. }
+            | AuthOperation::McpPromptGet { server_id, .. } => {
+                let connection = self.connection_for_auth_server(server_id).await?;
+                connection.replay_auth_operation(&request.operation).await
+            }
+            AuthOperation::ToolCall { metadata, .. } => {
+                let server_id = metadata
+                    .get("server_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        McpError::AuthResolution(
+                            "tool-call auth replay requires metadata.server_id".into(),
+                        )
+                    })?;
+                let connection = self.connection_for_auth_server(server_id).await?;
+                connection.replay_auth_operation(&request.operation).await
+            }
+            AuthOperation::Custom { kind, .. } => Err(McpError::AuthResolution(format!(
+                "unsupported auth operation for replay: {kind}"
+            ))),
+        }
+    }
+
+    async fn connection_for_auth_server(
+        &mut self,
+        server_id: &str,
+    ) -> Result<Arc<McpConnection>, McpError> {
+        let server_id = McpServerId::new(server_id);
+        if !self.connections.contains_key(&server_id) {
+            self.connect_server(&server_id).await?;
+        }
+        self.connections
+            .get(&server_id)
+            .map(McpServerHandle::connection)
+            .ok_or_else(|| McpError::UnknownServer(server_id.to_string()))
+    }
+
     pub fn tool_registry(&self) -> ToolRegistry {
         self.connections
             .values()
@@ -1356,6 +1492,14 @@ fn auth_operation_for_method(
             },
         },
     }
+}
+
+fn normalize_mcp_tool_name(server_id: &McpServerId, tool_name: &str) -> String {
+    let prefix = format!("mcp.{server_id}.");
+    tool_name
+        .strip_prefix(&prefix)
+        .unwrap_or(tool_name)
+        .to_string()
 }
 
 async fn read_sse_stream<R>(
@@ -1852,6 +1996,118 @@ mod tests {
             "expected initialize to include stored auth, saw {:?}",
             sent
         );
+    }
+
+    #[tokio::test]
+    async fn manager_resolves_auth_and_replays_resource_read() {
+        let factory = RecordingTransportFactory::new(vec![vec![
+            json!({ "jsonrpc": "2.0", "id": 0, "result": { "capabilities": {} } }),
+            json!({ "jsonrpc": "2.0", "id": 1, "result": { "tools": [] } }),
+            json!({ "jsonrpc": "2.0", "id": 2, "result": { "resources": [] } }),
+            json!({ "jsonrpc": "2.0", "id": 3, "result": { "prompts": [] } }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "result": {
+                    "contents": [
+                        {
+                            "uri": "file:///tmp/secret.txt",
+                            "text": "secret from resource"
+                        }
+                    ]
+                }
+            }),
+        ]]);
+        let server_id = McpServerId::new("recording");
+        let mut manager = McpServerManager::new().with_server(McpServerConfig::new(
+            server_id.to_string(),
+            McpTransportBinding::Custom(Arc::new(factory.clone())),
+        ));
+        let mut auth = MetadataMap::new();
+        auth.insert("token".into(), json!("resource-token"));
+        let request = AuthRequest {
+            id: "auth-recording-resource".into(),
+            provider: "mcp.recording".into(),
+            operation: AuthOperation::McpResourceRead {
+                server_id: server_id.to_string(),
+                resource_id: "file:///tmp/secret.txt".into(),
+                metadata: MetadataMap::new(),
+            },
+            challenge: MetadataMap::new(),
+        };
+
+        let result = manager
+            .resolve_auth_and_resume(agentkit_tools_core::AuthResolution::Provided {
+                request,
+                credentials: auth,
+            })
+            .await
+            .unwrap();
+
+        match result {
+            McpOperationResult::Resource(contents) => {
+                assert_eq!(
+                    contents.data,
+                    DataRef::InlineText("secret from resource".into())
+                );
+            }
+            other => panic!("unexpected replay result: {other:?}"),
+        }
+
+        let sent = factory.sent();
+        assert!(
+            sent.iter().any(|value| {
+                value.get("method").and_then(Value::as_str) == Some("resources/read")
+                    && value
+                        .get("params")
+                        .and_then(|params| params.get("auth"))
+                        .and_then(|auth| auth.get("token"))
+                        == Some(&json!("resource-token"))
+            }),
+            "expected resources/read to include resolved auth, saw {:?}",
+            sent
+        );
+    }
+
+    #[tokio::test]
+    async fn manager_resolves_auth_and_replays_connect() {
+        let factory = RecordingTransportFactory::new(vec![vec![
+            json!({ "jsonrpc": "2.0", "id": 0, "result": { "capabilities": {} } }),
+            json!({ "jsonrpc": "2.0", "id": 1, "result": { "tools": [] } }),
+            json!({ "jsonrpc": "2.0", "id": 2, "result": { "resources": [] } }),
+            json!({ "jsonrpc": "2.0", "id": 3, "result": { "prompts": [] } }),
+        ]]);
+        let server_id = McpServerId::new("recording");
+        let mut manager = McpServerManager::new().with_server(McpServerConfig::new(
+            server_id.to_string(),
+            McpTransportBinding::Custom(Arc::new(factory.clone())),
+        ));
+        let mut auth = MetadataMap::new();
+        auth.insert("token".into(), json!("connect-token"));
+        let request = AuthRequest {
+            id: "auth-recording-connect-replay".into(),
+            provider: "mcp.recording".into(),
+            operation: AuthOperation::McpConnect {
+                server_id: server_id.to_string(),
+                metadata: MetadataMap::new(),
+            },
+            challenge: MetadataMap::new(),
+        };
+
+        let result = manager
+            .resolve_auth_and_resume(agentkit_tools_core::AuthResolution::Provided {
+                request,
+                credentials: auth,
+            })
+            .await
+            .unwrap();
+
+        match result {
+            McpOperationResult::Connected(snapshot) => {
+                assert_eq!(snapshot.server_id, server_id);
+            }
+            other => panic!("unexpected replay result: {other:?}"),
+        }
     }
 
     #[tokio::test]
