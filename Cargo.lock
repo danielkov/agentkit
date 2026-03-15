@@ -770,6 +770,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "openrouter-mcp-tool"
+version = "0.1.0"
+dependencies = [
+ "agentkit-core",
+ "agentkit-loop",
+ "agentkit-mcp",
+ "agentkit-provider-openrouter",
+ "dotenvy",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "openrouter-subagent-tool"
 version = "0.1.0"
 dependencies = [
