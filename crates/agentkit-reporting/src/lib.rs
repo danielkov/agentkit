@@ -303,8 +303,14 @@ where
                 request.summary, request.reason
             )?;
         }
+        AgentEvent::AuthRequired(request) => {
+            writeln!(writer, "[auth] required provider={}", request.provider)?;
+        }
         AgentEvent::ApprovalResolved { approved } => {
             writeln!(writer, "[approval] resolved approved={approved}")?;
+        }
+        AgentEvent::AuthResolved { provided } => {
+            writeln!(writer, "[auth] resolved provided={provided}")?;
         }
         AgentEvent::UsageUpdated(usage) if show_usage => {
             writeln!(writer, "[usage] {}", format_usage(usage))?;

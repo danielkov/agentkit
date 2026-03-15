@@ -144,6 +144,12 @@ pub struct AuthRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AuthResolution {
+    Provided(MetadataMap),
+    Cancelled,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToolInterruption {
     ApprovalRequired(ApprovalRequest),
     AuthRequired(AuthRequest),
@@ -1037,6 +1043,9 @@ impl ToolExecutor for BasicToolExecutor {
 
         match tool.invoke(request, ctx).await {
             Ok(result) => ToolExecutionOutcome::Completed(result),
+            Err(ToolError::AuthRequired(request)) => {
+                ToolExecutionOutcome::Interrupted(ToolInterruption::AuthRequired(request))
+            }
             Err(error) => ToolExecutionOutcome::Failed(error),
         }
     }
@@ -1052,6 +1061,8 @@ pub enum ToolError {
     PermissionDenied(PermissionDenial),
     #[error("tool execution failed: {0}")]
     ExecutionFailed(String),
+    #[error("tool auth required: {0:?}")]
+    AuthRequired(AuthRequest),
     #[error("tool unavailable: {0}")]
     Unavailable(String),
     #[error("internal tool error: {0}")]

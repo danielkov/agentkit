@@ -6,8 +6,9 @@ use agentkit_core::{
     ToolResultPart, Usage,
 };
 use agentkit_tools_core::{
-    ApprovalDecision, ApprovalRequest, BasicToolExecutor, PermissionChecker, ToolContext,
-    ToolError, ToolExecutionOutcome, ToolExecutor, ToolRegistry, ToolRequest, ToolSpec,
+    ApprovalDecision, ApprovalRequest, AuthRequest, AuthResolution, BasicToolExecutor,
+    PermissionChecker, ToolContext, ToolError, ToolExecutionOutcome, ToolExecutor, ToolRegistry,
+    ToolRequest, ToolSpec,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -83,8 +84,12 @@ pub enum AgentEvent {
     ContentDelta(Delta),
     ToolCallRequested(ToolCallPart),
     ApprovalRequired(ApprovalRequest),
+    AuthRequired(AuthRequest),
     ApprovalResolved {
         approved: bool,
+    },
+    AuthResolved {
+        provided: bool,
     },
     UsageUpdated(Usage),
     Warning {
@@ -114,6 +119,7 @@ pub struct TurnResult {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LoopInterrupt {
     ApprovalRequest(ApprovalRequest),
+    AuthRequest(AuthRequest),
     AwaitingInput(InputRequest),
 }
 
@@ -134,6 +140,7 @@ pub struct LoopSnapshot {
 enum DriverState {
     Idle,
     AwaitingApproval,
+    AwaitingAuth,
 }
 
 pub struct Agent<M>
@@ -169,6 +176,7 @@ where
             transcript: Vec::new(),
             pending_input: Vec::new(),
             pending_approval: None,
+            pending_auth: None,
             next_turn_index: 1,
             state: DriverState::Idle,
         };
@@ -251,6 +259,7 @@ where
     transcript: Vec<Item>,
     pending_input: Vec<Item>,
     pending_approval: Option<ApprovalRequest>,
+    pending_auth: Option<AuthRequest>,
     next_turn_index: u64,
     state: DriverState,
 }
@@ -260,9 +269,9 @@ where
     S: ModelSession,
 {
     pub fn submit_input(&mut self, input: Vec<Item>) -> Result<(), LoopError> {
-        if self.state == DriverState::AwaitingApproval {
+        if self.state != DriverState::Idle {
             return Err(LoopError::InvalidState(
-                "cannot submit input while approval is pending".into(),
+                "cannot submit input while an interrupt is pending".into(),
             ));
         }
         self.emit(AgentEvent::InputAccepted {
@@ -286,6 +295,17 @@ where
         Ok(())
     }
 
+    pub fn resolve_auth(&mut self, resolution: AuthResolution) -> Result<(), LoopError> {
+        let Some(_request) = self.pending_auth.take() else {
+            return Err(LoopError::InvalidState("no auth request is pending".into()));
+        };
+        self.state = DriverState::Idle;
+        self.emit(AgentEvent::AuthResolved {
+            provided: matches!(resolution, AuthResolution::Provided(_)),
+        });
+        Ok(())
+    }
+
     pub fn snapshot(&self) -> LoopSnapshot {
         LoopSnapshot {
             session_id: self.session_id.clone(),
@@ -295,9 +315,9 @@ where
     }
 
     pub async fn next(&mut self) -> Result<LoopStep, LoopError> {
-        if self.state == DriverState::AwaitingApproval {
+        if self.state != DriverState::Idle {
             return Err(LoopError::InvalidState(
-                "cannot advance while approval is pending".into(),
+                "cannot advance while an interrupt is pending".into(),
             ));
         }
 
@@ -386,11 +406,14 @@ where
                                 )));
                             }
                             ToolExecutionOutcome::Interrupted(
-                                agentkit_tools_core::ToolInterruption::AuthRequired(_),
+                                agentkit_tools_core::ToolInterruption::AuthRequired(request),
                             ) => {
-                                return Err(LoopError::Unsupported(
-                                    "auth interruptions are not wired into the loop yet".into(),
-                                ));
+                                self.pending_auth = Some(request.clone());
+                                self.state = DriverState::AwaitingAuth;
+                                self.emit(AgentEvent::AuthRequired(request.clone()));
+                                return Ok(LoopStep::Interrupt(LoopInterrupt::AuthRequest(
+                                    request,
+                                )));
                             }
                             ToolExecutionOutcome::Failed(error) => {
                                 self.emit(AgentEvent::Warning {
@@ -513,6 +536,11 @@ mod tests {
                         .iter()
                         .any(|part| matches!(part, Part::ToolResult(_)))
             });
+            let tool_name = request
+                .available_tools
+                .first()
+                .map(|tool| tool.name.0.clone())
+                .unwrap_or_else(|| "echo".into());
 
             let events = if has_tool_result {
                 let result_text = request
@@ -548,7 +576,7 @@ mod tests {
                 VecDeque::from([
                     ModelTurnEvent::ToolCall(agentkit_core::ToolCallPart {
                         id: ToolCallId::new("call-1"),
-                        name: "echo".into(),
+                        name: tool_name.clone(),
                         input: json!({ "value": "pong" }),
                         metadata: MetadataMap::new(),
                     }),
@@ -559,7 +587,7 @@ mod tests {
                             kind: ItemKind::Assistant,
                             parts: vec![Part::ToolCall(agentkit_core::ToolCallPart {
                                 id: ToolCallId::new("call-1"),
-                                name: "echo".into(),
+                                name: tool_name,
                                 input: json!({ "value": "pong" }),
                                 metadata: MetadataMap::new(),
                             })],
@@ -672,6 +700,51 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct AuthTool {
+        spec: ToolSpec,
+    }
+
+    impl Default for AuthTool {
+        fn default() -> Self {
+            Self {
+                spec: ToolSpec {
+                    name: ToolName::new("auth-tool"),
+                    description: "Always requires auth".into(),
+                    input_schema: json!({
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": false
+                    }),
+                    annotations: ToolAnnotations::default(),
+                    metadata: MetadataMap::new(),
+                },
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Tool for AuthTool {
+        fn spec(&self) -> &ToolSpec {
+            &self.spec
+        }
+
+        async fn invoke(
+            &self,
+            _request: agentkit_tools_core::ToolRequest,
+            _ctx: &mut ToolContext<'_>,
+        ) -> Result<ToolResult, agentkit_tools_core::ToolError> {
+            let mut details = MetadataMap::new();
+            details.insert("server_id".into(), json!("mock"));
+            details.insert("scope".into(), json!("secret.read"));
+
+            Err(agentkit_tools_core::ToolError::AuthRequired(AuthRequest {
+                provider: "mcp.mock".into(),
+                details,
+            }))
+        }
+    }
+
     #[tokio::test]
     async fn loop_continues_after_completed_tool_call() {
         let tools = ToolRegistry::new().with(EchoTool::default());
@@ -754,6 +827,47 @@ mod tests {
                 Part::Text(text) => assert!(text.text.contains("tool permission denied")),
                 other => panic!("unexpected part: {other:?}"),
             },
+            other => panic!("unexpected loop step: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn loop_surfaces_auth_interruptions_from_tools() {
+        let tools = ToolRegistry::new().with(AuthTool::default());
+        let agent = Agent::builder()
+            .model(FakeAdapter)
+            .tools(tools)
+            .permissions(AllowAllPermissions)
+            .build()
+            .unwrap();
+
+        let mut driver = agent
+            .start(SessionConfig {
+                session_id: SessionId::new("session-3"),
+                metadata: MetadataMap::new(),
+            })
+            .await
+            .unwrap();
+
+        driver
+            .submit_input(vec![Item {
+                id: None,
+                kind: ItemKind::User,
+                parts: vec![Part::Text(TextPart {
+                    text: "ping".into(),
+                    metadata: MetadataMap::new(),
+                })],
+                metadata: MetadataMap::new(),
+            }])
+            .unwrap();
+
+        let result = driver.next().await.unwrap();
+
+        match result {
+            LoopStep::Interrupt(LoopInterrupt::AuthRequest(request)) => {
+                assert_eq!(request.provider, "mcp.mock");
+                assert_eq!(request.details.get("scope"), Some(&json!("secret.read")));
+            }
             other => panic!("unexpected loop step: {other:?}"),
         }
     }

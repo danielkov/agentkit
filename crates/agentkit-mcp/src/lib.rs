@@ -14,8 +14,8 @@ use agentkit_core::{
     DataRef, Item, ItemKind, MetadataMap, Part, TextPart, ToolOutput, ToolResultPart,
 };
 use agentkit_tools_core::{
-    Tool, ToolAnnotations, ToolContext, ToolError, ToolName, ToolRegistry, ToolRequest, ToolResult,
-    ToolSpec,
+    AuthRequest, Tool, ToolAnnotations, ToolContext, ToolError, ToolName, ToolRegistry,
+    ToolRequest, ToolResult, ToolSpec,
 };
 use async_trait::async_trait;
 use futures_util::TryStreamExt;
@@ -577,6 +577,9 @@ impl McpConnection {
             }
 
             if let Some(error) = frame.value.get("error") {
+                if let Some(auth_request) = parse_auth_request(&self.server_id, method, error) {
+                    return Err(McpError::AuthRequired(auth_request));
+                }
                 return Err(McpError::Invocation(error.to_string()));
             }
 
@@ -634,7 +637,12 @@ impl Invocable for McpInvocable {
             .connection
             .call_tool(&self.descriptor.name, request.input)
             .await
-            .map_err(|error| CapabilityError::ExecutionFailed(error.to_string()))?;
+            .map_err(|error| match error {
+                McpError::AuthRequired(request) => {
+                    CapabilityError::Unavailable(format!("auth required: {:?}", request))
+                }
+                other => CapabilityError::ExecutionFailed(other.to_string()),
+            })?;
 
         Ok(InvocableResult {
             output: value_to_invocable_output(result),
@@ -662,7 +670,12 @@ impl ResourceProvider for McpResourceHandle {
         self.connection
             .read_resource(&id.0)
             .await
-            .map_err(|error| CapabilityError::ExecutionFailed(error.to_string()))
+            .map_err(|error| match error {
+                McpError::AuthRequired(request) => {
+                    CapabilityError::Unavailable(format!("auth required: {:?}", request))
+                }
+                other => CapabilityError::ExecutionFailed(other.to_string()),
+            })
     }
 }
 
@@ -686,7 +699,12 @@ impl PromptProvider for McpPromptHandle {
         self.connection
             .get_prompt(&id.0, args)
             .await
-            .map_err(|error| CapabilityError::ExecutionFailed(error.to_string()))
+            .map_err(|error| match error {
+                McpError::AuthRequired(request) => {
+                    CapabilityError::Unavailable(format!("auth required: {:?}", request))
+                }
+                other => CapabilityError::ExecutionFailed(other.to_string()),
+            })
     }
 }
 
@@ -989,7 +1007,10 @@ impl Tool for McpToolAdapter {
             .connection
             .call_tool(&self.descriptor.name, request.input)
             .await
-            .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
+            .map_err(|error| match error {
+                McpError::AuthRequired(request) => ToolError::AuthRequired(request),
+                other => ToolError::ExecutionFailed(other.to_string()),
+            })?;
 
         Ok(ToolResult {
             result: ToolResultPart {
@@ -1140,6 +1161,42 @@ fn invocable_output_to_tool_output(output: InvocableOutput) -> ToolOutput {
     }
 }
 
+fn parse_auth_request(server_id: &McpServerId, method: &str, error: &Value) -> Option<AuthRequest> {
+    let code = error.get("code").and_then(Value::as_i64);
+    let message = error.get("message").and_then(Value::as_str);
+    let data = error.get("data");
+
+    let auth_marker = matches!(code, Some(401 | -32001))
+        || data
+            .and_then(|data| data.get("auth_required"))
+            .and_then(Value::as_bool)
+            == Some(true)
+        || data.and_then(|data| data.get("auth")).is_some();
+
+    if !auth_marker {
+        return None;
+    }
+
+    let mut details = MetadataMap::new();
+    details.insert("server_id".into(), Value::String(server_id.to_string()));
+    details.insert("method".into(), Value::String(method.into()));
+
+    if let Some(code) = code {
+        details.insert("code".into(), Value::Number(code.into()));
+    }
+    if let Some(message) = message {
+        details.insert("message".into(), Value::String(message.into()));
+    }
+    if let Some(data) = data {
+        details.insert("data".into(), data.clone());
+    }
+
+    Some(AuthRequest {
+        provider: format!("mcp.{}", server_id),
+        details,
+    })
+}
+
 async fn read_sse_stream<R>(
     mut reader: R,
     response_url: Url,
@@ -1255,6 +1312,8 @@ pub enum McpError {
     Transport(String),
     #[error("protocol error: {0}")]
     Protocol(String),
+    #[error("MCP auth required: {0:?}")]
+    AuthRequired(AuthRequest),
     #[error("invocation error: {0}")]
     Invocation(String),
     #[error("unknown MCP server: {0}")]
@@ -1393,6 +1452,90 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.result.output, ToolOutput::Text("pong".into()));
+    }
+
+    #[tokio::test]
+    async fn request_surfaces_auth_required_errors() {
+        let connection = fake_connection(vec![json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {
+                "code": -32001,
+                "message": "authentication required",
+                "data": {
+                    "auth_required": true,
+                    "scope": "secrets.read"
+                }
+            }
+        })]);
+
+        let error = connection.call_tool("echo", json!({})).await.unwrap_err();
+        match error {
+            McpError::AuthRequired(request) => {
+                assert_eq!(request.provider, "mcp.fake");
+                assert_eq!(
+                    request.details.get("method"),
+                    Some(&Value::String("tools/call".into()))
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_adapter_maps_auth_required_into_tool_error() {
+        let connection = Arc::new(fake_connection(vec![json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {
+                "code": -32001,
+                "message": "authentication required",
+                "data": { "auth_required": true }
+            }
+        })]));
+        let server_id = connection.server_id().clone();
+        let adapter = McpToolAdapter::new(
+            &server_id,
+            connection,
+            McpToolDescriptor {
+                name: "echo".into(),
+                description: Some("Echo".into()),
+                input_schema: json!({ "type": "object" }),
+                metadata: MetadataMap::new(),
+            },
+        );
+        let metadata = MetadataMap::new();
+        let mut ctx = ToolContext {
+            capability: CapabilityContext {
+                session_id: None,
+                turn_id: None,
+                metadata: &metadata,
+            },
+            permissions: &AllowAll,
+            resources: &(),
+        };
+
+        let error = adapter
+            .invoke(
+                ToolRequest {
+                    call_id: "call-1".into(),
+                    tool_name: ToolName::new("mcp.fake.echo"),
+                    input: json!({}),
+                    session_id: "session-1".into(),
+                    turn_id: "turn-1".into(),
+                    metadata: MetadataMap::new(),
+                },
+                &mut ctx,
+            )
+            .await
+            .unwrap_err();
+
+        match error {
+            ToolError::AuthRequired(request) => {
+                assert_eq!(request.provider, "mcp.fake");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     #[tokio::test]

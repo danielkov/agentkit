@@ -105,6 +105,10 @@ where
             eprintln!("approval required: {}", request.summary);
             Ok(())
         }
+        LoopStep::Interrupt(LoopInterrupt::AuthRequest(request)) => {
+            eprintln!("auth required: {}", request.provider);
+            Ok(())
+        }
     }
 }
 

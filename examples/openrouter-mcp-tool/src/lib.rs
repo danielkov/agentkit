@@ -260,6 +260,9 @@ where
         LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(request)) => {
             Err(format!("unexpected approval request: {}", request.summary).into())
         }
+        LoopStep::Interrupt(LoopInterrupt::AuthRequest(request)) => {
+            Err(format!("unexpected auth request from {}", request.provider).into())
+        }
         LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_)) => {
             Err("loop requested more input before finishing".into())
         }
