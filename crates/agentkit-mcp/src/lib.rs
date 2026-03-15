@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -13,7 +14,8 @@ use agentkit_core::{
     DataRef, Item, ItemKind, MetadataMap, Part, TextPart, ToolOutput, ToolResultPart,
 };
 use agentkit_tools_core::{
-    Tool, ToolAnnotations, ToolContext, ToolError, ToolName, ToolRequest, ToolResult, ToolSpec,
+    Tool, ToolAnnotations, ToolContext, ToolError, ToolName, ToolRegistry, ToolRequest, ToolResult,
+    ToolSpec,
 };
 use async_trait::async_trait;
 use futures_util::TryStreamExt;
@@ -426,6 +428,11 @@ impl McpConnection {
         &self.server_id
     }
 
+    pub async fn close(&self) -> Result<(), McpError> {
+        let mut transport = self.transport.lock().await;
+        transport.close().await
+    }
+
     pub async fn discover(&self) -> Result<McpDiscoverySnapshot, McpError> {
         Ok(McpDiscoverySnapshot {
             server_id: self.server_id.clone(),
@@ -690,12 +697,7 @@ pub struct McpCapabilityProvider {
 }
 
 impl McpCapabilityProvider {
-    pub async fn connect(
-        config: &McpServerConfig,
-    ) -> Result<(Arc<McpConnection>, Self, McpDiscoverySnapshot), McpError> {
-        let connection = Arc::new(McpConnection::connect(config).await?);
-        let snapshot = connection.discover().await?;
-
+    pub fn from_snapshot(connection: Arc<McpConnection>, snapshot: &McpDiscoverySnapshot) -> Self {
         let invocables = snapshot
             .tools
             .iter()
@@ -741,15 +743,42 @@ impl McpCapabilityProvider {
             })
             .collect();
 
-        Ok((
-            connection,
-            Self {
-                invocables,
-                resources,
-                prompts,
-            },
-            snapshot,
-        ))
+        Self {
+            invocables,
+            resources,
+            prompts,
+        }
+    }
+
+    pub fn merge<I>(providers: I) -> Self
+    where
+        I: IntoIterator<Item = Self>,
+    {
+        let mut invocables = Vec::new();
+        let mut resources = Vec::new();
+        let mut prompts = Vec::new();
+
+        for provider in providers {
+            invocables.extend(provider.invocables);
+            resources.extend(provider.resources);
+            prompts.extend(provider.prompts);
+        }
+
+        Self {
+            invocables,
+            resources,
+            prompts,
+        }
+    }
+
+    pub async fn connect(
+        config: &McpServerConfig,
+    ) -> Result<(Arc<McpConnection>, Self, McpDiscoverySnapshot), McpError> {
+        let connection = Arc::new(McpConnection::connect(config).await?);
+        let snapshot = connection.discover().await?;
+        let provider = Self::from_snapshot(connection.clone(), &snapshot);
+
+        Ok((connection, provider, snapshot))
     }
 }
 
@@ -764,6 +793,153 @@ impl CapabilityProvider for McpCapabilityProvider {
 
     fn prompts(&self) -> Vec<Arc<dyn PromptProvider>> {
         self.prompts.clone()
+    }
+}
+
+#[derive(Clone)]
+pub struct McpServerHandle {
+    config: McpServerConfig,
+    connection: Arc<McpConnection>,
+    snapshot: McpDiscoverySnapshot,
+}
+
+impl McpServerHandle {
+    pub fn config(&self) -> &McpServerConfig {
+        &self.config
+    }
+
+    pub fn server_id(&self) -> &McpServerId {
+        self.connection.server_id()
+    }
+
+    pub fn connection(&self) -> Arc<McpConnection> {
+        self.connection.clone()
+    }
+
+    pub fn snapshot(&self) -> &McpDiscoverySnapshot {
+        &self.snapshot
+    }
+
+    pub fn tool_registry(&self) -> ToolRegistry {
+        self.snapshot
+            .tools
+            .iter()
+            .cloned()
+            .fold(ToolRegistry::new(), |registry, descriptor| {
+                registry.with(McpToolAdapter::new(
+                    self.server_id(),
+                    self.connection.clone(),
+                    descriptor,
+                ))
+            })
+    }
+
+    pub fn capability_provider(&self) -> McpCapabilityProvider {
+        McpCapabilityProvider::from_snapshot(self.connection.clone(), &self.snapshot)
+    }
+}
+
+#[derive(Default)]
+pub struct McpServerManager {
+    configs: BTreeMap<McpServerId, McpServerConfig>,
+    connections: BTreeMap<McpServerId, McpServerHandle>,
+}
+
+impl McpServerManager {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_server(mut self, config: McpServerConfig) -> Self {
+        self.register_server(config);
+        self
+    }
+
+    pub fn register_server(&mut self, config: McpServerConfig) -> &mut Self {
+        self.configs.insert(config.id.clone(), config);
+        self
+    }
+
+    pub fn connected_server(&self, server_id: &McpServerId) -> Option<&McpServerHandle> {
+        self.connections.get(server_id)
+    }
+
+    pub fn connected_servers(&self) -> Vec<&McpServerHandle> {
+        self.connections.values().collect()
+    }
+
+    pub async fn connect_server(
+        &mut self,
+        server_id: &McpServerId,
+    ) -> Result<McpServerHandle, McpError> {
+        let config = self
+            .configs
+            .get(server_id)
+            .cloned()
+            .ok_or_else(|| McpError::UnknownServer(server_id.to_string()))?;
+        let connection = Arc::new(McpConnection::connect(&config).await?);
+        let snapshot = connection.discover().await?;
+        let handle = McpServerHandle {
+            config,
+            connection,
+            snapshot,
+        };
+        self.connections.insert(server_id.clone(), handle.clone());
+        Ok(handle)
+    }
+
+    pub async fn connect_all(&mut self) -> Result<Vec<McpServerHandle>, McpError> {
+        let server_ids = self.configs.keys().cloned().collect::<Vec<_>>();
+        let mut handles = Vec::with_capacity(server_ids.len());
+
+        for server_id in server_ids {
+            handles.push(self.connect_server(&server_id).await?);
+        }
+
+        Ok(handles)
+    }
+
+    pub async fn refresh_server(
+        &mut self,
+        server_id: &McpServerId,
+    ) -> Result<McpDiscoverySnapshot, McpError> {
+        let handle = self
+            .connections
+            .get_mut(server_id)
+            .ok_or_else(|| McpError::UnknownServer(server_id.to_string()))?;
+        let snapshot = handle.connection.discover().await?;
+        handle.snapshot = snapshot.clone();
+        Ok(snapshot)
+    }
+
+    pub async fn disconnect_server(&mut self, server_id: &McpServerId) -> Result<(), McpError> {
+        let Some(handle) = self.connections.remove(server_id) else {
+            return Err(McpError::UnknownServer(server_id.to_string()));
+        };
+        handle.connection.close().await
+    }
+
+    pub fn tool_registry(&self) -> ToolRegistry {
+        self.connections
+            .values()
+            .fold(ToolRegistry::new(), |mut registry, handle| {
+                for tool in handle.snapshot.tools.iter().cloned() {
+                    registry.register(McpToolAdapter::new(
+                        handle.server_id(),
+                        handle.connection.clone(),
+                        tool,
+                    ));
+                }
+                registry
+            })
+    }
+
+    pub fn capability_provider(&self) -> McpCapabilityProvider {
+        McpCapabilityProvider::merge(
+            self.connections
+                .values()
+                .map(McpServerHandle::capability_provider),
+        )
     }
 }
 
@@ -1081,6 +1257,8 @@ pub enum McpError {
     Protocol(String),
     #[error("invocation error: {0}")]
     Invocation(String),
+    #[error("unknown MCP server: {0}")]
+    UnknownServer(String),
 }
 
 #[cfg(test)]
@@ -1127,6 +1305,32 @@ mod tests {
                 recv: responses.into(),
             })),
             next_id: AtomicU64::new(1),
+        }
+    }
+
+    #[derive(Clone)]
+    struct FakeTransportFactory {
+        responses: StdArc<StdMutex<VecDeque<Vec<Value>>>>,
+    }
+
+    impl FakeTransportFactory {
+        fn new(sequences: Vec<Vec<Value>>) -> Self {
+            Self {
+                responses: StdArc::new(StdMutex::new(sequences.into())),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl McpTransportFactory for FakeTransportFactory {
+        async fn connect(&self) -> Result<Box<dyn McpTransport>, McpError> {
+            let responses =
+                self.responses.lock().unwrap().pop_front().ok_or_else(|| {
+                    McpError::Transport("no fake transport responses left".into())
+                })?;
+            Ok(Box::new(FakeTransport {
+                recv: responses.into(),
+            }))
         }
     }
 
@@ -1253,5 +1457,72 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert!(requests[0].starts_with("POST /messages "));
         assert!(requests[0].contains("\"method\":\"tools/list\""));
+    }
+
+    #[tokio::test]
+    async fn server_manager_connects_refreshes_and_aggregates_tools() {
+        let alpha = McpServerConfig::new(
+            "alpha",
+            McpTransportBinding::Custom(Arc::new(FakeTransportFactory::new(vec![vec![
+                json!({ "jsonrpc": "2.0", "id": 0, "result": { "capabilities": {} } }),
+                json!({ "jsonrpc": "2.0", "id": 1, "result": { "tools": [{ "name": "echo", "description": "Echo", "inputSchema": {"type": "object"} }] } }),
+                json!({ "jsonrpc": "2.0", "id": 2, "result": { "resources": [] } }),
+                json!({ "jsonrpc": "2.0", "id": 3, "result": { "prompts": [] } }),
+                json!({ "jsonrpc": "2.0", "id": 4, "result": { "tools": [{ "name": "echo_v2", "description": "Echo 2", "inputSchema": {"type": "object"} }] } }),
+                json!({ "jsonrpc": "2.0", "id": 5, "result": { "resources": [] } }),
+                json!({ "jsonrpc": "2.0", "id": 6, "result": { "prompts": [] } }),
+            ]]))),
+        );
+        let beta = McpServerConfig::new(
+            "beta",
+            McpTransportBinding::Custom(Arc::new(FakeTransportFactory::new(vec![vec![
+                json!({ "jsonrpc": "2.0", "id": 0, "result": { "capabilities": {} } }),
+                json!({ "jsonrpc": "2.0", "id": 1, "result": { "tools": [{ "name": "search", "description": "Search", "inputSchema": {"type": "object"} }] } }),
+                json!({ "jsonrpc": "2.0", "id": 2, "result": { "resources": [] } }),
+                json!({ "jsonrpc": "2.0", "id": 3, "result": { "prompts": [] } }),
+            ]]))),
+        );
+
+        let mut manager = McpServerManager::new().with_server(alpha).with_server(beta);
+
+        let handles = manager.connect_all().await.unwrap();
+        assert_eq!(handles.len(), 2);
+        assert_eq!(
+            manager
+                .tool_registry()
+                .specs()
+                .into_iter()
+                .map(|spec| spec.name.0)
+                .collect::<Vec<_>>(),
+            vec!["mcp.alpha.echo".to_string(), "mcp.beta.search".to_string()]
+        );
+
+        let refreshed = manager
+            .refresh_server(&McpServerId::new("alpha"))
+            .await
+            .unwrap();
+        assert_eq!(refreshed.tools[0].name, "echo_v2");
+        assert_eq!(
+            manager
+                .connected_server(&McpServerId::new("alpha"))
+                .unwrap()
+                .snapshot()
+                .tools[0]
+                .name,
+            "echo_v2"
+        );
+
+        let capabilities = manager.capability_provider();
+        assert_eq!(capabilities.invocables().len(), 2);
+
+        manager
+            .disconnect_server(&McpServerId::new("alpha"))
+            .await
+            .unwrap();
+        assert!(
+            manager
+                .connected_server(&McpServerId::new("alpha"))
+                .is_none()
+        );
     }
 }
