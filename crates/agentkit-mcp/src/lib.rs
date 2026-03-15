@@ -14,8 +14,8 @@ use agentkit_core::{
     DataRef, Item, ItemKind, MetadataMap, Part, TextPart, ToolOutput, ToolResultPart,
 };
 use agentkit_tools_core::{
-    AuthRequest, Tool, ToolAnnotations, ToolContext, ToolError, ToolName, ToolRegistry,
-    ToolRequest, ToolResult, ToolSpec,
+    AuthOperation, AuthRequest, AuthResolution, Tool, ToolAnnotations, ToolContext, ToolError,
+    ToolName, ToolRegistry, ToolRequest, ToolResult, ToolSpec,
 };
 use async_trait::async_trait;
 use futures_util::TryStreamExt;
@@ -410,13 +410,14 @@ impl McpConnection {
         if let Some(auth) = auth {
             params.insert("auth".into(), metadata_to_value(auth));
         }
+        let init_params = Value::Object(params.clone());
         transport
             .send(McpFrame {
                 value: json!({
                     "jsonrpc": "2.0",
                     "id": 0,
                     "method": "initialize",
-                    "params": Value::Object(params)
+                    "params": init_params.clone()
                 }),
             })
             .await?;
@@ -424,8 +425,10 @@ impl McpConnection {
             McpError::Transport("transport closed during MCP initialization".into())
         })?;
         if let Some(error) = init_response.value.get("error") {
-            if let Some(auth_request) = parse_auth_request(&config.id, "initialize", error) {
-                return Err(McpError::AuthRequired(auth_request));
+            if let Some(auth_request) =
+                parse_auth_request(&config.id, "initialize", &init_params, error)
+            {
+                return Err(McpError::AuthRequired(Box::new(auth_request)));
             }
             return Err(McpError::Invocation(error.to_string()));
         }
@@ -456,16 +459,13 @@ impl McpConnection {
         transport.close().await
     }
 
-    pub async fn resolve_auth(
-        &self,
-        resolution: agentkit_tools_core::AuthResolution,
-    ) -> Result<(), McpError> {
+    pub async fn resolve_auth(&self, resolution: AuthResolution) -> Result<(), McpError> {
         let mut auth = self.auth.lock().await;
         match resolution {
-            agentkit_tools_core::AuthResolution::Provided(details) => {
-                *auth = Some(details);
+            AuthResolution::Provided { credentials, .. } => {
+                *auth = Some(credentials);
             }
-            agentkit_tools_core::AuthResolution::Cancelled => {
+            AuthResolution::Cancelled { .. } => {
                 *auth = None;
             }
         }
@@ -592,7 +592,7 @@ impl McpConnection {
 
     async fn request(&self, method: &str, params: Value) -> Result<Value, McpError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let params = self.enrich_params(params).await;
+        let params = self.enrich_params(params.clone()).await;
         let mut transport = self.transport.lock().await;
         transport
             .send(McpFrame {
@@ -617,8 +617,10 @@ impl McpConnection {
             }
 
             if let Some(error) = frame.value.get("error") {
-                if let Some(auth_request) = parse_auth_request(&self.server_id, method, error) {
-                    return Err(McpError::AuthRequired(auth_request));
+                if let Some(auth_request) =
+                    parse_auth_request(&self.server_id, method, &params, error)
+                {
+                    return Err(McpError::AuthRequired(Box::new(auth_request)));
                 }
                 return Err(McpError::Invocation(error.to_string()));
             }
@@ -996,26 +998,27 @@ impl McpServerManager {
         handle.connection.close().await
     }
 
-    pub async fn resolve_auth(
-        &mut self,
-        server_id: &McpServerId,
-        resolution: agentkit_tools_core::AuthResolution,
-    ) -> Result<(), McpError> {
+    pub async fn resolve_auth(&mut self, resolution: AuthResolution) -> Result<(), McpError> {
+        let server_id = resolution
+            .request()
+            .server_id()
+            .ok_or_else(|| McpError::AuthResolution("auth resolution missing server id".into()))?;
+        let server_id = McpServerId::new(server_id);
         match &resolution {
-            agentkit_tools_core::AuthResolution::Provided(details) => {
-                self.auth.insert(server_id.clone(), details.clone());
+            AuthResolution::Provided { credentials, .. } => {
+                self.auth.insert(server_id.clone(), credentials.clone());
             }
-            agentkit_tools_core::AuthResolution::Cancelled => {
-                self.auth.remove(server_id);
+            AuthResolution::Cancelled { .. } => {
+                self.auth.remove(&server_id);
             }
         }
 
-        if let Some(handle) = self.connections.get(server_id) {
+        if let Some(handle) = self.connections.get(&server_id) {
             handle.connection.resolve_auth(resolution).await?;
             return Ok(());
         }
 
-        if self.configs.contains_key(server_id) {
+        if self.configs.contains_key(&server_id) {
             Ok(())
         } else {
             Err(McpError::UnknownServer(server_id.to_string()))
@@ -1255,7 +1258,12 @@ fn metadata_to_value(metadata: &MetadataMap) -> Value {
     )
 }
 
-fn parse_auth_request(server_id: &McpServerId, method: &str, error: &Value) -> Option<AuthRequest> {
+fn parse_auth_request(
+    server_id: &McpServerId,
+    method: &str,
+    params: &Value,
+    error: &Value,
+) -> Option<AuthRequest> {
     let code = error.get("code").and_then(Value::as_i64);
     let message = error.get("message").and_then(Value::as_str);
     let data = error.get("data");
@@ -1271,24 +1279,83 @@ fn parse_auth_request(server_id: &McpServerId, method: &str, error: &Value) -> O
         return None;
     }
 
-    let mut details = MetadataMap::new();
-    details.insert("server_id".into(), Value::String(server_id.to_string()));
-    details.insert("method".into(), Value::String(method.into()));
+    let mut challenge = MetadataMap::new();
+    challenge.insert("server_id".into(), Value::String(server_id.to_string()));
+    challenge.insert("method".into(), Value::String(method.into()));
 
     if let Some(code) = code {
-        details.insert("code".into(), Value::Number(code.into()));
+        challenge.insert("code".into(), Value::Number(code.into()));
     }
     if let Some(message) = message {
-        details.insert("message".into(), Value::String(message.into()));
+        challenge.insert("message".into(), Value::String(message.into()));
     }
     if let Some(data) = data {
-        details.insert("data".into(), data.clone());
+        challenge.insert("data".into(), data.clone());
     }
 
     Some(AuthRequest {
+        id: format!("mcp:{}:{}", server_id, method),
         provider: format!("mcp.{}", server_id),
-        details,
+        operation: auth_operation_for_method(server_id, method, params),
+        challenge,
     })
+}
+
+fn auth_operation_for_method(
+    server_id: &McpServerId,
+    method: &str,
+    params: &Value,
+) -> AuthOperation {
+    match method {
+        "initialize" => AuthOperation::McpConnect {
+            server_id: server_id.to_string(),
+            metadata: MetadataMap::new(),
+        },
+        "tools/call" => AuthOperation::McpToolCall {
+            server_id: server_id.to_string(),
+            tool_name: params
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            input: params
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
+            metadata: MetadataMap::new(),
+        },
+        "resources/read" => AuthOperation::McpResourceRead {
+            server_id: server_id.to_string(),
+            resource_id: params
+                .get("uri")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            metadata: MetadataMap::new(),
+        },
+        "prompts/get" => AuthOperation::McpPromptGet {
+            server_id: server_id.to_string(),
+            prompt_id: params
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            args: params
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
+            metadata: MetadataMap::new(),
+        },
+        other => AuthOperation::Custom {
+            kind: format!("mcp.{other}"),
+            payload: params.clone(),
+            metadata: {
+                let mut metadata = MetadataMap::new();
+                metadata.insert("server_id".into(), Value::String(server_id.to_string()));
+                metadata
+            },
+        },
+    }
 }
 
 async fn read_sse_stream<R>(
@@ -1407,7 +1474,9 @@ pub enum McpError {
     #[error("protocol error: {0}")]
     Protocol(String),
     #[error("MCP auth required: {0:?}")]
-    AuthRequired(AuthRequest),
+    AuthRequired(Box<AuthRequest>),
+    #[error("auth resolution error: {0}")]
+    AuthResolution(String),
     #[error("invocation error: {0}")]
     Invocation(String),
     #[error("unknown MCP server: {0}")]
@@ -1569,9 +1638,13 @@ mod tests {
             McpError::AuthRequired(request) => {
                 assert_eq!(request.provider, "mcp.fake");
                 assert_eq!(
-                    request.details.get("method"),
+                    request.challenge.get("method"),
                     Some(&Value::String("tools/call".into()))
                 );
+                assert!(matches!(
+                    request.operation,
+                    AuthOperation::McpToolCall { ref tool_name, .. } if tool_name == "echo"
+                ));
             }
             other => panic!("unexpected error: {other:?}"),
         }
@@ -1699,8 +1772,22 @@ mod tests {
         let connection = McpConnection::connect(&config).await.unwrap();
         let mut auth = MetadataMap::new();
         auth.insert("token".into(), json!("secret-token"));
+        let request = AuthRequest {
+            id: "auth-recording-tool".into(),
+            provider: "mcp.recording".into(),
+            operation: AuthOperation::McpToolCall {
+                server_id: "recording".into(),
+                tool_name: "echo".into(),
+                input: json!({}),
+                metadata: MetadataMap::new(),
+            },
+            challenge: MetadataMap::new(),
+        };
         connection
-            .resolve_auth(agentkit_tools_core::AuthResolution::Provided(auth))
+            .resolve_auth(agentkit_tools_core::AuthResolution::Provided {
+                request,
+                credentials: auth,
+            })
             .await
             .unwrap();
 
@@ -1734,11 +1821,20 @@ mod tests {
         ));
         let mut auth = MetadataMap::new();
         auth.insert("token".into(), json!("seed-token"));
+        let request = AuthRequest {
+            id: "auth-recording-connect".into(),
+            provider: "mcp.recording".into(),
+            operation: AuthOperation::McpConnect {
+                server_id: server_id.to_string(),
+                metadata: MetadataMap::new(),
+            },
+            challenge: MetadataMap::new(),
+        };
         manager
-            .resolve_auth(
-                &server_id,
-                agentkit_tools_core::AuthResolution::Provided(auth),
-            )
+            .resolve_auth(agentkit_tools_core::AuthResolution::Provided {
+                request,
+                credentials: auth,
+            })
             .await
             .unwrap();
 

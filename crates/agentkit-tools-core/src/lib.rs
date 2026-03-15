@@ -139,14 +139,87 @@ pub enum ApprovalDecision {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthRequest {
+    pub id: String,
     pub provider: String,
-    pub details: MetadataMap,
+    pub operation: AuthOperation,
+    pub challenge: MetadataMap,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AuthOperation {
+    ToolCall {
+        tool_name: String,
+        input: Value,
+        call_id: Option<ToolCallId>,
+        session_id: Option<SessionId>,
+        turn_id: Option<TurnId>,
+        metadata: MetadataMap,
+    },
+    McpConnect {
+        server_id: String,
+        metadata: MetadataMap,
+    },
+    McpToolCall {
+        server_id: String,
+        tool_name: String,
+        input: Value,
+        metadata: MetadataMap,
+    },
+    McpResourceRead {
+        server_id: String,
+        resource_id: String,
+        metadata: MetadataMap,
+    },
+    McpPromptGet {
+        server_id: String,
+        prompt_id: String,
+        args: Value,
+        metadata: MetadataMap,
+    },
+    Custom {
+        kind: String,
+        payload: Value,
+        metadata: MetadataMap,
+    },
+}
+
+impl AuthOperation {
+    pub fn server_id(&self) -> Option<&str> {
+        match self {
+            Self::McpConnect { server_id, .. }
+            | Self::McpToolCall { server_id, .. }
+            | Self::McpResourceRead { server_id, .. }
+            | Self::McpPromptGet { server_id, .. } => Some(server_id.as_str()),
+            Self::ToolCall { metadata, .. } | Self::Custom { metadata, .. } => {
+                metadata.get("server_id").and_then(Value::as_str)
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AuthResolution {
-    Provided(MetadataMap),
-    Cancelled,
+    Provided {
+        request: AuthRequest,
+        credentials: MetadataMap,
+    },
+    Cancelled {
+        request: AuthRequest,
+    },
+}
+
+impl AuthResolution {
+    pub fn request(&self) -> &AuthRequest {
+        match self {
+            Self::Provided { request, .. } | Self::Cancelled { request } => request,
+        }
+    }
+}
+
+impl AuthRequest {
+    pub fn server_id(&self) -> Option<&str> {
+        self.operation.server_id()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1044,7 +1117,7 @@ impl ToolExecutor for BasicToolExecutor {
         match tool.invoke(request, ctx).await {
             Ok(result) => ToolExecutionOutcome::Completed(result),
             Err(ToolError::AuthRequired(request)) => {
-                ToolExecutionOutcome::Interrupted(ToolInterruption::AuthRequired(request))
+                ToolExecutionOutcome::Interrupted(ToolInterruption::AuthRequired(*request))
             }
             Err(error) => ToolExecutionOutcome::Failed(error),
         }
@@ -1062,7 +1135,7 @@ pub enum ToolError {
     #[error("tool execution failed: {0}")]
     ExecutionFailed(String),
     #[error("tool auth required: {0:?}")]
-    AuthRequired(AuthRequest),
+    AuthRequired(Box<AuthRequest>),
     #[error("tool unavailable: {0}")]
     Unavailable(String),
     #[error("internal tool error: {0}")]

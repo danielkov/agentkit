@@ -6,9 +6,9 @@ use agentkit_core::{
     ToolResultPart, Usage,
 };
 use agentkit_tools_core::{
-    ApprovalDecision, ApprovalRequest, AuthRequest, AuthResolution, BasicToolExecutor,
-    PermissionChecker, ToolContext, ToolError, ToolExecutionOutcome, ToolExecutor, ToolRegistry,
-    ToolRequest, ToolSpec,
+    ApprovalDecision, ApprovalRequest, AuthOperation, AuthRequest, AuthResolution,
+    BasicToolExecutor, PermissionChecker, ToolContext, ToolError, ToolExecutionOutcome,
+    ToolExecutor, ToolRegistry, ToolRequest, ToolSpec,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -143,6 +143,15 @@ enum DriverState {
     AwaitingAuth,
 }
 
+#[derive(Clone, Debug)]
+struct PendingAuthToolCall {
+    request: AuthRequest,
+    resolution: Option<AuthResolution>,
+    turn_id: agentkit_core::TurnId,
+    call: ToolCallPart,
+    tool_request: ToolRequest,
+}
+
 pub struct Agent<M>
 where
     M: ModelAdapter,
@@ -259,7 +268,7 @@ where
     transcript: Vec<Item>,
     pending_input: Vec<Item>,
     pending_approval: Option<ApprovalRequest>,
-    pending_auth: Option<AuthRequest>,
+    pending_auth: Option<PendingAuthToolCall>,
     next_turn_index: u64,
     state: DriverState,
 }
@@ -268,76 +277,18 @@ impl<S> LoopDriver<S>
 where
     S: ModelSession,
 {
-    pub fn submit_input(&mut self, input: Vec<Item>) -> Result<(), LoopError> {
-        if self.state != DriverState::Idle {
-            return Err(LoopError::InvalidState(
-                "cannot submit input while an interrupt is pending".into(),
-            ));
-        }
-        self.emit(AgentEvent::InputAccepted {
-            session_id: self.session_id.clone(),
-            items: input.clone(),
-        });
-        self.pending_input.extend(input);
-        Ok(())
-    }
-
-    pub fn resolve_approval(&mut self, decision: ApprovalDecision) -> Result<(), LoopError> {
-        let Some(_request) = self.pending_approval.take() else {
-            return Err(LoopError::InvalidState(
-                "no approval request is pending".into(),
-            ));
-        };
-        self.state = DriverState::Idle;
-        self.emit(AgentEvent::ApprovalResolved {
-            approved: matches!(decision, ApprovalDecision::Approve),
-        });
-        Ok(())
-    }
-
-    pub fn resolve_auth(&mut self, resolution: AuthResolution) -> Result<(), LoopError> {
-        let Some(_request) = self.pending_auth.take() else {
-            return Err(LoopError::InvalidState("no auth request is pending".into()));
-        };
-        self.state = DriverState::Idle;
-        self.emit(AgentEvent::AuthResolved {
-            provided: matches!(resolution, AuthResolution::Provided(_)),
-        });
-        Ok(())
-    }
-
-    pub fn snapshot(&self) -> LoopSnapshot {
-        LoopSnapshot {
-            session_id: self.session_id.clone(),
-            transcript: self.transcript.clone(),
-            pending_input: self.pending_input.clone(),
-        }
-    }
-
-    pub async fn next(&mut self) -> Result<LoopStep, LoopError> {
-        if self.state != DriverState::Idle {
-            return Err(LoopError::InvalidState(
-                "cannot advance while an interrupt is pending".into(),
-            ));
+    async fn drive_turn(
+        &mut self,
+        turn_id: agentkit_core::TurnId,
+        emit_started: bool,
+    ) -> Result<LoopStep, LoopError> {
+        if emit_started {
+            self.emit(AgentEvent::TurnStarted {
+                session_id: self.session_id.clone(),
+                turn_id: turn_id.clone(),
+            });
         }
 
-        if self.pending_input.is_empty() {
-            return Ok(LoopStep::Interrupt(LoopInterrupt::AwaitingInput(
-                InputRequest {
-                    session_id: self.session_id.clone(),
-                    reason: "driver is waiting for input".into(),
-                },
-            )));
-        }
-
-        let turn_id = agentkit_core::TurnId::new(format!("turn-{}", self.next_turn_index));
-        self.next_turn_index += 1;
-        self.emit(AgentEvent::TurnStarted {
-            session_id: self.session_id.clone(),
-            turn_id: turn_id.clone(),
-        });
-
-        self.transcript.append(&mut self.pending_input);
         loop {
             let request = TurnRequest {
                 session_id: self.session_id.clone(),
@@ -384,7 +335,7 @@ where
 
                         match self
                             .tool_executor
-                            .execute(tool_request, &mut tool_ctx)
+                            .execute(tool_request.clone(), &mut tool_ctx)
                             .await
                         {
                             ToolExecutionOutcome::Completed(result) => {
@@ -408,7 +359,14 @@ where
                             ToolExecutionOutcome::Interrupted(
                                 agentkit_tools_core::ToolInterruption::AuthRequired(request),
                             ) => {
-                                self.pending_auth = Some(request.clone());
+                                let request = upgrade_auth_request(request, &tool_request, &call);
+                                self.pending_auth = Some(PendingAuthToolCall {
+                                    request: request.clone(),
+                                    resolution: None,
+                                    turn_id: turn_id.clone(),
+                                    call,
+                                    tool_request,
+                                });
                                 self.state = DriverState::AwaitingAuth;
                                 self.emit(AgentEvent::AuthRequired(request.clone()));
                                 return Ok(LoopStep::Interrupt(LoopInterrupt::AuthRequest(
@@ -464,11 +422,223 @@ where
         }
     }
 
+    async fn resume_after_auth(
+        &mut self,
+        pending: PendingAuthToolCall,
+    ) -> Result<LoopStep, LoopError> {
+        let resolution = pending
+            .resolution
+            .clone()
+            .ok_or_else(|| LoopError::InvalidState("pending auth has no resolution".into()))?;
+
+        self.transcript.push(Item {
+            id: None,
+            kind: ItemKind::Assistant,
+            parts: vec![Part::ToolCall(pending.call.clone())],
+            metadata: MetadataMap::new(),
+        });
+
+        let tool_item = match resolution {
+            AuthResolution::Provided { .. } => {
+                let tool_metadata = pending.tool_request.metadata.clone();
+                let mut tool_ctx = ToolContext {
+                    capability: CapabilityContext {
+                        session_id: Some(&self.session_id),
+                        turn_id: Some(&pending.turn_id),
+                        metadata: &tool_metadata,
+                    },
+                    permissions: self.permissions.as_ref(),
+                    resources: &(),
+                };
+
+                match self
+                    .tool_executor
+                    .execute(pending.tool_request.clone(), &mut tool_ctx)
+                    .await
+                {
+                    ToolExecutionOutcome::Completed(result) => Item {
+                        id: None,
+                        kind: ItemKind::Tool,
+                        parts: vec![Part::ToolResult(result.result)],
+                        metadata: result.metadata,
+                    },
+                    ToolExecutionOutcome::Interrupted(
+                        agentkit_tools_core::ToolInterruption::AuthRequired(request),
+                    ) => {
+                        let request =
+                            upgrade_auth_request(request, &pending.tool_request, &pending.call);
+                        self.pending_auth = Some(PendingAuthToolCall {
+                            request,
+                            resolution: None,
+                            turn_id: pending.turn_id,
+                            call: pending.call,
+                            tool_request: pending.tool_request,
+                        });
+                        self.state = DriverState::AwaitingAuth;
+                        let request = self
+                            .pending_auth
+                            .as_ref()
+                            .map(|pending| pending.request.clone())
+                            .ok_or_else(|| {
+                                LoopError::InvalidState("missing pending auth request".into())
+                            })?;
+                        self.emit(AgentEvent::AuthRequired(request.clone()));
+                        return Ok(LoopStep::Interrupt(LoopInterrupt::AuthRequest(request)));
+                    }
+                    ToolExecutionOutcome::Interrupted(
+                        agentkit_tools_core::ToolInterruption::ApprovalRequired(request),
+                    ) => {
+                        self.pending_approval = Some(request.clone());
+                        self.state = DriverState::AwaitingApproval;
+                        self.emit(AgentEvent::ApprovalRequired(request.clone()));
+                        return Ok(LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(request)));
+                    }
+                    ToolExecutionOutcome::Failed(error) => Item {
+                        id: None,
+                        kind: ItemKind::Tool,
+                        parts: vec![Part::ToolResult(ToolResultPart {
+                            call_id: pending.call.id.clone(),
+                            output: ToolOutput::Text(error.to_string()),
+                            is_error: true,
+                            metadata: pending.call.metadata.clone(),
+                        })],
+                        metadata: MetadataMap::new(),
+                    },
+                }
+            }
+            AuthResolution::Cancelled { .. } => Item {
+                id: None,
+                kind: ItemKind::Tool,
+                parts: vec![Part::ToolResult(ToolResultPart {
+                    call_id: pending.call.id.clone(),
+                    output: ToolOutput::Text("auth cancelled".into()),
+                    is_error: true,
+                    metadata: pending.call.metadata.clone(),
+                })],
+                metadata: MetadataMap::new(),
+            },
+        };
+
+        self.transcript.push(tool_item);
+        self.drive_turn(pending.turn_id, false).await
+    }
+
+    pub fn submit_input(&mut self, input: Vec<Item>) -> Result<(), LoopError> {
+        if self.state != DriverState::Idle {
+            return Err(LoopError::InvalidState(
+                "cannot submit input while an interrupt is pending".into(),
+            ));
+        }
+        self.emit(AgentEvent::InputAccepted {
+            session_id: self.session_id.clone(),
+            items: input.clone(),
+        });
+        self.pending_input.extend(input);
+        Ok(())
+    }
+
+    pub fn resolve_approval(&mut self, decision: ApprovalDecision) -> Result<(), LoopError> {
+        let Some(_request) = self.pending_approval.take() else {
+            return Err(LoopError::InvalidState(
+                "no approval request is pending".into(),
+            ));
+        };
+        self.state = DriverState::Idle;
+        self.emit(AgentEvent::ApprovalResolved {
+            approved: matches!(decision, ApprovalDecision::Approve),
+        });
+        Ok(())
+    }
+
+    pub fn resolve_auth(&mut self, resolution: AuthResolution) -> Result<(), LoopError> {
+        let Some(pending) = self.pending_auth.as_mut() else {
+            return Err(LoopError::InvalidState("no auth request is pending".into()));
+        };
+        if pending.request.id != resolution.request().id {
+            return Err(LoopError::InvalidState(
+                "auth resolution does not match the pending request".into(),
+            ));
+        }
+        pending.resolution = Some(resolution.clone());
+        self.state = DriverState::Idle;
+        self.emit(AgentEvent::AuthResolved {
+            provided: matches!(resolution, AuthResolution::Provided { .. }),
+        });
+        Ok(())
+    }
+
+    pub fn snapshot(&self) -> LoopSnapshot {
+        LoopSnapshot {
+            session_id: self.session_id.clone(),
+            transcript: self.transcript.clone(),
+            pending_input: self.pending_input.clone(),
+        }
+    }
+
+    pub async fn next(&mut self) -> Result<LoopStep, LoopError> {
+        if self.state != DriverState::Idle {
+            return Err(LoopError::InvalidState(
+                "cannot advance while an interrupt is pending".into(),
+            ));
+        }
+
+        if self
+            .pending_auth
+            .as_ref()
+            .is_some_and(|pending| pending.resolution.is_some())
+        {
+            let pending = self
+                .pending_auth
+                .take()
+                .ok_or_else(|| LoopError::InvalidState("missing pending auth state".into()))?;
+            return self.resume_after_auth(pending).await;
+        }
+
+        if self.pending_input.is_empty() {
+            return Ok(LoopStep::Interrupt(LoopInterrupt::AwaitingInput(
+                InputRequest {
+                    session_id: self.session_id.clone(),
+                    reason: "driver is waiting for input".into(),
+                },
+            )));
+        }
+
+        let turn_id = agentkit_core::TurnId::new(format!("turn-{}", self.next_turn_index));
+        self.next_turn_index += 1;
+        self.transcript.append(&mut self.pending_input);
+        self.drive_turn(turn_id, true).await
+    }
+
     fn emit(&mut self, event: AgentEvent) {
         for observer in &mut self.observers {
             observer.handle_event(event.clone());
         }
     }
+}
+
+fn upgrade_auth_request(
+    mut request: AuthRequest,
+    tool_request: &ToolRequest,
+    _call: &ToolCallPart,
+) -> AuthRequest {
+    if matches!(request.operation, AuthOperation::ToolCall { .. }) {
+        return request;
+    }
+
+    let prior_server_id = request.challenge.get("server_id").cloned();
+    let mut metadata = tool_request.metadata.clone();
+    if let Some(server_id) = prior_server_id {
+        metadata.entry("server_id".into()).or_insert(server_id);
+    }
+    request.operation = AuthOperation::ToolCall {
+        tool_name: tool_request.tool_name.0.clone(),
+        input: tool_request.input.clone(),
+        call_id: Some(tool_request.call_id.clone()),
+        session_id: Some(tool_request.session_id.clone()),
+        turn_id: Some(tool_request.turn_id.clone()),
+        metadata,
+    };
+    request
 }
 
 struct AllowAllPermissions;
@@ -731,17 +901,28 @@ mod tests {
 
         async fn invoke(
             &self,
-            _request: agentkit_tools_core::ToolRequest,
+            request: agentkit_tools_core::ToolRequest,
             _ctx: &mut ToolContext<'_>,
         ) -> Result<ToolResult, agentkit_tools_core::ToolError> {
-            let mut details = MetadataMap::new();
-            details.insert("server_id".into(), json!("mock"));
-            details.insert("scope".into(), json!("secret.read"));
+            let mut challenge = MetadataMap::new();
+            challenge.insert("server_id".into(), json!("mock"));
+            challenge.insert("scope".into(), json!("secret.read"));
 
-            Err(agentkit_tools_core::ToolError::AuthRequired(AuthRequest {
-                provider: "mcp.mock".into(),
-                details,
-            }))
+            Err(agentkit_tools_core::ToolError::AuthRequired(Box::new(
+                AuthRequest {
+                    id: "auth-1".into(),
+                    provider: "mcp.mock".into(),
+                    operation: AuthOperation::ToolCall {
+                        tool_name: request.tool_name.0,
+                        input: request.input,
+                        call_id: Some(request.call_id),
+                        session_id: Some(request.session_id),
+                        turn_id: Some(request.turn_id),
+                        metadata: request.metadata,
+                    },
+                    challenge,
+                },
+            )))
         }
     }
 
@@ -866,7 +1047,13 @@ mod tests {
         match result {
             LoopStep::Interrupt(LoopInterrupt::AuthRequest(request)) => {
                 assert_eq!(request.provider, "mcp.mock");
-                assert_eq!(request.details.get("scope"), Some(&json!("secret.read")));
+                assert_eq!(request.challenge.get("scope"), Some(&json!("secret.read")));
+                match request.operation {
+                    AuthOperation::ToolCall { tool_name, .. } => {
+                        assert_eq!(tool_name, "auth-tool");
+                    }
+                    other => panic!("unexpected auth operation: {other:?}"),
+                }
             }
             other => panic!("unexpected loop step: {other:?}"),
         }
