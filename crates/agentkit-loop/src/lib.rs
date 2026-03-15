@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use agentkit_capabilities::CapabilityContext;
+use agentkit_compaction::{CompactionConfig, CompactionReason, CompactionResult};
 use agentkit_core::{
     Delta, FinishReason, Item, ItemKind, MetadataMap, Part, SessionId, ToolCallPart, ToolOutput,
     ToolResultPart, Usage,
@@ -91,6 +92,18 @@ pub enum AgentEvent {
     AuthResolved {
         provided: bool,
     },
+    CompactionStarted {
+        session_id: SessionId,
+        turn_id: Option<agentkit_core::TurnId>,
+        reason: CompactionReason,
+    },
+    CompactionFinished {
+        session_id: SessionId,
+        turn_id: Option<agentkit_core::TurnId>,
+        replaced_items: usize,
+        transcript_len: usize,
+        metadata: MetadataMap,
+    },
     UsageUpdated(Usage),
     Warning {
         message: String,
@@ -159,6 +172,7 @@ where
     model: M,
     tools: ToolRegistry,
     permissions: Arc<dyn PermissionChecker>,
+    compaction: Option<CompactionConfig>,
     observers: Vec<Box<dyn LoopObserver>>,
 }
 
@@ -181,6 +195,7 @@ where
             tool_executor,
             tool_specs,
             permissions: self.permissions,
+            compaction: self.compaction,
             observers: self.observers,
             transcript: Vec::new(),
             pending_input: Vec::new(),
@@ -201,6 +216,7 @@ where
     model: Option<M>,
     tools: ToolRegistry,
     permissions: Arc<dyn PermissionChecker>,
+    compaction: Option<CompactionConfig>,
     observers: Vec<Box<dyn LoopObserver>>,
 }
 
@@ -213,6 +229,7 @@ where
             model: None,
             tools: ToolRegistry::new(),
             permissions: Arc::new(AllowAllPermissions),
+            compaction: None,
             observers: Vec::new(),
         }
     }
@@ -237,6 +254,11 @@ where
         self
     }
 
+    pub fn compaction(mut self, config: CompactionConfig) -> Self {
+        self.compaction = Some(config);
+        self
+    }
+
     pub fn observer(mut self, observer: impl LoopObserver + 'static) -> Self {
         self.observers.push(Box::new(observer));
         self
@@ -250,6 +272,7 @@ where
             model,
             tools: self.tools,
             permissions: self.permissions,
+            compaction: self.compaction,
             observers: self.observers,
         })
     }
@@ -264,6 +287,7 @@ where
     tool_executor: Arc<dyn ToolExecutor>,
     tool_specs: Vec<ToolSpec>,
     permissions: Arc<dyn PermissionChecker>,
+    compaction: Option<CompactionConfig>,
     observers: Vec<Box<dyn LoopObserver>>,
     transcript: Vec<Item>,
     pending_input: Vec<Item>,
@@ -277,11 +301,60 @@ impl<S> LoopDriver<S>
 where
     S: ModelSession,
 {
+    async fn maybe_compact(
+        &mut self,
+        turn_id: Option<&agentkit_core::TurnId>,
+    ) -> Result<(), LoopError> {
+        let Some(compaction) = self.compaction.as_ref().cloned() else {
+            return Ok(());
+        };
+        let Some(reason) =
+            compaction
+                .trigger
+                .should_compact(&self.session_id, turn_id, &self.transcript)
+        else {
+            return Ok(());
+        };
+
+        self.emit(AgentEvent::CompactionStarted {
+            session_id: self.session_id.clone(),
+            turn_id: turn_id.cloned(),
+            reason: reason.clone(),
+        });
+
+        let CompactionResult {
+            transcript,
+            replaced_items,
+            metadata,
+        } = compaction
+            .compactor
+            .compact(agentkit_compaction::CompactionRequest {
+                session_id: self.session_id.clone(),
+                turn_id: turn_id.cloned(),
+                transcript: self.transcript.clone(),
+                reason,
+                metadata: MetadataMap::new(),
+            })
+            .await
+            .map_err(|error| LoopError::Compaction(error.to_string()))?;
+
+        self.transcript = transcript;
+        self.emit(AgentEvent::CompactionFinished {
+            session_id: self.session_id.clone(),
+            turn_id: turn_id.cloned(),
+            replaced_items,
+            transcript_len: self.transcript.len(),
+            metadata,
+        });
+        Ok(())
+    }
+
     async fn drive_turn(
         &mut self,
         turn_id: agentkit_core::TurnId,
         emit_started: bool,
     ) -> Result<LoopStep, LoopError> {
+        self.maybe_compact(Some(&turn_id)).await?;
         if emit_started {
             self.emit(AgentEvent::TurnStarted {
                 session_id: self.session_id.clone(),
@@ -660,6 +733,8 @@ pub enum LoopError {
     Provider(String),
     #[error("tool error: {0}")]
     Tool(#[from] ToolError),
+    #[error("compaction error: {0}")]
+    Compaction(String),
     #[error("unsupported operation: {0}")]
     Unsupported(String),
 }
@@ -667,7 +742,11 @@ pub enum LoopError {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::sync::{Arc as StdArc, Mutex as StdMutex};
 
+    use agentkit_compaction::{
+        CompactionError, CompactionRequest, CompactionResult, CompactionTrigger, Compactor,
+    };
     use agentkit_core::{ItemKind, Part, TextPart, ToolCallId, ToolOutput, ToolResultPart};
     use agentkit_tools_core::{
         FileSystemPermissionRequest, PermissionCode, PermissionDecision, PermissionDenial, Tool,
@@ -870,6 +949,52 @@ mod tests {
         }
     }
 
+    struct CountTrigger;
+
+    impl CompactionTrigger for CountTrigger {
+        fn should_compact(
+            &self,
+            _session_id: &SessionId,
+            _turn_id: Option<&agentkit_core::TurnId>,
+            transcript: &[Item],
+        ) -> Option<agentkit_compaction::CompactionReason> {
+            (transcript.len() >= 2)
+                .then_some(agentkit_compaction::CompactionReason::TranscriptTooLong)
+        }
+    }
+
+    struct KeepLastCompactor;
+
+    #[async_trait]
+    impl Compactor for KeepLastCompactor {
+        async fn compact(
+            &self,
+            request: CompactionRequest,
+        ) -> Result<CompactionResult, CompactionError> {
+            let transcript = request
+                .transcript
+                .last()
+                .cloned()
+                .into_iter()
+                .collect::<Vec<_>>();
+            Ok(CompactionResult {
+                replaced_items: request.transcript.len().saturating_sub(transcript.len()),
+                transcript,
+                metadata: MetadataMap::new(),
+            })
+        }
+    }
+
+    struct RecordingObserver {
+        events: StdArc<StdMutex<Vec<AgentEvent>>>,
+    }
+
+    impl LoopObserver for RecordingObserver {
+        fn handle_event(&mut self, event: AgentEvent) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
     #[derive(Clone)]
     struct AuthTool {
         spec: ToolSpec,
@@ -1057,5 +1182,50 @@ mod tests {
             }
             other => panic!("unexpected loop step: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn loop_compacts_transcript_before_new_turns() {
+        let events = StdArc::new(StdMutex::new(Vec::new()));
+        let agent = Agent::builder()
+            .model(FakeAdapter)
+            .compaction(CompactionConfig::new(CountTrigger, KeepLastCompactor))
+            .observer(RecordingObserver {
+                events: events.clone(),
+            })
+            .build()
+            .unwrap();
+
+        let mut driver = agent
+            .start(SessionConfig {
+                session_id: SessionId::new("session-4"),
+                metadata: MetadataMap::new(),
+            })
+            .await
+            .unwrap();
+
+        for text in ["first", "second"] {
+            driver
+                .submit_input(vec![Item {
+                    id: None,
+                    kind: ItemKind::User,
+                    parts: vec![Part::Text(TextPart {
+                        text: text.into(),
+                        metadata: MetadataMap::new(),
+                    })],
+                    metadata: MetadataMap::new(),
+                }])
+                .unwrap();
+            let _ = driver.next().await.unwrap();
+        }
+
+        let events = events.lock().unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::CompactionFinished {
+                replaced_items,
+                ..
+            } if *replaced_items > 0
+        )));
     }
 }

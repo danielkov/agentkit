@@ -1,19 +1,15 @@
 [package]
-name = "agentkit-loop"
+name = "agentkit-compaction"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-agentkit-compaction = { path = "../agentkit-compaction" }
-agentkit-capabilities = { path = "../agentkit-capabilities" }
 agentkit-core = { path = "../agentkit-core" }
-agentkit-tools-core = { path = "../agentkit-tools-core" }
 async-trait.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
-tokio.workspace = true

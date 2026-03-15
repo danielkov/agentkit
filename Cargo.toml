@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/agentkit-compaction",
     "crates/agentkit-core",
     "crates/agentkit-context",
     "crates/agentkit-capabilities",

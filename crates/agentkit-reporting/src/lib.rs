@@ -312,6 +312,35 @@ where
         AgentEvent::AuthResolved { provided } => {
             writeln!(writer, "[auth] resolved provided={provided}")?;
         }
+        AgentEvent::CompactionStarted {
+            turn_id, reason, ..
+        } => {
+            writeln!(
+                writer,
+                "[compaction] started turn={} reason={reason:?}",
+                turn_id
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "none".into())
+            )?;
+        }
+        AgentEvent::CompactionFinished {
+            turn_id,
+            replaced_items,
+            transcript_len,
+            ..
+        } => {
+            writeln!(
+                writer,
+                "[compaction] finished turn={} replaced_items={} transcript_len={}",
+                turn_id
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "none".into()),
+                replaced_items,
+                transcript_len
+            )?;
+        }
         AgentEvent::UsageUpdated(usage) if show_usage => {
             writeln!(writer, "[usage] {}", format_usage(usage))?;
         }

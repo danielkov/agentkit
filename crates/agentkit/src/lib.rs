@@ -1,5 +1,7 @@
 #[cfg(feature = "capabilities")]
 pub use agentkit_capabilities as capabilities;
+#[cfg(feature = "compaction")]
+pub use agentkit_compaction as compaction;
 #[cfg(feature = "context")]
 pub use agentkit_context as context;
 #[cfg(feature = "core")]
@@ -22,6 +24,8 @@ pub use agentkit_tools_core as tools;
 pub mod prelude {
     #[cfg(feature = "capabilities")]
     pub use crate::capabilities::*;
+    #[cfg(feature = "compaction")]
+    pub use crate::compaction::*;
     #[cfg(feature = "context")]
     pub use crate::context::*;
     #[cfg(feature = "core")]

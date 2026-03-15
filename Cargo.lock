@@ -7,6 +7,7 @@ name = "agentkit"
 version = "0.1.0"
 dependencies = [
  "agentkit-capabilities",
+ "agentkit-compaction",
  "agentkit-context",
  "agentkit-core",
  "agentkit-loop",
@@ -20,6 +21,17 @@ dependencies = [
 
 [[package]]
 name = "agentkit-capabilities"
+version = "0.1.0"
+dependencies = [
+ "agentkit-core",
+ "async-trait",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "agentkit-compaction"
 version = "0.1.0"
 dependencies = [
  "agentkit-core",
@@ -56,6 +68,7 @@ name = "agentkit-loop"
 version = "0.1.0"
 dependencies = [
  "agentkit-capabilities",
+ "agentkit-compaction",
  "agentkit-core",
  "agentkit-tools-core",
  "async-trait",
