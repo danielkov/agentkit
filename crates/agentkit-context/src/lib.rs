@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use agentkit_core::{Item, ItemKind, MetadataMap, Part, TextPart};
@@ -8,6 +9,12 @@ use thiserror::Error;
 
 const DEFAULT_AGENTS_FILE: &str = "AGENTS.md";
 const DEFAULT_SKILL_FILE: &str = "SKILL.md";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentsMdMode {
+    Nearest,
+    All,
+}
 
 #[async_trait]
 pub trait ContextSource: Send + Sync {
@@ -43,15 +50,30 @@ impl ContextLoader {
 #[derive(Clone, Debug)]
 pub struct AgentsMd {
     start_dir: PathBuf,
+    mode: AgentsMdMode,
     file_name: String,
+    explicit_paths: Vec<PathBuf>,
+    search_dirs: Vec<PathBuf>,
 }
 
 impl AgentsMd {
     pub fn discover(start_dir: impl Into<PathBuf>) -> Self {
         Self {
             start_dir: start_dir.into(),
+            mode: AgentsMdMode::Nearest,
             file_name: DEFAULT_AGENTS_FILE.into(),
+            explicit_paths: Vec::new(),
+            search_dirs: Vec::new(),
         }
+    }
+
+    pub fn discover_all(start_dir: impl Into<PathBuf>) -> Self {
+        Self::discover(start_dir).with_mode(AgentsMdMode::All)
+    }
+
+    pub fn with_mode(mut self, mode: AgentsMdMode) -> Self {
+        self.mode = mode;
+        self
     }
 
     pub fn with_file_name(mut self, file_name: impl Into<String>) -> Self {
@@ -59,48 +81,100 @@ impl AgentsMd {
         self
     }
 
+    pub fn with_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.explicit_paths.push(path.into());
+        self
+    }
+
+    pub fn with_search_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.search_dirs.push(dir.into());
+        self
+    }
+
     pub async fn resolve(&self) -> Result<Option<PathBuf>, ContextError> {
-        find_in_ancestors(&self.start_dir, &self.file_name).await
+        Ok(self.resolve_all().await?.into_iter().next())
+    }
+
+    pub async fn resolve_all(&self) -> Result<Vec<PathBuf>, ContextError> {
+        let mut paths = Vec::new();
+
+        for path in &self.explicit_paths {
+            if path_exists(path).await? {
+                paths.push(path.clone());
+            }
+        }
+
+        for dir in &self.search_dirs {
+            let candidate = dir.join(&self.file_name);
+            if path_exists(&candidate).await? {
+                paths.push(candidate);
+            }
+        }
+
+        paths.extend(
+            find_in_ancestors_with_mode(
+                &self.start_dir,
+                &self.file_name,
+                self.mode == AgentsMdMode::All,
+            )
+            .await?,
+        );
+
+        let mut seen = BTreeSet::new();
+        paths.retain(|path| seen.insert(path.clone()));
+        if self.mode == AgentsMdMode::Nearest {
+            Ok(paths.into_iter().rev().take(1).collect())
+        } else {
+            Ok(paths)
+        }
     }
 }
 
 #[async_trait]
 impl ContextSource for AgentsMd {
     async fn load(&self) -> Result<Vec<Item>, ContextError> {
-        let Some(path) = self.resolve().await? else {
-            return Ok(Vec::new());
-        };
-        let body =
-            async_fs::read_to_string(&path)
-                .await
-                .map_err(|error| ContextError::ReadFailed {
+        let paths = self.resolve_all().await?;
+        let mut items = Vec::with_capacity(paths.len());
+
+        for path in paths {
+            let body = async_fs::read_to_string(&path).await.map_err(|error| {
+                ContextError::ReadFailed {
                     path: path.clone(),
                     error,
-                })?;
+                }
+            })?;
 
-        Ok(vec![context_item(
-            format!(
-                "[Loaded AGENTS]\nPath: {}\n\n{}",
-                path.display(),
-                body.trim_end()
-            ),
-            metadata_for("agents_md", &path, None),
-        )])
+            items.push(context_item(
+                format!(
+                    "[Loaded AGENTS]\nPath: {}\n\n{}",
+                    path.display(),
+                    body.trim_end()
+                ),
+                metadata_for("agents_md", &path, None),
+            ));
+        }
+
+        Ok(items)
     }
 }
 
 #[derive(Clone, Debug)]
 pub struct SkillsDirectory {
-    root: PathBuf,
+    roots: Vec<PathBuf>,
     skill_file_name: String,
 }
 
 impl SkillsDirectory {
     pub fn from_dir(root: impl Into<PathBuf>) -> Self {
         Self {
-            root: root.into(),
+            roots: vec![root.into()],
             skill_file_name: DEFAULT_SKILL_FILE.into(),
         }
+    }
+
+    pub fn with_dir(mut self, root: impl Into<PathBuf>) -> Self {
+        self.roots.push(root.into());
+        self
     }
 
     pub fn with_skill_file_name(mut self, skill_file_name: impl Into<String>) -> Self {
@@ -112,11 +186,16 @@ impl SkillsDirectory {
 #[async_trait]
 impl ContextSource for SkillsDirectory {
     async fn load(&self) -> Result<Vec<Item>, ContextError> {
-        if !path_exists(&self.root).await? {
-            return Ok(Vec::new());
+        let mut skill_paths = Vec::new();
+        for root in &self.roots {
+            if !path_exists(root).await? {
+                continue;
+            }
+            skill_paths.extend(collect_skill_files(root, &self.skill_file_name).await?);
         }
+        skill_paths.sort();
+        skill_paths.dedup();
 
-        let skill_paths = collect_skill_files(&self.root, &self.skill_file_name).await?;
         let mut items = Vec::with_capacity(skill_paths.len());
 
         for path in skill_paths {
@@ -185,22 +264,30 @@ async fn path_exists(path: &Path) -> Result<bool, ContextError> {
     }
 }
 
-async fn find_in_ancestors(
+async fn find_in_ancestors_with_mode(
     start_dir: &Path,
     file_name: &str,
-) -> Result<Option<PathBuf>, ContextError> {
+    include_all: bool,
+) -> Result<Vec<PathBuf>, ContextError> {
     let mut current = start_dir.to_path_buf();
+    let mut matches = Vec::new();
 
     loop {
         let candidate = current.join(file_name);
         if path_exists(&candidate).await? {
-            return Ok(Some(candidate));
+            matches.push(candidate);
+            if !include_all {
+                break;
+            }
         }
         let Some(parent) = current.parent() else {
-            return Ok(None);
+            break;
         };
         current = parent.to_path_buf();
     }
+
+    matches.reverse();
+    Ok(matches)
 }
 
 async fn collect_skill_files(
@@ -293,6 +380,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn discovers_all_agents_files_when_requested() {
+        let root = temp_path("agentkit-context-agents-all");
+        let nested = root.join("nested/project");
+        async_fs::create_dir_all(&nested).await.unwrap();
+        async_fs::write(root.join("AGENTS.md"), "project = lantern")
+            .await
+            .unwrap();
+        async_fs::write(root.join("nested/AGENTS.md"), "team = orbit")
+            .await
+            .unwrap();
+
+        let items = AgentsMd::discover_all(&nested).load().await.unwrap();
+        assert_eq!(items.len(), 2);
+
+        async_fs::remove_dir_all(&root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn loads_agents_from_explicit_search_paths() {
+        let root = temp_path("agentkit-context-agents-explicit");
+        let nested = root.join("nested/project");
+        let shared = root.join("shared");
+        async_fs::create_dir_all(&nested).await.unwrap();
+        async_fs::create_dir_all(&shared).await.unwrap();
+        async_fs::write(shared.join("AGENTS.md"), "policy = explicit")
+            .await
+            .unwrap();
+
+        let items = AgentsMd::discover(&nested)
+            .with_search_dir(&shared)
+            .load()
+            .await
+            .unwrap();
+        assert_eq!(items.len(), 1);
+        assert!(
+            items[0]
+                .metadata
+                .get("agentkit.context.path")
+                .and_then(Value::as_str)
+                .is_some_and(|path| path.ends_with("/shared/AGENTS.md"))
+        );
+
+        async_fs::remove_dir_all(&root).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn loads_skills_recursively() {
         let root = temp_path("agentkit-context-skills");
         let skill_dir = root.join("skills/release-notes");
@@ -310,6 +443,30 @@ mod tests {
             items[0].metadata.get("agentkit.context.name"),
             Some(&Value::String("release-notes".into()))
         );
+
+        async_fs::remove_dir_all(&root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn loads_skills_from_multiple_roots() {
+        let root = temp_path("agentkit-context-skills-multi");
+        let root_a = root.join("skills-a/release-notes");
+        let root_b = root.join("skills-b/deploy");
+        async_fs::create_dir_all(&root_a).await.unwrap();
+        async_fs::create_dir_all(&root_b).await.unwrap();
+        async_fs::write(root_a.join("SKILL.md"), "# Release Notes")
+            .await
+            .unwrap();
+        async_fs::write(root_b.join("SKILL.md"), "# Deploy")
+            .await
+            .unwrap();
+
+        let items = SkillsDirectory::from_dir(root.join("skills-a"))
+            .with_dir(root.join("skills-b"))
+            .load()
+            .await
+            .unwrap();
+        assert_eq!(items.len(), 2);
 
         async_fs::remove_dir_all(&root).await.unwrap();
     }
