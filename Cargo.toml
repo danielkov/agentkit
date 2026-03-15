@@ -15,6 +15,7 @@ members = [
     "examples/openrouter-chat",
     "examples/openrouter-coding-agent",
     "examples/openrouter-context-agent",
+    "examples/openrouter-agent-cli",
     "examples/openrouter-mcp-tool",
     "examples/openrouter-subagent-tool",
 ]

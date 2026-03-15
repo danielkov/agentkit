@@ -869,6 +869,11 @@ impl ToolRegistry {
         self
     }
 
+    pub fn register_arc(&mut self, tool: Arc<dyn Tool>) -> &mut Self {
+        self.tools.insert(tool.spec().name.clone(), tool);
+        self
+    }
+
     pub fn get(&self, name: &ToolName) -> Option<Arc<dyn Tool>> {
         self.tools.get(name).cloned()
     }

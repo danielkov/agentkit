@@ -745,6 +745,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
+name = "openrouter-agent-cli"
+version = "0.1.0"
+dependencies = [
+ "agentkit-compaction",
+ "agentkit-context",
+ "agentkit-core",
+ "agentkit-loop",
+ "agentkit-mcp",
+ "agentkit-provider-openrouter",
+ "agentkit-reporting",
+ "agentkit-tool-fs",
+ "agentkit-tool-shell",
+ "agentkit-tools-core",
+ "async-trait",
+ "dotenvy",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "openrouter-chat"
 version = "0.1.0"
 dependencies = [
