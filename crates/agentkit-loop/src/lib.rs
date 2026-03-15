@@ -157,6 +157,15 @@ enum DriverState {
 }
 
 #[derive(Clone, Debug)]
+struct PendingApprovalToolCall {
+    request: ApprovalRequest,
+    decision: Option<ApprovalDecision>,
+    turn_id: agentkit_core::TurnId,
+    call: ToolCallPart,
+    tool_request: ToolRequest,
+}
+
+#[derive(Clone, Debug)]
 struct PendingAuthToolCall {
     request: AuthRequest,
     resolution: Option<AuthResolution>,
@@ -291,7 +300,7 @@ where
     observers: Vec<Box<dyn LoopObserver>>,
     transcript: Vec<Item>,
     pending_input: Vec<Item>,
-    pending_approval: Option<ApprovalRequest>,
+    pending_approval: Option<PendingApprovalToolCall>,
     pending_auth: Option<PendingAuthToolCall>,
     next_turn_index: u64,
     state: DriverState,
@@ -422,7 +431,13 @@ where
                             ToolExecutionOutcome::Interrupted(
                                 agentkit_tools_core::ToolInterruption::ApprovalRequired(request),
                             ) => {
-                                self.pending_approval = Some(request.clone());
+                                self.pending_approval = Some(PendingApprovalToolCall {
+                                    request: request.clone(),
+                                    decision: None,
+                                    turn_id: turn_id.clone(),
+                                    call,
+                                    tool_request,
+                                });
                                 self.state = DriverState::AwaitingApproval;
                                 self.emit(AgentEvent::ApprovalRequired(request.clone()));
                                 return Ok(LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(
@@ -561,7 +576,13 @@ where
                     ToolExecutionOutcome::Interrupted(
                         agentkit_tools_core::ToolInterruption::ApprovalRequired(request),
                     ) => {
-                        self.pending_approval = Some(request.clone());
+                        self.pending_approval = Some(PendingApprovalToolCall {
+                            request: request.clone(),
+                            decision: None,
+                            turn_id: pending.turn_id,
+                            call: pending.call,
+                            tool_request: pending.tool_request,
+                        });
                         self.state = DriverState::AwaitingApproval;
                         self.emit(AgentEvent::ApprovalRequired(request.clone()));
                         return Ok(LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(request)));
@@ -596,6 +617,110 @@ where
         self.drive_turn(pending.turn_id, false).await
     }
 
+    async fn resume_after_approval(
+        &mut self,
+        pending: PendingApprovalToolCall,
+    ) -> Result<LoopStep, LoopError> {
+        let decision = pending
+            .decision
+            .clone()
+            .ok_or_else(|| LoopError::InvalidState("pending approval has no decision".into()))?;
+
+        self.transcript.push(Item {
+            id: None,
+            kind: ItemKind::Assistant,
+            parts: vec![Part::ToolCall(pending.call.clone())],
+            metadata: MetadataMap::new(),
+        });
+
+        let tool_item = match decision {
+            ApprovalDecision::Approve => {
+                let tool_metadata = pending.tool_request.metadata.clone();
+                let mut tool_ctx = ToolContext {
+                    capability: CapabilityContext {
+                        session_id: Some(&self.session_id),
+                        turn_id: Some(&pending.turn_id),
+                        metadata: &tool_metadata,
+                    },
+                    permissions: self.permissions.as_ref(),
+                    resources: &(),
+                };
+
+                match self
+                    .tool_executor
+                    .execute_approved(
+                        pending.tool_request.clone(),
+                        &pending.request,
+                        &mut tool_ctx,
+                    )
+                    .await
+                {
+                    ToolExecutionOutcome::Completed(result) => Item {
+                        id: None,
+                        kind: ItemKind::Tool,
+                        parts: vec![Part::ToolResult(result.result)],
+                        metadata: result.metadata,
+                    },
+                    ToolExecutionOutcome::Interrupted(
+                        agentkit_tools_core::ToolInterruption::ApprovalRequired(request),
+                    ) => {
+                        self.pending_approval = Some(PendingApprovalToolCall {
+                            request: request.clone(),
+                            decision: None,
+                            turn_id: pending.turn_id,
+                            call: pending.call,
+                            tool_request: pending.tool_request,
+                        });
+                        self.state = DriverState::AwaitingApproval;
+                        self.emit(AgentEvent::ApprovalRequired(request.clone()));
+                        return Ok(LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(request)));
+                    }
+                    ToolExecutionOutcome::Interrupted(
+                        agentkit_tools_core::ToolInterruption::AuthRequired(request),
+                    ) => {
+                        let request =
+                            upgrade_auth_request(request, &pending.tool_request, &pending.call);
+                        self.pending_auth = Some(PendingAuthToolCall {
+                            request: request.clone(),
+                            resolution: None,
+                            turn_id: pending.turn_id,
+                            call: pending.call,
+                            tool_request: pending.tool_request,
+                        });
+                        self.state = DriverState::AwaitingAuth;
+                        self.emit(AgentEvent::AuthRequired(request.clone()));
+                        return Ok(LoopStep::Interrupt(LoopInterrupt::AuthRequest(request)));
+                    }
+                    ToolExecutionOutcome::Failed(error) => Item {
+                        id: None,
+                        kind: ItemKind::Tool,
+                        parts: vec![Part::ToolResult(ToolResultPart {
+                            call_id: pending.call.id.clone(),
+                            output: ToolOutput::Text(error.to_string()),
+                            is_error: true,
+                            metadata: pending.call.metadata.clone(),
+                        })],
+                        metadata: MetadataMap::new(),
+                    },
+                }
+            }
+            ApprovalDecision::Deny { reason } => Item {
+                id: None,
+                kind: ItemKind::Tool,
+                parts: vec![Part::ToolResult(ToolResultPart {
+                    call_id: pending.call.id.clone(),
+                    output: ToolOutput::Text(reason.unwrap_or_else(|| "approval denied".into())),
+                    is_error: true,
+                    metadata: pending.call.metadata.clone(),
+                })],
+                metadata: MetadataMap::new(),
+            },
+        };
+
+        self.transcript.push(tool_item);
+        self.drive_turn(pending.turn_id, false).await
+    }
+
     pub fn submit_input(&mut self, input: Vec<Item>) -> Result<(), LoopError> {
         if self.state != DriverState::Idle {
             return Err(LoopError::InvalidState(
@@ -611,11 +736,12 @@ where
     }
 
     pub fn resolve_approval(&mut self, decision: ApprovalDecision) -> Result<(), LoopError> {
-        let Some(_request) = self.pending_approval.take() else {
+        let Some(pending) = self.pending_approval.as_mut() else {
             return Err(LoopError::InvalidState(
                 "no approval request is pending".into(),
             ));
         };
+        pending.decision = Some(decision.clone());
         self.state = DriverState::Idle;
         self.emit(AgentEvent::ApprovalResolved {
             approved: matches!(decision, ApprovalDecision::Approve),
@@ -653,6 +779,18 @@ where
             return Err(LoopError::InvalidState(
                 "cannot advance while an interrupt is pending".into(),
             ));
+        }
+
+        if self
+            .pending_approval
+            .as_ref()
+            .is_some_and(|pending| pending.decision.is_some())
+        {
+            let pending = self
+                .pending_approval
+                .take()
+                .ok_or_else(|| LoopError::InvalidState("missing pending approval state".into()))?;
+            return self.resume_after_approval(pending).await;
         }
 
         if self
@@ -949,6 +1087,27 @@ mod tests {
         }
     }
 
+    struct ApproveFsReads;
+
+    impl PermissionChecker for ApproveFsReads {
+        fn evaluate(
+            &self,
+            request: &dyn agentkit_tools_core::PermissionRequest,
+        ) -> PermissionDecision {
+            if request.kind() == "filesystem.read" {
+                return PermissionDecision::RequireApproval(ApprovalRequest {
+                    id: "approval:fs-read".into(),
+                    request_kind: request.kind().into(),
+                    reason: agentkit_tools_core::ApprovalReason::SensitivePath,
+                    summary: request.summary(),
+                    metadata: request.metadata().clone(),
+                });
+            }
+
+            PermissionDecision::Allow
+        }
+    }
+
     struct CountTrigger;
 
     impl CompactionTrigger for CountTrigger {
@@ -1181,6 +1340,55 @@ mod tests {
                 }
             }
             other => panic!("unexpected loop step: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn loop_resumes_after_approved_tool_request() {
+        let tools = ToolRegistry::new().with(EchoTool::default());
+        let agent = Agent::builder()
+            .model(FakeAdapter)
+            .tools(tools)
+            .permissions(ApproveFsReads)
+            .build()
+            .unwrap();
+
+        let mut driver = agent
+            .start(SessionConfig {
+                session_id: SessionId::new("session-approval"),
+                metadata: MetadataMap::new(),
+            })
+            .await
+            .unwrap();
+
+        driver
+            .submit_input(vec![Item {
+                id: None,
+                kind: ItemKind::User,
+                parts: vec![Part::Text(TextPart {
+                    text: "ping".into(),
+                    metadata: MetadataMap::new(),
+                })],
+                metadata: MetadataMap::new(),
+            }])
+            .unwrap();
+
+        let first = driver.next().await.unwrap();
+        match first {
+            LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(request)) => {
+                assert_eq!(request.id.0, "approval:fs-read");
+            }
+            other => panic!("unexpected loop step: {other:?}"),
+        }
+
+        driver.resolve_approval(ApprovalDecision::Approve).unwrap();
+        let second = driver.next().await.unwrap();
+        match second {
+            LoopStep::Finished(turn) => match &turn.items[0].parts[0] {
+                Part::Text(text) => assert_eq!(text.text, "tool said: pong"),
+                other => panic!("unexpected part: {other:?}"),
+            },
+            other => panic!("unexpected loop step after approval: {other:?}"),
         }
     }
 

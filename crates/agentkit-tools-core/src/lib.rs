@@ -684,6 +684,11 @@ impl CommandPolicy {
         self.denied_env_keys.insert(key.into());
         self
     }
+
+    pub fn require_approval_for_unknown(mut self, value: bool) -> Self {
+        self.require_approval_for_unknown = value;
+        self
+    }
 }
 
 impl Default for CommandPolicy {
@@ -1071,6 +1076,16 @@ pub trait ToolExecutor: Send + Sync {
         request: ToolRequest,
         ctx: &mut ToolContext<'_>,
     ) -> ToolExecutionOutcome;
+
+    async fn execute_approved(
+        &self,
+        request: ToolRequest,
+        approved_request: &ApprovalRequest,
+        ctx: &mut ToolContext<'_>,
+    ) -> ToolExecutionOutcome {
+        let _ = approved_request;
+        self.execute(request, ctx).await
+    }
 }
 
 pub struct BasicToolExecutor {
@@ -1085,13 +1100,11 @@ impl BasicToolExecutor {
     pub fn specs(&self) -> Vec<ToolSpec> {
         self.registry.specs()
     }
-}
 
-#[async_trait]
-impl ToolExecutor for BasicToolExecutor {
-    async fn execute(
+    async fn execute_inner(
         &self,
         request: ToolRequest,
+        approved_request_id: Option<&ApprovalId>,
         ctx: &mut ToolContext<'_>,
     ) -> ToolExecutionOutcome {
         let Some(tool) = self.registry.get(&request.tool_name) else {
@@ -1109,9 +1122,11 @@ impl ToolExecutor for BasicToolExecutor {
                             ));
                         }
                         PermissionDecision::RequireApproval(req) => {
-                            return ToolExecutionOutcome::Interrupted(
-                                ToolInterruption::ApprovalRequired(req),
-                            );
+                            if approved_request_id != Some(&req.id) {
+                                return ToolExecutionOutcome::Interrupted(
+                                    ToolInterruption::ApprovalRequired(req),
+                                );
+                            }
                         }
                     }
                 }
@@ -1126,6 +1141,27 @@ impl ToolExecutor for BasicToolExecutor {
             }
             Err(error) => ToolExecutionOutcome::Failed(error),
         }
+    }
+}
+
+#[async_trait]
+impl ToolExecutor for BasicToolExecutor {
+    async fn execute(
+        &self,
+        request: ToolRequest,
+        ctx: &mut ToolContext<'_>,
+    ) -> ToolExecutionOutcome {
+        self.execute_inner(request, None, ctx).await
+    }
+
+    async fn execute_approved(
+        &self,
+        request: ToolRequest,
+        approved_request: &ApprovalRequest,
+        ctx: &mut ToolContext<'_>,
+    ) -> ToolExecutionOutcome {
+        self.execute_inner(request, Some(&approved_request.id), ctx)
+            .await
     }
 }
 
@@ -1156,5 +1192,31 @@ impl ToolError {
 impl From<PermissionDenial> for ToolError {
     fn from(value: PermissionDenial) -> Self {
         Self::permission_denied(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_policy_can_deny_unknown_executables_without_approval() {
+        let policy = CommandPolicy::new()
+            .allow_executable("pwd")
+            .require_approval_for_unknown(false);
+        let request = ShellPermissionRequest {
+            executable: "rm".into(),
+            argv: vec!["-rf".into(), "/tmp/demo".into()],
+            cwd: None,
+            env_keys: Vec::new(),
+            metadata: MetadataMap::new(),
+        };
+
+        match policy.evaluate(&request) {
+            PolicyMatch::Deny(denial) => {
+                assert_eq!(denial.code, PermissionCode::CommandNotAllowed);
+            }
+            other => panic!("unexpected policy match: {other:?}"),
+        }
     }
 }

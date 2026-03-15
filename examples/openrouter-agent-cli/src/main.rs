@@ -98,7 +98,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .allow_cwd(workspace_root.clone())
             .allow_executable("pwd")
             .allow_executable("ls")
-            .allow_executable("cat"),
+            .allow_executable("cat")
+            .require_approval_for_unknown(false),
     );
 
     let agent = Agent::builder()
