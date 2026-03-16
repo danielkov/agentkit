@@ -791,6 +791,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "openrouter-compaction-agent"
+version = "0.1.0"
+dependencies = [
+ "agentkit-compaction",
+ "agentkit-core",
+ "agentkit-loop",
+ "agentkit-provider-openrouter",
+ "agentkit-reporting",
+ "agentkit-tools-core",
+ "async-trait",
+ "dotenvy",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "openrouter-context-agent"
 version = "0.1.0"
 dependencies = [
