@@ -5,17 +5,22 @@ use agentkit_compaction::{
     CompactionConfig, CompactionContext, CompactionReason, CompactionResult,
 };
 use agentkit_core::{
-    Delta, FinishReason, Item, ItemKind, MetadataMap, Part, SessionId, ToolCallPart, ToolOutput,
-    ToolResultPart, Usage,
+    CancellationHandle, Delta, FinishReason, Item, ItemKind, MetadataMap, Part, SessionId,
+    TextPart, ToolCallPart, ToolOutput, ToolResultPart, TurnCancellation, Usage,
 };
 use agentkit_tools_core::{
     ApprovalDecision, ApprovalRequest, AuthOperation, AuthRequest, AuthResolution,
     BasicToolExecutor, PermissionChecker, ToolContext, ToolError, ToolExecutionOutcome,
-    ToolExecutor, ToolRegistry, ToolRequest, ToolSpec,
+    ToolExecutor, ToolRegistry, ToolRequest, ToolResources, ToolSpec,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+const INTERRUPTED_METADATA_KEY: &str = "agentkit.interrupted";
+const INTERRUPT_REASON_METADATA_KEY: &str = "agentkit.interrupt_reason";
+const INTERRUPT_STAGE_METADATA_KEY: &str = "agentkit.interrupt_stage";
+const USER_CANCELLED_REASON: &str = "user_cancelled";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionConfig {
@@ -59,12 +64,19 @@ pub trait ModelAdapter: Send + Sync {
 pub trait ModelSession: Send {
     type Turn: ModelTurn;
 
-    async fn begin_turn(&mut self, request: TurnRequest) -> Result<Self::Turn, LoopError>;
+    async fn begin_turn(
+        &mut self,
+        request: TurnRequest,
+        cancellation: Option<TurnCancellation>,
+    ) -> Result<Self::Turn, LoopError>;
 }
 
 #[async_trait]
 pub trait ModelTurn: Send {
-    async fn next_event(&mut self) -> Result<Option<ModelTurnEvent>, LoopError>;
+    async fn next_event(
+        &mut self,
+        cancellation: Option<TurnCancellation>,
+    ) -> Result<Option<ModelTurnEvent>, LoopError>;
 }
 
 pub trait LoopObserver: Send {
@@ -183,6 +195,8 @@ where
     model: M,
     tools: ToolRegistry,
     permissions: Arc<dyn PermissionChecker>,
+    resources: Arc<dyn ToolResources>,
+    cancellation: Option<CancellationHandle>,
     compaction: Option<CompactionConfig>,
     observers: Vec<Box<dyn LoopObserver>>,
 }
@@ -206,6 +220,8 @@ where
             tool_executor,
             tool_specs,
             permissions: self.permissions,
+            resources: self.resources,
+            cancellation: self.cancellation,
             compaction: self.compaction,
             observers: self.observers,
             transcript: Vec::new(),
@@ -227,6 +243,8 @@ where
     model: Option<M>,
     tools: ToolRegistry,
     permissions: Arc<dyn PermissionChecker>,
+    resources: Arc<dyn ToolResources>,
+    cancellation: Option<CancellationHandle>,
     compaction: Option<CompactionConfig>,
     observers: Vec<Box<dyn LoopObserver>>,
 }
@@ -240,6 +258,8 @@ where
             model: None,
             tools: ToolRegistry::new(),
             permissions: Arc::new(AllowAllPermissions),
+            resources: Arc::new(()),
+            cancellation: None,
             compaction: None,
             observers: Vec::new(),
         }
@@ -265,6 +285,16 @@ where
         self
     }
 
+    pub fn resources(mut self, resources: impl ToolResources + 'static) -> Self {
+        self.resources = Arc::new(resources);
+        self
+    }
+
+    pub fn cancellation(mut self, handle: CancellationHandle) -> Self {
+        self.cancellation = Some(handle);
+        self
+    }
+
     pub fn compaction(mut self, config: CompactionConfig) -> Self {
         self.compaction = Some(config);
         self
@@ -283,6 +313,8 @@ where
             model,
             tools: self.tools,
             permissions: self.permissions,
+            resources: self.resources,
+            cancellation: self.cancellation,
             compaction: self.compaction,
             observers: self.observers,
         })
@@ -298,6 +330,8 @@ where
     tool_executor: Arc<dyn ToolExecutor>,
     tool_specs: Vec<ToolSpec>,
     permissions: Arc<dyn PermissionChecker>,
+    resources: Arc<dyn ToolResources>,
+    cancellation: Option<CancellationHandle>,
     compaction: Option<CompactionConfig>,
     observers: Vec<Box<dyn LoopObserver>>,
     transcript: Vec<Item>,
@@ -315,10 +349,17 @@ where
     async fn maybe_compact(
         &mut self,
         turn_id: Option<&agentkit_core::TurnId>,
+        cancellation: Option<TurnCancellation>,
     ) -> Result<(), LoopError> {
         let Some(compaction) = self.compaction.as_ref().cloned() else {
             return Ok(());
         };
+        if cancellation
+            .as_ref()
+            .is_some_and(TurnCancellation::is_cancelled)
+        {
+            return Err(LoopError::Cancelled);
+        }
         let Some(reason) =
             compaction
                 .trigger
@@ -350,10 +391,14 @@ where
                 &mut CompactionContext {
                     backend: compaction.backend.as_deref(),
                     metadata: &compaction.metadata,
+                    cancellation,
                 },
             )
             .await
-            .map_err(|error| LoopError::Compaction(error.to_string()))?;
+            .map_err(|error| match error {
+                agentkit_compaction::CompactionError::Cancelled => LoopError::Cancelled,
+                other => LoopError::Compaction(other.to_string()),
+            })?;
 
         self.transcript = transcript;
         self.emit(AgentEvent::CompactionFinished {
@@ -371,12 +416,31 @@ where
         turn_id: agentkit_core::TurnId,
         emit_started: bool,
     ) -> Result<LoopStep, LoopError> {
-        self.maybe_compact(Some(&turn_id)).await?;
+        let cancellation = self
+            .cancellation
+            .as_ref()
+            .map(CancellationHandle::checkpoint);
+        match self
+            .maybe_compact(Some(&turn_id), cancellation.clone())
+            .await
+        {
+            Ok(()) => {}
+            Err(LoopError::Cancelled) => {
+                return self.finish_cancelled(turn_id, interrupted_assistant_items());
+            }
+            Err(error) => return Err(error),
+        }
         if emit_started {
             self.emit(AgentEvent::TurnStarted {
                 session_id: self.session_id.clone(),
                 turn_id: turn_id.clone(),
             });
+        }
+        if cancellation
+            .as_ref()
+            .is_some_and(TurnCancellation::is_cancelled)
+        {
+            return self.finish_cancelled(turn_id, interrupted_assistant_items());
         }
 
         loop {
@@ -392,17 +456,43 @@ where
                 .session
                 .as_mut()
                 .ok_or_else(|| LoopError::InvalidState("model session is not available".into()))?;
-            let mut turn = session.begin_turn(request).await?;
+            let mut turn = match session.begin_turn(request, cancellation.clone()).await {
+                Ok(turn) => turn,
+                Err(LoopError::Cancelled) => {
+                    return self.finish_cancelled(turn_id, interrupted_assistant_items());
+                }
+                Err(error) => return Err(error),
+            };
             let mut saw_tool_call = false;
             let mut tool_results = Vec::new();
 
-            while let Some(event) = turn.next_event().await? {
+            while let Some(event) = match turn.next_event(cancellation.clone()).await {
+                Ok(event) => event,
+                Err(LoopError::Cancelled) => {
+                    return self.finish_cancelled(turn_id, interrupted_assistant_items());
+                }
+                Err(error) => return Err(error),
+            } {
+                if cancellation
+                    .as_ref()
+                    .is_some_and(TurnCancellation::is_cancelled)
+                {
+                    return self.finish_cancelled(turn_id, interrupted_assistant_items());
+                }
                 match event {
                     ModelTurnEvent::Delta(delta) => self.emit(AgentEvent::ContentDelta(delta)),
                     ModelTurnEvent::Usage(usage) => self.emit(AgentEvent::UsageUpdated(usage)),
                     ModelTurnEvent::ToolCall(call) => {
                         saw_tool_call = true;
                         self.emit(AgentEvent::ToolCallRequested(call.clone()));
+                        if cancellation
+                            .as_ref()
+                            .is_some_and(TurnCancellation::is_cancelled)
+                        {
+                            let mut items = tool_results;
+                            items.extend(interrupted_tool_items(&call));
+                            return self.finish_cancelled(turn_id, items);
+                        }
 
                         let tool_request = ToolRequest {
                             call_id: call.id.clone(),
@@ -420,7 +510,8 @@ where
                                 metadata: &tool_metadata,
                             },
                             permissions: self.permissions.as_ref(),
-                            resources: &(),
+                            resources: self.resources.as_ref(),
+                            cancellation: cancellation.clone(),
                         };
 
                         match self
@@ -470,6 +561,11 @@ where
                                 )));
                             }
                             ToolExecutionOutcome::Failed(error) => {
+                                if matches!(error, ToolError::Cancelled) {
+                                    let mut items = tool_results;
+                                    items.extend(interrupted_tool_items(&call));
+                                    return self.finish_cancelled(turn_id, items);
+                                }
                                 self.emit(AgentEvent::Warning {
                                     message: format!("tool {} failed: {}", call.name, error),
                                 });
@@ -544,7 +640,11 @@ where
                         metadata: &tool_metadata,
                     },
                     permissions: self.permissions.as_ref(),
-                    resources: &(),
+                    resources: self.resources.as_ref(),
+                    cancellation: self
+                        .cancellation
+                        .as_ref()
+                        .map(CancellationHandle::checkpoint),
                 };
 
                 match self
@@ -595,17 +695,23 @@ where
                         self.emit(AgentEvent::ApprovalRequired(request.clone()));
                         return Ok(LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(request)));
                     }
-                    ToolExecutionOutcome::Failed(error) => Item {
-                        id: None,
-                        kind: ItemKind::Tool,
-                        parts: vec![Part::ToolResult(ToolResultPart {
-                            call_id: pending.call.id.clone(),
-                            output: ToolOutput::Text(error.to_string()),
-                            is_error: true,
-                            metadata: pending.call.metadata.clone(),
-                        })],
-                        metadata: MetadataMap::new(),
-                    },
+                    ToolExecutionOutcome::Failed(error) => {
+                        if matches!(error, ToolError::Cancelled) {
+                            let items = interrupted_tool_items(&pending.call);
+                            return self.finish_cancelled(pending.turn_id, items);
+                        }
+                        Item {
+                            id: None,
+                            kind: ItemKind::Tool,
+                            parts: vec![Part::ToolResult(ToolResultPart {
+                                call_id: pending.call.id.clone(),
+                                output: ToolOutput::Text(error.to_string()),
+                                is_error: true,
+                                metadata: pending.call.metadata.clone(),
+                            })],
+                            metadata: MetadataMap::new(),
+                        }
+                    }
                 }
             }
             AuthResolution::Cancelled { .. } => Item {
@@ -651,7 +757,11 @@ where
                         metadata: &tool_metadata,
                     },
                     permissions: self.permissions.as_ref(),
-                    resources: &(),
+                    resources: self.resources.as_ref(),
+                    cancellation: self
+                        .cancellation
+                        .as_ref()
+                        .map(CancellationHandle::checkpoint),
                 };
 
                 match self
@@ -699,17 +809,23 @@ where
                         self.emit(AgentEvent::AuthRequired(request.clone()));
                         return Ok(LoopStep::Interrupt(LoopInterrupt::AuthRequest(request)));
                     }
-                    ToolExecutionOutcome::Failed(error) => Item {
-                        id: None,
-                        kind: ItemKind::Tool,
-                        parts: vec![Part::ToolResult(ToolResultPart {
-                            call_id: pending.call.id.clone(),
-                            output: ToolOutput::Text(error.to_string()),
-                            is_error: true,
-                            metadata: pending.call.metadata.clone(),
-                        })],
-                        metadata: MetadataMap::new(),
-                    },
+                    ToolExecutionOutcome::Failed(error) => {
+                        if matches!(error, ToolError::Cancelled) {
+                            let items = interrupted_tool_items(&pending.call);
+                            return self.finish_cancelled(pending.turn_id, items);
+                        }
+                        Item {
+                            id: None,
+                            kind: ItemKind::Tool,
+                            parts: vec![Part::ToolResult(ToolResultPart {
+                                call_id: pending.call.id.clone(),
+                                output: ToolOutput::Text(error.to_string()),
+                                is_error: true,
+                                metadata: pending.call.metadata.clone(),
+                            })],
+                            metadata: MetadataMap::new(),
+                        }
+                    }
                 }
             }
             ApprovalDecision::Deny { reason } => Item {
@@ -727,6 +843,23 @@ where
 
         self.transcript.push(tool_item);
         self.drive_turn(pending.turn_id, false).await
+    }
+
+    fn finish_cancelled(
+        &mut self,
+        turn_id: agentkit_core::TurnId,
+        items: Vec<Item>,
+    ) -> Result<LoopStep, LoopError> {
+        self.transcript.extend(items.clone());
+        let turn_result = TurnResult {
+            turn_id,
+            finish_reason: FinishReason::Cancelled,
+            items,
+            usage: None,
+            metadata: interrupted_metadata("turn"),
+        };
+        self.emit(AgentEvent::TurnFinished(turn_result.clone()));
+        Ok(LoopStep::Finished(turn_result))
     }
 
     pub fn submit_input(&mut self, input: Vec<Item>) -> Result<(), LoopError> {
@@ -835,6 +968,52 @@ where
     }
 }
 
+fn interrupted_metadata(stage: &str) -> MetadataMap {
+    let mut metadata = MetadataMap::new();
+    metadata.insert(INTERRUPTED_METADATA_KEY.into(), true.into());
+    metadata.insert(
+        INTERRUPT_REASON_METADATA_KEY.into(),
+        USER_CANCELLED_REASON.into(),
+    );
+    metadata.insert(INTERRUPT_STAGE_METADATA_KEY.into(), stage.into());
+    metadata
+}
+
+fn interrupted_assistant_items() -> Vec<Item> {
+    vec![Item {
+        id: None,
+        kind: ItemKind::Assistant,
+        parts: vec![Part::Text(TextPart {
+            text: "Previous assistant response was interrupted by the user before completion."
+                .into(),
+            metadata: interrupted_metadata("assistant"),
+        })],
+        metadata: interrupted_metadata("assistant"),
+    }]
+}
+
+fn interrupted_tool_items(call: &ToolCallPart) -> Vec<Item> {
+    vec![
+        Item {
+            id: None,
+            kind: ItemKind::Assistant,
+            parts: vec![Part::ToolCall(call.clone())],
+            metadata: interrupted_metadata("tool_call"),
+        },
+        Item {
+            id: None,
+            kind: ItemKind::Tool,
+            parts: vec![Part::ToolResult(ToolResultPart {
+                call_id: call.id.clone(),
+                output: ToolOutput::Text("tool execution interrupted by user".into()),
+                is_error: true,
+                metadata: interrupted_metadata("tool_result"),
+            })],
+            metadata: interrupted_metadata("tool_result"),
+        },
+    ]
+}
+
 fn upgrade_auth_request(
     mut request: AuthRequest,
     tool_request: &ToolRequest,
@@ -875,6 +1054,8 @@ impl PermissionChecker for AllowAllPermissions {
 pub enum LoopError {
     #[error("invalid driver state: {0}")]
     InvalidState(String),
+    #[error("turn cancelled")]
+    Cancelled,
     #[error("provider error: {0}")]
     Provider(String),
     #[error("tool error: {0}")]
@@ -891,7 +1072,9 @@ mod tests {
     use std::sync::{Arc as StdArc, Mutex as StdMutex};
 
     use agentkit_compaction::{CompactionPipeline, CompactionTrigger, KeepRecentStrategy};
-    use agentkit_core::{ItemKind, Part, TextPart, ToolCallId, ToolOutput, ToolResultPart};
+    use agentkit_core::{
+        CancellationController, ItemKind, Part, TextPart, ToolCallId, ToolOutput, ToolResultPart,
+    };
     use agentkit_tools_core::{
         FileSystemPermissionRequest, PermissionCode, PermissionDecision, PermissionDenial, Tool,
         ToolAnnotations, ToolName, ToolResult, ToolSpec,
@@ -901,11 +1084,17 @@ mod tests {
     use super::*;
 
     struct FakeAdapter;
+    struct SlowAdapter;
 
     struct FakeSession;
+    struct SlowSession;
 
     struct FakeTurn {
         events: VecDeque<ModelTurnEvent>,
+    }
+
+    struct SlowTurn {
+        emitted: bool,
     }
 
     #[async_trait]
@@ -918,10 +1107,23 @@ mod tests {
     }
 
     #[async_trait]
+    impl ModelAdapter for SlowAdapter {
+        type Session = SlowSession;
+
+        async fn start_session(&self, _config: SessionConfig) -> Result<Self::Session, LoopError> {
+            Ok(SlowSession)
+        }
+    }
+
+    #[async_trait]
     impl ModelSession for FakeSession {
         type Turn = FakeTurn;
 
-        async fn begin_turn(&mut self, request: TurnRequest) -> Result<Self::Turn, LoopError> {
+        async fn begin_turn(
+            &mut self,
+            request: TurnRequest,
+            _cancellation: Option<TurnCancellation>,
+        ) -> Result<Self::Turn, LoopError> {
             let has_tool_result = request.transcript.iter().any(|item| {
                 item.kind == ItemKind::Tool
                     && item
@@ -997,9 +1199,76 @@ mod tests {
     }
 
     #[async_trait]
+    impl ModelSession for SlowSession {
+        type Turn = SlowTurn;
+
+        async fn begin_turn(
+            &mut self,
+            request: TurnRequest,
+            cancellation: Option<TurnCancellation>,
+        ) -> Result<Self::Turn, LoopError> {
+            let should_block = request
+                .transcript
+                .iter()
+                .rev()
+                .find(|item| item.kind == ItemKind::User)
+                .is_some_and(|item| {
+                    item.parts.iter().any(|part| match part {
+                        Part::Text(text) => text.text == "do the long task",
+                        _ => false,
+                    })
+                });
+
+            if should_block && let Some(cancellation) = cancellation {
+                cancellation.cancelled().await;
+                return Err(LoopError::Cancelled);
+            }
+
+            Ok(SlowTurn { emitted: false })
+        }
+    }
+
+    #[async_trait]
     impl ModelTurn for FakeTurn {
-        async fn next_event(&mut self) -> Result<Option<ModelTurnEvent>, LoopError> {
+        async fn next_event(
+            &mut self,
+            _cancellation: Option<TurnCancellation>,
+        ) -> Result<Option<ModelTurnEvent>, LoopError> {
             Ok(self.events.pop_front())
+        }
+    }
+
+    #[async_trait]
+    impl ModelTurn for SlowTurn {
+        async fn next_event(
+            &mut self,
+            cancellation: Option<TurnCancellation>,
+        ) -> Result<Option<ModelTurnEvent>, LoopError> {
+            if let Some(cancellation) = cancellation
+                && cancellation.is_cancelled()
+            {
+                return Err(LoopError::Cancelled);
+            }
+
+            if self.emitted {
+                Ok(None)
+            } else {
+                self.emitted = true;
+                Ok(Some(ModelTurnEvent::Finished(ModelTurnResult {
+                    finish_reason: FinishReason::Completed,
+                    output_items: vec![Item {
+                        id: None,
+                        kind: ItemKind::Assistant,
+                        parts: vec![Part::Text(TextPart {
+                            text: "done".into(),
+                            metadata: MetadataMap::new(),
+                        })],
+                        metadata: MetadataMap::new(),
+                    }],
+                    usage: None,
+                    metadata: MetadataMap::new(),
+                })))
+            }
         }
     }
 
@@ -1324,6 +1593,78 @@ mod tests {
                 }
             }
             other => panic!("unexpected loop step: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn loop_can_cancel_a_turn_and_continue_after_new_input() {
+        let controller = CancellationController::new();
+        let agent = Agent::builder()
+            .model(SlowAdapter)
+            .cancellation(controller.handle())
+            .build()
+            .unwrap();
+
+        let mut driver = agent
+            .start(SessionConfig {
+                session_id: SessionId::new("session-cancel"),
+                metadata: MetadataMap::new(),
+            })
+            .await
+            .unwrap();
+
+        driver
+            .submit_input(vec![Item {
+                id: None,
+                kind: ItemKind::User,
+                parts: vec![Part::Text(TextPart {
+                    text: "do the long task".into(),
+                    metadata: MetadataMap::new(),
+                })],
+                metadata: MetadataMap::new(),
+            }])
+            .unwrap();
+
+        let task = tokio::spawn(async move {
+            let result = driver.next().await;
+            (driver, result)
+        });
+        tokio::task::yield_now().await;
+        controller.interrupt();
+        let (mut driver, cancelled) = task.await.unwrap();
+        let cancelled = cancelled.unwrap();
+
+        match cancelled {
+            LoopStep::Finished(turn) => {
+                assert_eq!(turn.finish_reason, FinishReason::Cancelled);
+                assert_eq!(turn.items.len(), 1);
+                assert_eq!(turn.items[0].kind, ItemKind::Assistant);
+                assert_eq!(
+                    turn.items[0].metadata.get(INTERRUPTED_METADATA_KEY),
+                    Some(&Value::Bool(true))
+                );
+            }
+            other => panic!("unexpected loop step: {other:?}"),
+        }
+
+        driver
+            .submit_input(vec![Item {
+                id: None,
+                kind: ItemKind::User,
+                parts: vec![Part::Text(TextPart {
+                    text: "try again".into(),
+                    metadata: MetadataMap::new(),
+                })],
+                metadata: MetadataMap::new(),
+            }])
+            .unwrap();
+
+        let result = driver.next().await.unwrap();
+        match result {
+            LoopStep::Finished(turn) => {
+                assert_eq!(turn.finish_reason, FinishReason::Completed);
+            }
+            other => panic!("unexpected loop step after retry: {other:?}"),
         }
     }
 

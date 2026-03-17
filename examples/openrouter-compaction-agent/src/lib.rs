@@ -9,7 +9,7 @@ use agentkit_compaction::{
 };
 use agentkit_core::{
     Item, ItemKind, MetadataMap, Part, ReasoningPart, SessionId, TextPart, ToolCallId, ToolOutput,
-    ToolResultPart,
+    ToolResultPart, TurnCancellation,
 };
 use agentkit_loop::{Agent, AgentEvent, LoopInterrupt, LoopObserver, LoopStep, SessionConfig};
 use agentkit_provider_openrouter::{OpenRouterAdapter, OpenRouterConfig};
@@ -364,10 +364,22 @@ impl CompactionBackend for NestedLoopCompactionBackend {
     async fn summarize(
         &self,
         request: SummaryRequest,
+        cancellation: Option<TurnCancellation>,
     ) -> Result<SummaryResult, agentkit_compaction::CompactionError> {
-        let agent = Agent::builder()
+        if cancellation
+            .as_ref()
+            .is_some_and(TurnCancellation::is_cancelled)
+        {
+            return Err(agentkit_compaction::CompactionError::Cancelled);
+        }
+
+        let mut builder = Agent::builder()
             .model(self.adapter.clone())
-            .permissions(AllowAll)
+            .permissions(AllowAll);
+        if let Some(cancellation) = cancellation.as_ref() {
+            builder = builder.cancellation(cancellation.handle().clone());
+        }
+        let agent = builder
             .build()
             .map_err(|error| agentkit_compaction::CompactionError::Failed(error.to_string()))?;
 

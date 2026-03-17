@@ -1742,6 +1742,7 @@ mod tests {
             },
             permissions: &AllowAll,
             resources: &(),
+            cancellation: None,
         };
 
         let result = adapter
@@ -1825,6 +1826,7 @@ mod tests {
             },
             permissions: &AllowAll,
             resources: &(),
+            cancellation: None,
         };
 
         let error = adapter

@@ -1,10 +1,13 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::Instant;
 
-use agentkit_core::{MetadataMap, ToolOutput, ToolResultPart};
+use agentkit_core::{MetadataMap, SessionId, ToolOutput, ToolResultPart};
 use agentkit_tools_core::{
-    FileSystemPermissionRequest, PermissionRequest, Tool, ToolAnnotations, ToolContext, ToolError,
-    ToolName, ToolRegistry, ToolRequest, ToolResult, ToolSpec,
+    FileSystemPermissionRequest, PermissionCode, PermissionDenial, PermissionRequest, Tool,
+    ToolAnnotations, ToolContext, ToolError, ToolName, ToolRegistry, ToolRequest, ToolResources,
+    ToolResult, ToolSpec,
 };
 use async_trait::async_trait;
 use futures_lite::StreamExt;
@@ -16,6 +19,9 @@ pub fn registry() -> ToolRegistry {
     ToolRegistry::new()
         .with(ReadFileTool::default())
         .with(WriteFileTool::default())
+        .with(ReplaceInFileTool::default())
+        .with(MoveTool::default())
+        .with(DeleteTool::default())
         .with(ListDirectoryTool::default())
         .with(CreateDirectoryTool::default())
 }
@@ -24,6 +30,121 @@ pub fn registry() -> ToolRegistry {
 pub enum FileSystemToolError {
     #[error("path {0} is not valid UTF-8")]
     InvalidUtf8Path(PathBuf),
+    #[error("invalid line range: from={from:?} to={to:?}")]
+    InvalidLineRange {
+        from: Option<usize>,
+        to: Option<usize>,
+    },
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct FileSystemToolPolicy {
+    require_read_before_write: bool,
+}
+
+impl FileSystemToolPolicy {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn require_read_before_write(mut self, value: bool) -> Self {
+        self.require_read_before_write = value;
+        self
+    }
+}
+
+#[derive(Default)]
+struct SessionAccessState {
+    inspected_paths: BTreeSet<PathBuf>,
+}
+
+#[derive(Default)]
+pub struct FileSystemToolResources {
+    policy: FileSystemToolPolicy,
+    sessions: Mutex<BTreeMap<SessionId, SessionAccessState>>,
+}
+
+impl FileSystemToolResources {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_policy(mut self, policy: FileSystemToolPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    pub fn record_read(&self, session_id: &SessionId, path: &Path) {
+        self.record_inspected_path(session_id, path);
+    }
+
+    pub fn record_list(&self, session_id: &SessionId, path: &Path) {
+        self.record_inspected_path(session_id, path);
+    }
+
+    pub fn record_written(&self, session_id: &SessionId, path: &Path) {
+        self.record_inspected_path(session_id, path);
+    }
+
+    pub fn record_moved(&self, session_id: &SessionId, from: &Path, to: &Path) {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .expect("filesystem tool resources poisoned");
+        let state = sessions.entry(session_id.clone()).or_default();
+        state.inspected_paths.remove(from);
+        state.inspected_paths.insert(to.to_path_buf());
+    }
+
+    fn ensure_mutation_allowed(
+        &self,
+        session_id: Option<&SessionId>,
+        action: &'static str,
+        path: &Path,
+        target_exists: bool,
+    ) -> Result<(), ToolError> {
+        if !self.policy.require_read_before_write || !target_exists {
+            return Ok(());
+        }
+
+        let Some(session_id) = session_id else {
+            return Err(read_before_write_denial(action, path));
+        };
+
+        let sessions = self
+            .sessions
+            .lock()
+            .expect("filesystem tool resources poisoned");
+        let Some(state) = sessions.get(session_id) else {
+            return Err(read_before_write_denial(action, path));
+        };
+
+        if state
+            .inspected_paths
+            .iter()
+            .any(|inspected| path == inspected || path.starts_with(inspected))
+        {
+            Ok(())
+        } else {
+            Err(read_before_write_denial(action, path))
+        }
+    }
+
+    fn record_inspected_path(&self, session_id: &SessionId, path: &Path) {
+        self.sessions
+            .lock()
+            .expect("filesystem tool resources poisoned")
+            .entry(session_id.clone())
+            .or_default()
+            .inspected_paths
+            .insert(path.to_path_buf());
+    }
+}
+
+impl ToolResources for FileSystemToolResources {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -36,11 +157,14 @@ impl Default for ReadFileTool {
         Self {
             spec: ToolSpec {
                 name: ToolName::new("fs.read_file"),
-                description: "Read a UTF-8 text file from disk.".into(),
+                description: "Read a UTF-8 text file from disk, optionally limited to a 1-based inclusive line range."
+                    .into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
-                        "path": { "type": "string" }
+                        "path": { "type": "string" },
+                        "from": { "type": "integer", "minimum": 1 },
+                        "to": { "type": "integer", "minimum": 1 }
                     },
                     "required": ["path"],
                     "additionalProperties": false
@@ -59,6 +183,8 @@ impl Default for ReadFileTool {
 #[derive(Deserialize)]
 struct ReadFileInput {
     path: PathBuf,
+    from: Option<usize>,
+    to: Option<usize>,
 }
 
 #[async_trait]
@@ -81,18 +207,28 @@ impl Tool for ReadFileTool {
     async fn invoke(
         &self,
         request: ToolRequest,
-        _ctx: &mut ToolContext<'_>,
+        ctx: &mut ToolContext<'_>,
     ) -> Result<ToolResult, ToolError> {
         let started = Instant::now();
         let input: ReadFileInput = parse_input(&request.input)?;
+        validate_line_range(input.from, input.to)?;
+
         let contents = async_fs::read_to_string(&input.path)
             .await
             .map_err(|error| ToolError::ExecutionFailed(format!("failed to read file: {error}")))?;
+        let sliced = slice_lines(&contents, input.from, input.to)?;
+
+        if let (Some(session_id), Some(resources)) = (
+            ctx.capability.session_id,
+            file_system_resources(ctx.resources),
+        ) {
+            resources.record_read(session_id, &input.path);
+        }
 
         Ok(ToolResult {
             result: ToolResultPart {
                 call_id: request.call_id,
-                output: ToolOutput::Text(contents),
+                output: ToolOutput::Text(sliced),
                 is_error: false,
                 metadata: MetadataMap::new(),
             },
@@ -163,10 +299,12 @@ impl Tool for WriteFileTool {
     async fn invoke(
         &self,
         request: ToolRequest,
-        _ctx: &mut ToolContext<'_>,
+        ctx: &mut ToolContext<'_>,
     ) -> Result<ToolResult, ToolError> {
         let started = Instant::now();
         let input: WriteFileInput = parse_input(&request.input)?;
+        let existed = path_exists(&input.path).await?;
+        enforce_mutation_policy(ctx, "write", &input.path, existed)?;
 
         if input.create_parents
             && let Some(parent) = input.path.parent()
@@ -185,12 +323,370 @@ impl Tool for WriteFileTool {
                 ToolError::ExecutionFailed(format!("failed to write file: {error}"))
             })?;
 
+        if let (Some(session_id), Some(resources)) = (
+            ctx.capability.session_id,
+            file_system_resources(ctx.resources),
+        ) {
+            resources.record_written(session_id, &input.path);
+        }
+
         Ok(ToolResult {
             result: ToolResultPart {
                 call_id: request.call_id,
                 output: ToolOutput::Structured(json!({
                     "path": input.path.display().to_string(),
                     "bytes_written": input.contents.len(),
+                    "created": !existed,
+                })),
+                is_error: false,
+                metadata: MetadataMap::new(),
+            },
+            duration: Some(started.elapsed()),
+            metadata: MetadataMap::new(),
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ReplaceInFileTool {
+    spec: ToolSpec,
+}
+
+impl Default for ReplaceInFileTool {
+    fn default() -> Self {
+        Self {
+            spec: ToolSpec {
+                name: ToolName::new("fs.replace_in_file"),
+                description:
+                    "Replace exact text in a UTF-8 file. Fails if the search text is not found."
+                        .into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "find": { "type": "string" },
+                        "replace": { "type": "string" },
+                        "replace_all": { "type": "boolean", "default": false }
+                    },
+                    "required": ["path", "find", "replace"],
+                    "additionalProperties": false
+                }),
+                annotations: ToolAnnotations {
+                    destructive_hint: true,
+                    idempotent_hint: false,
+                    ..ToolAnnotations::default()
+                },
+                metadata: MetadataMap::new(),
+            },
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct ReplaceInFileInput {
+    path: PathBuf,
+    find: String,
+    replace: String,
+    #[serde(default)]
+    replace_all: bool,
+}
+
+#[async_trait]
+impl Tool for ReplaceInFileTool {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    fn proposed_requests(
+        &self,
+        request: &ToolRequest,
+    ) -> Result<Vec<Box<dyn PermissionRequest>>, ToolError> {
+        let input: ReplaceInFileInput = parse_input(&request.input)?;
+        Ok(vec![Box::new(FileSystemPermissionRequest::Edit {
+            path: input.path,
+            metadata: request.metadata.clone(),
+        })])
+    }
+
+    async fn invoke(
+        &self,
+        request: ToolRequest,
+        ctx: &mut ToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
+        let started = Instant::now();
+        let input: ReplaceInFileInput = parse_input(&request.input)?;
+        enforce_mutation_policy(ctx, "edit", &input.path, true)?;
+
+        let contents = async_fs::read_to_string(&input.path)
+            .await
+            .map_err(|error| ToolError::ExecutionFailed(format!("failed to read file: {error}")))?;
+
+        let replacement_count = contents.matches(&input.find).count();
+        if replacement_count == 0 {
+            return Err(ToolError::ExecutionFailed(format!(
+                "search text not found in {}",
+                input.path.display()
+            )));
+        }
+
+        let updated = if input.replace_all {
+            contents.replace(&input.find, &input.replace)
+        } else {
+            contents.replacen(&input.find, &input.replace, 1)
+        };
+        let applied = if input.replace_all {
+            replacement_count
+        } else {
+            1
+        };
+
+        async_fs::write(&input.path, updated.as_bytes())
+            .await
+            .map_err(|error| {
+                ToolError::ExecutionFailed(format!("failed to write file: {error}"))
+            })?;
+
+        if let (Some(session_id), Some(resources)) = (
+            ctx.capability.session_id,
+            file_system_resources(ctx.resources),
+        ) {
+            resources.record_written(session_id, &input.path);
+        }
+
+        Ok(ToolResult {
+            result: ToolResultPart {
+                call_id: request.call_id,
+                output: ToolOutput::Structured(json!({
+                    "path": input.path.display().to_string(),
+                    "replacements": applied,
+                })),
+                is_error: false,
+                metadata: MetadataMap::new(),
+            },
+            duration: Some(started.elapsed()),
+            metadata: MetadataMap::new(),
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct MoveTool {
+    spec: ToolSpec,
+}
+
+impl Default for MoveTool {
+    fn default() -> Self {
+        Self {
+            spec: ToolSpec {
+                name: ToolName::new("fs.move"),
+                description: "Move or rename a file or directory.".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "from": { "type": "string" },
+                        "to": { "type": "string" },
+                        "create_parents": { "type": "boolean", "default": true },
+                        "overwrite": { "type": "boolean", "default": false }
+                    },
+                    "required": ["from", "to"],
+                    "additionalProperties": false
+                }),
+                annotations: ToolAnnotations {
+                    destructive_hint: true,
+                    idempotent_hint: false,
+                    ..ToolAnnotations::default()
+                },
+                metadata: MetadataMap::new(),
+            },
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct MoveInput {
+    from: PathBuf,
+    to: PathBuf,
+    #[serde(default = "default_true")]
+    create_parents: bool,
+    #[serde(default)]
+    overwrite: bool,
+}
+
+#[async_trait]
+impl Tool for MoveTool {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    fn proposed_requests(
+        &self,
+        request: &ToolRequest,
+    ) -> Result<Vec<Box<dyn PermissionRequest>>, ToolError> {
+        let input: MoveInput = parse_input(&request.input)?;
+        Ok(vec![Box::new(FileSystemPermissionRequest::Move {
+            from: input.from,
+            to: input.to,
+            metadata: request.metadata.clone(),
+        })])
+    }
+
+    async fn invoke(
+        &self,
+        request: ToolRequest,
+        ctx: &mut ToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
+        let started = Instant::now();
+        let input: MoveInput = parse_input(&request.input)?;
+        enforce_mutation_policy(ctx, "move", &input.from, true)?;
+
+        if path_exists(&input.to).await? {
+            if input.overwrite {
+                remove_path(&input.to, true, true).await?;
+            } else {
+                return Err(ToolError::ExecutionFailed(format!(
+                    "destination {} already exists",
+                    input.to.display()
+                )));
+            }
+        }
+
+        if input.create_parents
+            && let Some(parent) = input.to.parent()
+        {
+            async_fs::create_dir_all(parent).await.map_err(|error| {
+                ToolError::ExecutionFailed(format!(
+                    "failed to create parent directories for {}: {error}",
+                    input.to.display()
+                ))
+            })?;
+        }
+
+        async_fs::rename(&input.from, &input.to)
+            .await
+            .map_err(|error| {
+                ToolError::ExecutionFailed(format!(
+                    "failed to move {} to {}: {error}",
+                    input.from.display(),
+                    input.to.display()
+                ))
+            })?;
+
+        if let (Some(session_id), Some(resources)) = (
+            ctx.capability.session_id,
+            file_system_resources(ctx.resources),
+        ) {
+            resources.record_moved(session_id, &input.from, &input.to);
+        }
+
+        Ok(ToolResult {
+            result: ToolResultPart {
+                call_id: request.call_id,
+                output: ToolOutput::Structured(json!({
+                    "from": input.from.display().to_string(),
+                    "to": input.to.display().to_string(),
+                    "moved": true,
+                })),
+                is_error: false,
+                metadata: MetadataMap::new(),
+            },
+            duration: Some(started.elapsed()),
+            metadata: MetadataMap::new(),
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct DeleteTool {
+    spec: ToolSpec,
+}
+
+impl Default for DeleteTool {
+    fn default() -> Self {
+        Self {
+            spec: ToolSpec {
+                name: ToolName::new("fs.delete"),
+                description: "Delete a file or directory.".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "recursive": { "type": "boolean", "default": false },
+                        "missing_ok": { "type": "boolean", "default": false }
+                    },
+                    "required": ["path"],
+                    "additionalProperties": false
+                }),
+                annotations: ToolAnnotations {
+                    destructive_hint: true,
+                    idempotent_hint: false,
+                    ..ToolAnnotations::default()
+                },
+                metadata: MetadataMap::new(),
+            },
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct DeleteInput {
+    path: PathBuf,
+    #[serde(default)]
+    recursive: bool,
+    #[serde(default)]
+    missing_ok: bool,
+}
+
+#[async_trait]
+impl Tool for DeleteTool {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    fn proposed_requests(
+        &self,
+        request: &ToolRequest,
+    ) -> Result<Vec<Box<dyn PermissionRequest>>, ToolError> {
+        let input: DeleteInput = parse_input(&request.input)?;
+        Ok(vec![Box::new(FileSystemPermissionRequest::Delete {
+            path: input.path,
+            metadata: request.metadata.clone(),
+        })])
+    }
+
+    async fn invoke(
+        &self,
+        request: ToolRequest,
+        ctx: &mut ToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
+        let started = Instant::now();
+        let input: DeleteInput = parse_input(&request.input)?;
+        let existed = path_exists(&input.path).await?;
+        if !existed && input.missing_ok {
+            return Ok(ToolResult {
+                result: ToolResultPart {
+                    call_id: request.call_id,
+                    output: ToolOutput::Structured(json!({
+                        "path": input.path.display().to_string(),
+                        "deleted": false,
+                        "missing": true,
+                    })),
+                    is_error: false,
+                    metadata: MetadataMap::new(),
+                },
+                duration: Some(started.elapsed()),
+                metadata: MetadataMap::new(),
+            });
+        }
+
+        enforce_mutation_policy(ctx, "delete", &input.path, existed)?;
+        remove_path(&input.path, input.recursive, false).await?;
+
+        Ok(ToolResult {
+            result: ToolResultPart {
+                call_id: request.call_id,
+                output: ToolOutput::Structured(json!({
+                    "path": input.path.display().to_string(),
+                    "deleted": true,
                 })),
                 is_error: false,
                 metadata: MetadataMap::new(),
@@ -256,7 +752,7 @@ impl Tool for ListDirectoryTool {
     async fn invoke(
         &self,
         request: ToolRequest,
-        _ctx: &mut ToolContext<'_>,
+        ctx: &mut ToolContext<'_>,
     ) -> Result<ToolResult, ToolError> {
         let started = Instant::now();
         let input: ListDirectoryInput = parse_input(&request.input)?;
@@ -286,6 +782,13 @@ impl Tool for ListDirectoryTool {
                 "path": entry.path().display().to_string(),
                 "kind": file_kind_label(&file_type),
             }));
+        }
+
+        if let (Some(session_id), Some(resources)) = (
+            ctx.capability.session_id,
+            file_system_resources(ctx.resources),
+        ) {
+            resources.record_list(session_id, &input.path);
         }
 
         Ok(ToolResult {
@@ -397,6 +900,105 @@ fn default_true() -> bool {
     true
 }
 
+fn validate_line_range(from: Option<usize>, to: Option<usize>) -> Result<(), ToolError> {
+    if matches!((from, to), (Some(start), Some(end)) if end < start) {
+        return Err(ToolError::InvalidInput(
+            FileSystemToolError::InvalidLineRange { from, to }.to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn slice_lines(
+    contents: &str,
+    from: Option<usize>,
+    to: Option<usize>,
+) -> Result<String, ToolError> {
+    validate_line_range(from, to)?;
+    if from.is_none() && to.is_none() {
+        return Ok(contents.to_string());
+    }
+
+    let start = from.unwrap_or(1);
+    let end = to.unwrap_or(usize::MAX);
+    let selected = contents
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let line_number = index + 1;
+            (line_number >= start && line_number <= end).then_some(line)
+        })
+        .collect::<Vec<_>>();
+
+    Ok(selected.join("\n"))
+}
+
+fn file_system_resources(resources: &dyn ToolResources) -> Option<&FileSystemToolResources> {
+    resources.as_any().downcast_ref::<FileSystemToolResources>()
+}
+
+fn enforce_mutation_policy(
+    ctx: &ToolContext<'_>,
+    action: &'static str,
+    path: &Path,
+    target_exists: bool,
+) -> Result<(), ToolError> {
+    let Some(resources) = file_system_resources(ctx.resources) else {
+        return Ok(());
+    };
+
+    resources.ensure_mutation_allowed(ctx.capability.session_id, action, path, target_exists)
+}
+
+fn read_before_write_denial(action: &'static str, path: &Path) -> ToolError {
+    ToolError::PermissionDenied(PermissionDenial {
+        code: PermissionCode::CustomPolicyDenied,
+        message: format!(
+            "filesystem policy requires reading {} before attempting to {} it",
+            path.display(),
+            action
+        ),
+        metadata: MetadataMap::new(),
+    })
+}
+
+async fn path_exists(path: &Path) -> Result<bool, ToolError> {
+    Ok(async_fs::metadata(path).await.is_ok())
+}
+
+async fn remove_path(path: &Path, recursive: bool, overwrite: bool) -> Result<(), ToolError> {
+    let metadata = async_fs::metadata(path).await.map_err(|error| {
+        ToolError::ExecutionFailed(format!(
+            "failed to inspect {} before deletion: {error}",
+            path.display()
+        ))
+    })?;
+
+    if metadata.is_dir() {
+        if recursive || overwrite {
+            async_fs::remove_dir_all(path).await.map_err(|error| {
+                ToolError::ExecutionFailed(format!(
+                    "failed to remove directory {}: {error}",
+                    path.display()
+                ))
+            })?;
+        } else {
+            async_fs::remove_dir(path).await.map_err(|error| {
+                ToolError::ExecutionFailed(format!(
+                    "failed to remove directory {}: {error}",
+                    path.display()
+                ))
+            })?;
+        }
+    } else {
+        async_fs::remove_file(path).await.map_err(|error| {
+            ToolError::ExecutionFailed(format!("failed to remove file {}: {error}", path.display()))
+        })?;
+    }
+
+    Ok(())
+}
+
 fn path_name(path: impl AsRef<Path>) -> Result<String, ToolError> {
     let path = path.as_ref();
     let name = path.file_name().ok_or_else(|| {
@@ -426,7 +1028,10 @@ mod tests {
 
     use agentkit_capabilities::CapabilityContext;
     use agentkit_core::{SessionId, ToolCallId, TurnId};
-    use agentkit_tools_core::{PermissionChecker, PermissionDecision, ToolExecutor};
+    use agentkit_tools_core::{
+        BasicToolExecutor, PermissionChecker, PermissionDecision, ToolExecutionOutcome,
+        ToolExecutor,
+    };
 
     use super::*;
 
@@ -441,9 +1046,43 @@ mod tests {
     fn temp_dir(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .expect("time moved backwards")
             .as_nanos();
         std::env::temp_dir().join(format!("agentkit-{name}-{nanos}"))
+    }
+
+    fn tool_context<'a>(
+        session_id: &'a SessionId,
+        turn_id: &'a TurnId,
+        metadata: &'a MetadataMap,
+        resources: &'a dyn ToolResources,
+    ) -> ToolContext<'a> {
+        ToolContext {
+            capability: CapabilityContext {
+                session_id: Some(session_id),
+                turn_id: Some(turn_id),
+                metadata,
+            },
+            permissions: &AllowAll,
+            resources,
+            cancellation: None,
+        }
+    }
+
+    fn request(
+        tool_name: &str,
+        input: Value,
+        session_id: &SessionId,
+        turn_id: &TurnId,
+    ) -> ToolRequest {
+        ToolRequest {
+            call_id: ToolCallId::new(format!("call-{tool_name}")),
+            tool_name: ToolName::new(tool_name),
+            input,
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            metadata: MetadataMap::new(),
+        }
     }
 
     #[test]
@@ -452,73 +1091,169 @@ mod tests {
         let names: Vec<_> = specs.into_iter().map(|spec| spec.name.0).collect();
         assert!(names.contains(&"fs.read_file".into()));
         assert!(names.contains(&"fs.write_file".into()));
+        assert!(names.contains(&"fs.replace_in_file".into()));
+        assert!(names.contains(&"fs.move".into()));
+        assert!(names.contains(&"fs.delete".into()));
         assert!(names.contains(&"fs.list_directory".into()));
         assert!(names.contains(&"fs.create_directory".into()));
     }
 
     #[tokio::test]
-    async fn write_then_read_roundtrip() {
+    async fn write_then_ranged_read_roundtrip() {
         let root = temp_dir("fs");
         async_fs::create_dir_all(&root).await.unwrap();
         let target = root.join("note.txt");
         let session_id = SessionId::new("session-1");
         let turn_id = TurnId::new("turn-1");
 
-        let executor = agentkit_tools_core::BasicToolExecutor::new(registry());
+        let executor = BasicToolExecutor::new(registry());
         let metadata = MetadataMap::new();
-        let mut ctx = ToolContext {
-            capability: CapabilityContext {
-                session_id: Some(&session_id),
-                turn_id: Some(&turn_id),
-                metadata: &metadata,
-            },
-            permissions: &AllowAll,
-            resources: &(),
-        };
+        let mut ctx = tool_context(&session_id, &turn_id, &metadata, &());
 
         let write = executor
             .execute(
-                ToolRequest {
-                    call_id: ToolCallId::new("call-write"),
-                    tool_name: ToolName::new("fs.write_file"),
-                    input: json!({
+                request(
+                    "fs.write_file",
+                    json!({
                         "path": target.display().to_string(),
-                        "contents": "hello"
+                        "contents": "alpha\nbeta\ngamma"
                     }),
-                    session_id: session_id.clone(),
-                    turn_id: turn_id.clone(),
-                    metadata: MetadataMap::new(),
-                },
+                    &session_id,
+                    &turn_id,
+                ),
                 &mut ctx,
             )
             .await;
-        assert!(matches!(
-            write,
-            agentkit_tools_core::ToolExecutionOutcome::Completed(_)
-        ));
+        assert!(matches!(write, ToolExecutionOutcome::Completed(_)));
 
         let read = executor
             .execute(
-                ToolRequest {
-                    call_id: ToolCallId::new("call-read"),
-                    tool_name: ToolName::new("fs.read_file"),
-                    input: json!({
-                        "path": target.display().to_string()
+                request(
+                    "fs.read_file",
+                    json!({
+                        "path": target.display().to_string(),
+                        "from": 2,
+                        "to": 3
                     }),
-                    session_id: session_id.clone(),
-                    turn_id: turn_id.clone(),
-                    metadata: MetadataMap::new(),
-                },
+                    &session_id,
+                    &turn_id,
+                ),
                 &mut ctx,
             )
             .await;
 
         match read {
-            agentkit_tools_core::ToolExecutionOutcome::Completed(result) => {
-                assert_eq!(result.result.output, ToolOutput::Text("hello".into()));
+            ToolExecutionOutcome::Completed(result) => {
+                assert_eq!(result.result.output, ToolOutput::Text("beta\ngamma".into()));
             }
             other => panic!("unexpected outcome: {other:?}"),
         }
+
+        let _ = async_fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn replace_move_and_delete_work() {
+        let root = temp_dir("fs-edit");
+        async_fs::create_dir_all(&root).await.unwrap();
+        let source = root.join("source.txt");
+        let destination = root.join("archive").join("renamed.txt");
+        async_fs::write(&source, "hello world").await.unwrap();
+
+        let resources = FileSystemToolResources::new()
+            .with_policy(FileSystemToolPolicy::new().require_read_before_write(true));
+        let session_id = SessionId::new("session-2");
+        let turn_id = TurnId::new("turn-2");
+        let metadata = MetadataMap::new();
+        let executor = BasicToolExecutor::new(registry());
+        let mut ctx = tool_context(&session_id, &turn_id, &metadata, &resources);
+
+        let denied_edit = executor
+            .execute(
+                request(
+                    "fs.replace_in_file",
+                    json!({
+                        "path": source.display().to_string(),
+                        "find": "world",
+                        "replace": "agentkit"
+                    }),
+                    &session_id,
+                    &turn_id,
+                ),
+                &mut ctx,
+            )
+            .await;
+        assert!(matches!(
+            denied_edit,
+            ToolExecutionOutcome::Failed(ToolError::PermissionDenied(_))
+        ));
+
+        let read = executor
+            .execute(
+                request(
+                    "fs.read_file",
+                    json!({
+                        "path": source.display().to_string()
+                    }),
+                    &session_id,
+                    &turn_id,
+                ),
+                &mut ctx,
+            )
+            .await;
+        assert!(matches!(read, ToolExecutionOutcome::Completed(_)));
+
+        let replace = executor
+            .execute(
+                request(
+                    "fs.replace_in_file",
+                    json!({
+                        "path": source.display().to_string(),
+                        "find": "world",
+                        "replace": "agentkit"
+                    }),
+                    &session_id,
+                    &turn_id,
+                ),
+                &mut ctx,
+            )
+            .await;
+        assert!(matches!(replace, ToolExecutionOutcome::Completed(_)));
+
+        let move_result = executor
+            .execute(
+                request(
+                    "fs.move",
+                    json!({
+                        "from": source.display().to_string(),
+                        "to": destination.display().to_string()
+                    }),
+                    &session_id,
+                    &turn_id,
+                ),
+                &mut ctx,
+            )
+            .await;
+        assert!(matches!(move_result, ToolExecutionOutcome::Completed(_)));
+
+        let read_moved = async_fs::read_to_string(&destination).await.unwrap();
+        assert_eq!(read_moved, "hello agentkit");
+
+        let delete = executor
+            .execute(
+                request(
+                    "fs.delete",
+                    json!({
+                        "path": destination.display().to_string()
+                    }),
+                    &session_id,
+                    &turn_id,
+                ),
+                &mut ctx,
+            )
+            .await;
+        assert!(matches!(delete, ToolExecutionOutcome::Completed(_)));
+        assert!(!path_exists(&destination).await.unwrap());
 
         let _ = async_fs::remove_dir_all(root).await;
     }

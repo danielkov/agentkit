@@ -1,6 +1,10 @@
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
+use futures_timer::Delay;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -49,6 +53,88 @@ id_newtype!(PartId);
 id_newtype!(ApprovalId);
 
 pub type MetadataMap = BTreeMap<String, Value>;
+
+#[derive(Default)]
+struct CancellationState {
+    generation: AtomicU64,
+}
+
+#[derive(Clone, Default)]
+pub struct CancellationController {
+    state: Arc<CancellationState>,
+}
+
+#[derive(Clone, Default)]
+pub struct CancellationHandle {
+    state: Arc<CancellationState>,
+}
+
+#[derive(Clone, Default)]
+pub struct TurnCancellation {
+    handle: CancellationHandle,
+    generation: u64,
+}
+
+impl CancellationController {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn handle(&self) -> CancellationHandle {
+        CancellationHandle {
+            state: Arc::clone(&self.state),
+        }
+    }
+
+    pub fn interrupt(&self) -> u64 {
+        self.state.generation.fetch_add(1, Ordering::SeqCst) + 1
+    }
+}
+
+impl CancellationHandle {
+    pub fn generation(&self) -> u64 {
+        self.state.generation.load(Ordering::SeqCst)
+    }
+
+    pub fn checkpoint(&self) -> TurnCancellation {
+        TurnCancellation {
+            handle: self.clone(),
+            generation: self.generation(),
+        }
+    }
+
+    pub fn is_cancelled_since(&self, generation: u64) -> bool {
+        self.generation() != generation
+    }
+
+    pub async fn cancelled_since(&self, generation: u64) {
+        while !self.is_cancelled_since(generation) {
+            Delay::new(Duration::from_millis(10)).await;
+        }
+    }
+}
+
+impl TurnCancellation {
+    pub fn new(handle: CancellationHandle) -> Self {
+        handle.checkpoint()
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.handle.is_cancelled_since(self.generation)
+    }
+
+    pub async fn cancelled(&self) {
+        self.handle.cancelled_since(self.generation).await;
+    }
+
+    pub fn handle(&self) -> &CancellationHandle {
+        &self.handle
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Item {

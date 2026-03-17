@@ -13,7 +13,7 @@ use agentkit_capabilities::{
 };
 use agentkit_core::{
     ApprovalId, Item, ItemKind, MetadataMap, Part, SessionId, ToolCallId, ToolOutput,
-    ToolResultPart, TurnId,
+    ToolResultPart, TurnCancellation, TurnId,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -76,14 +76,21 @@ pub struct ToolResult {
     pub metadata: MetadataMap,
 }
 
-pub trait ToolResources: Send + Sync {}
+pub trait ToolResources: Send + Sync {
+    fn as_any(&self) -> &dyn Any;
+}
 
-impl ToolResources for () {}
+impl ToolResources for () {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
 
 pub struct ToolContext<'a> {
     pub capability: CapabilityContext<'a>,
     pub permissions: &'a dyn PermissionChecker,
     pub resources: &'a dyn ToolResources,
+    pub cancellation: Option<TurnCancellation>,
 }
 
 pub trait PermissionRequest: Send + Sync {
@@ -989,6 +996,7 @@ impl Invocable for ToolInvocableAdapter {
             },
             permissions: self.permissions.as_ref(),
             resources: self.resources.as_ref(),
+            cancellation: None,
         };
 
         let result = self
@@ -1179,6 +1187,8 @@ pub enum ToolError {
     AuthRequired(Box<AuthRequest>),
     #[error("tool unavailable: {0}")]
     Unavailable(String),
+    #[error("tool execution cancelled")]
+    Cancelled,
     #[error("internal tool error: {0}")]
     Internal(String),
 }

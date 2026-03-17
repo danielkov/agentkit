@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use agentkit_core::{Item, ItemKind, MetadataMap, Part, SessionId, TurnId};
+use agentkit_core::{Item, ItemKind, MetadataMap, Part, SessionId, TurnCancellation, TurnId};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -55,12 +55,17 @@ pub trait CompactionTrigger: Send + Sync {
 
 #[async_trait]
 pub trait CompactionBackend: Send + Sync {
-    async fn summarize(&self, request: SummaryRequest) -> Result<SummaryResult, CompactionError>;
+    async fn summarize(
+        &self,
+        request: SummaryRequest,
+        cancellation: Option<TurnCancellation>,
+    ) -> Result<SummaryResult, CompactionError>;
 }
 
 pub struct CompactionContext<'a> {
     pub backend: Option<&'a dyn CompactionBackend>,
     pub metadata: &'a MetadataMap,
+    pub cancellation: Option<TurnCancellation>,
 }
 
 #[async_trait]
@@ -153,6 +158,13 @@ impl CompactionStrategy for CompactionPipeline {
         let mut metadata = MetadataMap::new();
 
         for strategy in &self.strategies {
+            if ctx
+                .cancellation
+                .as_ref()
+                .is_some_and(TurnCancellation::is_cancelled)
+            {
+                return Err(CompactionError::Cancelled);
+            }
             let result = strategy.apply(request.clone(), ctx).await?;
             request.transcript = result.transcript;
             replaced_items += result.replaced_items;
@@ -386,13 +398,16 @@ impl CompactionStrategy for SummarizeOlderStrategy {
             .map(|index| request.transcript[*index].clone())
             .collect::<Vec<_>>();
         let summary = backend
-            .summarize(SummaryRequest {
-                session_id: request.session_id.clone(),
-                turn_id: request.turn_id.clone(),
-                items: summary_items,
-                reason: request.reason.clone(),
-                metadata: request.metadata.clone(),
-            })
+            .summarize(
+                SummaryRequest {
+                    session_id: request.session_id.clone(),
+                    turn_id: request.turn_id.clone(),
+                    items: summary_items,
+                    reason: request.reason.clone(),
+                    metadata: request.metadata.clone(),
+                },
+                ctx.cancellation.clone(),
+            )
             .await?;
 
         let mut transcript = Vec::new();
@@ -427,6 +442,8 @@ fn removable_indices(transcript: &[Item], preserve_kinds: &BTreeSet<ItemKind>) -
 
 #[derive(Debug, Error)]
 pub enum CompactionError {
+    #[error("compaction cancelled")]
+    Cancelled,
     #[error("missing compaction backend: {0}")]
     MissingBackend(String),
     #[error("compaction failed: {0}")]
@@ -435,7 +452,7 @@ pub enum CompactionError {
 
 #[cfg(test)]
 mod tests {
-    use agentkit_core::{Part, TextPart, ToolOutput, ToolResultPart};
+    use agentkit_core::{CancellationController, Part, TextPart, ToolOutput, ToolResultPart};
 
     use super::*;
 
@@ -521,6 +538,7 @@ mod tests {
         let mut ctx = CompactionContext {
             backend: None,
             metadata: &MetadataMap::new(),
+            cancellation: None,
         };
 
         let result = pipeline.apply(request, &mut ctx).await.unwrap();
@@ -540,6 +558,7 @@ mod tests {
         async fn summarize(
             &self,
             request: SummaryRequest,
+            _cancellation: Option<TurnCancellation>,
         ) -> Result<SummaryResult, CompactionError> {
             Ok(SummaryResult {
                 items: vec![Item {
@@ -569,6 +588,7 @@ mod tests {
         let mut ctx = CompactionContext {
             backend: Some(&FakeBackend),
             metadata: &MetadataMap::new(),
+            cancellation: None,
         };
 
         let result = strategy.apply(request, &mut ctx).await.unwrap();
@@ -578,5 +598,28 @@ mod tests {
             Part::Text(text) => assert_eq!(text.text, "summary of 2 items"),
             other => panic!("unexpected part: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn pipeline_stops_when_cancelled() {
+        let controller = CancellationController::new();
+        let checkpoint = controller.handle().checkpoint();
+        controller.interrupt();
+        let request = CompactionRequest {
+            session_id: "s".into(),
+            turn_id: None,
+            transcript: vec![user_item("a"), user_item("b"), user_item("c")],
+            reason: CompactionReason::TranscriptTooLong,
+            metadata: MetadataMap::new(),
+        };
+        let pipeline = CompactionPipeline::new().with_strategy(DropReasoningStrategy::new());
+        let mut ctx = CompactionContext {
+            backend: None,
+            metadata: &MetadataMap::new(),
+            cancellation: Some(checkpoint),
+        };
+
+        let error = pipeline.apply(request, &mut ctx).await.unwrap_err();
+        assert!(matches!(error, CompactionError::Cancelled));
     }
 }

@@ -93,11 +93,12 @@ impl Tool for ShellExecTool {
     async fn invoke(
         &self,
         request: ToolRequest,
-        _ctx: &mut ToolContext<'_>,
+        ctx: &mut ToolContext<'_>,
     ) -> Result<ToolResult, ToolError> {
         let input: ShellExecInput = parse_input(&request)?;
         let mut command = Command::new(&input.executable);
         command.args(&input.argv);
+        command.kill_on_drop(true);
         if let Some(cwd) = &input.cwd {
             command.current_dir(cwd);
         }
@@ -106,17 +107,41 @@ impl Tool for ShellExecTool {
         }
 
         let duration_start = std::time::Instant::now();
+        let output_future = command.output();
+        tokio::pin!(output_future);
+
         let output = if let Some(timeout_ms) = input.timeout_ms {
-            timeout(Duration::from_millis(timeout_ms), command.output())
-                .await
-                .map_err(|_| {
-                    ToolError::ExecutionFailed(format!("command timed out after {timeout_ms}ms"))
-                })?
-                .map_err(|error| {
+            if let Some(cancellation) = ctx.cancellation.clone() {
+                tokio::select! {
+                    result = &mut output_future => result.map_err(|error| {
+                        ToolError::ExecutionFailed(format!("failed to spawn command: {error}"))
+                    })?,
+                    _ = cancellation.cancelled() => return Err(ToolError::Cancelled),
+                    _ = tokio::time::sleep(Duration::from_millis(timeout_ms)) => {
+                        return Err(ToolError::ExecutionFailed(format!("command timed out after {timeout_ms}ms")));
+                    }
+                }
+            } else {
+                timeout(Duration::from_millis(timeout_ms), &mut output_future)
+                    .await
+                    .map_err(|_| {
+                        ToolError::ExecutionFailed(format!(
+                            "command timed out after {timeout_ms}ms"
+                        ))
+                    })?
+                    .map_err(|error| {
+                        ToolError::ExecutionFailed(format!("failed to spawn command: {error}"))
+                    })?
+            }
+        } else if let Some(cancellation) = ctx.cancellation.clone() {
+            tokio::select! {
+                result = &mut output_future => result.map_err(|error| {
                     ToolError::ExecutionFailed(format!("failed to spawn command: {error}"))
-                })?
+                })?,
+                _ = cancellation.cancelled() => return Err(ToolError::Cancelled),
+            }
         } else {
-            command.output().await.map_err(|error| {
+            output_future.await.map_err(|error| {
                 ToolError::ExecutionFailed(format!("failed to spawn command: {error}"))
             })?
         };
@@ -198,6 +223,7 @@ mod tests {
             },
             permissions: &AllowAll,
             resources: &(),
+            cancellation: None,
         };
 
         let result = executor
@@ -242,6 +268,7 @@ mod tests {
             },
             permissions: &DenyCommands,
             resources: &(),
+            cancellation: None,
         };
 
         let result = executor

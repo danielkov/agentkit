@@ -1,6 +1,8 @@
 use std::io::{self, Write};
 
-use agentkit_core::{Item, ItemKind, MetadataMap, Part, SessionId, TextPart};
+use agentkit_core::{
+    CancellationController, Item, ItemKind, MetadataMap, Part, SessionId, TextPart,
+};
 use agentkit_loop::{Agent, LoopInterrupt, LoopStep, SessionConfig};
 use agentkit_provider_openrouter::{OpenRouterAdapter, OpenRouterConfig};
 
@@ -9,7 +11,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
     let config = OpenRouterConfig::from_env()?;
     let adapter = OpenRouterAdapter::new(config)?;
-    let agent = Agent::builder().model(adapter).build()?;
+    let cancellation = CancellationController::new();
+    let agent = Agent::builder()
+        .model(adapter)
+        .cancellation(cancellation.handle())
+        .build()?;
     let mut driver = agent
         .start(SessionConfig {
             session_id: SessionId::new("openrouter-chat"),
@@ -20,12 +26,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
         println!("openrouter-chat");
-        println!("Type a prompt and press enter. Use /exit to quit.");
-        repl(&mut driver).await?;
+        println!("Type a prompt and press enter. Use /exit to quit. Press Ctrl-C to cancel the current turn.");
+        repl(&mut driver, cancellation).await?;
     } else {
         let prompt = args.join(" ");
         submit_user_prompt(&mut driver, &prompt)?;
-        run_turn(&mut driver).await?;
+        run_turn(&mut driver, &cancellation).await?;
     }
 
     Ok(())
@@ -33,6 +39,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn repl<S>(
     driver: &mut agentkit_loop::LoopDriver<S>,
+    cancellation: CancellationController,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     S: agentkit_loop::ModelSession,
@@ -57,7 +64,7 @@ where
         }
 
         submit_user_prompt(driver, prompt)?;
-        run_turn(driver).await?;
+        run_turn(driver, &cancellation).await?;
     }
 
     Ok(())
@@ -85,12 +92,24 @@ where
 
 async fn run_turn<S>(
     driver: &mut agentkit_loop::LoopDriver<S>,
+    cancellation: &CancellationController,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     S: agentkit_loop::ModelSession,
 {
-    match driver.next().await? {
+    let interrupt = cancellation.clone();
+    let ctrl_c = tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        interrupt.interrupt();
+    });
+    let step = driver.next().await;
+    ctrl_c.abort();
+
+    match step? {
         LoopStep::Finished(result) => {
+            if result.finish_reason == agentkit_core::FinishReason::Cancelled {
+                eprintln!("turn cancelled");
+            }
             for item in result.items {
                 if item.kind != ItemKind::Assistant {
                     continue;

@@ -3,7 +3,8 @@ use std::sync::Arc;
 
 use agentkit_core::{
     CostUsage, DataRef, Delta, FilePart, FinishReason, Item, ItemKind, MediaPart, MetadataMap,
-    Modality, Part, PartKind, ReasoningPart, TextPart, TokenUsage, ToolCallPart, ToolOutput, Usage,
+    Modality, Part, PartKind, ReasoningPart, TextPart, TokenUsage, ToolCallPart, ToolOutput,
+    TurnCancellation, Usage,
 };
 use agentkit_loop::{
     LoopError, ModelAdapter, ModelSession, ModelTurn, ModelTurnEvent, ModelTurnResult,
@@ -11,6 +12,7 @@ use agentkit_loop::{
 };
 use async_trait::async_trait;
 use base64::Engine;
+use futures_util::future::{Either, select};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -158,48 +160,74 @@ impl ModelAdapter for OpenRouterAdapter {
 impl ModelSession for OpenRouterSession {
     type Turn = OpenRouterTurn;
 
-    async fn begin_turn(&mut self, request: TurnRequest) -> Result<Self::Turn, LoopError> {
-        let body = build_request_body(&self.config, &request).map_err(as_loop_error)?;
-        let mut http = self
-            .client
-            .post(&self.config.base_url)
-            .bearer_auth(&self.config.api_key)
-            .header("Content-Type", "application/json");
+    async fn begin_turn(
+        &mut self,
+        request: TurnRequest,
+        cancellation: Option<TurnCancellation>,
+    ) -> Result<Self::Turn, LoopError> {
+        let request_future = async {
+            let body = build_request_body(&self.config, &request).map_err(as_loop_error)?;
+            let mut http = self
+                .client
+                .post(&self.config.base_url)
+                .bearer_auth(&self.config.api_key)
+                .header("Content-Type", "application/json");
 
-        if let Some(app_name) = &self.config.app_name {
-            http = http.header("X-Title", app_name);
-        }
-        if let Some(site_url) = &self.config.site_url {
-            http = http.header("HTTP-Referer", site_url);
-        }
+            if let Some(app_name) = &self.config.app_name {
+                http = http.header("X-Title", app_name);
+            }
+            if let Some(site_url) = &self.config.site_url {
+                http = http.header("HTTP-Referer", site_url);
+            }
 
-        let response =
-            http.json(&body).send().await.map_err(|error| {
+            let response = http.json(&body).send().await.map_err(|error| {
                 LoopError::Provider(format!("OpenRouter request failed: {error}"))
             })?;
 
-        let status = response.status();
-        if !status.is_success() {
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<unreadable response body>".into());
-            return Err(LoopError::Provider(format!(
-                "OpenRouter request failed with status {status}: {body}"
-            )));
+            let status = response.status();
+            if !status.is_success() {
+                let body = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "<unreadable response body>".into());
+                return Err(LoopError::Provider(format!(
+                    "OpenRouter request failed with status {status}: {body}"
+                )));
+            }
+
+            let completion: ChatCompletionResponse = response.json().await.map_err(|error| {
+                LoopError::Provider(format!("invalid OpenRouter response: {error}"))
+            })?;
+
+            build_turn_from_response(completion).map_err(as_loop_error)
+        };
+
+        if let Some(cancellation) = cancellation {
+            futures_util::pin_mut!(request_future);
+            let cancelled = cancellation.cancelled();
+            futures_util::pin_mut!(cancelled);
+            match select(request_future, cancelled).await {
+                Either::Left((result, _)) => result,
+                Either::Right((_, _)) => Err(LoopError::Cancelled),
+            }
+        } else {
+            request_future.await
         }
-
-        let completion: ChatCompletionResponse = response.json().await.map_err(|error| {
-            LoopError::Provider(format!("invalid OpenRouter response: {error}"))
-        })?;
-
-        build_turn_from_response(completion).map_err(as_loop_error)
     }
 }
 
 #[async_trait]
 impl ModelTurn for OpenRouterTurn {
-    async fn next_event(&mut self) -> Result<Option<ModelTurnEvent>, LoopError> {
+    async fn next_event(
+        &mut self,
+        cancellation: Option<TurnCancellation>,
+    ) -> Result<Option<ModelTurnEvent>, LoopError> {
+        if cancellation
+            .as_ref()
+            .is_some_and(TurnCancellation::is_cancelled)
+        {
+            return Err(LoopError::Cancelled);
+        }
         Ok(self.events.pop_front())
     }
 }
