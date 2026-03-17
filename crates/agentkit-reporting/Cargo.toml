@@ -1,13 +1,16 @@
 [package]
+description = "Reporting observers and event consumers for agentkit loops."
+homepage.workspace = true
 name = "agentkit-reporting"
+repository.workspace = true
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-agentkit-core = { path = "../agentkit-core" }
-agentkit-loop = { path = "../agentkit-loop" }
+agentkit-core = { version = "0.1.0", path = "../agentkit-core" }
+agentkit-loop = { version = "0.1.0", path = "../agentkit-loop" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

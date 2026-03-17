@@ -1,15 +1,18 @@
 [package]
+description = "Runtime-agnostic loop driver, interrupts, and model session traits for agentkit."
+homepage.workspace = true
 name = "agentkit-loop"
+repository.workspace = true
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-agentkit-compaction = { path = "../agentkit-compaction" }
-agentkit-capabilities = { path = "../agentkit-capabilities" }
-agentkit-core = { path = "../agentkit-core" }
-agentkit-tools-core = { path = "../agentkit-tools-core" }
+agentkit-compaction = { version = "0.1.0", path = "../agentkit-compaction" }
+agentkit-capabilities = { version = "0.1.0", path = "../agentkit-capabilities" }
+agentkit-core = { version = "0.1.0", path = "../agentkit-core" }
+agentkit-tools-core = { version = "0.1.0", path = "../agentkit-tools-core" }
 async-trait.workspace = true
 serde.workspace = true
 thiserror.workspace = true

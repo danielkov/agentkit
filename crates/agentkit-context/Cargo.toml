@@ -1,12 +1,15 @@
 [package]
+description = "Context loading for AGENTS.md files and skills directories in agentkit."
+homepage.workspace = true
 name = "agentkit-context"
+repository.workspace = true
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-agentkit-core = { path = "../agentkit-core" }
+agentkit-core = { version = "0.1.0", path = "../agentkit-core" }
 async-fs = "2.2.0"
 async-trait.workspace = true
 futures-lite = "2.6.1"

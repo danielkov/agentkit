@@ -1,13 +1,16 @@
 [package]
+description = "Filesystem tools and session-scoped filesystem policies for agentkit."
+homepage.workspace = true
 name = "agentkit-tool-fs"
+repository.workspace = true
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-agentkit-core = { path = "../agentkit-core" }
-agentkit-tools-core = { path = "../agentkit-tools-core" }
+agentkit-core = { version = "0.1.0", path = "../agentkit-core" }
+agentkit-tools-core = { version = "0.1.0", path = "../agentkit-tools-core" }
 async-fs = "2.2.0"
 async-trait.workspace = true
 futures-lite = "2.6.1"
@@ -16,5 +19,5 @@ serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-agentkit-capabilities = { path = "../agentkit-capabilities" }
+agentkit-capabilities = { version = "0.1.0", path = "../agentkit-capabilities" }
 tokio.workspace = true

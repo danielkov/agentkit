@@ -1,13 +1,16 @@
 [package]
+description = "Tool traits, registry, execution, permissions, approvals, and auth for agentkit."
+homepage.workspace = true
 name = "agentkit-tools-core"
+repository.workspace = true
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-agentkit-capabilities = { path = "../agentkit-capabilities" }
-agentkit-core = { path = "../agentkit-core" }
+agentkit-capabilities = { version = "0.1.0", path = "../agentkit-capabilities" }
+agentkit-core = { version = "0.1.0", path = "../agentkit-core" }
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true

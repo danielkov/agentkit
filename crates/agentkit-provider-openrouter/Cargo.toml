@@ -1,14 +1,17 @@
 [package]
+description = "OpenRouter provider adapter for agentkit."
+homepage.workspace = true
 name = "agentkit-provider-openrouter"
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-agentkit-core = { path = "../agentkit-core" }
-agentkit-loop = { path = "../agentkit-loop" }
-agentkit-tools-core = { path = "../agentkit-tools-core" }
+agentkit-core = { version = "0.1.0", path = "../agentkit-core" }
+agentkit-loop = { version = "0.1.0", path = "../agentkit-loop" }
+agentkit-tools-core = { version = "0.1.0", path = "../agentkit-tools-core" }
 async-trait.workspace = true
 base64.workspace = true
 futures-util.workspace = true
