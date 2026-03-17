@@ -405,7 +405,7 @@ Recommended variants:
 - `FetchPrompt { server_id, prompt_id }`
 - `UseAuthScope { server_id, scope }`
 
-This matches the MCP surface designed in [mcp.md](/Users/danielkov/projects/agentkit/docs/mcp.md).
+This matches the MCP surface designed in [mcp.md](./mcp.md).
 
 ## Custom permission requests
 
