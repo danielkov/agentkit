@@ -2,6 +2,7 @@
 description = "Tool traits, registry, execution, permissions, approvals, and auth for agentkit."
 homepage.workspace = true
 name = "agentkit-tools-core"
+readme = "README.md"
 repository.workspace = true
 version.workspace = true
 edition.workspace = true

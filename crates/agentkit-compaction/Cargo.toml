@@ -2,6 +2,7 @@
 description = "Transcript compaction triggers, strategies, pipelines, and backend hooks for agentkit."
 homepage.workspace = true
 name = "agentkit-compaction"
+readme = "README.md"
 repository.workspace = true
 version.workspace = true
 edition.workspace = true

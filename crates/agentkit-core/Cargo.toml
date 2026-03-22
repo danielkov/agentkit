@@ -2,6 +2,7 @@
 description = "Core transcript, content, usage, and cancellation primitives for agentkit."
 homepage.workspace = true
 name = "agentkit-core"
+readme = "README.md"
 repository.workspace = true
 version.workspace = true
 edition.workspace = true

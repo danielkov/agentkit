@@ -2,6 +2,7 @@
 description = "Model Context Protocol integration for agentkit, including transports, auth, and adapters."
 homepage.workspace = true
 name = "agentkit-mcp"
+readme = "README.md"
 repository.workspace = true
 version.workspace = true
 edition.workspace = true

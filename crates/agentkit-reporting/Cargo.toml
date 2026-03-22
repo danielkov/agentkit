@@ -2,6 +2,7 @@
 description = "Reporting observers and event consumers for agentkit loops."
 homepage.workspace = true
 name = "agentkit-reporting"
+readme = "README.md"
 repository.workspace = true
 version.workspace = true
 edition.workspace = true

@@ -30,18 +30,6 @@ This makes it possible to combine:
 
 without hardcoding lookup logic in the host application.
 
-### `SkillsDirectory`
-
-Use `SkillsDirectory` for recursive skills loading.
-
-Supported configuration:
-
-- `SkillsDirectory::from_dir(path)`
-- `with_dir(...)`
-- `with_skill_file_name(...)`
-
-This supports one or more skill roots with recursive `SKILL.md` discovery.
-
 ## Composition
 
 Use `ContextLoader` to combine multiple context sources:
@@ -49,10 +37,6 @@ Use `ContextLoader` to combine multiple context sources:
 ```rust
 let items = ContextLoader::new()
     .with_source(AgentsMd::discover_all(workspace_root))
-    .with_source(
-        SkillsDirectory::from_dir(workspace_root.join("skills"))
-            .with_dir(workspace_root.join(".agent/skills")),
-    )
     .load()
     .await?;
 ```

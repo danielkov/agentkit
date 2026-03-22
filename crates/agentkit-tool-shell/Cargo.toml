@@ -2,6 +2,7 @@
 description = "Shell execution tool and shell-oriented safety hooks for agentkit."
 homepage.workspace = true
 name = "agentkit-tool-shell"
+readme = "README.md"
 repository.workspace = true
 version.workspace = true
 edition.workspace = true

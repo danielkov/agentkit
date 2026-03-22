@@ -2,6 +2,7 @@
 description = "Runtime-agnostic loop driver, interrupts, and model session traits for agentkit."
 homepage.workspace = true
 name = "agentkit-loop"
+readme = "README.md"
 repository.workspace = true
 version.workspace = true
 edition.workspace = true

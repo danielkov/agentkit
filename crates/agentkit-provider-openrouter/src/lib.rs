@@ -1,3 +1,36 @@
+//! OpenRouter model adapter for the agentkit agent loop.
+//!
+//! This crate translates between agentkit transcript primitives and OpenRouter
+//! chat completion requests. It handles tool declaration, tool-call decoding,
+//! multimodal content mapping (images, audio), usage normalization, and
+//! environment-based configuration.
+//!
+//! # Quick start
+//!
+//! ```rust,ignore
+//! use agentkit_core::SessionId;
+//! use agentkit_loop::{Agent, SessionConfig};
+//! use agentkit_provider_openrouter::{OpenRouterAdapter, OpenRouterConfig};
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     let config = OpenRouterConfig::from_env()?;
+//!     let adapter = OpenRouterAdapter::new(config)?;
+//!
+//!     let agent = Agent::builder()
+//!         .model(adapter)
+//!         .build()?;
+//!
+//!     let mut driver = agent
+//!         .start(SessionConfig {
+//!             session_id: SessionId::new("demo"),
+//!             metadata: Default::default(),
+//!         })
+//!         .await?;
+//!     Ok(())
+//! }
+//! ```
+
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -20,19 +53,55 @@ use thiserror::Error;
 
 const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 
+/// Configuration for connecting to the OpenRouter API.
+///
+/// Holds credentials, model selection, and optional request parameters.
+/// Build one with [`OpenRouterConfig::new`] for explicit values, or
+/// [`OpenRouterConfig::from_env`] to read from environment variables.
+/// Chain builder methods to customise temperature, token limits, and
+/// arbitrary extra body fields before passing the config to
+/// [`OpenRouterAdapter::new`].
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use agentkit_provider_openrouter::OpenRouterConfig;
+///
+/// let config = OpenRouterConfig::new("sk-or-v1-...", "anthropic/claude-sonnet-4")
+///     .with_temperature(0.0)
+///     .with_max_completion_tokens(4096)
+///     .with_app_name("my-agent");
+/// ```
 #[derive(Clone, Debug)]
 pub struct OpenRouterConfig {
+    /// OpenRouter API key (starts with `sk-or-`).
     pub api_key: String,
+    /// Model identifier, e.g. `"anthropic/claude-sonnet-4"` or `"openrouter/auto"`.
     pub model: String,
+    /// Chat completions endpoint URL. Defaults to the OpenRouter production URL.
     pub base_url: String,
+    /// Optional application name sent as the `X-Title` header.
     pub app_name: Option<String>,
+    /// Optional site URL sent as the `HTTP-Referer` header.
     pub site_url: Option<String>,
+    /// Maximum number of completion tokens the model may generate.
     pub max_completion_tokens: Option<u32>,
+    /// Sampling temperature (0.0 = deterministic, higher = more creative).
     pub temperature: Option<f32>,
+    /// Arbitrary extra fields merged into the request body.
     pub extra_body: MetadataMap,
 }
 
 impl OpenRouterConfig {
+    /// Creates a new configuration with the given API key and model identifier.
+    ///
+    /// All optional fields default to `None` and the base URL defaults to
+    /// the OpenRouter production endpoint.
+    ///
+    /// # Arguments
+    ///
+    /// * `api_key` - OpenRouter API key.
+    /// * `model` - Model identifier, e.g. `"anthropic/claude-sonnet-4"`.
     pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
             api_key: api_key.into(),
@@ -46,31 +115,40 @@ impl OpenRouterConfig {
         }
     }
 
+    /// Overrides the default chat completions endpoint URL.
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
         self
     }
 
+    /// Sets the application name sent via the `X-Title` HTTP header.
     pub fn with_app_name(mut self, app_name: impl Into<String>) -> Self {
         self.app_name = Some(app_name.into());
         self
     }
 
+    /// Sets the site URL sent via the `HTTP-Referer` header.
     pub fn with_site_url(mut self, site_url: impl Into<String>) -> Self {
         self.site_url = Some(site_url.into());
         self
     }
 
+    /// Sets the maximum number of tokens the model may generate per turn.
     pub fn with_max_completion_tokens(mut self, max_completion_tokens: u32) -> Self {
         self.max_completion_tokens = Some(max_completion_tokens);
         self
     }
 
+    /// Sets the sampling temperature (0.0 for deterministic output).
     pub fn with_temperature(mut self, temperature: f32) -> Self {
         self.temperature = Some(temperature);
         self
     }
 
+    /// Inserts an arbitrary key-value pair into the request body.
+    ///
+    /// Use this to pass provider-specific parameters (e.g. `top_p`, `top_k`)
+    /// that are not covered by dedicated builder methods.
     pub fn with_extra_body_value(
         mut self,
         key: impl Into<String>,
@@ -80,6 +158,35 @@ impl OpenRouterConfig {
         self
     }
 
+    /// Builds a configuration from environment variables.
+    ///
+    /// Reads the following variables:
+    ///
+    /// | Variable | Required | Default |
+    /// |---|---|---|
+    /// | `OPENROUTER_API_KEY` | yes | -- |
+    /// | `OPENROUTER_MODEL` | no | `openrouter/auto` |
+    /// | `OPENROUTER_BASE_URL` | no | production URL |
+    /// | `OPENROUTER_APP_NAME` | no | -- |
+    /// | `OPENROUTER_SITE_URL` | no | -- |
+    /// | `OPENROUTER_MAX_COMPLETION_TOKENS` | no | -- |
+    /// | `OPENROUTER_TEMPERATURE` | no | -- |
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OpenRouterError::MissingEnv`] if `OPENROUTER_API_KEY` is unset,
+    /// or [`OpenRouterError::InvalidConfig`] if a numeric variable cannot be
+    /// parsed.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use agentkit_provider_openrouter::OpenRouterConfig;
+    ///
+    /// let config = OpenRouterConfig::from_env()?
+    ///     .with_temperature(0.0);
+    /// # Ok::<(), agentkit_provider_openrouter::OpenRouterError>(())
+    /// ```
     pub fn from_env() -> Result<Self, OpenRouterError> {
         let api_key = std::env::var("OPENROUTER_API_KEY")
             .map_err(|_| OpenRouterError::MissingEnv("OPENROUTER_API_KEY"))?;
@@ -113,6 +220,32 @@ impl OpenRouterConfig {
     }
 }
 
+/// Model adapter that connects the agentkit agent loop to OpenRouter.
+///
+/// Implements [`ModelAdapter`] so it can be passed to
+/// [`Agent::builder().model()`](agentkit_loop::Agent::builder). Each call to
+/// [`start_session`](ModelAdapter::start_session) produces an
+/// [`OpenRouterSession`] that manages HTTP requests for individual turns.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use agentkit_loop::Agent;
+/// use agentkit_provider_openrouter::{OpenRouterAdapter, OpenRouterConfig};
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let adapter = OpenRouterAdapter::new(
+///     OpenRouterConfig::from_env()?
+///         .with_temperature(0.0)
+///         .with_max_completion_tokens(512),
+/// )?;
+///
+/// let agent = Agent::builder()
+///     .model(adapter)
+///     .build()?;
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Clone)]
 pub struct OpenRouterAdapter {
     client: Client,
@@ -120,6 +253,15 @@ pub struct OpenRouterAdapter {
 }
 
 impl OpenRouterAdapter {
+    /// Creates a new adapter from the given configuration.
+    ///
+    /// Initialises an HTTP client that will be reused for all sessions and
+    /// turns created from this adapter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OpenRouterError::HttpClient`] if the underlying HTTP client
+    /// cannot be constructed.
     pub fn new(config: OpenRouterConfig) -> Result<Self, OpenRouterError> {
         let client = Client::builder()
             .user_agent("agentkit-provider-openrouter/0.1.0")
@@ -133,12 +275,24 @@ impl OpenRouterAdapter {
     }
 }
 
+/// An active session with the OpenRouter API.
+///
+/// Created by [`OpenRouterAdapter::start_session`](ModelAdapter::start_session).
+/// Holds the HTTP client and shared configuration; each call to
+/// [`begin_turn`](ModelSession::begin_turn) sends a single chat completion
+/// request and returns an [`OpenRouterTurn`] with the buffered response events.
 pub struct OpenRouterSession {
     client: Client,
     config: Arc<OpenRouterConfig>,
     _session_config: SessionConfig,
 }
 
+/// A completed turn holding buffered events from a single OpenRouter response.
+///
+/// Because OpenRouter responses are consumed non-streaming (the full JSON body
+/// is read at once), all events are available immediately. Successive calls to
+/// [`next_event`](ModelTurn::next_event) drain the internal queue until it is
+/// empty.
 pub struct OpenRouterTurn {
     events: VecDeque<ModelTurnEvent>,
 }
@@ -806,24 +960,50 @@ fn as_loop_error(error: OpenRouterError) -> LoopError {
     LoopError::Provider(error.to_string())
 }
 
+/// Errors produced by the OpenRouter adapter.
+///
+/// Covers configuration problems, unsupported content types, HTTP failures,
+/// and protocol-level issues in the OpenRouter response.
 #[derive(Debug, Error)]
 pub enum OpenRouterError {
+    /// A required environment variable is not set.
     #[error("missing environment variable {0}")]
     MissingEnv(&'static str),
+
+    /// A configuration value could not be parsed or is otherwise invalid.
     #[error("invalid OpenRouter configuration: {0}")]
     InvalidConfig(String),
+
+    /// The underlying HTTP client could not be constructed.
     #[error("failed to build HTTP client: {0}")]
     HttpClient(reqwest::Error),
+
+    /// A transcript part is not supported for the given message role.
     #[error("unsupported item part {part_kind:?} for role {role:?}")]
-    UnsupportedPart { role: ItemKind, part_kind: PartKind },
+    UnsupportedPart {
+        /// The role of the item that contained the unsupported part.
+        role: ItemKind,
+        /// The kind of part that is not supported.
+        part_kind: PartKind,
+    },
+
+    /// A media modality (e.g. video) is not supported by the adapter.
     #[error("unsupported modality {0:?}")]
     UnsupportedModality(Modality),
+
+    /// A data reference type cannot be sent to the OpenRouter API.
     #[error("unsupported data reference: {0}")]
     UnsupportedDataRef(String),
+
+    /// The transcript structure is invalid for conversion to chat messages.
     #[error("invalid transcript: {0}")]
     InvalidTranscript(String),
+
+    /// The OpenRouter response could not be interpreted.
     #[error("OpenRouter protocol error: {0}")]
     Protocol(String),
+
+    /// A value could not be serialized to JSON for the request body.
     #[error("failed to serialize request data: {0}")]
     Serialize(serde_json::Error),
 }

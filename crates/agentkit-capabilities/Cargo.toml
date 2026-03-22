@@ -2,6 +2,7 @@
 description = "Capability abstractions shared by tools, MCP, and agentkit hosts."
 homepage.workspace = true
 name = "agentkit-capabilities"
+readme = "README.md"
 repository.workspace = true
 version.workspace = true
 edition.workspace = true

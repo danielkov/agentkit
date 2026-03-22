@@ -1,3 +1,53 @@
+//! Core transcript, content, usage, and cancellation primitives for agentkit.
+//!
+//! This crate provides the foundational data model shared by every crate in
+//! the agentkit workspace. It defines:
+//!
+//! - **Transcript items** ([`Item`], [`ItemKind`]) -- the messages exchanged
+//!   between system, user, assistant, and tools.
+//! - **Content parts** ([`Part`], [`TextPart`], [`ToolCallPart`], etc.) --
+//!   the multimodal pieces that make up each item.
+//! - **Streaming deltas** ([`Delta`]) -- incremental updates emitted while a
+//!   model turn is in progress.
+//! - **Usage tracking** ([`Usage`], [`TokenUsage`], [`CostUsage`]) -- token
+//!   counts and cost accounting reported by providers.
+//! - **Cancellation** ([`CancellationController`], [`CancellationHandle`],
+//!   [`TurnCancellation`]) -- cooperative interruption of running turns.
+//! - **Typed identifiers** ([`SessionId`], [`TurnId`], [`ToolCallId`], etc.)
+//!   -- lightweight newtypes that prevent accidental ID mix-ups.
+//! - **Error types** ([`NormalizeError`], [`ProtocolError`], [`AgentError`])
+//!   -- shared error variants used across the workspace.
+//!
+//! # Example
+//!
+//! ```rust
+//! use agentkit_core::{Item, ItemKind, MetadataMap, Part, TextPart};
+//!
+//! // Build a minimal transcript to feed into the agent loop.
+//! let transcript = vec![
+//!     Item {
+//!         id: None,
+//!         kind: ItemKind::System,
+//!         parts: vec![Part::Text(TextPart {
+//!             text: "You are a coding assistant.".into(),
+//!             metadata: MetadataMap::new(),
+//!         })],
+//!         metadata: MetadataMap::new(),
+//!     },
+//!     Item {
+//!         id: None,
+//!         kind: ItemKind::User,
+//!         parts: vec![Part::Text(TextPart {
+//!             text: "What files are in this repo?".into(),
+//!             metadata: MetadataMap::new(),
+//!         })],
+//!         metadata: MetadataMap::new(),
+//!     },
+//! ];
+//!
+//! assert_eq!(transcript[0].kind, ItemKind::System);
+//! ```
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
@@ -10,13 +60,15 @@ use serde_json::Value;
 use thiserror::Error;
 
 macro_rules! id_newtype {
-    ($name:ident) => {
+    ($(#[$meta:meta])* $name:ident) => {
+        $(#[$meta])*
         #[derive(
             Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
         )]
         pub struct $name(pub String);
 
         impl $name {
+            /// Creates a new identifier from any value that can be converted into a [`String`].
             pub fn new(value: impl Into<String>) -> Self {
                 Self(value.into())
             }
@@ -42,16 +94,97 @@ macro_rules! id_newtype {
     };
 }
 
-id_newtype!(SessionId);
-id_newtype!(TurnId);
-id_newtype!(MessageId);
-id_newtype!(ToolCallId);
-id_newtype!(ToolResultId);
-id_newtype!(ProviderMessageId);
-id_newtype!(ArtifactId);
-id_newtype!(PartId);
-id_newtype!(ApprovalId);
+id_newtype!(
+    /// Identifies an agent session.
+    ///
+    /// A session groups one or more turns that share the same model connection
+    /// and transcript history. Pass this to [`agentkit_loop`] when starting a
+    /// new session.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use agentkit_core::SessionId;
+    ///
+    /// let id = SessionId::new("coding-agent-1");
+    /// assert_eq!(id.to_string(), "coding-agent-1");
+    /// ```
+    SessionId
+);
+id_newtype!(
+    /// Identifies a single turn within a session.
+    ///
+    /// Each call to the model within a session gets a unique `TurnId`. This is
+    /// used by compaction and reporting to attribute work to specific turns.
+    TurnId
+);
+id_newtype!(
+    /// Identifies a transcript [`Item`].
+    ///
+    /// Providers may assign message IDs to track items across API calls.
+    /// This is optional -- locally constructed items typically leave it as `None`.
+    MessageId
+);
+id_newtype!(
+    /// Identifies a tool call emitted by the model.
+    ///
+    /// The model produces a [`ToolCallPart`] with this ID; the corresponding
+    /// [`ToolResultPart`] references it via `call_id` so the model can match
+    /// results back to requests.
+    ToolCallId
+);
+id_newtype!(
+    /// Identifies a tool result.
+    ///
+    /// Used by providers that assign their own IDs to tool-result payloads.
+    ToolResultId
+);
+id_newtype!(
+    /// Provider-assigned identifier for a message.
+    ///
+    /// Some providers return an opaque ID for each completion response;
+    /// this type preserves it for tracing and debugging.
+    ProviderMessageId
+);
+id_newtype!(
+    /// Identifies a binary or text artifact stored externally.
+    ///
+    /// Referenced by [`DataRef::Handle`] when content lives outside the
+    /// transcript (e.g. in an artifact store).
+    ArtifactId
+);
+id_newtype!(
+    /// Identifies a content part within a streaming [`Delta`] sequence.
+    ///
+    /// Deltas reference parts by `PartId` so the consumer can reconstruct the
+    /// full item as chunks arrive.
+    PartId
+);
+id_newtype!(
+    /// Identifies a pending tool-use approval request.
+    ///
+    /// When a tool requires human approval, the loop emits an approval request
+    /// tagged with this ID. The caller responds with a decision keyed to the
+    /// same ID.
+    ApprovalId
+);
 
+/// A map of arbitrary key-value metadata attached to items, parts, and other structures.
+///
+/// Most agentkit types carry a `metadata` field of this type. Providers,
+/// tools, and observers can store domain-specific information here without
+/// changing the core schema.
+///
+/// # Example
+///
+/// ```rust
+/// use agentkit_core::MetadataMap;
+/// use serde_json::json;
+///
+/// let mut meta = MetadataMap::new();
+/// meta.insert("source".into(), json!("user-clipboard"));
+/// assert_eq!(meta["source"], "user-clipboard");
+/// ```
 pub type MetadataMap = BTreeMap<String, Value>;
 
 #[derive(Default)]
@@ -59,16 +192,66 @@ struct CancellationState {
     generation: AtomicU64,
 }
 
+/// Owner-side handle for broadcasting cancellation to running turns.
+///
+/// Create one `CancellationController` per agent and hand out
+/// [`CancellationHandle`]s to the loop and tool executors. Calling
+/// [`interrupt`](Self::interrupt) bumps an internal generation counter so that
+/// every outstanding [`TurnCancellation`] checkpoint becomes cancelled.
+///
+/// # Example
+///
+/// ```rust
+/// use agentkit_core::CancellationController;
+///
+/// let controller = CancellationController::new();
+/// let handle = controller.handle();
+///
+/// // Before an interrupt the generation is 0.
+/// assert_eq!(handle.generation(), 0);
+///
+/// // Signal cancellation (e.g. from a Ctrl-C handler).
+/// controller.interrupt();
+/// assert_eq!(handle.generation(), 1);
+/// ```
 #[derive(Clone, Default)]
 pub struct CancellationController {
     state: Arc<CancellationState>,
 }
 
+/// Read-only view of cancellation state, cheaply cloneable.
+///
+/// The loop and tool executors receive a `CancellationHandle` and use it to
+/// create [`TurnCancellation`] checkpoints or poll for interrupts directly.
+///
+/// Obtain one from [`CancellationController::handle`].
 #[derive(Clone, Default)]
 pub struct CancellationHandle {
     state: Arc<CancellationState>,
 }
 
+/// A snapshot of the cancellation generation at the start of a turn.
+///
+/// Created via [`CancellationHandle::checkpoint`] or [`TurnCancellation::new`],
+/// this value records the generation counter at creation time. If the counter
+/// changes (because [`CancellationController::interrupt`] was called), the
+/// checkpoint reports itself as cancelled.
+///
+/// The agent loop passes a `TurnCancellation` into model and tool calls so
+/// they can bail out cooperatively.
+///
+/// # Example
+///
+/// ```rust
+/// use agentkit_core::{CancellationController, TurnCancellation};
+///
+/// let controller = CancellationController::new();
+/// let checkpoint = TurnCancellation::new(controller.handle());
+///
+/// assert!(!checkpoint.is_cancelled());
+/// controller.interrupt();
+/// assert!(checkpoint.is_cancelled());
+/// ```
 #[derive(Clone, Default)]
 pub struct TurnCancellation {
     handle: CancellationHandle,
@@ -76,26 +259,34 @@ pub struct TurnCancellation {
 }
 
 impl CancellationController {
+    /// Creates a new controller with generation starting at 0.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Returns a cloneable [`CancellationHandle`] that shares state with this controller.
     pub fn handle(&self) -> CancellationHandle {
         CancellationHandle {
             state: Arc::clone(&self.state),
         }
     }
 
+    /// Broadcasts a cancellation by incrementing the generation counter.
+    ///
+    /// Returns the new generation value. All [`TurnCancellation`] checkpoints
+    /// created before this call will report themselves as cancelled.
     pub fn interrupt(&self) -> u64 {
         self.state.generation.fetch_add(1, Ordering::SeqCst) + 1
     }
 }
 
 impl CancellationHandle {
+    /// Returns the current generation counter.
     pub fn generation(&self) -> u64 {
         self.state.generation.load(Ordering::SeqCst)
     }
 
+    /// Creates a [`TurnCancellation`] checkpoint capturing the current generation.
     pub fn checkpoint(&self) -> TurnCancellation {
         TurnCancellation {
             handle: self.clone(),
@@ -103,10 +294,25 @@ impl CancellationHandle {
         }
     }
 
+    /// Returns `true` if the generation has changed since `generation`.
+    ///
+    /// # Arguments
+    ///
+    /// * `generation` - The generation value to compare against, typically
+    ///   obtained from a prior call to [`generation`](Self::generation).
     pub fn is_cancelled_since(&self, generation: u64) -> bool {
         self.generation() != generation
     }
 
+    /// Waits asynchronously until the generation changes from `generation`.
+    ///
+    /// Polls the generation counter every 10 ms. Prefer using
+    /// [`TurnCancellation::cancelled`] instead, which captures the generation
+    /// automatically.
+    ///
+    /// # Arguments
+    ///
+    /// * `generation` - The generation value to wait for a change from.
     pub async fn cancelled_since(&self, generation: u64) {
         while !self.is_cancelled_since(generation) {
             Delay::new(Duration::from_millis(10)).await;
@@ -115,217 +321,539 @@ impl CancellationHandle {
 }
 
 impl TurnCancellation {
+    /// Creates a checkpoint from the given handle, capturing its current generation.
+    ///
+    /// # Arguments
+    ///
+    /// * `handle` - The [`CancellationHandle`] to observe.
     pub fn new(handle: CancellationHandle) -> Self {
         handle.checkpoint()
     }
 
+    /// Returns the generation that was captured when this checkpoint was created.
     pub fn generation(&self) -> u64 {
         self.generation
     }
 
+    /// Returns `true` if the controller has been interrupted since this checkpoint was created.
     pub fn is_cancelled(&self) -> bool {
         self.handle.is_cancelled_since(self.generation)
     }
 
+    /// Waits asynchronously until this checkpoint becomes cancelled.
+    ///
+    /// Useful in `tokio::select!` to race a model call against user interruption.
     pub async fn cancelled(&self) {
         self.handle.cancelled_since(self.generation).await;
     }
 
+    /// Returns a reference to the underlying [`CancellationHandle`].
     pub fn handle(&self) -> &CancellationHandle {
         &self.handle
     }
 }
 
+/// A single entry in the agent transcript.
+///
+/// An `Item` represents one message or event in the conversation between
+/// the system, user, assistant, and tools. Each item has a [`kind`](ItemKind)
+/// that determines its role and a vector of [`Part`]s that carry its content.
+///
+/// Items are the primary unit of data flowing through the agentkit loop:
+/// callers submit user and system items, the loop appends assistant and tool
+/// items, and compaction strategies operate on the full `Vec<Item>` transcript.
+///
+/// # Example
+///
+/// ```rust
+/// use agentkit_core::{Item, ItemKind, MetadataMap, Part, TextPart};
+///
+/// let user_msg = Item {
+///     id: None,
+///     kind: ItemKind::User,
+///     parts: vec![Part::Text(TextPart {
+///         text: "List the workspace crates.".into(),
+///         metadata: MetadataMap::new(),
+///     })],
+///     metadata: MetadataMap::new(),
+/// };
+///
+/// assert_eq!(user_msg.kind, ItemKind::User);
+/// assert_eq!(user_msg.parts.len(), 1);
+/// ```
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Item {
+    /// Optional provider-assigned or user-supplied message identifier.
     pub id: Option<MessageId>,
+    /// The role of this item in the transcript.
     pub kind: ItemKind,
+    /// The content parts that make up this item.
     pub parts: Vec<Part>,
+    /// Arbitrary key-value metadata for this item.
     pub metadata: MetadataMap,
 }
 
+/// The role of an [`Item`] in the transcript.
+///
+/// Variants are ordered so that `System < Developer < User < Assistant < Tool < Context`,
+/// which is useful for sorting items by priority during compaction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum ItemKind {
+    /// Instructions provided by the application author (highest priority).
     System,
+    /// Developer-level instructions that sit between system and user.
     Developer,
+    /// A message from the end user.
     User,
+    /// A response generated by the model.
     Assistant,
+    /// Output from a tool execution.
     Tool,
+    /// Ambient context injected by context loaders (e.g. project files, docs).
     Context,
 }
 
+/// A content part within an [`Item`].
+///
+/// Items are composed of one or more parts, each carrying a different kind of
+/// content -- plain text, images, files, tool calls, tool results, or
+/// provider-specific custom payloads.
+///
+/// # Example
+///
+/// ```rust
+/// use agentkit_core::{MetadataMap, Part, TextPart, ToolCallId, ToolCallPart};
+/// use serde_json::json;
+///
+/// let parts: Vec<Part> = vec![
+///     Part::Text(TextPart {
+///         text: "Reading the config file...".into(),
+///         metadata: MetadataMap::new(),
+///     }),
+///     Part::ToolCall(ToolCallPart {
+///         id: ToolCallId::new("call-42"),
+///         name: "fs.read_file".into(),
+///         input: json!({ "path": "config.toml" }),
+///         metadata: MetadataMap::new(),
+///     }),
+/// ];
+///
+/// assert!(matches!(parts[0], Part::Text(_)));
+/// assert!(matches!(parts[1], Part::ToolCall(_)));
+/// ```
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Part {
+    /// Plain text content.
     Text(TextPart),
+    /// Binary or encoded media (images, audio, video).
     Media(MediaPart),
+    /// A file attachment.
     File(FilePart),
+    /// Structured JSON data, optionally validated against a schema.
     Structured(StructuredPart),
+    /// Model reasoning / chain-of-thought output.
     Reasoning(ReasoningPart),
+    /// A tool invocation request emitted by the model.
     ToolCall(ToolCallPart),
+    /// The result returned by a tool after execution.
     ToolResult(ToolResultPart),
+    /// A provider-specific part that does not fit the standard variants.
     Custom(CustomPart),
 }
 
+/// Discriminant for [`Part`] variants, used in streaming [`Delta`]s.
+///
+/// When a [`Delta::BeginPart`] arrives the consumer uses the `PartKind` to
+/// allocate the right buffer before subsequent append deltas arrive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PartKind {
+    /// Corresponds to [`Part::Text`].
     Text,
+    /// Corresponds to [`Part::Media`].
     Media,
+    /// Corresponds to [`Part::File`].
     File,
+    /// Corresponds to [`Part::Structured`].
     Structured,
+    /// Corresponds to [`Part::Reasoning`].
     Reasoning,
+    /// Corresponds to [`Part::ToolCall`].
     ToolCall,
+    /// Corresponds to [`Part::ToolResult`].
     ToolResult,
+    /// Corresponds to [`Part::Custom`].
     Custom,
 }
 
+/// Plain text content within an [`Item`].
+///
+/// This is the most common part type: user messages, assistant replies, and
+/// system prompts are all represented as `TextPart`s.
+///
+/// # Example
+///
+/// ```rust
+/// use agentkit_core::{MetadataMap, TextPart};
+///
+/// let part = TextPart {
+///     text: "Hello, world!".into(),
+///     metadata: MetadataMap::new(),
+/// };
+/// assert_eq!(part.text, "Hello, world!");
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TextPart {
+    /// The text content.
     pub text: String,
+    /// Arbitrary key-value metadata.
     pub metadata: MetadataMap,
 }
 
+/// Binary or encoded media content (image, audio, video).
+///
+/// The actual bytes are referenced through a [`DataRef`] which can be inline,
+/// a URI, or a handle to an external artifact store.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MediaPart {
+    /// The kind of media (audio, image, video, or raw binary).
     pub modality: Modality,
+    /// MIME type of the media, e.g. `"image/png"` or `"audio/wav"`.
     pub mime_type: String,
+    /// Reference to the media data.
     pub data: DataRef,
+    /// Arbitrary key-value metadata.
     pub metadata: MetadataMap,
 }
 
+/// The kind of media carried by a [`MediaPart`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Modality {
+    /// Audio content (e.g. WAV, MP3).
     Audio,
+    /// Image content (e.g. PNG, JPEG).
     Image,
+    /// Video content (e.g. MP4).
     Video,
+    /// Opaque binary data that does not fit another category.
     Binary,
 }
 
+/// A reference to content data that may live inline, at a URI, or in an artifact store.
+///
+/// Used by [`MediaPart`], [`FilePart`], [`ReasoningPart`], and [`CustomPart`]
+/// to point at their underlying data without dictating storage.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DataRef {
+    /// UTF-8 text stored inline (e.g. base64-encoded image data).
     InlineText(String),
+    /// Raw bytes stored inline.
     InlineBytes(Vec<u8>),
+    /// A URI pointing to externally hosted content.
     Uri(String),
+    /// A handle to an artifact managed by an external store.
     Handle(ArtifactId),
 }
 
+/// A file attachment within an [`Item`].
+///
+/// Files are distinct from [`MediaPart`] in that they carry an optional
+/// filename and are not necessarily displayable media.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FilePart {
+    /// Optional human-readable filename (e.g. `"report.csv"`).
     pub name: Option<String>,
+    /// Optional MIME type of the file.
     pub mime_type: Option<String>,
+    /// Reference to the file data.
     pub data: DataRef,
+    /// Arbitrary key-value metadata.
     pub metadata: MetadataMap,
 }
 
+/// Structured JSON content, optionally paired with a JSON Schema for validation.
+///
+/// Providers that support structured output (e.g. function-calling mode) may
+/// return a `StructuredPart` instead of free-form text.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StructuredPart {
+    /// The structured data as a JSON [`Value`].
     pub value: Value,
+    /// An optional JSON Schema that `value` conforms to.
     pub schema: Option<Value>,
+    /// Arbitrary key-value metadata.
     pub metadata: MetadataMap,
 }
 
+/// Model reasoning or chain-of-thought output.
+///
+/// Some providers expose the model's internal reasoning alongside the final
+/// answer. The reasoning may be a readable summary, opaque data, or both.
+/// The `redacted` flag indicates provider-side filtering.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReasoningPart {
+    /// A human-readable summary of the model's reasoning.
     pub summary: Option<String>,
+    /// Opaque or detailed reasoning data.
     pub data: Option<DataRef>,
+    /// `true` if the provider redacted the full reasoning content.
     pub redacted: bool,
+    /// Arbitrary key-value metadata.
     pub metadata: MetadataMap,
 }
 
+/// A tool invocation request emitted by the model.
+///
+/// The agent loop receives this part, executes the named tool, and appends a
+/// [`ToolResultPart`] back to the transcript for the model to observe.
+///
+/// # Example
+///
+/// ```rust
+/// use agentkit_core::{MetadataMap, ToolCallId, ToolCallPart};
+/// use serde_json::json;
+///
+/// let call = ToolCallPart {
+///     id: ToolCallId::new("call-7"),
+///     name: "fs.read_file".into(),
+///     input: json!({ "path": "src/main.rs" }),
+///     metadata: MetadataMap::new(),
+/// };
+///
+/// assert_eq!(call.name, "fs.read_file");
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCallPart {
+    /// Unique identifier for this tool call, used to correlate with [`ToolResultPart::call_id`].
     pub id: ToolCallId,
+    /// The name of the tool to invoke (e.g. `"fs.read_file"`, `"shell.exec"`).
     pub name: String,
+    /// The JSON arguments to pass to the tool.
     pub input: Value,
+    /// Arbitrary key-value metadata.
     pub metadata: MetadataMap,
 }
 
+/// The result of executing a tool, sent back to the model.
+///
+/// Each `ToolResultPart` references the [`ToolCallPart`] it answers via
+/// `call_id`. The `is_error` flag tells the model whether the tool succeeded.
+///
+/// # Example
+///
+/// ```rust
+/// use agentkit_core::{MetadataMap, ToolCallId, ToolOutput, ToolResultPart};
+///
+/// let result = ToolResultPart {
+///     call_id: ToolCallId::new("call-7"),
+///     output: ToolOutput::Text("fn main() { ... }".into()),
+///     is_error: false,
+///     metadata: MetadataMap::new(),
+/// };
+///
+/// assert!(!result.is_error);
+/// ```
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ToolResultPart {
+    /// The [`ToolCallId`] of the tool call this result answers.
     pub call_id: ToolCallId,
+    /// The output produced by the tool.
     pub output: ToolOutput,
+    /// `true` if the tool execution failed.
     pub is_error: bool,
+    /// Arbitrary key-value metadata.
     pub metadata: MetadataMap,
 }
 
+/// The payload returned by a tool execution.
+///
+/// Tools may return plain text, structured JSON, a composite list of
+/// [`Part`]s, or a collection of files.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ToolOutput {
+    /// Plain text output.
     Text(String),
+    /// Structured JSON output.
     Structured(Value),
+    /// A list of content parts (e.g. text + images).
     Parts(Vec<Part>),
+    /// A list of file attachments.
     Files(Vec<FilePart>),
 }
 
+/// A provider-specific content part that does not fit the standard variants.
+///
+/// Use this for extensions or experimental features that have not been
+/// promoted to a first-class [`Part`] variant.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CustomPart {
+    /// A free-form string identifying the custom part type.
     pub kind: String,
+    /// Optional data reference.
     pub data: Option<DataRef>,
+    /// Optional structured value.
     pub value: Option<Value>,
+    /// Arbitrary key-value metadata.
     pub metadata: MetadataMap,
 }
 
+/// An incremental update emitted while a model turn is streaming.
+///
+/// The provider adapter emits a sequence of `Delta` values that the loop and
+/// reporters consume to reconstruct the full [`Item`] progressively. A typical
+/// sequence looks like:
+///
+/// 1. [`BeginPart`](Self::BeginPart) -- allocates a new part buffer.
+/// 2. One or more [`AppendText`](Self::AppendText) /
+///    [`AppendBytes`](Self::AppendBytes) -- fills the buffer.
+/// 3. [`CommitPart`](Self::CommitPart) -- finalises the part.
+///
+/// # Example
+///
+/// ```rust
+/// use agentkit_core::{Delta, PartId, PartKind};
+///
+/// let deltas = vec![
+///     Delta::BeginPart { part_id: PartId::new("p1"), kind: PartKind::Text },
+///     Delta::AppendText { part_id: PartId::new("p1"), chunk: "Hello".into() },
+///     Delta::AppendText { part_id: PartId::new("p1"), chunk: ", world!".into() },
+/// ];
+///
+/// assert_eq!(deltas.len(), 3);
+/// ```
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Delta {
+    /// Signals the start of a new part with the given kind.
     BeginPart {
+        /// Identifier for the part being constructed.
         part_id: PartId,
+        /// The kind of part being started.
         kind: PartKind,
     },
+    /// Appends a text chunk to an in-progress part.
     AppendText {
+        /// Identifier of the target part.
         part_id: PartId,
+        /// The text chunk to append.
         chunk: String,
     },
+    /// Appends raw bytes to an in-progress part.
     AppendBytes {
+        /// Identifier of the target part.
         part_id: PartId,
+        /// The byte chunk to append.
         chunk: Vec<u8>,
     },
+    /// Replaces the structured value of an in-progress part wholesale.
     ReplaceStructured {
+        /// Identifier of the target part.
         part_id: PartId,
+        /// The new structured value.
         value: Value,
     },
+    /// Sets or replaces the metadata on an in-progress part.
     SetMetadata {
+        /// Identifier of the target part.
         part_id: PartId,
+        /// The new metadata map.
         metadata: MetadataMap,
     },
+    /// Finalises a part, providing the fully assembled [`Part`].
     CommitPart {
+        /// The completed part.
         part: Part,
     },
 }
 
+/// Token and cost usage reported by a model provider for a single turn.
+///
+/// Reporters and compaction triggers inspect `Usage` to log progress, enforce
+/// budgets, and decide when to compact the transcript.
+///
+/// # Example
+///
+/// ```rust
+/// use agentkit_core::{MetadataMap, TokenUsage, Usage};
+///
+/// let usage = Usage {
+///     tokens: Some(TokenUsage {
+///         input_tokens: 1500,
+///         output_tokens: 200,
+///         reasoning_tokens: None,
+///         cached_input_tokens: Some(1000),
+///     }),
+///     cost: None,
+///     metadata: MetadataMap::new(),
+/// };
+///
+/// let tokens = usage.tokens.as_ref().unwrap();
+/// assert_eq!(tokens.input_tokens, 1500);
+/// ```
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Usage {
+    /// Token counts for this turn, if the provider reports them.
     pub tokens: Option<TokenUsage>,
+    /// Monetary cost for this turn, if the provider reports it.
     pub cost: Option<CostUsage>,
+    /// Arbitrary key-value metadata.
     pub metadata: MetadataMap,
 }
 
+/// Token counts broken down by direction and special categories.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenUsage {
+    /// Number of tokens in the input (prompt) sent to the model.
     pub input_tokens: u64,
+    /// Number of tokens in the model's output (completion).
     pub output_tokens: u64,
+    /// Tokens consumed by the model's internal reasoning, if reported.
     pub reasoning_tokens: Option<u64>,
+    /// Input tokens served from the provider's prompt cache, if reported.
     pub cached_input_tokens: Option<u64>,
 }
 
+/// Monetary cost for a single model turn.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CostUsage {
+    /// The cost amount as a floating-point number.
     pub amount: f64,
+    /// The ISO 4217 currency code (e.g. `"USD"`).
     pub currency: String,
+    /// An optional provider-specific cost string for display purposes.
     pub provider_amount: Option<String>,
 }
 
+/// The reason a model turn ended.
+///
+/// The loop inspects the `FinishReason` to decide whether to execute tool
+/// calls, request more input, or report an error.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FinishReason {
+    /// The model finished generating its response normally.
     Completed,
+    /// The model stopped to invoke one or more tools.
     ToolCall,
+    /// The response was truncated because the token limit was reached.
     MaxTokens,
+    /// The turn was cancelled via [`TurnCancellation`].
     Cancelled,
+    /// The provider blocked the response (e.g. content policy violation).
     Blocked,
+    /// An error occurred during generation.
     Error,
+    /// A provider-specific reason not covered by the standard variants.
     Other(String),
 }
 
+/// Read-only view over an [`Item`]'s essential fields.
+///
+/// This trait lets downstream crates (compaction, reporting) operate on
+/// item-like types without depending on the concrete [`Item`] struct.
 pub trait ItemView {
+    /// Returns the role of this item.
     fn kind(&self) -> ItemKind;
+    /// Returns the content parts.
     fn parts(&self) -> &[Part];
+    /// Returns the metadata map.
     fn metadata(&self) -> &MetadataMap;
 }
 
@@ -343,22 +871,32 @@ impl ItemView for Item {
     }
 }
 
+/// Error returned when content cannot be normalised into the agentkit data model.
 #[derive(Debug, Error)]
 pub enum NormalizeError {
+    /// The content shape is not supported by the current provider adapter.
     #[error("unsupported content shape: {0}")]
     Unsupported(String),
 }
 
+/// Error indicating an invalid state in the provider protocol.
 #[derive(Debug, Error)]
 pub enum ProtocolError {
+    /// The provider or loop reached a state that violates protocol invariants.
     #[error("invalid protocol state: {0}")]
     InvalidState(String),
 }
 
+/// Top-level error type that unifies normalisation and protocol errors.
+///
+/// Provider adapters and the agent loop surface this type so callers can
+/// handle both categories uniformly.
 #[derive(Debug, Error)]
 pub enum AgentError {
+    /// A content normalisation error.
     #[error(transparent)]
     Normalize(#[from] NormalizeError),
+    /// A protocol-level error.
     #[error(transparent)]
     Protocol(#[from] ProtocolError),
 }

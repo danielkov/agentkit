@@ -1,3 +1,33 @@
+//! Shell execution tool for agentkit agent loops.
+//!
+//! This crate provides [`ShellExecTool`], a tool that spawns subprocesses and
+//! captures their stdout, stderr, exit code, and success status.  It supports
+//! custom working directories, environment variables, per-invocation timeouts,
+//! and cooperative turn cancellation through [`agentkit_tools_core::ToolContext`].
+//!
+//! The easiest way to get started is with the [`registry()`] helper, which
+//! returns a [`ToolRegistry`] pre-loaded with the `shell.exec` tool.
+//!
+//! Pair the tool with [`CommandPolicy`](agentkit_tools_core::CommandPolicy) from
+//! `agentkit-tools-core` when you need fine-grained control over which
+//! executables, working directories, and environment variables are permitted.
+//!
+//! # Example
+//!
+//! ```rust
+//! use agentkit_tool_shell::{registry, ShellExecTool};
+//! use agentkit_tools_core::Tool;
+//!
+//! // Build a registry that contains the shell.exec tool.
+//! let reg = registry();
+//! let specs = reg.specs();
+//! assert!(specs.iter().any(|s| s.name.0 == "shell.exec"));
+//!
+//! // Or construct the tool manually and register it yourself.
+//! let tool = ShellExecTool::default();
+//! assert_eq!(tool.spec().name.0, "shell.exec");
+//! ```
+
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -13,10 +43,59 @@ use serde_json::json;
 use tokio::process::Command;
 use tokio::time::timeout;
 
+/// Creates a [`ToolRegistry`] pre-populated with [`ShellExecTool`].
+///
+/// This is the simplest way to add shell execution to an agent.  The returned
+/// registry contains a single tool registered under the name `shell.exec`.
+///
+/// # Example
+///
+/// ```rust
+/// use agentkit_tool_shell::registry;
+///
+/// let reg = registry();
+/// assert_eq!(reg.specs().len(), 1);
+/// assert_eq!(reg.specs()[0].name.0, "shell.exec");
+/// ```
 pub fn registry() -> ToolRegistry {
     ToolRegistry::new().with(ShellExecTool::default())
 }
 
+/// A tool that executes shell commands as subprocesses.
+///
+/// `ShellExecTool` implements the [`Tool`] trait and is registered under the
+/// name `shell.exec`.  When invoked it spawns the requested executable, waits
+/// for it to finish (respecting an optional timeout and turn cancellation), and
+/// returns a structured JSON object with `stdout`, `stderr`, `success`, and
+/// `exit_code` fields.
+///
+/// Before execution the tool emits a [`ShellPermissionRequest`] so that
+/// permission policies (e.g. [`CommandPolicy`](agentkit_tools_core::CommandPolicy))
+/// can allow, deny, or require approval for the command.
+///
+/// # Input schema
+///
+/// | Field          | Type              | Required | Description                              |
+/// |----------------|-------------------|----------|------------------------------------------|
+/// | `executable`   | `string`          | yes      | Program to run.                          |
+/// | `argv`         | `[string]`        | no       | Arguments passed to the executable.      |
+/// | `cwd`          | `string`          | no       | Working directory for the subprocess.    |
+/// | `env`          | `{string:string}` | no       | Extra environment variables.             |
+/// | `timeout_ms`   | `integer`         | no       | Maximum wall-clock time in milliseconds. |
+///
+/// # Example
+///
+/// ```rust
+/// use agentkit_tool_shell::ShellExecTool;
+/// use agentkit_tools_core::ToolRegistry;
+///
+/// let mut reg = ToolRegistry::new();
+/// reg.register(ShellExecTool::default());
+///
+/// let spec = &reg.specs()[0];
+/// assert_eq!(spec.name.0, "shell.exec");
+/// assert!(spec.annotations.destructive_hint);
+/// ```
 #[derive(Clone, Debug)]
 pub struct ShellExecTool {
     spec: ToolSpec,
@@ -72,10 +151,23 @@ struct ShellExecInput {
 
 #[async_trait]
 impl Tool for ShellExecTool {
+    /// Returns the [`ToolSpec`] describing the `shell.exec` tool.
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
 
+    /// Extracts a [`ShellPermissionRequest`] from the incoming [`ToolRequest`].
+    ///
+    /// The returned request is evaluated by the active
+    /// [`PermissionChecker`](agentkit_tools_core::PermissionChecker) before
+    /// [`invoke`](Self::invoke) runs, giving policies such as
+    /// [`CommandPolicy`](agentkit_tools_core::CommandPolicy) a chance to allow
+    /// or deny the command.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError::InvalidInput`] if the request input cannot be
+    /// deserialized into the expected schema.
     fn proposed_requests(
         &self,
         request: &ToolRequest,
@@ -90,6 +182,30 @@ impl Tool for ShellExecTool {
         })])
     }
 
+    /// Spawns the requested command and returns its output.
+    ///
+    /// The subprocess is spawned with `kill_on_drop(true)` so it is cleaned up
+    /// if the future is cancelled.  When a `timeout_ms` is specified in the
+    /// input the command is aborted after that duration.  If a turn
+    /// cancellation token is present in the [`ToolContext`] the command is also
+    /// aborted when the turn is cancelled.
+    ///
+    /// On success the returned [`ToolResult`] contains a JSON object:
+    ///
+    /// ```json
+    /// {
+    ///   "stdout": "...",
+    ///   "stderr": "...",
+    ///   "success": true,
+    ///   "exit_code": 0
+    /// }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// * [`ToolError::InvalidInput`] -- the request input does not match the schema.
+    /// * [`ToolError::ExecutionFailed`] -- the command could not be spawned or timed out.
+    /// * [`ToolError::Cancelled`] -- the turn was cancelled while the command was running.
     async fn invoke(
         &self,
         request: ToolRequest,

@@ -29,10 +29,25 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::io::StreamReader;
 
+/// Unique identifier for a registered MCP server.
+///
+/// Each MCP server in a [`McpServerManager`] is addressed by its `McpServerId`.
+/// The inner string is typically a short, human-readable name such as `"filesystem"`
+/// or `"github"`.
+///
+/// # Example
+///
+/// ```rust
+/// use agentkit_mcp::McpServerId;
+///
+/// let id = McpServerId::new("filesystem");
+/// assert_eq!(id.to_string(), "filesystem");
+/// ```
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct McpServerId(pub String);
 
 impl McpServerId {
+    /// Creates a new server identifier from any string-like value.
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
     }
@@ -44,15 +59,37 @@ impl fmt::Display for McpServerId {
     }
 }
 
+/// Configuration for an MCP server that communicates over standard I/O (stdin/stdout).
+///
+/// This is the most common transport for local MCP servers. The specified command is
+/// spawned as a child process, and JSON-RPC messages are exchanged line-by-line over
+/// its stdin and stdout streams.
+///
+/// # Example
+///
+/// ```rust
+/// use agentkit_mcp::StdioTransportConfig;
+///
+/// let config = StdioTransportConfig::new("npx")
+///     .with_arg("-y")
+///     .with_arg("@modelcontextprotocol/server-filesystem")
+///     .with_env("HOME", "/home/user")
+///     .with_cwd("/tmp");
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StdioTransportConfig {
+    /// The executable to launch (e.g. `"npx"`, `"python"`, `"node"`).
     pub command: String,
+    /// Command-line arguments passed to the executable.
     pub args: Vec<String>,
+    /// Additional environment variables set for the child process.
     pub env: Vec<(String, String)>,
+    /// Optional working directory for the child process.
     pub cwd: Option<std::path::PathBuf>,
 }
 
 impl StdioTransportConfig {
+    /// Creates a new stdio transport configuration for the given command.
     pub fn new(command: impl Into<String>) -> Self {
         Self {
             command: command.into(),
@@ -62,29 +99,49 @@ impl StdioTransportConfig {
         }
     }
 
+    /// Appends a command-line argument. Returns `self` for chaining.
     pub fn with_arg(mut self, arg: impl Into<String>) -> Self {
         self.args.push(arg.into());
         self
     }
 
+    /// Adds an environment variable for the child process. Returns `self` for chaining.
     pub fn with_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.env.push((key.into(), value.into()));
         self
     }
 
+    /// Sets the working directory for the child process. Returns `self` for chaining.
     pub fn with_cwd(mut self, cwd: impl Into<std::path::PathBuf>) -> Self {
         self.cwd = Some(cwd.into());
         self
     }
 }
 
+/// Configuration for an MCP server that communicates over Server-Sent Events (SSE).
+///
+/// Use this transport for remote MCP servers exposed over HTTP. The client opens an
+/// SSE stream to the given URL, receives an `endpoint` event pointing to the POST
+/// endpoint, and then exchanges JSON-RPC messages over that endpoint.
+///
+/// # Example
+///
+/// ```rust
+/// use agentkit_mcp::SseTransportConfig;
+///
+/// let config = SseTransportConfig::new("https://mcp.example.com/sse")
+///     .with_header("Authorization", "Bearer tok_abc123");
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SseTransportConfig {
+    /// The SSE endpoint URL to connect to.
     pub url: String,
+    /// Additional HTTP headers sent with every request (e.g. authentication tokens).
     pub headers: Vec<(String, String)>,
 }
 
 impl SseTransportConfig {
+    /// Creates a new SSE transport configuration for the given URL.
     pub fn new(url: impl Into<String>) -> Self {
         Self {
             url: url.into(),
@@ -92,27 +149,66 @@ impl SseTransportConfig {
         }
     }
 
+    /// Adds an HTTP header to include with every request. Returns `self` for chaining.
     pub fn with_header(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.headers.push((key.into(), value.into()));
         self
     }
 }
 
+/// Selects which transport an MCP server should use.
+///
+/// This enum is passed into [`McpServerConfig`] and determines how the client will
+/// communicate with the MCP server. The two built-in options are [`Stdio`](Self::Stdio)
+/// and [`Sse`](Self::Sse); use [`Custom`](Self::Custom) to provide your own
+/// [`McpTransportFactory`].
 #[derive(Clone)]
 pub enum McpTransportBinding {
+    /// Communicate over the child process's stdin/stdout.
     Stdio(StdioTransportConfig),
+    /// Communicate over HTTP Server-Sent Events.
     Sse(SseTransportConfig),
+    /// A user-supplied transport factory.
     Custom(Arc<dyn McpTransportFactory>),
 }
 
+/// Full configuration for a single MCP server, combining an identifier, a transport
+/// binding, and optional metadata.
+///
+/// Register one or more of these with [`McpServerManager`] to manage the lifecycle
+/// of MCP servers in an agentkit runtime.
+///
+/// # Example
+///
+/// ```rust
+/// use agentkit_mcp::{McpServerConfig, McpTransportBinding, StdioTransportConfig};
+///
+/// let config = McpServerConfig::new(
+///     "filesystem",
+///     McpTransportBinding::Stdio(
+///         StdioTransportConfig::new("npx")
+///             .with_arg("-y")
+///             .with_arg("@modelcontextprotocol/server-filesystem"),
+///     ),
+/// );
+/// ```
 #[derive(Clone)]
 pub struct McpServerConfig {
+    /// Unique identifier for this server.
     pub id: McpServerId,
+    /// Transport binding that determines how communication happens.
     pub transport: McpTransportBinding,
+    /// Arbitrary metadata attached to this server configuration.
     pub metadata: MetadataMap,
 }
 
 impl McpServerConfig {
+    /// Creates a new server configuration with the given identifier and transport.
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - A unique name for this server (e.g. `"filesystem"`).
+    /// * `transport` - The [`McpTransportBinding`] that determines how to connect.
     pub fn new(id: impl Into<String>, transport: McpTransportBinding) -> Self {
         Self {
             id: McpServerId::new(id),
@@ -122,28 +218,60 @@ impl McpServerConfig {
     }
 }
 
+/// A single JSON-RPC frame exchanged with an MCP server.
+///
+/// This is the low-level wire unit. Most users will not interact with `McpFrame`
+/// directly; instead use [`McpConnection`] or the higher-level adapters.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct McpFrame {
+    /// The raw JSON-RPC value (request, response, or notification).
     pub value: Value,
 }
 
+/// Factory trait for creating new [`McpTransport`] connections.
+///
+/// Implement this trait to provide a custom transport mechanism. The built-in
+/// [`StdioTransportFactory`] and [`SseTransportFactory`] cover the two standard
+/// MCP transports; use this trait for in-memory, WebSocket, or other custom
+/// transports.
+///
+/// # Errors
+///
+/// Returns [`McpError`] if the connection cannot be established.
 #[async_trait]
 pub trait McpTransportFactory: Send + Sync {
+    /// Establishes a new transport connection and returns it.
     async fn connect(&self) -> Result<Box<dyn McpTransport>, McpError>;
 }
 
+/// Bidirectional transport for exchanging [`McpFrame`] messages with an MCP server.
+///
+/// Implement this trait to provide a custom transport. Each transport instance
+/// represents a single, live connection.
+///
+/// # Errors
+///
+/// All methods return [`McpError`] on I/O or protocol failures.
 #[async_trait]
 pub trait McpTransport: Send + Sync {
+    /// Sends a JSON-RPC frame to the server.
     async fn send(&mut self, message: McpFrame) -> Result<(), McpError>;
+    /// Receives the next JSON-RPC frame from the server, or `None` if the stream has ended.
     async fn recv(&mut self) -> Result<Option<McpFrame>, McpError>;
+    /// Closes the transport, releasing any underlying resources.
     async fn close(&mut self) -> Result<(), McpError>;
 }
 
+/// Factory that spawns a child process and connects via stdin/stdout.
+///
+/// Created from a [`StdioTransportConfig`]. Each call to
+/// [`connect`](McpTransportFactory::connect) spawns a new child process.
 pub struct StdioTransportFactory {
     config: StdioTransportConfig,
 }
 
 impl StdioTransportFactory {
+    /// Creates a new factory from the given stdio transport configuration.
     pub fn new(config: StdioTransportConfig) -> Self {
         Self { config }
     }
@@ -184,11 +312,16 @@ impl McpTransportFactory for StdioTransportFactory {
     }
 }
 
+/// Factory that opens an HTTP SSE stream and connects via Server-Sent Events.
+///
+/// Created from an [`SseTransportConfig`]. Each call to
+/// [`connect`](McpTransportFactory::connect) opens a new HTTP connection.
 pub struct SseTransportFactory {
     config: SseTransportConfig,
 }
 
 impl SseTransportFactory {
+    /// Creates a new factory from the given SSE transport configuration.
     pub fn new(config: SseTransportConfig) -> Self {
         Self { config }
     }
@@ -335,41 +468,107 @@ impl McpTransport for SseTransport {
     }
 }
 
+/// Descriptor for a tool advertised by an MCP server.
+///
+/// Returned as part of a [`McpDiscoverySnapshot`] after server discovery. The
+/// [`input_schema`](Self::input_schema) field is the JSON Schema that describes
+/// the tool's expected input.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct McpToolDescriptor {
+    /// The tool name as reported by the MCP server.
     pub name: String,
+    /// Optional human-readable description of the tool.
     pub description: Option<String>,
+    /// JSON Schema describing the tool's input parameters.
     pub input_schema: Value,
+    /// Arbitrary metadata attached to this descriptor.
     pub metadata: MetadataMap,
 }
 
+/// Descriptor for a resource advertised by an MCP server.
+///
+/// Resources represent data that the server can provide (e.g. files, database
+/// records). Each resource is identified by a URI.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpResourceDescriptor {
+    /// The resource URI (e.g. `"file:///tmp/example.txt"`).
     pub id: String,
+    /// Human-readable name of the resource.
     pub name: String,
+    /// Optional description of the resource.
     pub description: Option<String>,
+    /// Optional MIME type (e.g. `"text/plain"`, `"application/json"`).
     pub mime_type: Option<String>,
+    /// Arbitrary metadata attached to this descriptor.
     pub metadata: MetadataMap,
 }
 
+/// Descriptor for a prompt template advertised by an MCP server.
+///
+/// Prompts are reusable message templates that can be parameterized with arguments.
+/// The [`input_schema`](Self::input_schema) describes the expected arguments.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct McpPromptDescriptor {
+    /// Unique identifier for the prompt (typically the same as `name`).
     pub id: String,
+    /// Human-readable name of the prompt.
     pub name: String,
+    /// Optional description of what the prompt does.
     pub description: Option<String>,
+    /// JSON Schema describing the prompt's input arguments.
     pub input_schema: Value,
+    /// Arbitrary metadata attached to this descriptor.
     pub metadata: MetadataMap,
 }
 
+/// A snapshot of all capabilities discovered from a single MCP server.
+///
+/// Obtained by calling [`McpConnection::discover`] or as part of a
+/// [`McpServerHandle`]. Contains the full list of tools, resources, and prompts
+/// that the server advertised at discovery time.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct McpDiscoverySnapshot {
+    /// The server this snapshot was taken from.
     pub server_id: McpServerId,
+    /// Tools advertised by the server.
     pub tools: Vec<McpToolDescriptor>,
+    /// Resources advertised by the server.
     pub resources: Vec<McpResourceDescriptor>,
+    /// Prompts advertised by the server.
     pub prompts: Vec<McpPromptDescriptor>,
+    /// Arbitrary metadata attached to this snapshot.
     pub metadata: MetadataMap,
 }
 
+/// A live connection to a single MCP server.
+///
+/// Handles JSON-RPC request/response framing, automatic auth enrichment, and
+/// high-level methods for tool calls, resource reads, prompt retrieval, and
+/// capability discovery.
+///
+/// Create a connection with [`McpConnection::connect`] or indirectly through
+/// [`McpServerManager::connect_server`].
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use agentkit_mcp::{McpConnection, McpServerConfig, McpTransportBinding, StdioTransportConfig};
+///
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let config = McpServerConfig::new(
+///     "filesystem",
+///     McpTransportBinding::Stdio(StdioTransportConfig::new("npx")
+///         .with_arg("-y")
+///         .with_arg("@modelcontextprotocol/server-filesystem")),
+/// );
+///
+/// let connection = McpConnection::connect(&config).await?;
+/// let snapshot = connection.discover().await?;
+/// println!("found {} tools", snapshot.tools.len());
+/// # Ok(())
+/// # }
+/// ```
 pub struct McpConnection {
     server_id: McpServerId,
     transport: Mutex<Box<dyn McpTransport>>,
@@ -377,15 +576,30 @@ pub struct McpConnection {
     next_id: AtomicU64,
 }
 
+/// The result of replaying an MCP operation after auth resolution.
+///
+/// Returned by [`McpConnection::replay_auth_operation`] and
+/// [`McpServerManager::resolve_auth_and_resume`].
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum McpOperationResult {
+    /// The server was successfully (re)connected; contains the discovery snapshot.
     Connected(McpDiscoverySnapshot),
+    /// A tool call completed; contains the raw JSON result.
     Tool(Value),
+    /// A resource was read successfully.
     Resource(ResourceContents),
+    /// A prompt was retrieved successfully.
     Prompt(PromptContents),
 }
 
 impl McpConnection {
+    /// Connects to an MCP server, performs the JSON-RPC `initialize` handshake, and
+    /// returns a ready-to-use connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError`] if the transport fails to connect, the handshake is
+    /// rejected, or the server requires authentication ([`McpError::AuthRequired`]).
     pub async fn connect(config: &McpServerConfig) -> Result<Self, McpError> {
         Self::connect_with_auth(config, None).await
     }
@@ -458,15 +672,30 @@ impl McpConnection {
         })
     }
 
+    /// Returns the [`McpServerId`] for this connection.
     pub fn server_id(&self) -> &McpServerId {
         &self.server_id
     }
 
+    /// Closes the underlying transport, shutting down the connection to the server.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError`] if the transport cannot be closed cleanly.
     pub async fn close(&self) -> Result<(), McpError> {
         let mut transport = self.transport.lock().await;
         transport.close().await
     }
 
+    /// Stores or clears authentication credentials for future requests on this
+    /// connection.
+    ///
+    /// After calling this method with [`AuthResolution::Provided`], every subsequent
+    /// JSON-RPC request will include the credentials in an `auth` field.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError`] if the resolution cannot be applied.
     pub async fn resolve_auth(&self, resolution: AuthResolution) -> Result<(), McpError> {
         let mut auth = self.auth.lock().await;
         match resolution {
@@ -480,6 +709,13 @@ impl McpConnection {
         Ok(())
     }
 
+    /// Performs full capability discovery by listing tools, resources, and prompts.
+    ///
+    /// Returns an [`McpDiscoverySnapshot`] containing everything the server advertises.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError`] if any of the list requests fail.
     pub async fn discover(&self) -> Result<McpDiscoverySnapshot, McpError> {
         Ok(McpDiscoverySnapshot {
             server_id: self.server_id.clone(),
@@ -490,6 +726,11 @@ impl McpConnection {
         })
     }
 
+    /// Lists all tools advertised by the connected MCP server.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError`] if the `tools/list` request fails.
     pub async fn list_tools(&self) -> Result<Vec<McpToolDescriptor>, McpError> {
         let result = self.request("tools/list", json!({})).await?;
         result
@@ -502,6 +743,11 @@ impl McpConnection {
             .collect()
     }
 
+    /// Lists all resources advertised by the connected MCP server.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError`] if the `resources/list` request fails.
     pub async fn list_resources(&self) -> Result<Vec<McpResourceDescriptor>, McpError> {
         let result = self.request("resources/list", json!({})).await?;
         result
@@ -514,6 +760,11 @@ impl McpConnection {
             .collect()
     }
 
+    /// Lists all prompts advertised by the connected MCP server.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError`] if the `prompts/list` request fails.
     pub async fn list_prompts(&self) -> Result<Vec<McpPromptDescriptor>, McpError> {
         let result = self.request("prompts/list", json!({})).await?;
         result
@@ -526,6 +777,17 @@ impl McpConnection {
             .collect()
     }
 
+    /// Invokes a tool on the MCP server and returns the raw JSON result.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - The tool name as it appears in the server's tool list.
+    /// * `arguments` - A JSON value matching the tool's input schema.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::AuthRequired`] if the server demands authentication,
+    /// or another [`McpError`] variant on transport or protocol failures.
     pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, McpError> {
         self.request(
             "tools/call",
@@ -537,6 +799,15 @@ impl McpConnection {
         .await
     }
 
+    /// Reads a resource from the MCP server by URI.
+    ///
+    /// # Arguments
+    ///
+    /// * `uri` - The resource URI (e.g. `"file:///tmp/example.txt"`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError`] if the resource cannot be read or the response is malformed.
     pub async fn read_resource(&self, uri: &str) -> Result<ResourceContents, McpError> {
         let result = self
             .request(
@@ -569,6 +840,16 @@ impl McpConnection {
         })
     }
 
+    /// Retrieves a prompt from the MCP server, rendering it with the given arguments.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - The prompt name as it appears in the server's prompt list.
+    /// * `arguments` - A JSON value containing the prompt's input arguments.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError`] if the prompt cannot be retrieved or the response is malformed.
     pub async fn get_prompt(
         &self,
         name: &str,
@@ -658,6 +939,15 @@ impl McpConnection {
         }
     }
 
+    /// Replays an MCP operation that previously failed with an auth challenge.
+    ///
+    /// This is called after credentials have been resolved via [`resolve_auth`](Self::resolve_auth).
+    /// The operation is re-issued with the stored credentials attached.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::AuthResolution`] if the operation targets a different server,
+    /// or other [`McpError`] variants if the replayed operation itself fails.
     pub async fn replay_auth_operation(
         &self,
         operation: &AuthOperation,
@@ -730,6 +1020,10 @@ impl McpConnection {
     }
 }
 
+/// Adapter that exposes an MCP tool as an [`Invocable`] for the capabilities system.
+///
+/// This is the capabilities-layer adapter. For the tool-layer adapter, see
+/// [`McpToolAdapter`]. Names are prefixed with `mcp.<server_id>.<tool_name>`.
 pub struct McpInvocable {
     connection: Arc<McpConnection>,
     descriptor: McpToolDescriptor,
@@ -737,6 +1031,12 @@ pub struct McpInvocable {
 }
 
 impl McpInvocable {
+    /// Creates a new invocable adapter for the given MCP tool.
+    ///
+    /// # Arguments
+    ///
+    /// * `connection` - A shared connection to the MCP server that owns the tool.
+    /// * `descriptor` - The tool descriptor obtained from discovery.
     pub fn new(connection: Arc<McpConnection>, descriptor: McpToolDescriptor) -> Self {
         let spec = InvocableSpec {
             name: CapabilityName::new(format!(
@@ -789,6 +1089,10 @@ impl Invocable for McpInvocable {
     }
 }
 
+/// Adapter that exposes a single MCP resource as a [`ResourceProvider`].
+///
+/// Created automatically by [`McpCapabilityProvider::from_snapshot`] for each
+/// resource discovered on the server.
 pub struct McpResourceHandle {
     connection: Arc<McpConnection>,
     descriptor: ResourceDescriptor,
@@ -817,6 +1121,10 @@ impl ResourceProvider for McpResourceHandle {
     }
 }
 
+/// Adapter that exposes a single MCP prompt as a [`PromptProvider`].
+///
+/// Created automatically by [`McpCapabilityProvider::from_snapshot`] for each
+/// prompt discovered on the server.
 pub struct McpPromptHandle {
     connection: Arc<McpConnection>,
     descriptor: PromptDescriptor,
@@ -846,6 +1154,32 @@ impl PromptProvider for McpPromptHandle {
     }
 }
 
+/// A [`CapabilityProvider`] that surfaces MCP tools, resources, and prompts into the
+/// agentkit capabilities system.
+///
+/// Built from a discovery snapshot, this provider wraps each MCP tool as an
+/// [`McpInvocable`], each resource as an [`McpResourceHandle`], and each prompt as
+/// an [`McpPromptHandle`].
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use std::sync::Arc;
+/// use agentkit_mcp::{McpCapabilityProvider, McpServerConfig, McpTransportBinding, StdioTransportConfig};
+///
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let config = McpServerConfig::new(
+///     "filesystem",
+///     McpTransportBinding::Stdio(StdioTransportConfig::new("npx")
+///         .with_arg("-y")
+///         .with_arg("@modelcontextprotocol/server-filesystem")),
+/// );
+/// let (connection, provider, snapshot) = McpCapabilityProvider::connect(&config).await?;
+/// // `provider` implements CapabilityProvider and can be registered with an agent.
+/// # Ok(())
+/// # }
+/// ```
 pub struct McpCapabilityProvider {
     invocables: Vec<Arc<dyn Invocable>>,
     resources: Vec<Arc<dyn ResourceProvider>>,
@@ -853,6 +1187,11 @@ pub struct McpCapabilityProvider {
 }
 
 impl McpCapabilityProvider {
+    /// Creates a capability provider from an existing connection and its discovery
+    /// snapshot.
+    ///
+    /// Each tool, resource, and prompt in the snapshot is wrapped in the appropriate
+    /// adapter type.
     pub fn from_snapshot(connection: Arc<McpConnection>, snapshot: &McpDiscoverySnapshot) -> Self {
         let invocables = snapshot
             .tools
@@ -906,6 +1245,10 @@ impl McpCapabilityProvider {
         }
     }
 
+    /// Merges multiple capability providers into a single provider.
+    ///
+    /// This is useful when managing several MCP servers through a
+    /// [`McpServerManager`] and you want one combined provider for the agent.
     pub fn merge<I>(providers: I) -> Self
     where
         I: IntoIterator<Item = Self>,
@@ -927,6 +1270,14 @@ impl McpCapabilityProvider {
         }
     }
 
+    /// Connects to an MCP server, performs discovery, and builds a capability
+    /// provider in one step.
+    ///
+    /// Returns the shared connection, the provider, and the discovery snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError`] if connection or discovery fails.
     pub async fn connect(
         config: &McpServerConfig,
     ) -> Result<(Arc<McpConnection>, Self, McpDiscoverySnapshot), McpError> {
@@ -952,6 +1303,11 @@ impl CapabilityProvider for McpCapabilityProvider {
     }
 }
 
+/// A connected MCP server together with its configuration and discovery snapshot.
+///
+/// Obtained from [`McpServerManager::connect_server`] or
+/// [`McpServerManager::connect_all`]. Provides convenience methods to create
+/// tool registries and capability providers from the server's discovered capabilities.
 #[derive(Clone)]
 pub struct McpServerHandle {
     config: McpServerConfig,
@@ -960,22 +1316,28 @@ pub struct McpServerHandle {
 }
 
 impl McpServerHandle {
+    /// Returns the original configuration used to connect this server.
     pub fn config(&self) -> &McpServerConfig {
         &self.config
     }
 
+    /// Returns the server's unique identifier.
     pub fn server_id(&self) -> &McpServerId {
         self.connection.server_id()
     }
 
+    /// Returns a shared reference to the underlying [`McpConnection`].
     pub fn connection(&self) -> Arc<McpConnection> {
         self.connection.clone()
     }
 
+    /// Returns the discovery snapshot captured when the server was connected.
     pub fn snapshot(&self) -> &McpDiscoverySnapshot {
         &self.snapshot
     }
 
+    /// Builds a [`ToolRegistry`] containing an [`McpToolAdapter`] for each tool
+    /// discovered on this server.
     pub fn tool_registry(&self) -> ToolRegistry {
         self.snapshot
             .tools
@@ -990,11 +1352,52 @@ impl McpServerHandle {
             })
     }
 
+    /// Builds an [`McpCapabilityProvider`] from this server's discovery snapshot.
     pub fn capability_provider(&self) -> McpCapabilityProvider {
         McpCapabilityProvider::from_snapshot(self.connection.clone(), &self.snapshot)
     }
 }
 
+/// Manages the lifecycle of one or more MCP servers: registration, connection,
+/// discovery, refresh, disconnection, and auth resolution.
+///
+/// This is the primary entry point for integrating MCP servers into an agentkit
+/// application. Register server configurations, connect them, and then obtain a
+/// combined [`ToolRegistry`] or [`McpCapabilityProvider`] for use in an agent loop.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use agentkit_mcp::{
+///     McpServerConfig, McpServerManager, McpTransportBinding, StdioTransportConfig,
+/// };
+///
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let mut manager = McpServerManager::new()
+///     .with_server(McpServerConfig::new(
+///         "filesystem",
+///         McpTransportBinding::Stdio(
+///             StdioTransportConfig::new("npx")
+///                 .with_arg("-y")
+///                 .with_arg("@modelcontextprotocol/server-filesystem"),
+///         ),
+///     ))
+///     .with_server(McpServerConfig::new(
+///         "github",
+///         McpTransportBinding::Stdio(
+///             StdioTransportConfig::new("npx")
+///                 .with_arg("-y")
+///                 .with_arg("@modelcontextprotocol/server-github"),
+///         ),
+///     ));
+///
+/// let handles = manager.connect_all().await?;
+/// let registry = manager.tool_registry();
+/// println!("tools: {:?}", registry.specs().iter().map(|s| &s.name).collect::<Vec<_>>());
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Default)]
 pub struct McpServerManager {
     configs: BTreeMap<McpServerId, McpServerConfig>,
@@ -1003,28 +1406,47 @@ pub struct McpServerManager {
 }
 
 impl McpServerManager {
+    /// Creates an empty server manager with no registered servers.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Registers a server configuration and returns `self` for chaining.
+    ///
+    /// The server is not connected until [`connect_server`](Self::connect_server) or
+    /// [`connect_all`](Self::connect_all) is called.
     pub fn with_server(mut self, config: McpServerConfig) -> Self {
         self.register_server(config);
         self
     }
 
+    /// Registers a server configuration by mutable reference.
+    ///
+    /// The server is not connected until [`connect_server`](Self::connect_server) or
+    /// [`connect_all`](Self::connect_all) is called.
     pub fn register_server(&mut self, config: McpServerConfig) -> &mut Self {
         self.configs.insert(config.id.clone(), config);
         self
     }
 
+    /// Returns the handle for a connected server, or `None` if it is not connected.
     pub fn connected_server(&self, server_id: &McpServerId) -> Option<&McpServerHandle> {
         self.connections.get(server_id)
     }
 
+    /// Returns handles for all currently connected servers.
     pub fn connected_servers(&self) -> Vec<&McpServerHandle> {
         self.connections.values().collect()
     }
 
+    /// Connects a single registered server by its identifier.
+    ///
+    /// Performs the MCP handshake and full capability discovery.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::UnknownServer`] if the server ID has not been registered,
+    /// or other [`McpError`] variants if connection or discovery fails.
     pub async fn connect_server(
         &mut self,
         server_id: &McpServerId,
@@ -1046,6 +1468,15 @@ impl McpServerManager {
         Ok(handle)
     }
 
+    /// Connects all registered servers sequentially.
+    ///
+    /// Returns a handle for each server in registration order. If any server fails
+    /// to connect, the error is returned immediately and remaining servers are
+    /// not attempted.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first [`McpError`] encountered during connection.
     pub async fn connect_all(&mut self) -> Result<Vec<McpServerHandle>, McpError> {
         let server_ids = self.configs.keys().cloned().collect::<Vec<_>>();
         let mut handles = Vec::with_capacity(server_ids.len());
@@ -1057,6 +1488,15 @@ impl McpServerManager {
         Ok(handles)
     }
 
+    /// Re-discovers capabilities for a connected server, updating the stored snapshot.
+    ///
+    /// Call this after the server's capabilities may have changed (e.g. after
+    /// installing a plugin).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::UnknownServer`] if the server is not connected, or other
+    /// [`McpError`] variants if discovery fails.
     pub async fn refresh_server(
         &mut self,
         server_id: &McpServerId,
@@ -1070,6 +1510,14 @@ impl McpServerManager {
         Ok(snapshot)
     }
 
+    /// Disconnects a server and removes it from the active connections.
+    ///
+    /// The server configuration remains registered and can be reconnected later
+    /// with [`connect_server`](Self::connect_server).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::UnknownServer`] if the server is not connected.
     pub async fn disconnect_server(&mut self, server_id: &McpServerId) -> Result<(), McpError> {
         let Some(handle) = self.connections.remove(server_id) else {
             return Err(McpError::UnknownServer(server_id.to_string()));
@@ -1077,6 +1525,13 @@ impl McpServerManager {
         handle.connection.close().await
     }
 
+    /// Stores or clears authentication credentials for a server and, if already
+    /// connected, updates the live connection as well.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::UnknownServer`] if the server ID from the resolution
+    /// does not match any registered server.
     pub async fn resolve_auth(&mut self, resolution: AuthResolution) -> Result<(), McpError> {
         let server_id = resolution
             .request()
@@ -1104,6 +1559,15 @@ impl McpServerManager {
         }
     }
 
+    /// Resolves authentication and immediately replays the operation that originally
+    /// triggered the auth challenge.
+    ///
+    /// This is a convenience method combining [`resolve_auth`](Self::resolve_auth)
+    /// and [`replay_auth_request`](Self::replay_auth_request).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError`] if auth resolution or the replayed operation fails.
     pub async fn resolve_auth_and_resume(
         &mut self,
         resolution: AuthResolution,
@@ -1113,6 +1577,15 @@ impl McpServerManager {
         self.replay_auth_request(&request).await
     }
 
+    /// Replays an auth request's original MCP operation using stored credentials.
+    ///
+    /// For connect operations the server is (re)connected. For tool calls, resource
+    /// reads, and prompt retrievals the request is re-issued on the existing or
+    /// newly established connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError`] if the operation cannot be replayed.
     pub async fn replay_auth_request(
         &mut self,
         request: &AuthRequest,
@@ -1161,6 +1634,10 @@ impl McpServerManager {
             .ok_or_else(|| McpError::UnknownServer(server_id.to_string()))
     }
 
+    /// Builds a combined [`ToolRegistry`] containing [`McpToolAdapter`]s for every
+    /// tool discovered across all connected servers.
+    ///
+    /// Tool names are prefixed as `mcp.<server_id>.<tool_name>`.
     pub fn tool_registry(&self) -> ToolRegistry {
         self.connections
             .values()
@@ -1176,6 +1653,8 @@ impl McpServerManager {
             })
     }
 
+    /// Builds a combined [`McpCapabilityProvider`] from all connected servers,
+    /// merging their tools, resources, and prompts.
     pub fn capability_provider(&self) -> McpCapabilityProvider {
         McpCapabilityProvider::merge(
             self.connections
@@ -1185,6 +1664,21 @@ impl McpServerManager {
     }
 }
 
+/// Adapter that exposes an MCP tool as an agentkit [`Tool`].
+///
+/// This is the tool-layer adapter for the tool registry. For the capabilities-layer
+/// adapter, see [`McpInvocable`]. Tool names are prefixed as
+/// `mcp.<server_id>.<tool_name>`.
+///
+/// # Example
+///
+/// ```rust
+/// use std::sync::Arc;
+/// use agentkit_core::MetadataMap;
+/// use agentkit_mcp::{McpToolAdapter, McpToolDescriptor, McpServerId};
+/// # // McpToolAdapter::new requires a connection which we cannot construct in a doc test,
+/// # // so this example only shows the construction pattern.
+/// ```
 pub struct McpToolAdapter {
     descriptor: McpToolDescriptor,
     connection: Arc<McpConnection>,
@@ -1192,6 +1686,13 @@ pub struct McpToolAdapter {
 }
 
 impl McpToolAdapter {
+    /// Creates a new tool adapter for the given MCP tool.
+    ///
+    /// # Arguments
+    ///
+    /// * `server_id` - The server's identifier, used to namespace the tool name.
+    /// * `connection` - A shared connection to the owning MCP server.
+    /// * `descriptor` - The tool descriptor obtained from discovery.
     pub fn new(
         server_id: &McpServerId,
         connection: Arc<McpConnection>,
@@ -1605,24 +2106,35 @@ fn resolve_sse_endpoint(response_url: &Url, endpoint: &str) -> Result<Url, McpEr
         .map_err(|error| McpError::Transport(format!("invalid SSE endpoint URL: {error}")))
 }
 
+/// Errors produced by MCP transport, protocol, and lifecycle operations.
 #[derive(Debug, Error)]
 pub enum McpError {
+    /// An underlying I/O error (e.g. spawning a child process or reading from a pipe).
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    /// An HTTP-level error from the SSE transport.
     #[error("http error: {0}")]
     Http(#[from] reqwest::Error),
+    /// A JSON serialization or deserialization error.
     #[error("serialization error: {0}")]
     Serialize(#[from] serde_json::Error),
+    /// A transport-level error (e.g. unexpected disconnection or bad SSE response).
     #[error("transport error: {0}")]
     Transport(String),
+    /// An MCP protocol violation (e.g. missing required fields in a response).
     #[error("protocol error: {0}")]
     Protocol(String),
+    /// The server requires authentication before the operation can proceed.
+    /// Contains the [`AuthRequest`] that describes the challenge.
     #[error("MCP auth required: {0:?}")]
     AuthRequired(Box<AuthRequest>),
+    /// An error occurred while resolving or replaying authentication.
     #[error("auth resolution error: {0}")]
     AuthResolution(String),
+    /// The MCP server returned an error for the invoked method.
     #[error("invocation error: {0}")]
     Invocation(String),
+    /// The referenced server ID is not registered in the [`McpServerManager`].
     #[error("unknown MCP server: {0}")]
     UnknownServer(String),
 }

@@ -1,3 +1,32 @@
+//! Reporting observers for the agentkit agent loop.
+//!
+//! This crate provides [`LoopObserver`] implementations that turn
+//! [`AgentEvent`]s into logs, usage summaries, transcripts, and
+//! machine-readable JSONL streams. Reporters are designed to be composed
+//! through [`CompositeReporter`] so a single loop can feed multiple
+//! observers at once.
+//!
+//! # Included reporters
+//!
+//! | Reporter | Purpose |
+//! |---|---|
+//! | [`StdoutReporter`] | Human-readable terminal output |
+//! | [`JsonlReporter`] | Machine-readable newline-delimited JSON |
+//! | [`UsageReporter`] | Aggregated token / cost totals |
+//! | [`TranscriptReporter`] | Growing snapshot of conversation items |
+//! | [`CompositeReporter`] | Fan-out to multiple reporters |
+//!
+//! # Quick start
+//!
+//! ```rust
+//! use agentkit_reporting::{CompositeReporter, JsonlReporter, UsageReporter, TranscriptReporter};
+//!
+//! let reporter = CompositeReporter::new()
+//!     .with_observer(JsonlReporter::new(Vec::new()))
+//!     .with_observer(UsageReporter::new())
+//!     .with_observer(TranscriptReporter::new());
+//! ```
+
 use std::io::{self, Write};
 use std::time::SystemTime;
 
@@ -6,35 +35,83 @@ use agentkit_loop::{AgentEvent, LoopObserver, TurnResult};
 use serde::Serialize;
 use thiserror::Error;
 
+/// Errors that can occur while writing reports.
+///
+/// Reporter implementations (e.g. [`JsonlReporter`], [`StdoutReporter`])
+/// collect errors internally rather than surfacing them through the
+/// [`LoopObserver`] interface. Call the reporter's `take_errors()` method
+/// after the loop finishes to inspect any problems.
 #[derive(Debug, Error)]
 pub enum ReportError {
+    /// An I/O error occurred while writing to the underlying writer.
     #[error("io error: {0}")]
     Io(#[from] io::Error),
+    /// A serialization error occurred (JSONL reporters only).
     #[error("serialization error: {0}")]
     Serialize(#[from] serde_json::Error),
 }
 
+/// A timestamped wrapper around an [`AgentEvent`].
+///
+/// [`JsonlReporter`] serializes each incoming event inside an
+/// `EventEnvelope` so that the resulting JSONL stream carries
+/// wall-clock timestamps alongside the event payload.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct EventEnvelope<'a> {
+    /// When the event was observed.
     pub timestamp: SystemTime,
+    /// The underlying agent event.
     pub event: &'a AgentEvent,
 }
 
+/// Fan-out reporter that forwards every [`AgentEvent`] to multiple child observers.
+///
+/// `CompositeReporter` itself implements [`LoopObserver`], so it can be
+/// handed directly to the agent loop. Each event is cloned once per child
+/// observer.
+///
+/// # Example
+///
+/// ```rust
+/// use agentkit_reporting::{
+///     CompositeReporter, JsonlReporter, StdoutReporter, UsageReporter,
+/// };
+///
+/// // Build a reporter that writes to JSONL, prints to stdout, and tracks usage.
+/// let reporter = CompositeReporter::new()
+///     .with_observer(JsonlReporter::new(Vec::new()))
+///     .with_observer(StdoutReporter::new(std::io::stdout()))
+///     .with_observer(UsageReporter::new());
+/// ```
 #[derive(Default)]
 pub struct CompositeReporter {
     children: Vec<Box<dyn LoopObserver>>,
 }
 
 impl CompositeReporter {
+    /// Creates an empty `CompositeReporter` with no child observers.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Adds an observer and returns `self` (builder pattern).
+    ///
+    /// # Arguments
+    ///
+    /// * `observer` - Any type implementing [`LoopObserver`].
     pub fn with_observer(mut self, observer: impl LoopObserver + 'static) -> Self {
         self.children.push(Box::new(observer));
         self
     }
 
+    /// Adds an observer by mutable reference.
+    ///
+    /// Use this when you need to add observers after initial construction
+    /// rather than in a builder chain.
+    ///
+    /// # Arguments
+    ///
+    /// * `observer` - Any type implementing [`LoopObserver`].
     pub fn push(&mut self, observer: impl LoopObserver + 'static) -> &mut Self {
         self.children.push(Box::new(observer));
         self
@@ -49,6 +126,30 @@ impl LoopObserver for CompositeReporter {
     }
 }
 
+/// Machine-readable reporter that writes one JSON object per line (JSONL).
+///
+/// Each [`AgentEvent`] is wrapped in an [`EventEnvelope`] with a timestamp
+/// and serialized as a single JSON line. This format is easy to ingest in
+/// log aggregation systems or to replay offline.
+///
+/// I/O and serialization errors are collected internally and can be
+/// retrieved with [`take_errors`](JsonlReporter::take_errors).
+///
+/// # Example
+///
+/// ```rust
+/// use agentkit_reporting::JsonlReporter;
+///
+/// // Write JSONL to an in-memory buffer (useful in tests).
+/// let reporter = JsonlReporter::new(Vec::new());
+///
+/// // Write JSONL to a file, flushing after every event.
+/// # fn example() -> std::io::Result<()> {
+/// let file = std::fs::File::create("events.jsonl")?;
+/// let reporter = JsonlReporter::new(std::io::BufWriter::new(file));
+/// # Ok(())
+/// # }
+/// ```
 pub struct JsonlReporter<W> {
     writer: W,
     flush_each_event: bool,
@@ -59,6 +160,15 @@ impl<W> JsonlReporter<W>
 where
     W: Write,
 {
+    /// Creates a new `JsonlReporter` writing to the given writer.
+    ///
+    /// Flushing after each event is enabled by default. Disable it with
+    /// [`with_flush_each_event(false)`](JsonlReporter::with_flush_each_event)
+    /// if you are writing to a buffered sink and prefer to flush manually.
+    ///
+    /// # Arguments
+    ///
+    /// * `writer` - Any [`Write`] implementation (file, buffer, stdout, etc.).
     pub fn new(writer: W) -> Self {
         Self {
             writer,
@@ -67,19 +177,29 @@ where
         }
     }
 
+    /// Controls whether the writer is flushed after every event (builder pattern).
+    ///
+    /// Defaults to `true`. Set to `false` when batching writes for throughput.
     pub fn with_flush_each_event(mut self, flush_each_event: bool) -> Self {
         self.flush_each_event = flush_each_event;
         self
     }
 
+    /// Returns a shared reference to the underlying writer.
+    ///
+    /// Useful for inspecting an in-memory buffer after the loop finishes.
     pub fn writer(&self) -> &W {
         &self.writer
     }
 
+    /// Returns a mutable reference to the underlying writer.
     pub fn writer_mut(&mut self) -> &mut W {
         &mut self.writer
     }
 
+    /// Drains and returns all errors accumulated during event handling.
+    ///
+    /// Subsequent calls return an empty `Vec` until new errors occur.
     pub fn take_errors(&mut self) -> Vec<ReportError> {
         std::mem::take(&mut self.errors)
     }
@@ -112,39 +232,81 @@ where
     }
 }
 
+/// Accumulated token counts across all events seen by a [`UsageReporter`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct UsageTotals {
+    /// Total input (prompt) tokens consumed.
     pub input_tokens: u64,
+    /// Total output (completion) tokens produced.
     pub output_tokens: u64,
+    /// Total reasoning tokens used (model-dependent).
     pub reasoning_tokens: u64,
+    /// Total input tokens served from the provider's cache.
     pub cached_input_tokens: u64,
 }
 
+/// Accumulated monetary cost across all events seen by a [`UsageReporter`].
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CostTotals {
+    /// Running total cost expressed in `currency` units.
     pub amount: f64,
+    /// ISO 4217 currency code (e.g. `"USD"`), set from the first cost event.
     pub currency: Option<String>,
 }
 
+/// Snapshot of everything a [`UsageReporter`] has tracked so far.
+///
+/// Retrieve this via [`UsageReporter::summary`].
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct UsageSummary {
+    /// Total number of [`AgentEvent`]s observed (of any variant).
     pub events_seen: usize,
+    /// Number of events that carried usage information
+    /// ([`AgentEvent::UsageUpdated`] or [`AgentEvent::TurnFinished`] with usage).
     pub usage_events_seen: usize,
+    /// Number of [`AgentEvent::TurnFinished`] events observed.
     pub turn_results_seen: usize,
+    /// Aggregated token counts.
     pub totals: UsageTotals,
+    /// Aggregated cost, present only if at least one event carried cost data.
     pub cost: Option<CostTotals>,
 }
 
+/// Reporter that aggregates token usage and cost across the entire run.
+///
+/// `UsageReporter` listens for [`AgentEvent::UsageUpdated`] and
+/// [`AgentEvent::TurnFinished`] events and maintains a running
+/// [`UsageSummary`]. After the loop completes, call [`summary`](UsageReporter::summary)
+/// to read the totals.
+///
+/// # Example
+///
+/// ```rust
+/// use agentkit_reporting::UsageReporter;
+/// use agentkit_loop::LoopObserver;
+///
+/// let mut reporter = UsageReporter::new();
+///
+/// // ...pass `reporter` to the agent loop, then afterwards:
+/// let summary = reporter.summary();
+/// println!(
+///     "tokens: {} in / {} out",
+///     summary.totals.input_tokens,
+///     summary.totals.output_tokens,
+/// );
+/// ```
 #[derive(Default)]
 pub struct UsageReporter {
     summary: UsageSummary,
 }
 
 impl UsageReporter {
+    /// Creates a new `UsageReporter` with zeroed counters.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Returns a reference to the current [`UsageSummary`].
     pub fn summary(&self) -> &UsageSummary {
         &self.summary
     }
@@ -187,21 +349,48 @@ impl LoopObserver for UsageReporter {
     }
 }
 
+/// Growing list of conversation [`Item`]s captured by a [`TranscriptReporter`].
+///
+/// Items are appended in the order they arrive: user inputs first, then
+/// assistant outputs from each finished turn.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TranscriptView {
+    /// The ordered sequence of conversation items.
     pub items: Vec<Item>,
 }
 
+/// Reporter that captures the evolving conversation transcript.
+///
+/// `TranscriptReporter` listens for [`AgentEvent::InputAccepted`] and
+/// [`AgentEvent::TurnFinished`] events and accumulates their [`Item`]s
+/// into a [`TranscriptView`]. This is useful for post-run analysis or
+/// for displaying a conversation history.
+///
+/// # Example
+///
+/// ```rust
+/// use agentkit_reporting::TranscriptReporter;
+/// use agentkit_loop::LoopObserver;
+///
+/// let mut reporter = TranscriptReporter::new();
+///
+/// // ...pass `reporter` to the agent loop, then afterwards:
+/// for item in &reporter.transcript().items {
+///     println!("{:?}: {} parts", item.kind, item.parts.len());
+/// }
+/// ```
 #[derive(Default)]
 pub struct TranscriptReporter {
     transcript: TranscriptView,
 }
 
 impl TranscriptReporter {
+    /// Creates a new `TranscriptReporter` with an empty transcript.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Returns a reference to the current [`TranscriptView`].
     pub fn transcript(&self) -> &TranscriptView {
         &self.transcript
     }
@@ -221,6 +410,25 @@ impl LoopObserver for TranscriptReporter {
     }
 }
 
+/// Human-readable reporter that writes structured log lines to a [`Write`] sink.
+///
+/// Each [`AgentEvent`] is printed as a bracketed tag followed by key fields,
+/// for example `[turn] started session=abc turn=1`. Turn results include
+/// indented item and part summaries so the operator can follow the
+/// conversation at a glance.
+///
+/// I/O errors are collected internally; call
+/// [`take_errors`](StdoutReporter::take_errors) after the loop to inspect them.
+///
+/// # Example
+///
+/// ```rust
+/// use agentkit_reporting::StdoutReporter;
+///
+/// // Print events to stderr, hiding usage lines.
+/// let reporter = StdoutReporter::new(std::io::stderr())
+///     .with_usage(false);
+/// ```
 pub struct StdoutReporter<W> {
     writer: W,
     show_usage: bool,
@@ -231,6 +439,15 @@ impl<W> StdoutReporter<W>
 where
     W: Write,
 {
+    /// Creates a new `StdoutReporter` that writes to the given writer.
+    ///
+    /// Usage lines are shown by default. Disable them with
+    /// [`with_usage(false)`](StdoutReporter::with_usage).
+    ///
+    /// # Arguments
+    ///
+    /// * `writer` - Any [`Write`] implementation (typically `std::io::stdout()`
+    ///   or `std::io::stderr()`).
     pub fn new(writer: W) -> Self {
         Self {
             writer,
@@ -239,15 +456,23 @@ where
         }
     }
 
+    /// Controls whether `[usage]` lines are printed (builder pattern).
+    ///
+    /// Defaults to `true`. Set to `false` to reduce output noise when
+    /// you are already tracking usage through a [`UsageReporter`].
     pub fn with_usage(mut self, show_usage: bool) -> Self {
         self.show_usage = show_usage;
         self
     }
 
+    /// Returns a shared reference to the underlying writer.
     pub fn writer(&self) -> &W {
         &self.writer
     }
 
+    /// Drains and returns all errors accumulated during event handling.
+    ///
+    /// Subsequent calls return an empty `Vec` until new errors occur.
     pub fn take_errors(&mut self) -> Vec<ReportError> {
         std::mem::take(&mut self.errors)
     }
