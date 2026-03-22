@@ -1,3 +1,53 @@
+//! Runtime-agnostic agent loop orchestration for sessions, turns, tools, and interrupts.
+//!
+//! `agentkit-loop` is the central coordination layer in the agentkit workspace.  It
+//! drives a model through a multi-turn agentic loop, executing tool calls,
+//! respecting permission checks, surfacing approval and authentication interrupts
+//! to the host application, and optionally compacting the transcript when it grows
+//! too large.
+//!
+//! # Architecture
+//!
+//! The main entry point is [`Agent`], constructed via [`AgentBuilder`].  After
+//! calling [`Agent::start`] you receive a [`LoopDriver`] that yields
+//! [`LoopStep`]s -- either a finished turn or an interrupt that requires host
+//! resolution before the loop can continue.
+//!
+//! ```text
+//! Agent::builder()
+//!     .model(adapter)        // ModelAdapter implementation
+//!     .tools(registry)       // ToolRegistry with registered tools
+//!     .permissions(checker)  // PermissionChecker for gating tool use
+//!     .observer(obs)         // LoopObserver for streaming events
+//!     .build()?
+//!     .start(config).await?  -> LoopDriver
+//!         .submit_input(...)
+//!         .next().await?     -> LoopStep::Finished | LoopStep::Interrupt
+//! ```
+//!
+//! # Example
+//!
+//! ```rust,no_run
+//! use agentkit_core::SessionId;
+//! use agentkit_loop::{Agent, SessionConfig};
+//! # // Trait import needed for .start()
+//! # use agentkit_core::MetadataMap;
+//!
+//! # async fn example<M: agentkit_loop::ModelAdapter>(adapter: M) -> Result<(), agentkit_loop::LoopError> {
+//! let agent = Agent::builder()
+//!     .model(adapter)
+//!     .build()?;
+//!
+//! let mut driver = agent
+//!     .start(SessionConfig {
+//!         session_id: SessionId::new("demo"),
+//!         metadata: MetadataMap::new(),
+//!     })
+//!     .await?;
+//! # Ok(())
+//! # }
+//! ```
+
 use std::sync::Arc;
 
 use agentkit_capabilities::CapabilityContext;
@@ -22,48 +72,154 @@ const INTERRUPT_REASON_METADATA_KEY: &str = "agentkit.interrupt_reason";
 const INTERRUPT_STAGE_METADATA_KEY: &str = "agentkit.interrupt_stage";
 const USER_CANCELLED_REASON: &str = "user_cancelled";
 
+/// Configuration required to start a new model session.
+///
+/// Pass this to [`Agent::start`] to initialise the underlying [`ModelSession`]
+/// and obtain a [`LoopDriver`].
+///
+/// # Example
+///
+/// ```rust
+/// use agentkit_core::{MetadataMap, SessionId};
+/// use agentkit_loop::SessionConfig;
+///
+/// let config = SessionConfig {
+///     session_id: SessionId::new("my-session"),
+///     metadata: MetadataMap::new(),
+/// };
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionConfig {
+    /// Unique identifier for the session.
     pub session_id: SessionId,
+    /// Arbitrary key-value metadata forwarded to the model adapter.
     pub metadata: MetadataMap,
 }
 
+/// Payload sent to the model at the start of each turn.
+///
+/// The [`LoopDriver`] constructs this automatically from its internal state
+/// and passes it to [`ModelSession::begin_turn`].  Model adapter authors
+/// use the fields to build the provider-specific request.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TurnRequest {
+    /// Session this turn belongs to.
     pub session_id: SessionId,
+    /// Unique identifier for the current turn.
     pub turn_id: agentkit_core::TurnId,
+    /// Full conversation transcript accumulated so far.
     pub transcript: Vec<Item>,
+    /// Tool specifications the model may invoke during this turn.
     pub available_tools: Vec<ToolSpec>,
+    /// Per-turn metadata (e.g. provider hints).
     pub metadata: MetadataMap,
 }
 
+/// Final result produced by a single model turn.
+///
+/// Returned inside [`ModelTurnEvent::Finished`] to signal that the model has
+/// completed its generation for this turn.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ModelTurnResult {
+    /// Why the model stopped generating (e.g. completed, tool call, length).
     pub finish_reason: FinishReason,
+    /// Items the model produced during this turn (text, tool calls, etc.).
     pub output_items: Vec<Item>,
+    /// Token usage statistics, if available.
     pub usage: Option<Usage>,
+    /// Provider-specific metadata about the turn.
     pub metadata: MetadataMap,
 }
 
+/// Streaming event emitted by a [`ModelTurn`] during generation.
+///
+/// The [`LoopDriver`] consumes these events one-by-one via
+/// [`ModelTurn::next_event`] and translates them into [`AgentEvent`]s for
+/// observers and into transcript mutations.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ModelTurnEvent {
+    /// Incremental text or content delta from the model.
     Delta(Delta),
+    /// The model is requesting a tool call.
     ToolCall(ToolCallPart),
+    /// Updated token usage statistics.
     Usage(Usage),
+    /// The model has finished generating for this turn.
     Finished(ModelTurnResult),
 }
 
+/// Factory for creating model sessions.
+///
+/// Implement this trait to integrate a model provider (e.g. OpenRouter,
+/// Anthropic, a local LLM server) with the agent loop.  [`Agent`] holds a
+/// single adapter and calls [`start_session`](ModelAdapter::start_session)
+/// once when [`Agent::start`] is invoked.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use agentkit_loop::{ModelAdapter, ModelSession, SessionConfig, LoopError};
+/// use async_trait::async_trait;
+///
+/// struct MyAdapter;
+///
+/// #[async_trait]
+/// impl ModelAdapter for MyAdapter {
+///     type Session = MySession;
+///
+///     async fn start_session(&self, config: SessionConfig) -> Result<MySession, LoopError> {
+///         // Initialize provider-specific session state here.
+///         Ok(MySession { /* ... */ })
+///     }
+/// }
+/// # struct MySession;
+/// # #[async_trait]
+/// # impl ModelSession for MySession {
+/// #     type Turn = MyTurn;
+/// #     async fn begin_turn(&mut self, _r: agentkit_loop::TurnRequest, _c: Option<agentkit_core::TurnCancellation>) -> Result<MyTurn, LoopError> { todo!() }
+/// # }
+/// # struct MyTurn;
+/// # #[async_trait]
+/// # impl agentkit_loop::ModelTurn for MyTurn {
+/// #     async fn next_event(&mut self, _c: Option<agentkit_core::TurnCancellation>) -> Result<Option<agentkit_loop::ModelTurnEvent>, LoopError> { todo!() }
+/// # }
+/// ```
 #[async_trait]
 pub trait ModelAdapter: Send + Sync {
+    /// The session type produced by this adapter.
     type Session: ModelSession;
 
+    /// Create a new model session from the given configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoopError`] if the provider connection or initialisation fails.
     async fn start_session(&self, config: SessionConfig) -> Result<Self::Session, LoopError>;
 }
 
+/// An active model session that can produce sequential turns.
+///
+/// A session is created once per [`Agent::start`] call and lives for the
+/// lifetime of the [`LoopDriver`].  Each call to [`begin_turn`](ModelSession::begin_turn)
+/// hands the full transcript to the model and returns a streaming
+/// [`ModelTurn`].
 #[async_trait]
 pub trait ModelSession: Send {
+    /// The turn type produced by this session.
     type Turn: ModelTurn;
 
+    /// Start a new turn, sending the transcript and available tools to the model.
+    ///
+    /// # Arguments
+    ///
+    /// * `request` -- the turn payload including transcript and tool specs.
+    /// * `cancellation` -- optional handle the implementation should poll to
+    ///   detect user-initiated cancellation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoopError::Cancelled`] when the turn is cancelled, or a
+    /// provider-specific error wrapped in [`LoopError`].
     async fn begin_turn(
         &mut self,
         request: TurnRequest,
@@ -71,46 +227,88 @@ pub trait ModelSession: Send {
     ) -> Result<Self::Turn, LoopError>;
 }
 
+/// A streaming model turn that yields events one at a time.
+///
+/// The loop driver calls [`next_event`](ModelTurn::next_event) repeatedly
+/// until it returns `Ok(None)` (stream exhausted) or
+/// `Ok(Some(ModelTurnEvent::Finished(_)))`.
 #[async_trait]
 pub trait ModelTurn: Send {
+    /// Retrieve the next event from the model's response stream.
+    ///
+    /// Returns `Ok(None)` when the stream is exhausted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoopError::Cancelled`] if `cancellation` fires, or a
+    /// provider-specific error wrapped in [`LoopError`].
     async fn next_event(
         &mut self,
         cancellation: Option<TurnCancellation>,
     ) -> Result<Option<ModelTurnEvent>, LoopError>;
 }
 
+/// Observer hook for streaming agent events to the host application.
+///
+/// Register observers via [`AgentBuilder::observer`] to receive real-time
+/// notifications about deltas, tool calls, usage, warnings, and lifecycle
+/// events.
+///
+/// # Example
+///
+/// ```rust
+/// use agentkit_loop::{AgentEvent, LoopObserver};
+///
+/// struct StdoutObserver;
+///
+/// impl LoopObserver for StdoutObserver {
+///     fn handle_event(&mut self, event: AgentEvent) {
+///         println!("{event:?}");
+///     }
+/// }
+/// ```
 pub trait LoopObserver: Send {
+    /// Called synchronously for every [`AgentEvent`] emitted by the loop driver.
     fn handle_event(&mut self, event: AgentEvent);
 }
 
+/// Lifecycle and streaming events emitted by the [`LoopDriver`].
+///
+/// Observers (see [`LoopObserver`]) receive these events in the order they
+/// occur.  They are useful for building UIs, logging, or telemetry.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum AgentEvent {
-    RunStarted {
-        session_id: SessionId,
-    },
+    /// The agent run has been initialised.
+    RunStarted { session_id: SessionId },
+    /// A new model turn is starting.
     TurnStarted {
         session_id: SessionId,
         turn_id: agentkit_core::TurnId,
     },
+    /// User input has been accepted into the pending queue.
     InputAccepted {
         session_id: SessionId,
         items: Vec<Item>,
     },
+    /// Incremental content delta from the model.
     ContentDelta(Delta),
+    /// The model has requested a tool call.
     ToolCallRequested(ToolCallPart),
+    /// A tool call requires explicit user approval before execution.
     ApprovalRequired(ApprovalRequest),
+    /// A tool call requires authentication before execution.
     AuthRequired(AuthRequest),
-    ApprovalResolved {
-        approved: bool,
-    },
-    AuthResolved {
-        provided: bool,
-    },
+    /// An approval interrupt has been resolved.
+    ApprovalResolved { approved: bool },
+    /// An authentication interrupt has been resolved.
+    AuthResolved { provided: bool },
+    /// Transcript compaction is about to begin.
     CompactionStarted {
         session_id: SessionId,
         turn_id: Option<agentkit_core::TurnId>,
         reason: CompactionReason,
     },
+    /// Transcript compaction has finished.
     CompactionFinished {
         session_id: SessionId,
         turn_id: Option<agentkit_core::TurnId>,
@@ -118,48 +316,138 @@ pub enum AgentEvent {
         transcript_len: usize,
         metadata: MetadataMap,
     },
+    /// Updated token usage statistics.
     UsageUpdated(Usage),
-    Warning {
-        message: String,
-    },
-    RunFailed {
-        message: String,
-    },
+    /// Non-fatal warning (e.g. a tool failure that was recovered from).
+    Warning { message: String },
+    /// The agent run has failed with an unrecoverable error.
+    RunFailed { message: String },
+    /// A turn has finished (successfully, via cancellation, etc.).
     TurnFinished(TurnResult),
 }
 
+/// Descriptor for a [`LoopInterrupt::AwaitingInput`] interrupt.
+///
+/// Returned when the driver has no pending input and needs the host to call
+/// [`LoopDriver::submit_input`] before advancing.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InputRequest {
+    /// The session that is waiting for input.
     pub session_id: SessionId,
+    /// Human-readable explanation of why input is needed.
     pub reason: String,
 }
 
+/// Outcome of a completed (or cancelled) turn.
+///
+/// Wrapped by [`LoopStep::Finished`] and also emitted as
+/// [`AgentEvent::TurnFinished`] to observers.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TurnResult {
+    /// Identifier for the turn that produced this result.
     pub turn_id: agentkit_core::TurnId,
+    /// Why the turn ended (completed, tool call, cancelled, etc.).
     pub finish_reason: FinishReason,
+    /// Items produced during this turn (assistant text, tool results, etc.).
     pub items: Vec<Item>,
+    /// Aggregated token usage, if reported by the model.
     pub usage: Option<Usage>,
+    /// Additional metadata about the turn.
     pub metadata: MetadataMap,
 }
 
+/// An interrupt that pauses the agent loop until the host resolves it.
+///
+/// The loop returns an interrupt inside [`LoopStep::Interrupt`] whenever it
+/// cannot proceed autonomously.  The host must resolve the interrupt
+/// (via [`LoopDriver::resolve_approval`], [`LoopDriver::resolve_auth`], or
+/// [`LoopDriver::submit_input`]) and then call [`LoopDriver::next`] again.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use agentkit_loop::{LoopInterrupt, LoopStep};
+/// # use agentkit_loop::LoopDriver;
+/// # use agentkit_tools_core::ApprovalDecision;
+///
+/// # async fn handle<S: agentkit_loop::ModelSession>(driver: &mut LoopDriver<S>) -> Result<(), agentkit_loop::LoopError> {
+/// match driver.next().await? {
+///     LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(req)) => {
+///         println!("Tool {} needs approval: {}", req.request_kind, req.summary);
+///         driver.resolve_approval(ApprovalDecision::Approve)?;
+///     }
+///     LoopStep::Interrupt(LoopInterrupt::AuthRequest(req)) => {
+///         println!("Auth required from provider: {}", req.provider);
+///         // ... obtain credentials and call driver.resolve_auth(...)
+///     }
+///     LoopStep::Interrupt(LoopInterrupt::AwaitingInput(req)) => {
+///         println!("Waiting for input: {}", req.reason);
+///         // ... call driver.submit_input(...)
+///     }
+///     LoopStep::Finished(result) => {
+///         println!("Turn finished: {:?}", result.finish_reason);
+///     }
+/// }
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LoopInterrupt {
+    /// A tool call requires explicit approval before it can execute.
     ApprovalRequest(ApprovalRequest),
+    /// A tool call requires authentication credentials.
     AuthRequest(AuthRequest),
+    /// The driver has no pending input and needs the host to supply some.
     AwaitingInput(InputRequest),
 }
 
+/// The result of advancing the agent loop by one step.
+///
+/// Returned by [`LoopDriver::next`].  The host should pattern-match on this
+/// to decide whether to continue the loop or resolve an interrupt first.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use agentkit_loop::LoopStep;
+/// # use agentkit_loop::LoopDriver;
+///
+/// # async fn run<S: agentkit_loop::ModelSession>(driver: &mut LoopDriver<S>) -> Result<(), agentkit_loop::LoopError> {
+/// loop {
+///     match driver.next().await? {
+///         LoopStep::Finished(result) => {
+///             println!("Turn complete: {:?}", result.finish_reason);
+///             break;
+///         }
+///         LoopStep::Interrupt(interrupt) => {
+///             // Resolve the interrupt, then continue the loop.
+///             # break;
+///         }
+///     }
+/// }
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum LoopStep {
+    /// The loop is paused and requires host action.
     Interrupt(LoopInterrupt),
+    /// A turn has completed (or been cancelled).
     Finished(TurnResult),
 }
 
+/// A read-only snapshot of the loop driver's current state.
+///
+/// Obtained via [`LoopDriver::snapshot`].  Useful for persisting or
+/// inspecting the conversation transcript without holding a mutable
+/// reference to the driver.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LoopSnapshot {
+    /// Session identifier.
     pub session_id: SessionId,
+    /// The full transcript accumulated so far.
     pub transcript: Vec<Item>,
+    /// Input items queued but not yet consumed by a turn.
     pub pending_input: Vec<Item>,
 }
 
@@ -188,6 +476,36 @@ struct PendingAuthToolCall {
     tool_request: ToolRequest,
 }
 
+/// A configured agent ready to start a session.
+///
+/// Build one with [`Agent::builder`], supplying at minimum a [`ModelAdapter`].
+/// Then call [`Agent::start`] with a [`SessionConfig`] to obtain a
+/// [`LoopDriver`] that drives the agentic loop.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use agentkit_core::{MetadataMap, SessionId};
+/// use agentkit_loop::{Agent, SessionConfig, LoopStep};
+/// use agentkit_tools_core::ToolRegistry;
+///
+/// # async fn example<M: agentkit_loop::ModelAdapter>(adapter: M) -> Result<(), agentkit_loop::LoopError> {
+/// let agent = Agent::builder()
+///     .model(adapter)
+///     .tools(ToolRegistry::new())
+///     .build()?;
+///
+/// let mut driver = agent
+///     .start(SessionConfig {
+///         session_id: SessionId::new("s1"),
+///         metadata: MetadataMap::new(),
+///     })
+///     .await?;
+///
+/// // Submit input and advance
+/// # Ok(())
+/// # }
+/// ```
 pub struct Agent<M>
 where
     M: ModelAdapter,
@@ -205,20 +523,27 @@ impl<M> Agent<M>
 where
     M: ModelAdapter,
 {
+    /// Create a new [`AgentBuilder`] for configuring this agent.
     pub fn builder() -> AgentBuilder<M> {
         AgentBuilder::default()
     }
 
+    /// Consume the agent and start a new session, returning a [`LoopDriver`].
+    ///
+    /// This calls [`ModelAdapter::start_session`] and emits an
+    /// [`AgentEvent::RunStarted`] event to all registered observers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoopError`] if the model adapter fails to create a session.
     pub async fn start(self, config: SessionConfig) -> Result<LoopDriver<M::Session>, LoopError> {
         let session_id = config.session_id.clone();
         let session = self.model.start_session(config).await?;
         let tool_executor = Arc::new(BasicToolExecutor::new(self.tools.clone()));
-        let tool_specs = tool_executor.specs();
         let mut driver = LoopDriver {
             session_id: session_id.clone(),
             session: Some(session),
             tool_executor,
-            tool_specs,
             permissions: self.permissions,
             resources: self.resources,
             cancellation: self.cancellation,
@@ -236,6 +561,11 @@ where
     }
 }
 
+/// Builder for constructing an [`Agent`].
+///
+/// Obtained via [`Agent::builder`].  The only required field is
+/// [`model`](AgentBuilder::model); all others have sensible defaults
+/// (no tools, allow-all permissions, no compaction, no observers).
 pub struct AgentBuilder<M>
 where
     M: ModelAdapter,
@@ -270,41 +600,60 @@ impl<M> AgentBuilder<M>
 where
     M: ModelAdapter,
 {
+    /// Set the model adapter (required).
     pub fn model(mut self, model: M) -> Self {
         self.model = Some(model);
         self
     }
 
+    /// Set the tool registry.  Defaults to an empty [`ToolRegistry`].
     pub fn tools(mut self, tools: ToolRegistry) -> Self {
         self.tools = tools;
         self
     }
 
+    /// Set the permission checker that gates tool execution.
+    ///
+    /// Defaults to allowing all tool calls without prompting.
     pub fn permissions(mut self, permissions: impl PermissionChecker + 'static) -> Self {
         self.permissions = Arc::new(permissions);
         self
     }
 
+    /// Set shared resources available to tool implementations.
     pub fn resources(mut self, resources: impl ToolResources + 'static) -> Self {
         self.resources = Arc::new(resources);
         self
     }
 
+    /// Attach a [`CancellationHandle`] for cooperative cancellation of turns.
     pub fn cancellation(mut self, handle: CancellationHandle) -> Self {
         self.cancellation = Some(handle);
         self
     }
 
+    /// Enable transcript compaction with the given configuration.
+    ///
+    /// When configured, the driver checks the compaction trigger before each
+    /// turn and applies the compaction strategy if the transcript is too long.
     pub fn compaction(mut self, config: CompactionConfig) -> Self {
         self.compaction = Some(config);
         self
     }
 
+    /// Register a [`LoopObserver`] that receives [`AgentEvent`]s.
+    ///
+    /// Multiple observers may be registered; they are called in order.
     pub fn observer(mut self, observer: impl LoopObserver + 'static) -> Self {
         self.observers.push(Box::new(observer));
         self
     }
 
+    /// Consume the builder and produce an [`Agent`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoopError::InvalidState`] if no model adapter was provided.
     pub fn build(self) -> Result<Agent<M>, LoopError> {
         let model = self
             .model
@@ -321,6 +670,44 @@ where
     }
 }
 
+/// The runtime driver that advances the agent loop step by step.
+///
+/// Obtained from [`Agent::start`].  The typical usage pattern is:
+///
+/// 1. Call [`submit_input`](LoopDriver::submit_input) to enqueue user messages.
+/// 2. Call [`next`](LoopDriver::next) to run the next turn.
+/// 3. Handle the returned [`LoopStep`]:
+///    - [`LoopStep::Finished`] -- the turn completed, inspect the result.
+///    - [`LoopStep::Interrupt`] -- resolve the interrupt and call `next` again.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use agentkit_core::{Item, ItemKind, MetadataMap, Part, TextPart};
+/// use agentkit_loop::{LoopDriver, LoopStep};
+///
+/// # async fn drive<S: agentkit_loop::ModelSession>(driver: &mut LoopDriver<S>) -> Result<(), agentkit_loop::LoopError> {
+/// driver.submit_input(vec![Item {
+///     id: None,
+///     kind: ItemKind::User,
+///     parts: vec![Part::Text(TextPart {
+///         text: "Hello!".into(),
+///         metadata: MetadataMap::new(),
+///     })],
+///     metadata: MetadataMap::new(),
+/// }])?;
+///
+/// let step = driver.next().await?;
+/// match step {
+///     LoopStep::Finished(result) => println!("Done: {:?}", result.finish_reason),
+///     LoopStep::Interrupt(interrupt) => {
+///         // Resolve the interrupt (approval, auth, or input), then call next() again.
+///         println!("Interrupted: {interrupt:?}");
+///     }
+/// }
+/// # Ok(())
+/// # }
+/// ```
 pub struct LoopDriver<S>
 where
     S: ModelSession,
@@ -328,7 +715,6 @@ where
     session_id: SessionId,
     session: Option<S>,
     tool_executor: Arc<dyn ToolExecutor>,
-    tool_specs: Vec<ToolSpec>,
     permissions: Arc<dyn PermissionChecker>,
     resources: Arc<dyn ToolResources>,
     cancellation: Option<CancellationHandle>,
@@ -448,7 +834,7 @@ where
                 session_id: self.session_id.clone(),
                 turn_id: turn_id.clone(),
                 transcript: self.transcript.clone(),
-                available_tools: self.tool_specs.clone(),
+                available_tools: self.tool_executor.specs(),
                 metadata: MetadataMap::new(),
             };
 
@@ -862,6 +1248,14 @@ where
         Ok(LoopStep::Finished(turn_result))
     }
 
+    /// Enqueue user input items for the next turn.
+    ///
+    /// Items are buffered and consumed the next time [`next`](LoopDriver::next)
+    /// is called.  Must not be called while an interrupt is pending.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoopError::InvalidState`] if an interrupt is still unresolved.
     pub fn submit_input(&mut self, input: Vec<Item>) -> Result<(), LoopError> {
         if self.state != DriverState::Idle {
             return Err(LoopError::InvalidState(
@@ -876,6 +1270,15 @@ where
         Ok(())
     }
 
+    /// Resolve a pending [`LoopInterrupt::ApprovalRequest`].
+    ///
+    /// After calling this, invoke [`next`](LoopDriver::next) to continue the
+    /// loop.  If the decision is [`ApprovalDecision::Approve`] the tool call
+    /// executes; if denied, an error result is fed back to the model.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoopError::InvalidState`] if no approval is pending.
     pub fn resolve_approval(&mut self, decision: ApprovalDecision) -> Result<(), LoopError> {
         let Some(pending) = self.pending_approval.as_mut() else {
             return Err(LoopError::InvalidState(
@@ -890,6 +1293,16 @@ where
         Ok(())
     }
 
+    /// Resolve a pending [`LoopInterrupt::AuthRequest`].
+    ///
+    /// The resolution must reference the same request id as the pending
+    /// [`AuthRequest`].  After calling this, invoke [`next`](LoopDriver::next)
+    /// to continue the loop.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoopError::InvalidState`] if no auth request is pending or
+    /// if the resolution's request id does not match.
     pub fn resolve_auth(&mut self, resolution: AuthResolution) -> Result<(), LoopError> {
         let Some(pending) = self.pending_auth.as_mut() else {
             return Err(LoopError::InvalidState("no auth request is pending".into()));
@@ -907,6 +1320,7 @@ where
         Ok(())
     }
 
+    /// Take a read-only snapshot of the driver's current transcript and input queue.
     pub fn snapshot(&self) -> LoopSnapshot {
         LoopSnapshot {
             session_id: self.session_id.clone(),
@@ -915,6 +1329,20 @@ where
         }
     }
 
+    /// Advance the loop by one step.
+    ///
+    /// This is the main method for driving the agent.  It processes pending
+    /// interrupt resolutions, consumes queued input, starts a model turn,
+    /// executes tool calls, and returns once the turn finishes or an
+    /// interrupt occurs.
+    ///
+    /// If no input is queued and no interrupt is pending, returns
+    /// [`LoopStep::Interrupt(LoopInterrupt::AwaitingInput(..))`](LoopInterrupt::AwaitingInput).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoopError::InvalidState`] if called while an unresolved
+    /// interrupt is pending, or propagates provider / tool / compaction errors.
     pub async fn next(&mut self) -> Result<LoopStep, LoopError> {
         if self.state != DriverState::Idle {
             return Err(LoopError::InvalidState(
@@ -1050,18 +1478,25 @@ impl PermissionChecker for AllowAllPermissions {
     }
 }
 
+/// Errors that can occur while driving the agent loop.
 #[derive(Debug, Error)]
 pub enum LoopError {
+    /// The driver was in an unexpected state for the requested operation.
     #[error("invalid driver state: {0}")]
     InvalidState(String),
+    /// The current turn was cancelled via the [`CancellationHandle`].
     #[error("turn cancelled")]
     Cancelled,
+    /// An error originating from the model provider.
     #[error("provider error: {0}")]
     Provider(String),
+    /// An error originating from tool execution.
     #[error("tool error: {0}")]
     Tool(#[from] ToolError),
+    /// An error that occurred during transcript compaction.
     #[error("compaction error: {0}")]
     Compaction(String),
+    /// The requested operation is not supported.
     #[error("unsupported operation: {0}")]
     Unsupported(String),
 }
@@ -1069,6 +1504,7 @@ pub enum LoopError {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc as StdArc, Mutex as StdMutex};
 
     use agentkit_compaction::{CompactionPipeline, CompactionTrigger, KeepRecentStrategy};
@@ -1085,15 +1521,25 @@ mod tests {
 
     struct FakeAdapter;
     struct SlowAdapter;
+    struct RecordingAdapter {
+        seen_descriptions: StdArc<StdMutex<Vec<Vec<String>>>>,
+    }
 
     struct FakeSession;
     struct SlowSession;
+    struct RecordingSession {
+        seen_descriptions: StdArc<StdMutex<Vec<Vec<String>>>>,
+    }
 
     struct FakeTurn {
         events: VecDeque<ModelTurnEvent>,
     }
 
     struct SlowTurn {
+        emitted: bool,
+    }
+
+    struct RecordingTurn {
         emitted: bool,
     }
 
@@ -1112,6 +1558,17 @@ mod tests {
 
         async fn start_session(&self, _config: SessionConfig) -> Result<Self::Session, LoopError> {
             Ok(SlowSession)
+        }
+    }
+
+    #[async_trait]
+    impl ModelAdapter for RecordingAdapter {
+        type Session = RecordingSession;
+
+        async fn start_session(&self, _config: SessionConfig) -> Result<Self::Session, LoopError> {
+            Ok(RecordingSession {
+                seen_descriptions: self.seen_descriptions.clone(),
+            })
         }
     }
 
@@ -1229,6 +1686,26 @@ mod tests {
     }
 
     #[async_trait]
+    impl ModelSession for RecordingSession {
+        type Turn = RecordingTurn;
+
+        async fn begin_turn(
+            &mut self,
+            request: TurnRequest,
+            _cancellation: Option<TurnCancellation>,
+        ) -> Result<Self::Turn, LoopError> {
+            let descriptions = request
+                .available_tools
+                .iter()
+                .map(|tool| tool.description.clone())
+                .collect::<Vec<_>>();
+            self.seen_descriptions.lock().unwrap().push(descriptions);
+
+            Ok(RecordingTurn { emitted: false })
+        }
+    }
+
+    #[async_trait]
     impl ModelTurn for FakeTurn {
         async fn next_event(
             &mut self,
@@ -1250,6 +1727,34 @@ mod tests {
                 return Err(LoopError::Cancelled);
             }
 
+            if self.emitted {
+                Ok(None)
+            } else {
+                self.emitted = true;
+                Ok(Some(ModelTurnEvent::Finished(ModelTurnResult {
+                    finish_reason: FinishReason::Completed,
+                    output_items: vec![Item {
+                        id: None,
+                        kind: ItemKind::Assistant,
+                        parts: vec![Part::Text(TextPart {
+                            text: "done".into(),
+                            metadata: MetadataMap::new(),
+                        })],
+                        metadata: MetadataMap::new(),
+                    }],
+                    usage: None,
+                    metadata: MetadataMap::new(),
+                })))
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ModelTurn for RecordingTurn {
+        async fn next_event(
+            &mut self,
+            _cancellation: Option<TurnCancellation>,
+        ) -> Result<Option<ModelTurnEvent>, LoopError> {
             if self.emitted {
                 Ok(None)
             } else {
@@ -1298,6 +1803,31 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct DynamicSpecTool {
+        spec: ToolSpec,
+        version: StdArc<AtomicUsize>,
+    }
+
+    impl DynamicSpecTool {
+        fn new(version: StdArc<AtomicUsize>) -> Self {
+            Self {
+                spec: ToolSpec {
+                    name: ToolName::new("dynamic"),
+                    description: "dynamic version 0".into(),
+                    input_schema: json!({
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": false
+                    }),
+                    annotations: ToolAnnotations::default(),
+                    metadata: MetadataMap::new(),
+                },
+                version,
+            }
+        }
+    }
+
     #[async_trait]
     impl Tool for EchoTool {
         fn spec(&self) -> &ToolSpec {
@@ -1334,6 +1864,39 @@ mod tests {
                 result: ToolResultPart {
                     call_id: request.call_id,
                     output: ToolOutput::Text(value.into()),
+                    is_error: false,
+                    metadata: MetadataMap::new(),
+                },
+                duration: None,
+                metadata: MetadataMap::new(),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl Tool for DynamicSpecTool {
+        fn spec(&self) -> &ToolSpec {
+            &self.spec
+        }
+
+        fn current_spec(&self) -> Option<ToolSpec> {
+            let mut spec = self.spec.clone();
+            spec.description = format!(
+                "dynamic version {}",
+                self.version.load(Ordering::SeqCst)
+            );
+            Some(spec)
+        }
+
+        async fn invoke(
+            &self,
+            request: agentkit_tools_core::ToolRequest,
+            _ctx: &mut ToolContext<'_>,
+        ) -> Result<ToolResult, agentkit_tools_core::ToolError> {
+            Ok(ToolResult {
+                result: ToolResultPart {
+                    call_id: request.call_id,
+                    output: ToolOutput::Text("ok".into()),
                     is_error: false,
                     metadata: MetadataMap::new(),
                 },
@@ -1763,5 +2326,52 @@ mod tests {
                 ..
             } if *replaced_items > 0
         )));
+    }
+
+    #[tokio::test]
+    async fn loop_refreshes_tool_specs_each_turn() {
+        let seen_descriptions = StdArc::new(StdMutex::new(Vec::new()));
+        let version = StdArc::new(AtomicUsize::new(1));
+        let tools = ToolRegistry::new().with(DynamicSpecTool::new(version.clone()));
+        let agent = Agent::builder()
+            .model(RecordingAdapter {
+                seen_descriptions: seen_descriptions.clone(),
+            })
+            .tools(tools)
+            .permissions(AllowAllPermissions)
+            .build()
+            .unwrap();
+
+        let mut driver = agent
+            .start(SessionConfig {
+                session_id: SessionId::new("session-dynamic-tools"),
+                metadata: MetadataMap::new(),
+            })
+            .await
+            .unwrap();
+
+        for text in ["first", "second"] {
+            driver
+                .submit_input(vec![Item {
+                    id: None,
+                    kind: ItemKind::User,
+                    parts: vec![Part::Text(TextPart {
+                        text: text.into(),
+                        metadata: MetadataMap::new(),
+                    })],
+                    metadata: MetadataMap::new(),
+                }])
+                .unwrap();
+
+            let _ = driver.next().await.unwrap();
+            if text == "first" {
+                version.store(2, Ordering::SeqCst);
+            }
+        }
+
+        let seen_descriptions = seen_descriptions.lock().unwrap();
+        assert_eq!(seen_descriptions.len(), 2);
+        assert_eq!(seen_descriptions[0], vec!["dynamic version 1".to_string()]);
+        assert_eq!(seen_descriptions[1], vec!["dynamic version 2".to_string()]);
     }
 }

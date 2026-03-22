@@ -1,7 +1,7 @@
 [package]
-description = "Context loading for AGENTS.md files in agentkit."
+description = "Agent Skills tool for progressive skill discovery and activation in agentkit."
 homepage.workspace = true
-name = "agentkit-context"
+name = "agentkit-tool-skills"
 readme = "README.md"
 repository.workspace = true
 version.workspace = true
@@ -11,10 +11,15 @@ rust-version.workspace = true
 
 [dependencies]
 agentkit-core = { version = "0.1.0", path = "../agentkit-core" }
+agentkit-tools-core = { version = "0.1.0", path = "../agentkit-tools-core" }
 async-fs = "2.2.0"
 async-trait.workspace = true
+futures-lite = "2.6.1"
+serde.workspace = true
 serde_json.workspace = true
+serde-saphyr = "0.0.8"
 thiserror.workspace = true
 
 [dev-dependencies]
+agentkit-capabilities = { version = "0.1.0", path = "../agentkit-capabilities" }
 tokio.workspace = true

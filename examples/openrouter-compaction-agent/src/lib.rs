@@ -439,7 +439,7 @@ impl RecordingObserver {
     fn compaction_events(&self) -> Vec<CompactionEventRecord> {
         self.compaction_events
             .lock()
-            .expect("observer poisoned")
+            .unwrap_or_else(|err| err.into_inner())
             .clone()
     }
 }
@@ -448,7 +448,10 @@ impl LoopObserver for RecordingObserver {
     fn handle_event(&mut self, event: AgentEvent) {
         match event {
             AgentEvent::CompactionStarted { reason, .. } => {
-                *self.pending_reason.lock().expect("observer poisoned") = Some(reason);
+                *self
+                    .pending_reason
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner()) = Some(reason);
             }
             AgentEvent::CompactionFinished {
                 replaced_items,
@@ -459,11 +462,11 @@ impl LoopObserver for RecordingObserver {
                 let reason = self
                     .pending_reason
                     .lock()
-                    .expect("observer poisoned")
+                    .unwrap_or_else(|err| err.into_inner())
                     .take();
                 self.compaction_events
                     .lock()
-                    .expect("observer poisoned")
+                    .unwrap_or_else(|err| err.into_inner())
                     .push(CompactionEventRecord {
                         reason,
                         replaced_items,

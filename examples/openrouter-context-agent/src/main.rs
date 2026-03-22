@@ -2,16 +2,17 @@ use std::env;
 use std::io;
 use std::path::PathBuf;
 
-use agentkit_context::{AgentsMd, ContextLoader, SkillsDirectory};
+use agentkit_context::{AgentsMd, ContextLoader};
 use agentkit_core::{Item, ItemKind, MetadataMap, Part, SessionId, TextPart};
 use agentkit_loop::{Agent, LoopInterrupt, LoopStep, SessionConfig};
 use agentkit_provider_openrouter::{OpenRouterAdapter, OpenRouterConfig};
 use agentkit_reporting::{CompositeReporter, StdoutReporter};
+use agentkit_tool_skills::SkillRegistry;
 
 const SYSTEM_PROMPT: &str = "\
 You are a careful repository assistant.
 Use the loaded context items as authoritative project guidance.
-If the user asks about project instructions or skills, answer from the provided context before making assumptions.
+When a task matches a skill's description, activate it before proceeding.
 Prefer concise answers.
 ";
 
@@ -20,18 +21,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
 
     let args = Args::parse()?;
+
+    // Load project-level instructions (AGENTS.md) eagerly — these are small.
     let context_items = ContextLoader::new()
         .with_source(AgentsMd::discover(&args.context_root))
-        .with_source(SkillsDirectory::from_dir(args.context_root.join("skills")))
         .load()
         .await?;
+
+    // Discover skills progressively — catalog in tool description, body on demand.
+    let skill_registry = SkillRegistry::from_paths(vec![
+        args.context_root.join("skills"),
+        args.context_root.join(".agents/skills"),
+    ])
+    .discover_skills()
+    .await;
 
     let config = OpenRouterConfig::from_env()?;
     let adapter = OpenRouterAdapter::new(config)?;
     let reporter =
         CompositeReporter::new().with_observer(StdoutReporter::new(io::stderr()).with_usage(false));
 
-    let agent = Agent::builder().model(adapter).observer(reporter).build()?;
+    let mut builder = Agent::builder().model(adapter).observer(reporter);
+
+    // Only add the skill tool if skills were discovered.
+    if skill_registry.has_skills() {
+        builder = builder.tools(skill_registry.tool_registry());
+    }
+
+    let agent = builder.build()?;
 
     let mut driver = agent
         .start(SessionConfig {
@@ -124,11 +141,11 @@ where
             }
             Ok(())
         }
-        LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(request)) => {
-            Err(format!("unexpected approval request: {}", request.summary).into())
+        LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(req)) => {
+            Err(format!("unexpected approval request: {}", req.summary).into())
         }
-        LoopStep::Interrupt(LoopInterrupt::AuthRequest(request)) => {
-            Err(format!("unexpected auth request from {}", request.provider).into())
+        LoopStep::Interrupt(LoopInterrupt::AuthRequest(req)) => {
+            Err(format!("unexpected auth request from {}", req.provider).into())
         }
         LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_)) => {
             Err("loop requested more input before finishing".into())

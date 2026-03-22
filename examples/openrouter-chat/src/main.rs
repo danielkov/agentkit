@@ -26,7 +26,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
         println!("openrouter-chat");
-        println!("Type a prompt and press enter. Use /exit to quit. Press Ctrl-C to cancel the current turn.");
+        println!(
+            "Type a prompt and press enter. Use /exit to quit. Press Ctrl-C to cancel the current turn."
+        );
         repl(&mut driver, cancellation).await?;
     } else {
         let prompt = args.join(" ");

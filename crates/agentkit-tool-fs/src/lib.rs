@@ -1,3 +1,32 @@
+//! Filesystem tools and session-scoped policies for agentkit.
+//!
+//! This crate provides a set of tools that let an agent interact with the
+//! local filesystem: reading, writing, replacing, moving, deleting files,
+//! listing directories, and creating directories. All tools implement the
+//! [`Tool`](agentkit_tools_core::Tool) trait and can be registered with a
+//! [`ToolRegistry`](agentkit_tools_core::ToolRegistry).
+//!
+//! The crate also provides [`FileSystemToolResources`] and
+//! [`FileSystemToolPolicy`] for enforcing session-scoped access rules such
+//! as requiring a path to be read before it can be modified.
+//!
+//! # Quick start
+//!
+//! ```rust
+//! use agentkit_tool_fs::{registry, FileSystemToolPolicy, FileSystemToolResources};
+//!
+//! // Get a registry with all seven filesystem tools.
+//! let reg = registry();
+//! assert_eq!(reg.specs().len(), 7);
+//!
+//! // Optionally configure a policy to guard mutations.
+//! let resources = FileSystemToolResources::new()
+//!     .with_policy(
+//!         FileSystemToolPolicy::new()
+//!             .require_read_before_write(true),
+//!     );
+//! ```
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -15,6 +44,21 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use thiserror::Error;
 
+/// Creates a [`ToolRegistry`] pre-populated with all filesystem tools.
+///
+/// The returned registry contains [`ReadFileTool`], [`WriteFileTool`],
+/// [`ReplaceInFileTool`], [`MoveTool`], [`DeleteTool`], [`ListDirectoryTool`],
+/// and [`CreateDirectoryTool`], each with default configuration.
+///
+/// # Example
+///
+/// ```rust
+/// use agentkit_tool_fs::registry;
+///
+/// let reg = registry();
+/// let specs = reg.specs();
+/// assert_eq!(specs.len(), 7);
+/// ```
 pub fn registry() -> ToolRegistry {
     ToolRegistry::new()
         .with(ReadFileTool::default())
@@ -26,27 +70,56 @@ pub fn registry() -> ToolRegistry {
         .with(CreateDirectoryTool::default())
 }
 
+/// Errors specific to filesystem tool operations.
+///
+/// These are domain errors that arise from invalid arguments or unsupported
+/// paths rather than I/O failures. They are typically converted into
+/// [`ToolError::InvalidInput`](agentkit_tools_core::ToolError::InvalidInput)
+/// before being returned to the caller.
 #[derive(Debug, Error)]
 pub enum FileSystemToolError {
+    /// The given path cannot be represented as valid UTF-8.
     #[error("path {0} is not valid UTF-8")]
     InvalidUtf8Path(PathBuf),
+    /// The requested line range is invalid (e.g. `from` exceeds `to`).
     #[error("invalid line range: from={from:?} to={to:?}")]
     InvalidLineRange {
+        /// 1-based inclusive start line, if specified.
         from: Option<usize>,
+        /// 1-based inclusive end line, if specified.
         to: Option<usize>,
     },
 }
 
+/// Policy governing session-scoped filesystem access rules.
+///
+/// Policies are enforced by [`FileSystemToolResources`] on a per-session basis.
+/// The primary policy today is `require_read_before_write`, which prevents an
+/// agent from mutating a path it has not first inspected (via read or list).
+///
+/// # Example
+///
+/// ```rust
+/// use agentkit_tool_fs::FileSystemToolPolicy;
+///
+/// let policy = FileSystemToolPolicy::new()
+///     .require_read_before_write(true);
+/// ```
 #[derive(Clone, Debug, Default)]
 pub struct FileSystemToolPolicy {
     require_read_before_write: bool,
 }
 
 impl FileSystemToolPolicy {
+    /// Creates a new policy with all rules disabled.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// When enabled, the agent must read (or list) a path before it can write,
+    /// replace, move, or delete it. This helps prevent accidental overwrites.
+    ///
+    /// Defaults to `false`.
     pub fn require_read_before_write(mut self, value: bool) -> Self {
         self.require_read_before_write = value;
         self
@@ -58,6 +131,28 @@ struct SessionAccessState {
     inspected_paths: BTreeSet<PathBuf>,
 }
 
+/// Session-scoped resource state for filesystem tools.
+///
+/// `FileSystemToolResources` implements
+/// [`ToolResources`](agentkit_tools_core::ToolResources) and tracks which paths
+/// each session has inspected. Combined with a [`FileSystemToolPolicy`], it
+/// enforces rules such as requiring a read before a write.
+///
+/// Pass an instance as the `resources` field of
+/// [`ToolContext`](agentkit_tools_core::ToolContext) so that filesystem tools
+/// can record and check access.
+///
+/// # Example
+///
+/// ```rust
+/// use agentkit_tool_fs::{FileSystemToolPolicy, FileSystemToolResources};
+///
+/// let resources = FileSystemToolResources::new()
+///     .with_policy(
+///         FileSystemToolPolicy::new()
+///             .require_read_before_write(true),
+///     );
+/// ```
 #[derive(Default)]
 pub struct FileSystemToolResources {
     policy: FileSystemToolPolicy,
@@ -65,32 +160,47 @@ pub struct FileSystemToolResources {
 }
 
 impl FileSystemToolResources {
+    /// Creates a new resource instance with all policies disabled.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Sets the [`FileSystemToolPolicy`] that governs mutation guards.
     pub fn with_policy(mut self, policy: FileSystemToolPolicy) -> Self {
         self.policy = policy;
         self
     }
 
+    /// Records that the given path was read during `session_id`.
+    ///
+    /// This marks the path as inspected, satisfying any
+    /// `require_read_before_write` policy for subsequent mutations.
     pub fn record_read(&self, session_id: &SessionId, path: &Path) {
         self.record_inspected_path(session_id, path);
     }
 
+    /// Records that the given directory was listed during `session_id`.
+    ///
+    /// Like [`record_read`](Self::record_read), this marks the path as
+    /// inspected.
     pub fn record_list(&self, session_id: &SessionId, path: &Path) {
         self.record_inspected_path(session_id, path);
     }
 
+    /// Records that the given path was written during `session_id`.
+    ///
+    /// After a write the path is considered inspected, so subsequent mutations
+    /// are allowed without an additional read.
     pub fn record_written(&self, session_id: &SessionId, path: &Path) {
         self.record_inspected_path(session_id, path);
     }
 
+    /// Records that a path was moved from `from` to `to` during `session_id`.
+    ///
+    /// The old path is removed from the inspected set and the new path is
+    /// added.
     pub fn record_moved(&self, session_id: &SessionId, from: &Path, to: &Path) {
-        let mut sessions = self
-            .sessions
-            .lock()
-            .expect("filesystem tool resources poisoned");
+        let mut sessions = self.sessions.lock().unwrap_or_else(|err| err.into_inner());
         let state = sessions.entry(session_id.clone()).or_default();
         state.inspected_paths.remove(from);
         state.inspected_paths.insert(to.to_path_buf());
@@ -111,10 +221,7 @@ impl FileSystemToolResources {
             return Err(read_before_write_denial(action, path));
         };
 
-        let sessions = self
-            .sessions
-            .lock()
-            .expect("filesystem tool resources poisoned");
+        let sessions = self.sessions.lock().unwrap_or_else(|err| err.into_inner());
         let Some(state) = sessions.get(session_id) else {
             return Err(read_before_write_denial(action, path));
         };
@@ -133,7 +240,7 @@ impl FileSystemToolResources {
     fn record_inspected_path(&self, session_id: &SessionId, path: &Path) {
         self.sessions
             .lock()
-            .expect("filesystem tool resources poisoned")
+            .unwrap_or_else(|err| err.into_inner())
             .entry(session_id.clone())
             .or_default()
             .inspected_paths
@@ -147,6 +254,22 @@ impl ToolResources for FileSystemToolResources {
     }
 }
 
+/// Reads a UTF-8 text file, optionally limited to a 1-based inclusive line range.
+///
+/// Tool name: `fs.read_file`
+///
+/// When [`FileSystemToolResources`] is available in the tool context, a
+/// successful read marks the path as inspected for the current session.
+///
+/// # Example
+///
+/// ```rust
+/// use agentkit_tool_fs::ReadFileTool;
+/// use agentkit_tools_core::Tool;
+///
+/// let tool = ReadFileTool::default();
+/// assert_eq!(&tool.spec().name.0, "fs.read_file");
+/// ```
 #[derive(Clone, Debug)]
 pub struct ReadFileTool {
     spec: ToolSpec,
@@ -238,6 +361,23 @@ impl Tool for ReadFileTool {
     }
 }
 
+/// Writes UTF-8 text to a file, creating parent directories if needed.
+///
+/// Tool name: `fs.write_file`
+///
+/// If `require_read_before_write` is active and the target file already exists,
+/// this tool will refuse to execute unless the path was previously inspected
+/// during the same session.
+///
+/// # Example
+///
+/// ```rust
+/// use agentkit_tool_fs::WriteFileTool;
+/// use agentkit_tools_core::Tool;
+///
+/// let tool = WriteFileTool::default();
+/// assert_eq!(&tool.spec().name.0, "fs.write_file");
+/// ```
 #[derive(Clone, Debug)]
 pub struct WriteFileTool {
     spec: ToolSpec,
@@ -347,6 +487,22 @@ impl Tool for WriteFileTool {
     }
 }
 
+/// Replaces exact text within a UTF-8 file.
+///
+/// Tool name: `fs.replace_in_file`
+///
+/// Fails if the search text is not found. Supports replacing only the first
+/// occurrence (default) or all occurrences via the `replace_all` input flag.
+///
+/// # Example
+///
+/// ```rust
+/// use agentkit_tool_fs::ReplaceInFileTool;
+/// use agentkit_tools_core::Tool;
+///
+/// let tool = ReplaceInFileTool::default();
+/// assert_eq!(&tool.spec().name.0, "fs.replace_in_file");
+/// ```
 #[derive(Clone, Debug)]
 pub struct ReplaceInFileTool {
     spec: ToolSpec,
@@ -469,6 +625,23 @@ impl Tool for ReplaceInFileTool {
     }
 }
 
+/// Moves or renames a file or directory.
+///
+/// Tool name: `fs.move`
+///
+/// Optionally creates parent directories for the destination and can overwrite
+/// an existing target when `overwrite` is set. Subject to `require_read_before_write`
+/// policy on the source path.
+///
+/// # Example
+///
+/// ```rust
+/// use agentkit_tool_fs::MoveTool;
+/// use agentkit_tools_core::Tool;
+///
+/// let tool = MoveTool::default();
+/// assert_eq!(&tool.spec().name.0, "fs.move");
+/// ```
 #[derive(Clone, Debug)]
 pub struct MoveTool {
     spec: ToolSpec,
@@ -595,6 +768,22 @@ impl Tool for MoveTool {
     }
 }
 
+/// Deletes a file or directory.
+///
+/// Tool name: `fs.delete`
+///
+/// For directories, set `recursive` to remove non-empty directories. The
+/// `missing_ok` flag suppresses errors when the target does not exist.
+///
+/// # Example
+///
+/// ```rust
+/// use agentkit_tool_fs::DeleteTool;
+/// use agentkit_tools_core::Tool;
+///
+/// let tool = DeleteTool::default();
+/// assert_eq!(&tool.spec().name.0, "fs.delete");
+/// ```
 #[derive(Clone, Debug)]
 pub struct DeleteTool {
     spec: ToolSpec,
@@ -697,6 +886,23 @@ impl Tool for DeleteTool {
     }
 }
 
+/// Lists entries in a directory.
+///
+/// Tool name: `fs.list_directory`
+///
+/// Returns a JSON array of objects with `name`, `path`, and `kind` (one of
+/// `"file"`, `"directory"`, or `"symlink"`) for each entry. A successful list
+/// marks the directory as inspected for `require_read_before_write` purposes.
+///
+/// # Example
+///
+/// ```rust
+/// use agentkit_tool_fs::ListDirectoryTool;
+/// use agentkit_tools_core::Tool;
+///
+/// let tool = ListDirectoryTool::default();
+/// assert_eq!(&tool.spec().name.0, "fs.list_directory");
+/// ```
 #[derive(Clone, Debug)]
 pub struct ListDirectoryTool {
     spec: ToolSpec,
@@ -804,6 +1010,22 @@ impl Tool for ListDirectoryTool {
     }
 }
 
+/// Creates a directory and any missing parent directories.
+///
+/// Tool name: `fs.create_directory`
+///
+/// This is idempotent: calling it on an already-existing directory succeeds
+/// without error.
+///
+/// # Example
+///
+/// ```rust
+/// use agentkit_tool_fs::CreateDirectoryTool;
+/// use agentkit_tools_core::Tool;
+///
+/// let tool = CreateDirectoryTool::default();
+/// assert_eq!(&tool.spec().name.0, "fs.create_directory");
+/// ```
 #[derive(Clone, Debug)]
 pub struct CreateDirectoryTool {
     spec: ToolSpec,

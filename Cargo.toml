@@ -11,6 +11,7 @@ members = [
     "crates/agentkit-reporting",
     "crates/agentkit-tool-fs",
     "crates/agentkit-tool-shell",
+    "crates/agentkit-tool-skills",
     "crates/agentkit-mcp",
     "examples/openrouter-chat",
     "examples/openrouter-coding-agent",

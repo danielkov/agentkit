@@ -2,6 +2,7 @@
 description = "Feature-gated umbrella crate for building agent applications with agentkit."
 homepage.workspace = true
 name = "agentkit"
+readme = "README.md"
 repository.workspace = true
 version.workspace = true
 edition.workspace = true
@@ -19,6 +20,7 @@ agentkit-provider-openrouter = { version = "0.1.0", path = "../agentkit-provider
 agentkit-reporting = { version = "0.1.0", path = "../agentkit-reporting", optional = true }
 agentkit-tool-fs = { version = "0.1.0", path = "../agentkit-tool-fs", optional = true }
 agentkit-tool-shell = { version = "0.1.0", path = "../agentkit-tool-shell", optional = true }
+agentkit-tool-skills = { version = "0.1.0", path = "../agentkit-tool-skills", optional = true }
 agentkit-tools-core = { version = "0.1.0", path = "../agentkit-tools-core", optional = true }
 
 [features]
@@ -34,3 +36,4 @@ provider-openrouter = ["dep:agentkit-provider-openrouter", "loop"]
 reporting = ["dep:agentkit-reporting", "loop"]
 tool-fs = ["dep:agentkit-tool-fs", "tools"]
 tool-shell = ["dep:agentkit-tool-shell", "tools"]
+tool-skills = ["dep:agentkit-tool-skills", "tools"]

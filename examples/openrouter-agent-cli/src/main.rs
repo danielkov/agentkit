@@ -7,7 +7,8 @@ use agentkit_compaction::{
     CompactionConfig, CompactionPipeline, DropFailedToolResultsStrategy, DropReasoningStrategy,
     ItemCountTrigger, KeepRecentStrategy,
 };
-use agentkit_context::{AgentsMd, ContextLoader, SkillsDirectory};
+use agentkit_context::{AgentsMd, ContextLoader};
+use agentkit_tool_skills::SkillRegistry;
 use agentkit_core::{Item, ItemKind, MetadataMap, Part, SessionId, TextPart};
 use agentkit_loop::{Agent, LoopInterrupt, LoopStep, SessionConfig};
 use agentkit_mcp::{
@@ -48,12 +49,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .with_source(
             AgentsMd::discover_all(&context_root).with_search_dir(context_root.join(".agent")),
         )
-        .with_source(
-            SkillsDirectory::from_dir(context_root.join("skills"))
-                .with_dir(context_root.join(".agent/skills")),
-        )
         .load()
         .await?;
+
+    // Discover skills progressively — catalog in tool description, body on demand.
+    let skill_registry = SkillRegistry::from_paths(vec![
+        context_root.join("skills"),
+        context_root.join(".agent/skills"),
+        context_root.join(".agents/skills"),
+    ])
+    .discover_skills()
+    .await;
 
     let config = OpenRouterConfig::from_env()?
         .with_temperature(0.0)
@@ -65,6 +71,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut tools = ToolRegistry::new();
     merge_registry(&mut tools, agentkit_tool_fs::registry());
     merge_registry(&mut tools, agentkit_tool_shell::registry());
+    skill_registry.register_tool(&mut tools);
 
     let mut manager = if args.mcp_mock {
         let mut manager = McpServerManager::new().with_server(McpServerConfig::new(
