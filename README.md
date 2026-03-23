@@ -180,4 +180,3 @@ The main remaining work is polish and hardening rather than missing foundation:
 - richer docs and onboarding polish
 - deeper built-in tool ergonomics
 - more end-to-end examples and integration coverage
-
