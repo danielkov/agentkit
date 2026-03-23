@@ -32,7 +32,7 @@ use agentkit_capabilities::{
     ResourceProvider,
 };
 use agentkit_core::{
-    ApprovalId, Item, ItemKind, MetadataMap, Part, SessionId, ToolCallId, ToolOutput,
+    ApprovalId, Item, ItemKind, MetadataMap, Part, SessionId, TaskId, ToolCallId, ToolOutput,
     ToolResultPart, TurnCancellation, TurnId,
 };
 use async_trait::async_trait;
@@ -231,6 +231,43 @@ pub struct ToolContext<'a> {
     pub cancellation: Option<TurnCancellation>,
 }
 
+/// Owned execution context that can outlive a single stack frame.
+///
+/// This is useful for schedulers or task managers that need to move a tool
+/// execution onto another task while still constructing the borrowed
+/// [`ToolContext`] expected by existing tool implementations.
+#[derive(Clone)]
+pub struct OwnedToolContext {
+    /// Session identifier for the invocation.
+    pub session_id: SessionId,
+    /// Turn identifier for the invocation.
+    pub turn_id: TurnId,
+    /// Arbitrary invocation metadata.
+    pub metadata: MetadataMap,
+    /// Shared permission checker.
+    pub permissions: Arc<dyn PermissionChecker>,
+    /// Shared resources injected by the host.
+    pub resources: Arc<dyn ToolResources>,
+    /// Cooperative cancellation signal for the invocation.
+    pub cancellation: Option<TurnCancellation>,
+}
+
+impl OwnedToolContext {
+    /// Creates a borrowed [`ToolContext`] view over this owned context.
+    pub fn borrowed(&self) -> ToolContext<'_> {
+        ToolContext {
+            capability: CapabilityContext {
+                session_id: Some(&self.session_id),
+                turn_id: Some(&self.turn_id),
+                metadata: &self.metadata,
+            },
+            permissions: self.permissions.as_ref(),
+            resources: self.resources.as_ref(),
+            cancellation: self.cancellation.clone(),
+        }
+    }
+}
+
 /// A description of an operation that requires permission before it can proceed.
 ///
 /// Tool implementations return `PermissionRequest` objects from
@@ -334,6 +371,8 @@ pub enum ApprovalReason {
 /// loop can re-submit the tool call via [`ToolExecutor::execute_approved`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalRequest {
+    /// Runtime task identifier associated with this approval request, if any.
+    pub task_id: Option<TaskId>,
     /// Stable identifier so the executor can match the approval to its request.
     pub id: ApprovalId,
     /// The [`PermissionRequest::kind`] string that triggered the approval flow.
@@ -365,6 +404,8 @@ pub enum ApprovalDecision {
 /// the user must supply interactively.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthRequest {
+    /// Runtime task identifier associated with this auth request, if any.
+    pub task_id: Option<TaskId>,
     /// Unique identifier for this auth challenge.
     pub id: String,
     /// Name of the authentication provider (e.g. `"github"`, `"google"`).
@@ -918,6 +959,7 @@ impl PermissionPolicy for CustomKindPolicy {
         }
         if self.require_approval_by_default {
             PolicyMatch::RequireApproval(ApprovalRequest {
+                task_id: None,
                 id: ApprovalId::new(format!("approval:{kind}")),
                 request_kind: kind.to_string(),
                 reason: ApprovalReason::PolicyRequiresConfirmation,
@@ -1036,6 +1078,7 @@ impl PermissionPolicy for PathPolicy {
             PolicyMatch::Allow
         } else if self.require_approval_outside_allowed {
             PolicyMatch::RequireApproval(ApprovalRequest {
+                task_id: None,
                 id: ApprovalId::new(format!("approval:{}", fs.kind())),
                 request_kind: fs.kind().to_string(),
                 reason: ApprovalReason::SensitivePath,
@@ -1155,6 +1198,7 @@ impl PermissionPolicy for CommandPolicy {
             && !self.allowed_cwds.iter().any(|root| cwd.starts_with(root))
         {
             return PolicyMatch::RequireApproval(ApprovalRequest {
+                task_id: None,
                 id: ApprovalId::new("approval:shell.cwd"),
                 request_kind: shell.kind().to_string(),
                 reason: ApprovalReason::SensitiveCommand,
@@ -1169,6 +1213,7 @@ impl PermissionPolicy for CommandPolicy {
             PolicyMatch::Allow
         } else if self.require_approval_for_unknown {
             PolicyMatch::RequireApproval(ApprovalRequest {
+                task_id: None,
                 id: ApprovalId::new("approval:shell.command"),
                 request_kind: shell.kind().to_string(),
                 reason: ApprovalReason::SensitiveCommand,
@@ -1251,6 +1296,7 @@ impl PermissionPolicy for McpServerPolicy {
         if !self.trusted_servers.is_empty() && !self.trusted_servers.contains(server_id) {
             return if self.require_approval_for_untrusted {
                 PolicyMatch::RequireApproval(ApprovalRequest {
+                    task_id: None,
                     id: ApprovalId::new(format!("approval:mcp:{server_id}")),
                     request_kind: mcp.kind().to_string(),
                     reason: ApprovalReason::SensitiveServer,
@@ -1634,12 +1680,8 @@ impl ToolCapabilityProvider {
             .tools()
             .into_iter()
             .filter_map(|tool| {
-                ToolInvocableAdapter::new(
-                    tool,
-                    permissions.clone(),
-                    resources.clone(),
-                )
-                .map(|adapter| Arc::new(adapter) as Arc<dyn Invocable>)
+                ToolInvocableAdapter::new(tool, permissions.clone(), resources.clone())
+                    .map(|adapter| Arc::new(adapter) as Arc<dyn Invocable>)
             })
             .collect();
 
@@ -1695,6 +1737,17 @@ pub trait ToolExecutor: Send + Sync {
         ctx: &mut ToolContext<'_>,
     ) -> ToolExecutionOutcome;
 
+    /// Looks up the tool, evaluates permissions, and invokes it using an
+    /// owned execution context.
+    async fn execute_owned(
+        &self,
+        request: ToolRequest,
+        ctx: OwnedToolContext,
+    ) -> ToolExecutionOutcome {
+        let mut borrowed = ctx.borrowed();
+        self.execute(request, &mut borrowed).await
+    }
+
     /// Re-executes a tool call that was previously interrupted for approval.
     ///
     /// The default implementation ignores `approved_request` and delegates
@@ -1708,6 +1761,19 @@ pub trait ToolExecutor: Send + Sync {
     ) -> ToolExecutionOutcome {
         let _ = approved_request;
         self.execute(request, ctx).await
+    }
+
+    /// Re-executes a tool call that was previously interrupted for approval
+    /// using an owned execution context.
+    async fn execute_approved_owned(
+        &self,
+        request: ToolRequest,
+        approved_request: &ApprovalRequest,
+        ctx: OwnedToolContext,
+    ) -> ToolExecutionOutcome {
+        let mut borrowed = ctx.borrowed();
+        self.execute_approved(request, approved_request, &mut borrowed)
+            .await
     }
 }
 

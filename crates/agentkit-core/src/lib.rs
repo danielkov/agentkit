@@ -140,6 +140,14 @@ id_newtype!(
     ToolResultId
 );
 id_newtype!(
+    /// Identifies a task tracked by a task manager.
+    ///
+    /// Unlike [`ToolCallId`], which is model/provider-facing, `TaskId` is a
+    /// runtime-facing identifier used to inspect, cancel, or correlate work
+    /// managed by a task scheduler.
+    TaskId
+);
+id_newtype!(
     /// Provider-assigned identifier for a message.
     ///
     /// Some providers return an opaque ID for each completion response;

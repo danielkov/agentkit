@@ -8,7 +8,6 @@ use agentkit_compaction::{
     ItemCountTrigger, KeepRecentStrategy,
 };
 use agentkit_context::{AgentsMd, ContextLoader};
-use agentkit_tool_skills::SkillRegistry;
 use agentkit_core::{Item, ItemKind, MetadataMap, Part, SessionId, TextPart};
 use agentkit_loop::{Agent, LoopInterrupt, LoopStep, SessionConfig};
 use agentkit_mcp::{
@@ -16,6 +15,7 @@ use agentkit_mcp::{
 };
 use agentkit_provider_openrouter::{OpenRouterAdapter, OpenRouterConfig};
 use agentkit_reporting::{CompositeReporter, StdoutReporter};
+use agentkit_tool_skills::SkillRegistry;
 use agentkit_tools_core::{
     CommandPolicy, CompositePermissionChecker, PathPolicy, PermissionCode, PermissionDecision,
     PermissionDenial, ToolRegistry,

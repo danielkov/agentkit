@@ -48,20 +48,26 @@
 //! # }
 //! ```
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
-use agentkit_capabilities::CapabilityContext;
 use agentkit_compaction::{
     CompactionConfig, CompactionContext, CompactionReason, CompactionResult,
 };
 use agentkit_core::{
-    CancellationHandle, Delta, FinishReason, Item, ItemKind, MetadataMap, Part, SessionId,
+    CancellationHandle, Delta, FinishReason, Item, ItemKind, MetadataMap, Part, SessionId, TaskId,
     TextPart, ToolCallPart, ToolOutput, ToolResultPart, TurnCancellation, Usage,
 };
+use agentkit_task_manager::{
+    PendingLoopUpdates, SimpleTaskManager, TaskLaunchRequest, TaskManager, TaskResolution,
+    TaskStartContext, TaskStartOutcome, TurnTaskUpdate,
+};
+#[cfg(test)]
+use agentkit_tools_core::ToolContext;
 use agentkit_tools_core::{
     ApprovalDecision, ApprovalRequest, AuthOperation, AuthRequest, AuthResolution,
-    BasicToolExecutor, PermissionChecker, ToolContext, ToolError, ToolExecutionOutcome,
-    ToolExecutor, ToolRegistry, ToolRequest, ToolResources, ToolSpec,
+    BasicToolExecutor, OwnedToolContext, PermissionChecker, ToolError, ToolExecutor, ToolRegistry,
+    ToolRequest, ToolResources, ToolSpec,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -463,6 +469,7 @@ struct PendingApprovalToolCall {
     request: ApprovalRequest,
     decision: Option<ApprovalDecision>,
     turn_id: agentkit_core::TurnId,
+    task_id: TaskId,
     call: ToolCallPart,
     tool_request: ToolRequest,
 }
@@ -472,8 +479,17 @@ struct PendingAuthToolCall {
     request: AuthRequest,
     resolution: Option<AuthResolution>,
     turn_id: agentkit_core::TurnId,
+    task_id: TaskId,
     call: ToolCallPart,
     tool_request: ToolRequest,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ActiveToolRound {
+    turn_id: agentkit_core::TurnId,
+    pending_calls: VecDeque<(ToolCallPart, ToolRequest)>,
+    background_pending: bool,
+    foreground_progressed: bool,
 }
 
 /// A configured agent ready to start a session.
@@ -512,6 +528,7 @@ where
 {
     model: M,
     tools: ToolRegistry,
+    task_manager: Arc<dyn TaskManager>,
     permissions: Arc<dyn PermissionChecker>,
     resources: Arc<dyn ToolResources>,
     cancellation: Option<CancellationHandle>,
@@ -544,6 +561,7 @@ where
             session_id: session_id.clone(),
             session: Some(session),
             tool_executor,
+            task_manager: self.task_manager,
             permissions: self.permissions,
             resources: self.resources,
             cancellation: self.cancellation,
@@ -553,6 +571,7 @@ where
             pending_input: Vec::new(),
             pending_approval: None,
             pending_auth: None,
+            active_tool_round: None,
             next_turn_index: 1,
             state: DriverState::Idle,
         };
@@ -572,6 +591,7 @@ where
 {
     model: Option<M>,
     tools: ToolRegistry,
+    task_manager: Option<Arc<dyn TaskManager>>,
     permissions: Arc<dyn PermissionChecker>,
     resources: Arc<dyn ToolResources>,
     cancellation: Option<CancellationHandle>,
@@ -587,6 +607,7 @@ where
         Self {
             model: None,
             tools: ToolRegistry::new(),
+            task_manager: None,
             permissions: Arc::new(AllowAllPermissions),
             resources: Arc::new(()),
             cancellation: None,
@@ -609,6 +630,15 @@ where
     /// Set the tool registry.  Defaults to an empty [`ToolRegistry`].
     pub fn tools(mut self, tools: ToolRegistry) -> Self {
         self.tools = tools;
+        self
+    }
+
+    /// Set the task manager that schedules tool-call execution.
+    ///
+    /// Defaults to [`SimpleTaskManager`], which preserves the existing
+    /// sequential request/response behavior.
+    pub fn task_manager(mut self, manager: impl TaskManager + 'static) -> Self {
+        self.task_manager = Some(Arc::new(manager));
         self
     }
 
@@ -661,6 +691,9 @@ where
         Ok(Agent {
             model,
             tools: self.tools,
+            task_manager: self
+                .task_manager
+                .unwrap_or_else(|| Arc::new(SimpleTaskManager::new())),
             permissions: self.permissions,
             resources: self.resources,
             cancellation: self.cancellation,
@@ -715,6 +748,7 @@ where
     session_id: SessionId,
     session: Option<S>,
     tool_executor: Arc<dyn ToolExecutor>,
+    task_manager: Arc<dyn TaskManager>,
     permissions: Arc<dyn PermissionChecker>,
     resources: Arc<dyn ToolResources>,
     cancellation: Option<CancellationHandle>,
@@ -724,6 +758,7 @@ where
     pending_input: Vec<Item>,
     pending_approval: Option<PendingApprovalToolCall>,
     pending_auth: Option<PendingAuthToolCall>,
+    active_tool_round: Option<ActiveToolRound>,
     next_turn_index: u64,
     state: DriverState,
 }
@@ -732,6 +767,166 @@ impl<S> LoopDriver<S>
 where
     S: ModelSession,
 {
+    fn start_task_via_manager(
+        &self,
+        task_id: Option<TaskId>,
+        tool_request: ToolRequest,
+        approved_request: Option<ApprovalRequest>,
+        cancellation: Option<TurnCancellation>,
+    ) -> impl std::future::Future<Output = Result<TaskStartOutcome, LoopError>> + Send + 'static
+    {
+        let task_manager = self.task_manager.clone();
+        let tool_executor = self.tool_executor.clone();
+        let permissions = self.permissions.clone();
+        let resources = self.resources.clone();
+        let session_id = self.session_id.clone();
+        let turn_id = tool_request.turn_id.clone();
+        let metadata = tool_request.metadata.clone();
+
+        async move {
+            task_manager
+                .start_task(
+                    TaskLaunchRequest {
+                        task_id,
+                        request: tool_request.clone(),
+                        approved_request,
+                    },
+                    TaskStartContext {
+                        executor: tool_executor,
+                        tool_context: OwnedToolContext {
+                            session_id,
+                            turn_id,
+                            metadata,
+                            permissions,
+                            resources,
+                            cancellation,
+                        },
+                    },
+                )
+                .await
+                .map_err(|error| LoopError::Tool(ToolError::Internal(error.to_string())))
+        }
+    }
+
+    fn queue_resolution_interrupt(
+        &mut self,
+        turn_id: &agentkit_core::TurnId,
+        resolution: TaskResolution,
+    ) -> Option<LoopStep> {
+        match resolution {
+            TaskResolution::Item(item) => {
+                self.transcript.push(item);
+                None
+            }
+            TaskResolution::Approval(task) => {
+                let call = ToolCallPart {
+                    id: task.tool_request.call_id.clone(),
+                    name: task.tool_request.tool_name.to_string(),
+                    input: task.tool_request.input.clone(),
+                    metadata: task.tool_request.metadata.clone(),
+                };
+                self.pending_approval = Some(PendingApprovalToolCall {
+                    request: task.approval.clone(),
+                    decision: None,
+                    turn_id: turn_id.clone(),
+                    task_id: task.task_id,
+                    call,
+                    tool_request: task.tool_request,
+                });
+                self.state = DriverState::AwaitingApproval;
+                self.emit(AgentEvent::ApprovalRequired(task.approval.clone()));
+                Some(LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(
+                    task.approval,
+                )))
+            }
+            TaskResolution::Auth(task) => {
+                let call = ToolCallPart {
+                    id: task.tool_request.call_id.clone(),
+                    name: task.tool_request.tool_name.to_string(),
+                    input: task.tool_request.input.clone(),
+                    metadata: task.tool_request.metadata.clone(),
+                };
+                let request = upgrade_auth_request(task.auth, &task.tool_request, &call);
+                self.pending_auth = Some(PendingAuthToolCall {
+                    request: request.clone(),
+                    resolution: None,
+                    turn_id: turn_id.clone(),
+                    task_id: task.task_id,
+                    call,
+                    tool_request: task.tool_request,
+                });
+                self.state = DriverState::AwaitingAuth;
+                self.emit(AgentEvent::AuthRequired(request.clone()));
+                Some(LoopStep::Interrupt(LoopInterrupt::AuthRequest(request)))
+            }
+        }
+    }
+
+    async fn drain_pending_loop_updates(&mut self) -> Result<(bool, Option<LoopStep>), LoopError> {
+        let PendingLoopUpdates { mut resolutions } = self
+            .task_manager
+            .take_pending_loop_updates()
+            .await
+            .map_err(|error| LoopError::Tool(ToolError::Internal(error.to_string())))?;
+        let mut saw_items = false;
+        while let Some(resolution) = resolutions.pop_front() {
+            match resolution {
+                TaskResolution::Item(item) => {
+                    self.transcript.push(item);
+                    saw_items = true;
+                }
+                TaskResolution::Approval(task) => {
+                    let call = ToolCallPart {
+                        id: task.tool_request.call_id.clone(),
+                        name: task.tool_request.tool_name.to_string(),
+                        input: task.tool_request.input.clone(),
+                        metadata: task.tool_request.metadata.clone(),
+                    };
+                    self.state = DriverState::AwaitingApproval;
+                    self.pending_approval = Some(PendingApprovalToolCall {
+                        request: task.approval.clone(),
+                        decision: None,
+                        turn_id: task.tool_request.turn_id.clone(),
+                        task_id: task.task_id,
+                        call,
+                        tool_request: task.tool_request,
+                    });
+                    self.emit(AgentEvent::ApprovalRequired(task.approval.clone()));
+                    return Ok((
+                        saw_items,
+                        Some(LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(
+                            task.approval,
+                        ))),
+                    ));
+                }
+                TaskResolution::Auth(task) => {
+                    let call = ToolCallPart {
+                        id: task.tool_request.call_id.clone(),
+                        name: task.tool_request.tool_name.to_string(),
+                        input: task.tool_request.input.clone(),
+                        metadata: task.tool_request.metadata.clone(),
+                    };
+                    let request = upgrade_auth_request(task.auth, &task.tool_request, &call);
+                    self.state = DriverState::AwaitingAuth;
+                    self.pending_auth = Some(PendingAuthToolCall {
+                        request: request.clone(),
+                        resolution: None,
+                        turn_id: task.tool_request.turn_id.clone(),
+                        task_id: task.task_id,
+                        call,
+                        tool_request: task.tool_request,
+                    });
+                    self.emit(AgentEvent::AuthRequired(request.clone()));
+                    return Ok((
+                        saw_items,
+                        Some(LoopStep::Interrupt(LoopInterrupt::AuthRequest(request))),
+                    ));
+                }
+            }
+        }
+        Ok((saw_items, None))
+    }
+
     async fn maybe_compact(
         &mut self,
         turn_id: Option<&agentkit_core::TurnId>,
@@ -797,6 +992,113 @@ where
         Ok(())
     }
 
+    async fn continue_active_tool_round(&mut self) -> Result<Option<LoopStep>, LoopError> {
+        let Some(_) = self.active_tool_round.as_ref() else {
+            return Ok(None);
+        };
+        loop {
+            let cancellation = self
+                .cancellation
+                .as_ref()
+                .map(CancellationHandle::checkpoint);
+            let turn_id = self
+                .active_tool_round
+                .as_ref()
+                .map(|active| active.turn_id.clone())
+                .ok_or_else(|| LoopError::InvalidState("missing active tool round".into()))?;
+
+            if cancellation
+                .as_ref()
+                .is_some_and(TurnCancellation::is_cancelled)
+            {
+                self.task_manager
+                    .on_turn_interrupted(&turn_id)
+                    .await
+                    .map_err(|error| LoopError::Tool(ToolError::Internal(error.to_string())))?;
+                self.active_tool_round = None;
+                return self.finish_cancelled(turn_id, Vec::new()).map(Some);
+            }
+
+            let next_call = self
+                .active_tool_round
+                .as_mut()
+                .and_then(|active| active.pending_calls.pop_front());
+            if let Some((_call, tool_request)) = next_call {
+                match self
+                    .start_task_via_manager(None, tool_request.clone(), None, cancellation.clone())
+                    .await?
+                {
+                    TaskStartOutcome::Ready(resolution) => {
+                        let resolution = *resolution;
+                        if matches!(resolution, TaskResolution::Item(_))
+                            && let Some(active) = self.active_tool_round.as_mut()
+                        {
+                            active.foreground_progressed = true;
+                        }
+                        if let Some(step) = self.queue_resolution_interrupt(&turn_id, resolution) {
+                            return Ok(Some(step));
+                        }
+                        continue;
+                    }
+                    TaskStartOutcome::Pending { kind, .. } => {
+                        if kind == agentkit_task_manager::TaskKind::Background
+                            && let Some(active) = self.active_tool_round.as_mut()
+                        {
+                            active.background_pending = true;
+                        }
+                        continue;
+                    }
+                }
+            }
+
+            match self
+                .task_manager
+                .wait_for_turn(&turn_id, cancellation.clone())
+                .await
+                .map_err(|error| LoopError::Tool(ToolError::Internal(error.to_string())))?
+            {
+                Some(TurnTaskUpdate::Resolution(resolution)) => {
+                    let resolution = *resolution;
+                    if matches!(resolution, TaskResolution::Item(_))
+                        && let Some(active) = self.active_tool_round.as_mut()
+                    {
+                        active.foreground_progressed = true;
+                    }
+                    if let Some(step) = self.queue_resolution_interrupt(&turn_id, resolution) {
+                        return Ok(Some(step));
+                    }
+                }
+                Some(TurnTaskUpdate::Detached(_)) => {
+                    if let Some(active) = self.active_tool_round.as_mut() {
+                        active.background_pending = true;
+                    }
+                }
+                None => {
+                    if cancellation
+                        .as_ref()
+                        .is_some_and(TurnCancellation::is_cancelled)
+                    {
+                        self.task_manager
+                            .on_turn_interrupted(&turn_id)
+                            .await
+                            .map_err(|error| {
+                                LoopError::Tool(ToolError::Internal(error.to_string()))
+                            })?;
+                        self.active_tool_round = None;
+                        return self.finish_cancelled(turn_id, Vec::new()).map(Some);
+                    }
+                    let active = self.active_tool_round.take().ok_or_else(|| {
+                        LoopError::InvalidState("missing active tool round".into())
+                    })?;
+                    if active.background_pending && !active.foreground_progressed {
+                        return Ok(None);
+                    }
+                    return Ok(Some(Box::pin(self.drive_turn(turn_id, false)).await?));
+                }
+            }
+        }
+    }
+
     async fn drive_turn(
         &mut self,
         turn_id: agentkit_core::TurnId,
@@ -829,175 +1131,113 @@ where
             return self.finish_cancelled(turn_id, interrupted_assistant_items());
         }
 
-        loop {
-            let request = TurnRequest {
-                session_id: self.session_id.clone(),
-                turn_id: turn_id.clone(),
-                transcript: self.transcript.clone(),
-                available_tools: self.tool_executor.specs(),
-                metadata: MetadataMap::new(),
-            };
+        let request = TurnRequest {
+            session_id: self.session_id.clone(),
+            turn_id: turn_id.clone(),
+            transcript: self.transcript.clone(),
+            available_tools: self.tool_executor.specs(),
+            metadata: MetadataMap::new(),
+        };
 
-            let session = self
-                .session
-                .as_mut()
-                .ok_or_else(|| LoopError::InvalidState("model session is not available".into()))?;
-            let mut turn = match session.begin_turn(request, cancellation.clone()).await {
-                Ok(turn) => turn,
-                Err(LoopError::Cancelled) => {
-                    return self.finish_cancelled(turn_id, interrupted_assistant_items());
+        let session = self
+            .session
+            .as_mut()
+            .ok_or_else(|| LoopError::InvalidState("model session is not available".into()))?;
+        let mut turn = match session.begin_turn(request, cancellation.clone()).await {
+            Ok(turn) => turn,
+            Err(LoopError::Cancelled) => {
+                self.task_manager
+                    .on_turn_interrupted(&turn_id)
+                    .await
+                    .map_err(|error| LoopError::Tool(ToolError::Internal(error.to_string())))?;
+                return self.finish_cancelled(turn_id, interrupted_assistant_items());
+            }
+            Err(error) => return Err(error),
+        };
+        let mut saw_tool_call = false;
+        let mut finished_result = None;
+
+        while let Some(event) = match turn.next_event(cancellation.clone()).await {
+            Ok(event) => event,
+            Err(LoopError::Cancelled) => {
+                self.task_manager
+                    .on_turn_interrupted(&turn_id)
+                    .await
+                    .map_err(|error| LoopError::Tool(ToolError::Internal(error.to_string())))?;
+                return self.finish_cancelled(turn_id, interrupted_assistant_items());
+            }
+            Err(error) => return Err(error),
+        } {
+            if cancellation
+                .as_ref()
+                .is_some_and(TurnCancellation::is_cancelled)
+            {
+                self.task_manager
+                    .on_turn_interrupted(&turn_id)
+                    .await
+                    .map_err(|error| LoopError::Tool(ToolError::Internal(error.to_string())))?;
+                return self.finish_cancelled(turn_id, interrupted_assistant_items());
+            }
+            match event {
+                ModelTurnEvent::Delta(delta) => self.emit(AgentEvent::ContentDelta(delta)),
+                ModelTurnEvent::Usage(usage) => self.emit(AgentEvent::UsageUpdated(usage)),
+                ModelTurnEvent::ToolCall(call) => {
+                    saw_tool_call = true;
+                    self.emit(AgentEvent::ToolCallRequested(call.clone()));
                 }
-                Err(error) => return Err(error),
-            };
-            let mut saw_tool_call = false;
-            let mut tool_results = Vec::new();
-
-            while let Some(event) = match turn.next_event(cancellation.clone()).await {
-                Ok(event) => event,
-                Err(LoopError::Cancelled) => {
-                    return self.finish_cancelled(turn_id, interrupted_assistant_items());
-                }
-                Err(error) => return Err(error),
-            } {
-                if cancellation
-                    .as_ref()
-                    .is_some_and(TurnCancellation::is_cancelled)
-                {
-                    return self.finish_cancelled(turn_id, interrupted_assistant_items());
-                }
-                match event {
-                    ModelTurnEvent::Delta(delta) => self.emit(AgentEvent::ContentDelta(delta)),
-                    ModelTurnEvent::Usage(usage) => self.emit(AgentEvent::UsageUpdated(usage)),
-                    ModelTurnEvent::ToolCall(call) => {
-                        saw_tool_call = true;
-                        self.emit(AgentEvent::ToolCallRequested(call.clone()));
-                        if cancellation
-                            .as_ref()
-                            .is_some_and(TurnCancellation::is_cancelled)
-                        {
-                            let mut items = tool_results;
-                            items.extend(interrupted_tool_items(&call));
-                            return self.finish_cancelled(turn_id, items);
-                        }
-
-                        let tool_request = ToolRequest {
-                            call_id: call.id.clone(),
-                            tool_name: agentkit_tools_core::ToolName::new(call.name.clone()),
-                            input: call.input.clone(),
-                            session_id: self.session_id.clone(),
-                            turn_id: turn_id.clone(),
-                            metadata: call.metadata.clone(),
-                        };
-                        let tool_metadata = tool_request.metadata.clone();
-                        let mut tool_ctx = ToolContext {
-                            capability: CapabilityContext {
-                                session_id: Some(&self.session_id),
-                                turn_id: Some(&turn_id),
-                                metadata: &tool_metadata,
-                            },
-                            permissions: self.permissions.as_ref(),
-                            resources: self.resources.as_ref(),
-                            cancellation: cancellation.clone(),
-                        };
-
-                        match self
-                            .tool_executor
-                            .execute(tool_request.clone(), &mut tool_ctx)
-                            .await
-                        {
-                            ToolExecutionOutcome::Completed(result) => {
-                                tool_results.push(Item {
-                                    id: None,
-                                    kind: ItemKind::Tool,
-                                    parts: vec![Part::ToolResult(result.result)],
-                                    metadata: result.metadata,
-                                });
-                            }
-                            ToolExecutionOutcome::Interrupted(
-                                agentkit_tools_core::ToolInterruption::ApprovalRequired(request),
-                            ) => {
-                                self.pending_approval = Some(PendingApprovalToolCall {
-                                    request: request.clone(),
-                                    decision: None,
-                                    turn_id: turn_id.clone(),
-                                    call,
-                                    tool_request,
-                                });
-                                self.state = DriverState::AwaitingApproval;
-                                self.emit(AgentEvent::ApprovalRequired(request.clone()));
-                                return Ok(LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(
-                                    request,
-                                )));
-                            }
-                            ToolExecutionOutcome::Interrupted(
-                                agentkit_tools_core::ToolInterruption::AuthRequired(request),
-                            ) => {
-                                let request = upgrade_auth_request(request, &tool_request, &call);
-                                self.pending_auth = Some(PendingAuthToolCall {
-                                    request: request.clone(),
-                                    resolution: None,
-                                    turn_id: turn_id.clone(),
-                                    call,
-                                    tool_request,
-                                });
-                                self.state = DriverState::AwaitingAuth;
-                                self.emit(AgentEvent::AuthRequired(request.clone()));
-                                return Ok(LoopStep::Interrupt(LoopInterrupt::AuthRequest(
-                                    request,
-                                )));
-                            }
-                            ToolExecutionOutcome::Failed(error) => {
-                                if matches!(error, ToolError::Cancelled) {
-                                    let mut items = tool_results;
-                                    items.extend(interrupted_tool_items(&call));
-                                    return self.finish_cancelled(turn_id, items);
-                                }
-                                self.emit(AgentEvent::Warning {
-                                    message: format!("tool {} failed: {}", call.name, error),
-                                });
-                                tool_results.push(Item {
-                                    id: None,
-                                    kind: ItemKind::Tool,
-                                    parts: vec![Part::ToolResult(ToolResultPart {
-                                        call_id: call.id.clone(),
-                                        output: ToolOutput::Text(error.to_string()),
-                                        is_error: true,
-                                        metadata: call.metadata.clone(),
-                                    })],
-                                    metadata: MetadataMap::new(),
-                                });
-                            }
-                        }
-                    }
-                    ModelTurnEvent::Finished(result) => {
-                        self.transcript.extend(result.output_items.clone());
-
-                        if saw_tool_call {
-                            self.transcript.append(&mut tool_results);
-                            break;
-                        }
-
-                        let turn_result = TurnResult {
-                            turn_id,
-                            finish_reason: result.finish_reason,
-                            items: result.output_items,
-                            usage: result.usage,
-                            metadata: result.metadata,
-                        };
-                        self.emit(AgentEvent::TurnFinished(turn_result.clone()));
-                        return Ok(LoopStep::Finished(turn_result));
-                    }
+                ModelTurnEvent::Finished(result) => {
+                    finished_result = Some(result);
+                    break;
                 }
             }
-
-            if saw_tool_call {
-                continue;
-            }
-
-            return Err(LoopError::Provider(
-                "model turn ended without a Finished event".into(),
-            ));
         }
+
+        let result = finished_result.ok_or_else(|| {
+            LoopError::Provider("model turn ended without a Finished event".into())
+        })?;
+        self.transcript.extend(result.output_items.clone());
+
+        if saw_tool_call {
+            let pending_calls = extract_tool_calls(&result.output_items)
+                .into_iter()
+                .map(|call| {
+                    let tool_request = ToolRequest {
+                        call_id: call.id.clone(),
+                        tool_name: agentkit_tools_core::ToolName::new(call.name.clone()),
+                        input: call.input.clone(),
+                        session_id: self.session_id.clone(),
+                        turn_id: turn_id.clone(),
+                        metadata: call.metadata.clone(),
+                    };
+                    (call, tool_request)
+                })
+                .collect();
+            self.active_tool_round = Some(ActiveToolRound {
+                turn_id: turn_id.clone(),
+                pending_calls,
+                background_pending: false,
+                foreground_progressed: false,
+            });
+            if let Some(step) = self.continue_active_tool_round().await? {
+                return Ok(step);
+            }
+            return Ok(LoopStep::Interrupt(LoopInterrupt::AwaitingInput(
+                InputRequest {
+                    session_id: self.session_id.clone(),
+                    reason: "driver is waiting for input".into(),
+                },
+            )));
+        }
+
+        let turn_result = TurnResult {
+            turn_id,
+            finish_reason: result.finish_reason,
+            items: result.output_items,
+            usage: result.usage,
+            metadata: result.metadata,
+        };
+        self.emit(AgentEvent::TurnFinished(turn_result.clone()));
+        Ok(LoopStep::Finished(turn_result))
     }
 
     async fn resume_after_auth(
@@ -1008,113 +1248,48 @@ where
             .resolution
             .clone()
             .ok_or_else(|| LoopError::InvalidState("pending auth has no resolution".into()))?;
-
-        self.transcript.push(Item {
-            id: None,
-            kind: ItemKind::Assistant,
-            parts: vec![Part::ToolCall(pending.call.clone())],
-            metadata: MetadataMap::new(),
-        });
-
-        let tool_item = match resolution {
-            AuthResolution::Provided { .. } => {
-                let tool_metadata = pending.tool_request.metadata.clone();
-                let mut tool_ctx = ToolContext {
-                    capability: CapabilityContext {
-                        session_id: Some(&self.session_id),
-                        turn_id: Some(&pending.turn_id),
-                        metadata: &tool_metadata,
-                    },
-                    permissions: self.permissions.as_ref(),
-                    resources: self.resources.as_ref(),
-                    cancellation: self
-                        .cancellation
+        match resolution {
+            AuthResolution::Provided { .. } => match self
+                .start_task_via_manager(
+                    Some(pending.task_id.clone()),
+                    pending.tool_request.clone(),
+                    None,
+                    self.cancellation
                         .as_ref()
                         .map(CancellationHandle::checkpoint),
-                };
-
-                match self
-                    .tool_executor
-                    .execute(pending.tool_request.clone(), &mut tool_ctx)
-                    .await
-                {
-                    ToolExecutionOutcome::Completed(result) => Item {
-                        id: None,
-                        kind: ItemKind::Tool,
-                        parts: vec![Part::ToolResult(result.result)],
-                        metadata: result.metadata,
-                    },
-                    ToolExecutionOutcome::Interrupted(
-                        agentkit_tools_core::ToolInterruption::AuthRequired(request),
-                    ) => {
-                        let request =
-                            upgrade_auth_request(request, &pending.tool_request, &pending.call);
-                        self.pending_auth = Some(PendingAuthToolCall {
-                            request,
-                            resolution: None,
-                            turn_id: pending.turn_id,
-                            call: pending.call,
-                            tool_request: pending.tool_request,
-                        });
-                        self.state = DriverState::AwaitingAuth;
-                        let request = self
-                            .pending_auth
-                            .as_ref()
-                            .map(|pending| pending.request.clone())
-                            .ok_or_else(|| {
-                                LoopError::InvalidState("missing pending auth request".into())
-                            })?;
-                        self.emit(AgentEvent::AuthRequired(request.clone()));
-                        return Ok(LoopStep::Interrupt(LoopInterrupt::AuthRequest(request)));
-                    }
-                    ToolExecutionOutcome::Interrupted(
-                        agentkit_tools_core::ToolInterruption::ApprovalRequired(request),
-                    ) => {
-                        self.pending_approval = Some(PendingApprovalToolCall {
-                            request: request.clone(),
-                            decision: None,
-                            turn_id: pending.turn_id,
-                            call: pending.call,
-                            tool_request: pending.tool_request,
-                        });
-                        self.state = DriverState::AwaitingApproval;
-                        self.emit(AgentEvent::ApprovalRequired(request.clone()));
-                        return Ok(LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(request)));
-                    }
-                    ToolExecutionOutcome::Failed(error) => {
-                        if matches!(error, ToolError::Cancelled) {
-                            let items = interrupted_tool_items(&pending.call);
-                            return self.finish_cancelled(pending.turn_id, items);
-                        }
-                        Item {
-                            id: None,
-                            kind: ItemKind::Tool,
-                            parts: vec![Part::ToolResult(ToolResultPart {
-                                call_id: pending.call.id.clone(),
-                                output: ToolOutput::Text(error.to_string()),
-                                is_error: true,
-                                metadata: pending.call.metadata.clone(),
-                            })],
-                            metadata: MetadataMap::new(),
-                        }
+                )
+                .await?
+            {
+                TaskStartOutcome::Ready(resolution) => {
+                    let resolution = *resolution;
+                    if let Some(step) =
+                        self.queue_resolution_interrupt(&pending.turn_id, resolution)
+                    {
+                        return Ok(step);
                     }
                 }
-            }
-            AuthResolution::Cancelled { .. } => Item {
-                id: None,
-                kind: ItemKind::Tool,
-                parts: vec![Part::ToolResult(ToolResultPart {
-                    call_id: pending.call.id.clone(),
-                    output: ToolOutput::Text("auth cancelled".into()),
-                    is_error: true,
-                    metadata: pending.call.metadata.clone(),
-                })],
-                metadata: MetadataMap::new(),
+                TaskStartOutcome::Pending { .. } => {}
             },
-        };
+            AuthResolution::Cancelled { .. } => {
+                self.transcript.push(Item {
+                    id: None,
+                    kind: ItemKind::Tool,
+                    parts: vec![Part::ToolResult(ToolResultPart {
+                        call_id: pending.call.id.clone(),
+                        output: ToolOutput::Text("auth cancelled".into()),
+                        is_error: true,
+                        metadata: pending.call.metadata.clone(),
+                    })],
+                    metadata: MetadataMap::new(),
+                });
+            }
+        }
 
-        self.transcript.push(tool_item);
-        self.drive_turn(pending.turn_id, false).await
+        if let Some(step) = self.continue_active_tool_round().await? {
+            Ok(step)
+        } else {
+            self.drive_turn(pending.turn_id, false).await
+        }
     }
 
     async fn resume_after_approval(
@@ -1126,109 +1301,50 @@ where
             .clone()
             .ok_or_else(|| LoopError::InvalidState("pending approval has no decision".into()))?;
 
-        self.transcript.push(Item {
-            id: None,
-            kind: ItemKind::Assistant,
-            parts: vec![Part::ToolCall(pending.call.clone())],
-            metadata: MetadataMap::new(),
-        });
-
-        let tool_item = match decision {
-            ApprovalDecision::Approve => {
-                let tool_metadata = pending.tool_request.metadata.clone();
-                let mut tool_ctx = ToolContext {
-                    capability: CapabilityContext {
-                        session_id: Some(&self.session_id),
-                        turn_id: Some(&pending.turn_id),
-                        metadata: &tool_metadata,
-                    },
-                    permissions: self.permissions.as_ref(),
-                    resources: self.resources.as_ref(),
-                    cancellation: self
-                        .cancellation
+        match decision {
+            ApprovalDecision::Approve => match self
+                .start_task_via_manager(
+                    Some(pending.task_id.clone()),
+                    pending.tool_request.clone(),
+                    Some(pending.request.clone()),
+                    self.cancellation
                         .as_ref()
                         .map(CancellationHandle::checkpoint),
-                };
-
-                match self
-                    .tool_executor
-                    .execute_approved(
-                        pending.tool_request.clone(),
-                        &pending.request,
-                        &mut tool_ctx,
-                    )
-                    .await
-                {
-                    ToolExecutionOutcome::Completed(result) => Item {
-                        id: None,
-                        kind: ItemKind::Tool,
-                        parts: vec![Part::ToolResult(result.result)],
-                        metadata: result.metadata,
-                    },
-                    ToolExecutionOutcome::Interrupted(
-                        agentkit_tools_core::ToolInterruption::ApprovalRequired(request),
-                    ) => {
-                        self.pending_approval = Some(PendingApprovalToolCall {
-                            request: request.clone(),
-                            decision: None,
-                            turn_id: pending.turn_id,
-                            call: pending.call,
-                            tool_request: pending.tool_request,
-                        });
-                        self.state = DriverState::AwaitingApproval;
-                        self.emit(AgentEvent::ApprovalRequired(request.clone()));
-                        return Ok(LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(request)));
-                    }
-                    ToolExecutionOutcome::Interrupted(
-                        agentkit_tools_core::ToolInterruption::AuthRequired(request),
-                    ) => {
-                        let request =
-                            upgrade_auth_request(request, &pending.tool_request, &pending.call);
-                        self.pending_auth = Some(PendingAuthToolCall {
-                            request: request.clone(),
-                            resolution: None,
-                            turn_id: pending.turn_id,
-                            call: pending.call,
-                            tool_request: pending.tool_request,
-                        });
-                        self.state = DriverState::AwaitingAuth;
-                        self.emit(AgentEvent::AuthRequired(request.clone()));
-                        return Ok(LoopStep::Interrupt(LoopInterrupt::AuthRequest(request)));
-                    }
-                    ToolExecutionOutcome::Failed(error) => {
-                        if matches!(error, ToolError::Cancelled) {
-                            let items = interrupted_tool_items(&pending.call);
-                            return self.finish_cancelled(pending.turn_id, items);
-                        }
-                        Item {
-                            id: None,
-                            kind: ItemKind::Tool,
-                            parts: vec![Part::ToolResult(ToolResultPart {
-                                call_id: pending.call.id.clone(),
-                                output: ToolOutput::Text(error.to_string()),
-                                is_error: true,
-                                metadata: pending.call.metadata.clone(),
-                            })],
-                            metadata: MetadataMap::new(),
-                        }
+                )
+                .await?
+            {
+                TaskStartOutcome::Ready(resolution) => {
+                    let resolution = *resolution;
+                    if let Some(step) =
+                        self.queue_resolution_interrupt(&pending.turn_id, resolution)
+                    {
+                        return Ok(step);
                     }
                 }
-            }
-            ApprovalDecision::Deny { reason } => Item {
-                id: None,
-                kind: ItemKind::Tool,
-                parts: vec![Part::ToolResult(ToolResultPart {
-                    call_id: pending.call.id.clone(),
-                    output: ToolOutput::Text(reason.unwrap_or_else(|| "approval denied".into())),
-                    is_error: true,
-                    metadata: pending.call.metadata.clone(),
-                })],
-                metadata: MetadataMap::new(),
+                TaskStartOutcome::Pending { .. } => {}
             },
-        };
+            ApprovalDecision::Deny { reason } => {
+                self.transcript.push(Item {
+                    id: None,
+                    kind: ItemKind::Tool,
+                    parts: vec![Part::ToolResult(ToolResultPart {
+                        call_id: pending.call.id.clone(),
+                        output: ToolOutput::Text(
+                            reason.unwrap_or_else(|| "approval denied".into()),
+                        ),
+                        is_error: true,
+                        metadata: pending.call.metadata.clone(),
+                    })],
+                    metadata: MetadataMap::new(),
+                });
+            }
+        }
 
-        self.transcript.push(tool_item);
-        self.drive_turn(pending.turn_id, false).await
+        if let Some(step) = self.continue_active_tool_round().await? {
+            Ok(step)
+        } else {
+            self.drive_turn(pending.turn_id, false).await
+        }
     }
 
     fn finish_cancelled(
@@ -1374,7 +1490,16 @@ where
             return self.resume_after_auth(pending).await;
         }
 
-        if self.pending_input.is_empty() {
+        if let Some(step) = self.continue_active_tool_round().await? {
+            return Ok(step);
+        }
+
+        let (had_loop_updates, loop_step) = self.drain_pending_loop_updates().await?;
+        if let Some(step) = loop_step {
+            return Ok(step);
+        }
+
+        if self.pending_input.is_empty() && !had_loop_updates {
             return Ok(LoopStep::Interrupt(LoopInterrupt::AwaitingInput(
                 InputRequest {
                     session_id: self.session_id.clone(),
@@ -1420,26 +1545,16 @@ fn interrupted_assistant_items() -> Vec<Item> {
     }]
 }
 
-fn interrupted_tool_items(call: &ToolCallPart) -> Vec<Item> {
-    vec![
-        Item {
-            id: None,
-            kind: ItemKind::Assistant,
-            parts: vec![Part::ToolCall(call.clone())],
-            metadata: interrupted_metadata("tool_call"),
-        },
-        Item {
-            id: None,
-            kind: ItemKind::Tool,
-            parts: vec![Part::ToolResult(ToolResultPart {
-                call_id: call.id.clone(),
-                output: ToolOutput::Text("tool execution interrupted by user".into()),
-                is_error: true,
-                metadata: interrupted_metadata("tool_result"),
-            })],
-            metadata: interrupted_metadata("tool_result"),
-        },
-    ]
+fn extract_tool_calls(items: &[Item]) -> Vec<ToolCallPart> {
+    let mut calls = Vec::new();
+    for item in items {
+        for part in &item.parts {
+            if let Part::ToolCall(call) = part {
+                calls.push(call.clone());
+            }
+        }
+    }
+    calls
 }
 
 fn upgrade_auth_request(
@@ -1504,18 +1619,24 @@ pub enum LoopError {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc as StdArc, Mutex as StdMutex};
 
     use agentkit_compaction::{CompactionPipeline, CompactionTrigger, KeepRecentStrategy};
     use agentkit_core::{
         CancellationController, ItemKind, Part, TextPart, ToolCallId, ToolOutput, ToolResultPart,
     };
+    use agentkit_task_manager::{
+        AsyncTaskManager, RoutingDecision, TaskEvent, TaskManager, TaskManagerHandle,
+        TaskRoutingPolicy,
+    };
     use agentkit_tools_core::{
         FileSystemPermissionRequest, PermissionCode, PermissionDecision, PermissionDenial, Tool,
         ToolAnnotations, ToolName, ToolResult, ToolSpec,
     };
     use serde_json::{Value, json};
+    use tokio::sync::Notify;
+    use tokio::time::{Duration, timeout};
 
     use super::*;
 
@@ -1524,12 +1645,14 @@ mod tests {
     struct RecordingAdapter {
         seen_descriptions: StdArc<StdMutex<Vec<Vec<String>>>>,
     }
+    struct MultiToolAdapter;
 
     struct FakeSession;
     struct SlowSession;
     struct RecordingSession {
         seen_descriptions: StdArc<StdMutex<Vec<Vec<String>>>>,
     }
+    struct MultiToolSession;
 
     struct FakeTurn {
         events: VecDeque<ModelTurnEvent>,
@@ -1541,6 +1664,9 @@ mod tests {
 
     struct RecordingTurn {
         emitted: bool,
+    }
+    struct MultiToolTurn {
+        events: VecDeque<ModelTurnEvent>,
     }
 
     #[async_trait]
@@ -1569,6 +1695,15 @@ mod tests {
             Ok(RecordingSession {
                 seen_descriptions: self.seen_descriptions.clone(),
             })
+        }
+    }
+
+    #[async_trait]
+    impl ModelAdapter for MultiToolAdapter {
+        type Session = MultiToolSession;
+
+        async fn start_session(&self, _config: SessionConfig) -> Result<Self::Session, LoopError> {
+            Ok(MultiToolSession)
         }
     }
 
@@ -1706,6 +1841,72 @@ mod tests {
     }
 
     #[async_trait]
+    impl ModelSession for MultiToolSession {
+        type Turn = MultiToolTurn;
+
+        async fn begin_turn(
+            &mut self,
+            request: TurnRequest,
+            _cancellation: Option<TurnCancellation>,
+        ) -> Result<Self::Turn, LoopError> {
+            let has_tool_result = request.transcript.iter().any(|item| {
+                item.kind == ItemKind::Tool
+                    && item
+                        .parts
+                        .iter()
+                        .any(|part| matches!(part, Part::ToolResult(_)))
+            });
+
+            let events = if has_tool_result {
+                VecDeque::from([ModelTurnEvent::Finished(ModelTurnResult {
+                    finish_reason: FinishReason::Completed,
+                    output_items: vec![Item {
+                        id: None,
+                        kind: ItemKind::Assistant,
+                        parts: vec![Part::Text(TextPart {
+                            text: "mixed tools finished".into(),
+                            metadata: MetadataMap::new(),
+                        })],
+                        metadata: MetadataMap::new(),
+                    }],
+                    usage: None,
+                    metadata: MetadataMap::new(),
+                })])
+            } else {
+                let foreground = agentkit_core::ToolCallPart {
+                    id: ToolCallId::new("call-foreground"),
+                    name: "foreground-wait".into(),
+                    input: json!({}),
+                    metadata: MetadataMap::new(),
+                };
+                let background = agentkit_core::ToolCallPart {
+                    id: ToolCallId::new("call-background"),
+                    name: "background-wait".into(),
+                    input: json!({}),
+                    metadata: MetadataMap::new(),
+                };
+                VecDeque::from([
+                    ModelTurnEvent::ToolCall(foreground.clone()),
+                    ModelTurnEvent::ToolCall(background.clone()),
+                    ModelTurnEvent::Finished(ModelTurnResult {
+                        finish_reason: FinishReason::ToolCall,
+                        output_items: vec![Item {
+                            id: None,
+                            kind: ItemKind::Assistant,
+                            parts: vec![Part::ToolCall(foreground), Part::ToolCall(background)],
+                            metadata: MetadataMap::new(),
+                        }],
+                        usage: None,
+                        metadata: MetadataMap::new(),
+                    }),
+                ])
+            };
+
+            Ok(MultiToolTurn { events })
+        }
+    }
+
+    #[async_trait]
     impl ModelTurn for FakeTurn {
         async fn next_event(
             &mut self,
@@ -1774,6 +1975,16 @@ mod tests {
                     metadata: MetadataMap::new(),
                 })))
             }
+        }
+    }
+
+    #[async_trait]
+    impl ModelTurn for MultiToolTurn {
+        async fn next_event(
+            &mut self,
+            _cancellation: Option<TurnCancellation>,
+        ) -> Result<Option<ModelTurnEvent>, LoopError> {
+            Ok(self.events.pop_front())
         }
     }
 
@@ -1881,10 +2092,7 @@ mod tests {
 
         fn current_spec(&self) -> Option<ToolSpec> {
             let mut spec = self.spec.clone();
-            spec.description = format!(
-                "dynamic version {}",
-                self.version.load(Ordering::SeqCst)
-            );
+            spec.description = format!("dynamic version {}", self.version.load(Ordering::SeqCst));
             Some(spec)
         }
 
@@ -1934,6 +2142,7 @@ mod tests {
         ) -> PermissionDecision {
             if request.kind() == "filesystem.read" {
                 return PermissionDecision::RequireApproval(ApprovalRequest {
+                    task_id: None,
                     id: "approval:fs-read".into(),
                     request_kind: request.kind().into(),
                     reason: agentkit_tools_core::ApprovalReason::SensitivePath,
@@ -2010,6 +2219,7 @@ mod tests {
 
             Err(agentkit_tools_core::ToolError::AuthRequired(Box::new(
                 AuthRequest {
+                    task_id: None,
                     id: "auth-1".into(),
                     provider: "mcp.mock".into(),
                     operation: AuthOperation::ToolCall {
@@ -2024,6 +2234,108 @@ mod tests {
                 },
             )))
         }
+    }
+
+    #[derive(Clone)]
+    struct BlockingTool {
+        spec: ToolSpec,
+        entered: StdArc<AtomicBool>,
+        release: StdArc<Notify>,
+        output: &'static str,
+    }
+
+    impl BlockingTool {
+        fn new(
+            name: &str,
+            entered: StdArc<AtomicBool>,
+            release: StdArc<Notify>,
+            output: &'static str,
+        ) -> Self {
+            Self {
+                spec: ToolSpec {
+                    name: ToolName::new(name),
+                    description: format!("blocking tool {name}"),
+                    input_schema: json!({
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": false
+                    }),
+                    annotations: ToolAnnotations::default(),
+                    metadata: MetadataMap::new(),
+                },
+                entered,
+                release,
+                output,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Tool for BlockingTool {
+        fn spec(&self) -> &ToolSpec {
+            &self.spec
+        }
+
+        async fn invoke(
+            &self,
+            request: agentkit_tools_core::ToolRequest,
+            _ctx: &mut ToolContext<'_>,
+        ) -> Result<ToolResult, agentkit_tools_core::ToolError> {
+            self.entered.store(true, Ordering::SeqCst);
+            self.release.notified().await;
+            Ok(ToolResult {
+                result: ToolResultPart {
+                    call_id: request.call_id,
+                    output: ToolOutput::Text(self.output.into()),
+                    is_error: false,
+                    metadata: MetadataMap::new(),
+                },
+                duration: None,
+                metadata: MetadataMap::new(),
+            })
+        }
+    }
+
+    struct NameRoutingPolicy {
+        routes: Vec<(String, RoutingDecision)>,
+    }
+
+    impl NameRoutingPolicy {
+        fn new(routes: impl IntoIterator<Item = (impl Into<String>, RoutingDecision)>) -> Self {
+            Self {
+                routes: routes
+                    .into_iter()
+                    .map(|(name, decision)| (name.into(), decision))
+                    .collect(),
+            }
+        }
+    }
+
+    impl TaskRoutingPolicy for NameRoutingPolicy {
+        fn route(&self, request: &ToolRequest) -> RoutingDecision {
+            self.routes
+                .iter()
+                .find(|(name, _)| name == &request.tool_name.0)
+                .map(|(_, decision)| *decision)
+                .unwrap_or(RoutingDecision::Foreground)
+        }
+    }
+
+    async fn wait_for_task_event(handle: &TaskManagerHandle) -> TaskEvent {
+        timeout(Duration::from_secs(1), handle.next_event())
+            .await
+            .expect("timed out waiting for task event")
+            .expect("task event stream ended unexpectedly")
+    }
+
+    async fn wait_until_entered(flag: &AtomicBool) {
+        timeout(Duration::from_secs(1), async {
+            while !flag.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("task never entered execution");
     }
 
     #[tokio::test]
@@ -2146,6 +2458,7 @@ mod tests {
 
         match result {
             LoopStep::Interrupt(LoopInterrupt::AuthRequest(request)) => {
+                assert!(request.task_id.is_some());
                 assert_eq!(request.provider, "mcp.mock");
                 assert_eq!(request.challenge.get("scope"), Some(&json!("secret.read")));
                 match request.operation {
@@ -2156,6 +2469,82 @@ mod tests {
                 }
             }
             other => panic!("unexpected loop step: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn async_task_manager_background_round_requires_explicit_continue() {
+        let entered = StdArc::new(AtomicBool::new(false));
+        let release = StdArc::new(Notify::new());
+        let task_manager = AsyncTaskManager::new().routing(NameRoutingPolicy::new([(
+            "background-wait",
+            RoutingDecision::Background,
+        )]));
+        let handle = task_manager.handle();
+        let tools = ToolRegistry::new().with(BlockingTool::new(
+            "background-wait",
+            entered.clone(),
+            release.clone(),
+            "background-done",
+        ));
+        let agent = Agent::builder()
+            .model(FakeAdapter)
+            .tools(tools)
+            .permissions(AllowAllPermissions)
+            .task_manager(task_manager)
+            .build()
+            .unwrap();
+
+        let mut driver = agent
+            .start(SessionConfig {
+                session_id: SessionId::new("session-background"),
+                metadata: MetadataMap::new(),
+            })
+            .await
+            .unwrap();
+
+        driver
+            .submit_input(vec![Item {
+                id: None,
+                kind: ItemKind::User,
+                parts: vec![Part::Text(TextPart {
+                    text: "ping".into(),
+                    metadata: MetadataMap::new(),
+                })],
+                metadata: MetadataMap::new(),
+            }])
+            .unwrap();
+
+        let first = driver.next().await.unwrap();
+        match first {
+            LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_)) => {}
+            other => panic!("unexpected first loop step: {other:?}"),
+        }
+
+        match wait_for_task_event(&handle).await {
+            TaskEvent::Started(snapshot) => assert_eq!(snapshot.tool_name, "background-wait"),
+            other => panic!("unexpected task event: {other:?}"),
+        }
+        wait_until_entered(entered.as_ref()).await;
+        release.notify_waiters();
+
+        match wait_for_task_event(&handle).await {
+            TaskEvent::Completed(_, result) => {
+                assert_eq!(result.output, ToolOutput::Text("background-done".into()))
+            }
+            other => panic!("unexpected completion event: {other:?}"),
+        }
+
+        let resumed = driver.next().await.unwrap();
+        match resumed {
+            LoopStep::Finished(turn) => {
+                assert_eq!(turn.finish_reason, FinishReason::Completed);
+                match &turn.items[0].parts[0] {
+                    Part::Text(text) => assert_eq!(text.text, "tool said: background-done"),
+                    other => panic!("unexpected part after resume: {other:?}"),
+                }
+            }
+            other => panic!("unexpected resumed step: {other:?}"),
         }
     }
 
@@ -2188,14 +2577,12 @@ mod tests {
             }])
             .unwrap();
 
-        let task = tokio::spawn(async move {
-            let result = driver.next().await;
-            (driver, result)
-        });
-        tokio::task::yield_now().await;
-        controller.interrupt();
-        let (mut driver, cancelled) = task.await.unwrap();
-        let cancelled = cancelled.unwrap();
+        let cancelled = tokio::join!(async { driver.next().await }, async {
+            tokio::task::yield_now().await;
+            controller.interrupt();
+        })
+        .0
+        .unwrap();
 
         match cancelled {
             LoopStep::Finished(turn) => {
@@ -2232,6 +2619,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn loop_interrupt_cancels_foreground_tasks_but_keeps_background_tasks_running() {
+        let controller = CancellationController::new();
+        let fg_entered = StdArc::new(AtomicBool::new(false));
+        let fg_release = StdArc::new(Notify::new());
+        let bg_entered = StdArc::new(AtomicBool::new(false));
+        let bg_release = StdArc::new(Notify::new());
+        let task_manager = AsyncTaskManager::new().routing(NameRoutingPolicy::new([
+            ("foreground-wait", RoutingDecision::Foreground),
+            ("background-wait", RoutingDecision::Background),
+        ]));
+        let handle = task_manager.handle();
+        let tools = ToolRegistry::new()
+            .with(BlockingTool::new(
+                "foreground-wait",
+                fg_entered.clone(),
+                fg_release,
+                "foreground-done",
+            ))
+            .with(BlockingTool::new(
+                "background-wait",
+                bg_entered.clone(),
+                bg_release.clone(),
+                "background-done",
+            ));
+        let agent = Agent::builder()
+            .model(MultiToolAdapter)
+            .tools(tools)
+            .permissions(AllowAllPermissions)
+            .cancellation(controller.handle())
+            .task_manager(task_manager)
+            .build()
+            .unwrap();
+
+        let mut driver = agent
+            .start(SessionConfig {
+                session_id: SessionId::new("session-mixed-cancel"),
+                metadata: MetadataMap::new(),
+            })
+            .await
+            .unwrap();
+
+        driver
+            .submit_input(vec![Item {
+                id: None,
+                kind: ItemKind::User,
+                parts: vec![Part::Text(TextPart {
+                    text: "run both".into(),
+                    metadata: MetadataMap::new(),
+                })],
+                metadata: MetadataMap::new(),
+            }])
+            .unwrap();
+
+        let cancelled = tokio::join!(async { driver.next().await }, async {
+            let _ = wait_for_task_event(&handle).await;
+            let _ = wait_for_task_event(&handle).await;
+            wait_until_entered(fg_entered.as_ref()).await;
+            wait_until_entered(bg_entered.as_ref()).await;
+            controller.interrupt();
+        })
+        .0
+        .unwrap();
+
+        match cancelled {
+            LoopStep::Finished(turn) => assert_eq!(turn.finish_reason, FinishReason::Cancelled),
+            other => panic!("unexpected loop step after interrupt: {other:?}"),
+        }
+
+        match wait_for_task_event(&handle).await {
+            TaskEvent::Cancelled(snapshot) => assert_eq!(snapshot.tool_name, "foreground-wait"),
+            other => panic!("unexpected post-interrupt event: {other:?}"),
+        }
+
+        let running = handle.list_running().await;
+        assert_eq!(running.len(), 1);
+        assert_eq!(running[0].tool_name, "background-wait");
+
+        bg_release.notify_waiters();
+        match wait_for_task_event(&handle).await {
+            TaskEvent::Completed(snapshot, result) => {
+                assert_eq!(snapshot.tool_name, "background-wait");
+                assert_eq!(result.output, ToolOutput::Text("background-done".into()));
+            }
+            other => panic!("unexpected background completion event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn loop_resumes_after_approved_tool_request() {
         let tools = ToolRegistry::new().with(EchoTool::default());
         let agent = Agent::builder()
@@ -2264,6 +2739,7 @@ mod tests {
         let first = driver.next().await.unwrap();
         match first {
             LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(request)) => {
+                assert!(request.task_id.is_some());
                 assert_eq!(request.id.0, "approval:fs-read");
             }
             other => panic!("unexpected loop step: {other:?}"),

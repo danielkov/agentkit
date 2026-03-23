@@ -18,6 +18,7 @@ agentkit-loop = { version = "0.1.0", path = "../agentkit-loop", optional = true 
 agentkit-mcp = { version = "0.1.0", path = "../agentkit-mcp", optional = true }
 agentkit-provider-openrouter = { version = "0.1.0", path = "../agentkit-provider-openrouter", optional = true }
 agentkit-reporting = { version = "0.1.0", path = "../agentkit-reporting", optional = true }
+agentkit-task-manager = { version = "0.1.0", path = "../agentkit-task-manager", optional = true }
 agentkit-tool-fs = { version = "0.1.0", path = "../agentkit-tool-fs", optional = true }
 agentkit-tool-shell = { version = "0.1.0", path = "../agentkit-tool-shell", optional = true }
 agentkit-tool-skills = { version = "0.1.0", path = "../agentkit-tool-skills", optional = true }
@@ -30,7 +31,8 @@ compaction = ["dep:agentkit-compaction", "core"]
 capabilities = ["dep:agentkit-capabilities", "core"]
 context = ["dep:agentkit-context", "core"]
 tools = ["dep:agentkit-tools-core", "capabilities"]
-loop = ["dep:agentkit-loop", "tools"]
+task-manager = ["dep:agentkit-task-manager", "tools"]
+loop = ["dep:agentkit-loop", "tools", "task-manager"]
 mcp = ["dep:agentkit-mcp", "capabilities", "tools"]
 provider-openrouter = ["dep:agentkit-provider-openrouter", "loop"]
 reporting = ["dep:agentkit-reporting", "loop"]

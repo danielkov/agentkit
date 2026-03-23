@@ -1931,6 +1931,7 @@ fn parse_auth_request(
     }
 
     Some(AuthRequest {
+        task_id: None,
         id: format!("mcp:{}:{}", server_id, method),
         provider: format!("mcp.{}", server_id),
         operation: auth_operation_for_method(server_id, method, params),
@@ -2431,6 +2432,7 @@ mod tests {
         let mut auth = MetadataMap::new();
         auth.insert("token".into(), json!("secret-token"));
         let request = AuthRequest {
+            task_id: None,
             id: "auth-recording-tool".into(),
             provider: "mcp.recording".into(),
             operation: AuthOperation::McpToolCall {
@@ -2480,6 +2482,7 @@ mod tests {
         let mut auth = MetadataMap::new();
         auth.insert("token".into(), json!("seed-token"));
         let request = AuthRequest {
+            task_id: None,
             id: "auth-recording-connect".into(),
             provider: "mcp.recording".into(),
             operation: AuthOperation::McpConnect {
@@ -2540,6 +2543,7 @@ mod tests {
         let mut auth = MetadataMap::new();
         auth.insert("token".into(), json!("resource-token"));
         let request = AuthRequest {
+            task_id: None,
             id: "auth-recording-resource".into(),
             provider: "mcp.recording".into(),
             operation: AuthOperation::McpResourceRead {
@@ -2599,6 +2603,7 @@ mod tests {
         let mut auth = MetadataMap::new();
         auth.insert("token".into(), json!("connect-token"));
         let request = AuthRequest {
+            task_id: None,
             id: "auth-recording-connect-replay".into(),
             provider: "mcp.recording".into(),
             operation: AuthOperation::McpConnect {

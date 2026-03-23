@@ -377,13 +377,13 @@ impl Tool for ActivateSkillTool {
         request: ToolRequest,
         _ctx: &mut ToolContext<'_>,
     ) -> Result<ToolResult, ToolError> {
-        let input: ActivateSkillInput =
-            serde_json::from_value(request.input).map_err(|e| ToolError::InvalidInput(format!("invalid input: {e}")))?;
+        let input: ActivateSkillInput = serde_json::from_value(request.input)
+            .map_err(|e| ToolError::InvalidInput(format!("invalid input: {e}")))?;
 
         let skills = discover_filtered_skills(&self.roots, &self.filters);
-        let skill = skills.get(&input.name).ok_or_else(|| {
-            ToolError::InvalidInput(format!("unknown skill: {}", input.name))
-        })?;
+        let skill = skills
+            .get(&input.name)
+            .ok_or_else(|| ToolError::InvalidInput(format!("unknown skill: {}", input.name)))?;
 
         // Deduplicate within a session, not globally across the registry.
         {
@@ -599,7 +599,9 @@ fn parse_skill(path: &Path) -> Option<Skill> {
 /// Split content into (frontmatter_yaml, body). Returns `None` if no valid
 /// frontmatter delimiters are found.
 fn split_frontmatter(content: &str) -> Option<(String, String)> {
-    let stripped = content.strip_prefix("---\n").or_else(|| content.strip_prefix("---\r\n"))?;
+    let stripped = content
+        .strip_prefix("---\n")
+        .or_else(|| content.strip_prefix("---\r\n"))?;
     if stripped.starts_with("---") {
         return None;
     }
@@ -698,12 +700,12 @@ fn collect_skill_files(root: &Path) -> Result<Vec<PathBuf>, SkillError> {
                 error,
             })?;
             let path = entry.path();
-            let ft = entry.file_type().map_err(|error| {
-                SkillError::InspectFailed {
+            let ft = entry
+                .file_type()
+                .map_err(|error| SkillError::InspectFailed {
                     path: path.clone(),
                     error,
-                }
-            })?;
+                })?;
 
             if ft.is_dir() {
                 let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -851,9 +853,12 @@ mod tests {
         // No frontmatter.
         let nofm_dir = root.join("nofm");
         async_fs::create_dir_all(&nofm_dir).await.unwrap();
-        async_fs::write(nofm_dir.join("SKILL.md"), "# Just markdown\nNo frontmatter here.")
-            .await
-            .unwrap();
+        async_fs::write(
+            nofm_dir.join("SKILL.md"),
+            "# Just markdown\nNo frontmatter here.",
+        )
+        .await
+        .unwrap();
 
         let reg = SkillRegistry::from_paths(vec![root.clone()])
             .discover_skills()
@@ -1085,9 +1090,7 @@ mod tests {
         let tool = reg.build_tool();
         let spec = tool.current_spec().unwrap();
         let schema = &spec.input_schema;
-        let enum_values = schema["properties"]["name"]["enum"]
-            .as_array()
-            .unwrap();
+        let enum_values = schema["properties"]["name"]["enum"].as_array().unwrap();
 
         assert_eq!(enum_values.len(), 2);
         let names: Vec<&str> = enum_values.iter().map(|v| v.as_str().unwrap()).collect();
@@ -1133,7 +1136,9 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(matches!(first.result.output, ToolOutput::Text(ref t) if t.contains("Body content here.")));
+        assert!(
+            matches!(first.result.output, ToolOutput::Text(ref t) if t.contains("Body content here."))
+        );
 
         let second = tool
             .invoke(
@@ -1149,7 +1154,9 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(matches!(second.result.output, ToolOutput::Text(ref t) if t.contains("Body content here.")));
+        assert!(
+            matches!(second.result.output, ToolOutput::Text(ref t) if t.contains("Body content here."))
+        );
 
         async_fs::remove_dir_all(&root).await.unwrap();
     }
@@ -1246,7 +1253,11 @@ mod tests {
             .discover_skills()
             .await;
 
-        let names: Vec<&str> = reg.skills().iter().map(|skill| skill.name.as_str()).collect();
+        let names: Vec<&str> = reg
+            .skills()
+            .iter()
+            .map(|skill| skill.name.as_str())
+            .collect();
         assert_eq!(names, vec!["valid-skill"]);
 
         async_fs::remove_dir_all(&root).await.unwrap();

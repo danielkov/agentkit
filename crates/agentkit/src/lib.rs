@@ -26,6 +26,7 @@
 //! | `context` | [`context`] | `AGENTS.md` discovery and context loading |
 //! | `mcp` | [`mcp`] | Model Context Protocol (MCP) server connections |
 //! | `provider-openrouter` | [`provider_openrouter`] | OpenRouter [`loop_::ModelAdapter`] implementation |
+//! | `task-manager` | [`task_manager`] | Tool task scheduling: [`task_manager::SimpleTaskManager`], [`task_manager::AsyncTaskManager`] |
 //! | `tool-fs` | [`tool_fs`] | Filesystem tools (read, write, edit, move, delete, list, mkdir) |
 //! | `tool-shell` | [`tool_shell`] | Shell execution tool (`shell.exec`) |
 //! | `tool-skills` | [`tool_skills`] | Progressive Agent Skills discovery and activation |
@@ -146,6 +147,16 @@ pub use agentkit_tools_core as tools;
 #[cfg(feature = "loop")]
 pub use agentkit_loop as loop_;
 
+/// Tool task scheduling for loop-integrated tool execution.
+///
+/// Provides [`task_manager::SimpleTaskManager`] for the existing sequential
+/// behavior and [`task_manager::AsyncTaskManager`] for foreground parallelism
+/// plus detached background tasks.
+///
+/// Requires the `task-manager` feature.
+#[cfg(feature = "task-manager")]
+pub use agentkit_task_manager as task_manager;
+
 /// Loop observers for logging, usage tracking, and transcript recording.
 ///
 /// Provides [`reporting::StdoutReporter`] for human-readable terminal output,
@@ -255,14 +266,16 @@ pub mod prelude {
     pub use crate::provider_openrouter::*;
     #[cfg(feature = "reporting")]
     pub use crate::reporting::*;
+    #[cfg(feature = "task-manager")]
+    pub use crate::task_manager::*;
     #[cfg(feature = "tool-fs")]
     pub use crate::tool_fs::{
-        registry as fs_registry, CreateDirectoryTool, DeleteTool, FileSystemToolError,
-        FileSystemToolPolicy, FileSystemToolResources, ListDirectoryTool, MoveTool, ReadFileTool,
-        ReplaceInFileTool, WriteFileTool,
+        CreateDirectoryTool, DeleteTool, FileSystemToolError, FileSystemToolPolicy,
+        FileSystemToolResources, ListDirectoryTool, MoveTool, ReadFileTool, ReplaceInFileTool,
+        WriteFileTool, registry as fs_registry,
     };
     #[cfg(feature = "tool-shell")]
-    pub use crate::tool_shell::{registry as shell_registry, ShellExecTool};
+    pub use crate::tool_shell::{ShellExecTool, registry as shell_registry};
     #[cfg(feature = "tools")]
     pub use crate::tools::*;
 }

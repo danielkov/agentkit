@@ -5,6 +5,7 @@ members = [
     "crates/agentkit-context",
     "crates/agentkit-capabilities",
     "crates/agentkit-tools-core",
+    "crates/agentkit-task-manager",
     "crates/agentkit-loop",
     "crates/agentkit",
     "crates/agentkit-provider-openrouter",

@@ -16,6 +16,7 @@ The project is intentionally split into small crates behind feature flags so hos
 - MCP transports, discovery, tool/resource/prompt adapters, auth replay, and lifecycle management
 - reporting observers
 - compaction triggers, strategy pipelines, and backend-driven semantic compaction
+- async task management with foreground/background scheduling, routing policies, and detach-after-timeout
 - optional turn cancellation with resumable sessions
 - an OpenRouter provider adapter
 
@@ -39,6 +40,8 @@ The repo also ships multiple examples that exercise these pieces end to end.
   - loop observers and reporting adapters
 - `agentkit-compaction`
   - compaction triggers, strategies, pipelines, backend hooks
+- `agentkit-task-manager`
+  - task scheduling for tool execution: foreground, background, and detach-after-timeout routing
 - `agentkit-tool-fs`
   - filesystem tools
 - `agentkit-tool-shell`
@@ -139,6 +142,130 @@ match driver.next().await? {
 }
 ```
 
+## Task management
+
+The `agentkit-task-manager` crate controls how the loop driver schedules tool-call execution. Two implementations are provided out of the box, and you can supply your own by implementing the `TaskManager` trait.
+
+### `SimpleTaskManager` (default)
+
+Runs every tool call inline on the current task, returning the result before the driver continues. This is the default when no task manager is configured and preserves purely sequential behavior.
+
+### `AsyncTaskManager`
+
+Spawns each tool call as a Tokio task. Tasks are classified as **foreground** or **background** through a pluggable `TaskRoutingPolicy`. Foreground tasks block the current turn until they resolve; background tasks run independently and deliver results back to the loop (or to a manual drain queue) when they complete.
+
+A third routing mode, `ForegroundThenDetachAfter(Duration)`, starts a task in the foreground and automatically promotes it to background if it hasn't finished within the given timeout.
+
+```rust
+use agentkit_task_manager::{AsyncTaskManager, RoutingDecision, TaskRoutingPolicy};
+use agentkit_tools_core::ToolRequest;
+use std::time::Duration;
+
+struct MyRoutingPolicy;
+
+impl TaskRoutingPolicy for MyRoutingPolicy {
+    fn route(&self, request: &ToolRequest) -> RoutingDecision {
+        if request.tool_name.as_ref() == "shell.exec" {
+            // Shell commands that take too long get detached automatically.
+            RoutingDecision::ForegroundThenDetachAfter(Duration::from_secs(5))
+        } else if request.metadata.get::<String>("background").is_some() {
+            RoutingDecision::Background
+        } else {
+            RoutingDecision::Foreground
+        }
+    }
+}
+
+let agent = Agent::builder()
+    .model(adapter)
+    .tools(agentkit_tool_fs::registry())
+    .task_manager(AsyncTaskManager::new().routing(MyRoutingPolicy))
+    .build()?;
+```
+
+`TaskRoutingPolicy` has a blanket impl for `Fn(&ToolRequest) -> RoutingDecision`, so you can pass a closure directly:
+
+```rust
+use agentkit_task_manager::{AsyncTaskManager, RoutingDecision};
+
+let agent = Agent::builder()
+    .model(adapter)
+    .task_manager(AsyncTaskManager::new().routing(|req| {
+        if req.tool_name.as_ref() == "shell.exec" {
+            RoutingDecision::Background
+        } else {
+            RoutingDecision::Foreground
+        }
+    }))
+    .build()?;
+```
+
+### Implementing a custom `TaskManager`
+
+The `TaskManager` trait lets you control how tool calls are scheduled, awaited, and delivered back to the loop.
+
+```rust
+use agentkit_task_manager::{
+    PendingLoopUpdates, TaskLaunchRequest, TaskManager, TaskManagerError,
+    TaskManagerHandle, TaskStartContext, TaskStartOutcome,
+    TurnTaskUpdate,
+};
+use agentkit_core::{TurnCancellation, TurnId};
+use async_trait::async_trait;
+
+struct MyTaskManager { /* ... */ }
+
+#[async_trait]
+impl TaskManager for MyTaskManager {
+    /// Launch a tool call. Return `Ready` for an immediate result
+    /// or `Pending` to indicate the task is running asynchronously.
+    async fn start_task(
+        &self,
+        request: TaskLaunchRequest,
+        ctx: TaskStartContext,
+    ) -> Result<TaskStartOutcome, TaskManagerError> {
+        // Execute immediately via the provided executor, apply
+        // your own scheduling, queue to a thread pool, etc.
+        todo!()
+    }
+
+    /// Block until the next foreground task for this turn resolves,
+    /// or return `None` when no foreground tasks remain.
+    async fn wait_for_turn(
+        &self,
+        turn_id: &TurnId,
+        cancellation: Option<TurnCancellation>,
+    ) -> Result<Option<TurnTaskUpdate>, TaskManagerError> {
+        todo!()
+    }
+
+    /// Drain any background-task results that are ready to be
+    /// injected into the next loop iteration.
+    async fn take_pending_loop_updates(
+        &self,
+    ) -> Result<PendingLoopUpdates, TaskManagerError> {
+        todo!()
+    }
+
+    /// Called when a turn is interrupted (e.g. by cancellation).
+    /// Cancel or clean up any foreground tasks for this turn.
+    async fn on_turn_interrupted(
+        &self,
+        turn_id: &TurnId,
+    ) -> Result<(), TaskManagerError> {
+        todo!()
+    }
+
+    /// Return a clonable handle for out-of-band task control:
+    /// listing, cancelling, draining, and subscribing to events.
+    fn handle(&self) -> TaskManagerHandle {
+        todo!()
+    }
+}
+```
+
+The `TaskManagerHandle` returned by `handle()` lets host code outside the loop observe task lifecycle events, cancel running tasks, list running/completed snapshots, and drain manually-delivered items.
+
 ## Feature flags
 
 The umbrella crate re-exports subcrates behind feature flags.
@@ -148,6 +275,7 @@ Default flags:
 - `core`
 - `capabilities`
 - `tools`
+- `task-manager`
 - `loop`
 - `reporting`
 
