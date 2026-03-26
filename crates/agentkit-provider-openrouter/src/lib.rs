@@ -349,9 +349,26 @@ impl ModelSession for OpenRouterSession {
                 )));
             }
 
-            let completion: ChatCompletionResponse = response.json().await.map_err(|error| {
-                LoopError::Provider(format!("invalid OpenRouter response: {error}"))
+            let body = response.text().await.map_err(|error| {
+                LoopError::Provider(format!("failed to read OpenRouter response body: {error}"))
             })?;
+
+            // OpenRouter sometimes returns 200 with an error body instead of
+            // a proper HTTP error status.  Check for that before attempting
+            // to deserialize the normal completion shape.
+            if let Ok(err_resp) = serde_json::from_str::<OpenRouterErrorResponse>(&body) {
+                return Err(LoopError::Provider(format!(
+                    "OpenRouter returned error (code {}): {}",
+                    err_resp.error.code, err_resp.error.message,
+                )));
+            }
+
+            let completion: ChatCompletionResponse =
+                serde_json::from_str(&body).map_err(|error| {
+                    LoopError::Provider(format!(
+                        "invalid OpenRouter response: {error}\n\nRaw response body:\n{body}"
+                    ))
+                })?;
 
             build_turn_from_response(completion).map_err(as_loop_error)
         };
@@ -1025,6 +1042,17 @@ impl PartExt for Part {
             Part::Custom(_) => PartKind::Custom,
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenRouterErrorResponse {
+    error: OpenRouterErrorBody,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenRouterErrorBody {
+    message: String,
+    code: serde_json::Value,
 }
 
 #[derive(Debug, Deserialize)]

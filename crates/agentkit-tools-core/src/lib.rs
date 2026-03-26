@@ -373,6 +373,9 @@ pub enum ApprovalReason {
 pub struct ApprovalRequest {
     /// Runtime task identifier associated with this approval request, if any.
     pub task_id: Option<TaskId>,
+    /// The originating tool call id when this approval was raised from a
+    /// tool invocation. Hosts can use this to resolve specific approvals.
+    pub call_id: Option<ToolCallId>,
     /// Stable identifier so the executor can match the approval to its request.
     pub id: ApprovalId,
     /// The [`PermissionRequest::kind`] string that triggered the approval flow.
@@ -960,6 +963,7 @@ impl PermissionPolicy for CustomKindPolicy {
         if self.require_approval_by_default {
             PolicyMatch::RequireApproval(ApprovalRequest {
                 task_id: None,
+                call_id: None,
                 id: ApprovalId::new(format!("approval:{kind}")),
                 request_kind: kind.to_string(),
                 reason: ApprovalReason::PolicyRequiresConfirmation,
@@ -1042,7 +1046,7 @@ impl PermissionPolicy for PathPolicy {
             return PolicyMatch::NoOpinion;
         };
 
-        let candidate_paths: Vec<&Path> = match fs {
+        let raw_paths: Vec<&Path> = match fs {
             FileSystemPermissionRequest::Move { from, to, .. } => {
                 vec![from.as_path(), to.as_path()]
             }
@@ -1053,6 +1057,11 @@ impl PermissionPolicy for PathPolicy {
             | FileSystemPermissionRequest::List { path, .. }
             | FileSystemPermissionRequest::CreateDir { path, .. } => vec![path.as_path()],
         };
+
+        let candidate_paths: Vec<PathBuf> = raw_paths
+            .iter()
+            .map(|p| std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf()))
+            .collect();
 
         if candidate_paths.iter().any(|path| {
             self.protected_roots
@@ -1079,6 +1088,7 @@ impl PermissionPolicy for PathPolicy {
         } else if self.require_approval_outside_allowed {
             PolicyMatch::RequireApproval(ApprovalRequest {
                 task_id: None,
+                call_id: None,
                 id: ApprovalId::new(format!("approval:{}", fs.kind())),
                 request_kind: fs.kind().to_string(),
                 reason: ApprovalReason::SensitivePath,
@@ -1199,6 +1209,7 @@ impl PermissionPolicy for CommandPolicy {
         {
             return PolicyMatch::RequireApproval(ApprovalRequest {
                 task_id: None,
+                call_id: None,
                 id: ApprovalId::new("approval:shell.cwd"),
                 request_kind: shell.kind().to_string(),
                 reason: ApprovalReason::SensitiveCommand,
@@ -1214,6 +1225,7 @@ impl PermissionPolicy for CommandPolicy {
         } else if self.require_approval_for_unknown {
             PolicyMatch::RequireApproval(ApprovalRequest {
                 task_id: None,
+                call_id: None,
                 id: ApprovalId::new("approval:shell.command"),
                 request_kind: shell.kind().to_string(),
                 reason: ApprovalReason::SensitiveCommand,
@@ -1297,6 +1309,7 @@ impl PermissionPolicy for McpServerPolicy {
             return if self.require_approval_for_untrusted {
                 PolicyMatch::RequireApproval(ApprovalRequest {
                     task_id: None,
+                    call_id: None,
                     id: ApprovalId::new(format!("approval:mcp:{server_id}")),
                     request_kind: mcp.kind().to_string(),
                     reason: ApprovalReason::SensitiveServer,
@@ -1824,7 +1837,8 @@ impl BasicToolExecutor {
                                 denial,
                             ));
                         }
-                        PermissionDecision::RequireApproval(req) => {
+                        PermissionDecision::RequireApproval(mut req) => {
+                            req.call_id = Some(request.call_id.clone());
                             if approved_request_id != Some(&req.id) {
                                 return ToolExecutionOutcome::Interrupted(
                                     ToolInterruption::ApprovalRequired(req),

@@ -48,7 +48,7 @@
 //! # }
 //! ```
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
 use agentkit_compaction::{
@@ -56,11 +56,11 @@ use agentkit_compaction::{
 };
 use agentkit_core::{
     CancellationHandle, Delta, FinishReason, Item, ItemKind, MetadataMap, Part, SessionId, TaskId,
-    TextPart, ToolCallPart, ToolOutput, ToolResultPart, TurnCancellation, Usage,
+    TextPart, ToolCallId, ToolCallPart, ToolOutput, ToolResultPart, TurnCancellation, Usage,
 };
 use agentkit_task_manager::{
-    PendingLoopUpdates, SimpleTaskManager, TaskLaunchRequest, TaskManager, TaskResolution,
-    TaskStartContext, TaskStartOutcome, TurnTaskUpdate,
+    PendingLoopUpdates, SimpleTaskManager, TaskApproval, TaskAuth, TaskLaunchRequest,
+    TaskManager, TaskResolution, TaskStartContext, TaskStartOutcome, TurnTaskUpdate,
 };
 #[cfg(test)]
 use agentkit_tools_core::ToolContext;
@@ -332,16 +332,175 @@ pub enum AgentEvent {
     TurnFinished(TurnResult),
 }
 
+/// Handle for a pending approval interrupt.
+///
+/// Wraps an [`ApprovalRequest`] and provides ergonomic resolution methods
+/// so callers can resolve the interrupt directly instead of searching for
+/// the matching method on [`LoopDriver`].
+///
+/// # Example
+///
+/// ```rust,no_run
+/// # use agentkit_loop::{LoopInterrupt, LoopStep, LoopDriver};
+/// # async fn handle<S: agentkit_loop::ModelSession>(driver: &mut LoopDriver<S>) -> Result<(), agentkit_loop::LoopError> {
+/// match driver.next().await? {
+///     LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(pending)) => {
+///         println!("Needs approval: {}", pending.request.summary);
+///         pending.approve(driver)?;
+///     }
+///     _ => {}
+/// }
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingApproval {
+    /// The underlying approval request details.
+    pub request: ApprovalRequest,
+}
+
+impl std::ops::Deref for PendingApproval {
+    type Target = ApprovalRequest;
+    fn deref(&self) -> &ApprovalRequest {
+        &self.request
+    }
+}
+
+impl PendingApproval {
+    /// Approve the pending tool call.
+    pub fn approve<S: ModelSession>(
+        self,
+        driver: &mut LoopDriver<S>,
+    ) -> Result<(), LoopError> {
+        let call_id = self
+            .request
+            .call_id
+            .ok_or_else(|| LoopError::InvalidState("pending approval is missing call id".into()))?;
+        driver.resolve_approval_for(call_id, ApprovalDecision::Approve)
+    }
+
+    /// Deny the pending tool call.
+    pub fn deny<S: ModelSession>(
+        self,
+        driver: &mut LoopDriver<S>,
+    ) -> Result<(), LoopError> {
+        let call_id = self
+            .request
+            .call_id
+            .ok_or_else(|| LoopError::InvalidState("pending approval is missing call id".into()))?;
+        driver.resolve_approval_for(call_id, ApprovalDecision::Deny { reason: None })
+    }
+
+    /// Deny the pending tool call with a reason.
+    pub fn deny_with_reason<S: ModelSession>(
+        self,
+        driver: &mut LoopDriver<S>,
+        reason: impl Into<String>,
+    ) -> Result<(), LoopError> {
+        let call_id = self
+            .request
+            .call_id
+            .ok_or_else(|| LoopError::InvalidState("pending approval is missing call id".into()))?;
+        driver.resolve_approval_for(call_id, ApprovalDecision::Deny {
+            reason: Some(reason.into()),
+        })
+    }
+}
+
+/// Handle for a pending authentication interrupt.
+///
+/// Wraps an [`AuthRequest`] and provides ergonomic resolution methods.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// # use agentkit_loop::{LoopInterrupt, LoopStep, LoopDriver};
+/// # use agentkit_core::MetadataMap;
+/// # async fn handle<S: agentkit_loop::ModelSession>(driver: &mut LoopDriver<S>) -> Result<(), agentkit_loop::LoopError> {
+/// match driver.next().await? {
+///     LoopStep::Interrupt(LoopInterrupt::AuthRequest(pending)) => {
+///         println!("Auth required from: {}", pending.request.provider);
+///         pending.cancel(driver)?;
+///     }
+///     _ => {}
+/// }
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingAuth {
+    /// The underlying auth request details.
+    pub request: AuthRequest,
+}
+
+impl std::ops::Deref for PendingAuth {
+    type Target = AuthRequest;
+    fn deref(&self) -> &AuthRequest {
+        &self.request
+    }
+}
+
+impl PendingAuth {
+    /// Provide credentials to satisfy the auth request.
+    pub fn provide<S: ModelSession>(
+        self,
+        driver: &mut LoopDriver<S>,
+        credentials: MetadataMap,
+    ) -> Result<(), LoopError> {
+        driver.resolve_auth(AuthResolution::Provided {
+            request: self.request,
+            credentials,
+        })
+    }
+
+    /// Cancel the auth flow.
+    pub fn cancel<S: ModelSession>(
+        self,
+        driver: &mut LoopDriver<S>,
+    ) -> Result<(), LoopError> {
+        driver.resolve_auth(AuthResolution::Cancelled {
+            request: self.request,
+        })
+    }
+}
+
 /// Descriptor for a [`LoopInterrupt::AwaitingInput`] interrupt.
 ///
-/// Returned when the driver has no pending input and needs the host to call
-/// [`LoopDriver::submit_input`] before advancing.
+/// Returned when the driver has no pending input and needs the host to
+/// supply items before advancing.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// # use agentkit_loop::{LoopInterrupt, LoopStep, LoopDriver};
+/// # use agentkit_core::Item;
+/// # async fn handle<S: agentkit_loop::ModelSession>(driver: &mut LoopDriver<S>, items: Vec<Item>) -> Result<(), agentkit_loop::LoopError> {
+/// match driver.next().await? {
+///     LoopStep::Interrupt(LoopInterrupt::AwaitingInput(pending)) => {
+///         pending.submit(driver, items)?;
+///     }
+///     _ => {}
+/// }
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InputRequest {
     /// The session that is waiting for input.
     pub session_id: SessionId,
     /// Human-readable explanation of why input is needed.
     pub reason: String,
+}
+
+impl InputRequest {
+    /// Submit input items to the driver.
+    pub fn submit<S: ModelSession>(
+        self,
+        driver: &mut LoopDriver<S>,
+        items: Vec<Item>,
+    ) -> Result<(), LoopError> {
+        driver.submit_input(items)
+    }
 }
 
 /// Outcome of a completed (or cancelled) turn.
@@ -365,30 +524,28 @@ pub struct TurnResult {
 /// An interrupt that pauses the agent loop until the host resolves it.
 ///
 /// The loop returns an interrupt inside [`LoopStep::Interrupt`] whenever it
-/// cannot proceed autonomously.  The host must resolve the interrupt
-/// (via [`LoopDriver::resolve_approval`], [`LoopDriver::resolve_auth`], or
-/// [`LoopDriver::submit_input`]) and then call [`LoopDriver::next`] again.
+/// cannot proceed autonomously.  Each variant carries a handle with
+/// resolution methods so callers can resolve the interrupt directly.
 ///
 /// # Example
 ///
 /// ```rust,no_run
 /// use agentkit_loop::{LoopInterrupt, LoopStep};
 /// # use agentkit_loop::LoopDriver;
-/// # use agentkit_tools_core::ApprovalDecision;
 ///
 /// # async fn handle<S: agentkit_loop::ModelSession>(driver: &mut LoopDriver<S>) -> Result<(), agentkit_loop::LoopError> {
 /// match driver.next().await? {
-///     LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(req)) => {
-///         println!("Tool {} needs approval: {}", req.request_kind, req.summary);
-///         driver.resolve_approval(ApprovalDecision::Approve)?;
+///     LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(pending)) => {
+///         println!("Tool {} needs approval: {}", pending.request.request_kind, pending.request.summary);
+///         pending.approve(driver)?;
 ///     }
-///     LoopStep::Interrupt(LoopInterrupt::AuthRequest(req)) => {
-///         println!("Auth required from provider: {}", req.provider);
-///         // ... obtain credentials and call driver.resolve_auth(...)
+///     LoopStep::Interrupt(LoopInterrupt::AuthRequest(pending)) => {
+///         println!("Auth required from provider: {}", pending.request.provider);
+///         pending.cancel(driver)?;
 ///     }
-///     LoopStep::Interrupt(LoopInterrupt::AwaitingInput(req)) => {
-///         println!("Waiting for input: {}", req.reason);
-///         // ... call driver.submit_input(...)
+///     LoopStep::Interrupt(LoopInterrupt::AwaitingInput(pending)) => {
+///         println!("Waiting for input: {}", pending.reason);
+///         // ... call pending.submit(driver, items)
 ///     }
 ///     LoopStep::Finished(result) => {
 ///         println!("Turn finished: {:?}", result.finish_reason);
@@ -400,9 +557,9 @@ pub struct TurnResult {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LoopInterrupt {
     /// A tool call requires explicit approval before it can execute.
-    ApprovalRequest(ApprovalRequest),
+    ApprovalRequest(PendingApproval),
     /// A tool call requires authentication credentials.
-    AuthRequest(AuthRequest),
+    AuthRequest(PendingAuth),
     /// The driver has no pending input and needs the host to supply some.
     AwaitingInput(InputRequest),
 }
@@ -457,17 +614,11 @@ pub struct LoopSnapshot {
     pub pending_input: Vec<Item>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum DriverState {
-    Idle,
-    AwaitingApproval,
-    AwaitingAuth,
-}
-
 #[derive(Clone, Debug)]
 struct PendingApprovalToolCall {
     request: ApprovalRequest,
     decision: Option<ApprovalDecision>,
+    surfaced: bool,
     turn_id: agentkit_core::TurnId,
     task_id: TaskId,
     call: ToolCallPart,
@@ -569,11 +720,11 @@ where
             observers: self.observers,
             transcript: Vec::new(),
             pending_input: Vec::new(),
-            pending_approval: None,
+            pending_approvals: BTreeMap::new(),
+            pending_approval_order: VecDeque::new(),
             pending_auth: None,
             active_tool_round: None,
             next_turn_index: 1,
-            state: DriverState::Idle,
         };
         driver.emit(AgentEvent::RunStarted { session_id });
         Ok(driver)
@@ -756,11 +907,11 @@ where
     observers: Vec<Box<dyn LoopObserver>>,
     transcript: Vec<Item>,
     pending_input: Vec<Item>,
-    pending_approval: Option<PendingApprovalToolCall>,
+    pending_approvals: BTreeMap<ToolCallId, PendingApprovalToolCall>,
+    pending_approval_order: VecDeque<ToolCallId>,
     pending_auth: Option<PendingAuthToolCall>,
     active_tool_round: Option<ActiveToolRound>,
     next_turn_index: u64,
-    state: DriverState,
 }
 
 impl<S> LoopDriver<S>
@@ -808,6 +959,113 @@ where
         }
     }
 
+    fn has_pending_interrupts(&self) -> bool {
+        self.pending_auth.is_some() || !self.pending_approvals.is_empty()
+    }
+
+    fn enqueue_pending_approval(
+        &mut self,
+        turn_id: &agentkit_core::TurnId,
+        task: TaskApproval,
+    ) {
+        let call_id = task.tool_request.call_id.clone();
+        let call = ToolCallPart {
+            id: call_id.clone(),
+            name: task.tool_request.tool_name.to_string(),
+            input: task.tool_request.input.clone(),
+            metadata: task.tool_request.metadata.clone(),
+        };
+        let mut request = task.approval;
+        request.call_id = Some(call_id.clone());
+        let pending = PendingApprovalToolCall {
+            request: request.clone(),
+            decision: None,
+            surfaced: false,
+            turn_id: turn_id.clone(),
+            task_id: task.task_id,
+            call,
+            tool_request: task.tool_request,
+        };
+        self.pending_approvals.insert(call_id.clone(), pending);
+        if !self.pending_approval_order.iter().any(|id| id == &call_id) {
+            self.pending_approval_order.push_back(call_id);
+        }
+        self.emit(AgentEvent::ApprovalRequired(request));
+    }
+
+    fn take_next_unsurfaced_approval_interrupt(&mut self) -> Option<LoopStep> {
+        for call_id in self.pending_approval_order.clone() {
+            let Some(pending) = self.pending_approvals.get_mut(&call_id) else {
+                continue;
+            };
+            if pending.decision.is_none() && !pending.surfaced {
+                pending.surfaced = true;
+                return Some(LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(
+                    PendingApproval {
+                        request: pending.request.clone(),
+                    },
+                )));
+            }
+        }
+        None
+    }
+
+    fn next_unresolved_approval_interrupt(&self) -> Option<LoopStep> {
+        self.pending_approval_order.iter().find_map(|call_id| {
+            self.pending_approvals.get(call_id).and_then(|pending| {
+                pending.decision.is_none().then(|| {
+                    LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(PendingApproval {
+                        request: pending.request.clone(),
+                    }))
+                })
+            })
+        })
+    }
+
+    fn take_next_resolved_approval(&mut self) -> Option<PendingApprovalToolCall> {
+        let call_id = self.pending_approval_order.iter().find_map(|call_id| {
+            self.pending_approvals
+                .get(call_id)
+                .and_then(|pending| pending.decision.as_ref().map(|_| call_id.clone()))
+        })?;
+        self.pending_approval_order.retain(|id| id != &call_id);
+        self.pending_approvals.remove(&call_id)
+    }
+
+    fn pending_auth_interrupt(&self) -> Option<LoopStep> {
+        self.pending_auth.as_ref().and_then(|pending| {
+            pending.resolution.is_none().then(|| {
+                LoopStep::Interrupt(LoopInterrupt::AuthRequest(PendingAuth {
+                    request: pending.request.clone(),
+                }))
+            })
+        })
+    }
+
+    fn queue_auth_interrupt(
+        &mut self,
+        turn_id: &agentkit_core::TurnId,
+        task: TaskAuth,
+    ) -> LoopStep {
+        let call = ToolCallPart {
+            id: task.tool_request.call_id.clone(),
+            name: task.tool_request.tool_name.to_string(),
+            input: task.tool_request.input.clone(),
+            metadata: task.tool_request.metadata.clone(),
+        };
+        let request = upgrade_auth_request(task.auth, &task.tool_request, &call);
+        self.pending_auth = Some(PendingAuthToolCall {
+            request: request.clone(),
+            resolution: None,
+            turn_id: turn_id.clone(),
+            task_id: task.task_id,
+            call,
+            tool_request: task.tool_request,
+        });
+        self.emit(AgentEvent::AuthRequired(request.clone()));
+        LoopStep::Interrupt(LoopInterrupt::AuthRequest(PendingAuth { request }))
+    }
+
     fn queue_resolution_interrupt(
         &mut self,
         turn_id: &agentkit_core::TurnId,
@@ -819,46 +1077,10 @@ where
                 None
             }
             TaskResolution::Approval(task) => {
-                let call = ToolCallPart {
-                    id: task.tool_request.call_id.clone(),
-                    name: task.tool_request.tool_name.to_string(),
-                    input: task.tool_request.input.clone(),
-                    metadata: task.tool_request.metadata.clone(),
-                };
-                self.pending_approval = Some(PendingApprovalToolCall {
-                    request: task.approval.clone(),
-                    decision: None,
-                    turn_id: turn_id.clone(),
-                    task_id: task.task_id,
-                    call,
-                    tool_request: task.tool_request,
-                });
-                self.state = DriverState::AwaitingApproval;
-                self.emit(AgentEvent::ApprovalRequired(task.approval.clone()));
-                Some(LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(
-                    task.approval,
-                )))
+                self.enqueue_pending_approval(turn_id, task);
+                self.take_next_unsurfaced_approval_interrupt()
             }
-            TaskResolution::Auth(task) => {
-                let call = ToolCallPart {
-                    id: task.tool_request.call_id.clone(),
-                    name: task.tool_request.tool_name.to_string(),
-                    input: task.tool_request.input.clone(),
-                    metadata: task.tool_request.metadata.clone(),
-                };
-                let request = upgrade_auth_request(task.auth, &task.tool_request, &call);
-                self.pending_auth = Some(PendingAuthToolCall {
-                    request: request.clone(),
-                    resolution: None,
-                    turn_id: turn_id.clone(),
-                    task_id: task.task_id,
-                    call,
-                    tool_request: task.tool_request,
-                });
-                self.state = DriverState::AwaitingAuth;
-                self.emit(AgentEvent::AuthRequired(request.clone()));
-                Some(LoopStep::Interrupt(LoopInterrupt::AuthRequest(request)))
-            }
+            TaskResolution::Auth(task) => Some(self.queue_auth_interrupt(turn_id, task)),
         }
     }
 
@@ -876,55 +1098,17 @@ where
                     saw_items = true;
                 }
                 TaskResolution::Approval(task) => {
-                    let call = ToolCallPart {
-                        id: task.tool_request.call_id.clone(),
-                        name: task.tool_request.tool_name.to_string(),
-                        input: task.tool_request.input.clone(),
-                        metadata: task.tool_request.metadata.clone(),
-                    };
-                    self.state = DriverState::AwaitingApproval;
-                    self.pending_approval = Some(PendingApprovalToolCall {
-                        request: task.approval.clone(),
-                        decision: None,
-                        turn_id: task.tool_request.turn_id.clone(),
-                        task_id: task.task_id,
-                        call,
-                        tool_request: task.tool_request,
-                    });
-                    self.emit(AgentEvent::ApprovalRequired(task.approval.clone()));
-                    return Ok((
-                        saw_items,
-                        Some(LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(
-                            task.approval,
-                        ))),
-                    ));
+                    self.enqueue_pending_approval(&task.tool_request.turn_id.clone(), task);
                 }
                 TaskResolution::Auth(task) => {
-                    let call = ToolCallPart {
-                        id: task.tool_request.call_id.clone(),
-                        name: task.tool_request.tool_name.to_string(),
-                        input: task.tool_request.input.clone(),
-                        metadata: task.tool_request.metadata.clone(),
-                    };
-                    let request = upgrade_auth_request(task.auth, &task.tool_request, &call);
-                    self.state = DriverState::AwaitingAuth;
-                    self.pending_auth = Some(PendingAuthToolCall {
-                        request: request.clone(),
-                        resolution: None,
-                        turn_id: task.tool_request.turn_id.clone(),
-                        task_id: task.task_id,
-                        call,
-                        tool_request: task.tool_request,
-                    });
-                    self.emit(AgentEvent::AuthRequired(request.clone()));
                     return Ok((
                         saw_items,
-                        Some(LoopStep::Interrupt(LoopInterrupt::AuthRequest(request))),
+                        Some(self.queue_auth_interrupt(&task.tool_request.turn_id.clone(), task)),
                     ));
                 }
             }
         }
-        Ok((saw_items, None))
+        Ok((saw_items, self.take_next_unsurfaced_approval_interrupt()))
     }
 
     async fn maybe_compact(
@@ -1030,13 +1214,19 @@ where
                 {
                     TaskStartOutcome::Ready(resolution) => {
                         let resolution = *resolution;
-                        if matches!(resolution, TaskResolution::Item(_))
-                            && let Some(active) = self.active_tool_round.as_mut()
-                        {
-                            active.foreground_progressed = true;
-                        }
-                        if let Some(step) = self.queue_resolution_interrupt(&turn_id, resolution) {
-                            return Ok(Some(step));
+                        match resolution {
+                            TaskResolution::Item(item) => {
+                                if let Some(active) = self.active_tool_round.as_mut() {
+                                    active.foreground_progressed = true;
+                                }
+                                self.transcript.push(item);
+                            }
+                            TaskResolution::Approval(task) => {
+                                self.enqueue_pending_approval(&turn_id, task);
+                            }
+                            TaskResolution::Auth(task) => {
+                                return Ok(Some(self.queue_auth_interrupt(&turn_id, task)));
+                            }
                         }
                         continue;
                     }
@@ -1059,18 +1249,43 @@ where
             {
                 Some(TurnTaskUpdate::Resolution(resolution)) => {
                     let resolution = *resolution;
-                    if matches!(resolution, TaskResolution::Item(_))
-                        && let Some(active) = self.active_tool_round.as_mut()
-                    {
-                        active.foreground_progressed = true;
-                    }
-                    if let Some(step) = self.queue_resolution_interrupt(&turn_id, resolution) {
-                        return Ok(Some(step));
+                    match resolution {
+                        TaskResolution::Item(item) => {
+                            if let Some(active) = self.active_tool_round.as_mut() {
+                                active.foreground_progressed = true;
+                            }
+                            self.transcript.push(item);
+                        }
+                        TaskResolution::Approval(task) => {
+                            self.enqueue_pending_approval(&turn_id, task);
+                        }
+                        TaskResolution::Auth(task) => {
+                            return Ok(Some(self.queue_auth_interrupt(&turn_id, task)));
+                        }
                     }
                 }
-                Some(TurnTaskUpdate::Detached(_)) => {
+                Some(TurnTaskUpdate::Detached(snapshot)) => {
+                    // The task was promoted to background. Push a synthetic
+                    // tool result so the model knows the call is still
+                    // running and can continue its turn.
+                    self.transcript.push(Item {
+                        id: None,
+                        kind: ItemKind::Tool,
+                        parts: vec![Part::ToolResult(ToolResultPart {
+                            call_id: snapshot.call_id,
+                            output: ToolOutput::Text(format!(
+                                "Tool {} is now running in the background. \
+                                 The result will be delivered when it completes.",
+                                snapshot.tool_name,
+                            )),
+                            is_error: false,
+                            metadata: MetadataMap::new(),
+                        })],
+                        metadata: MetadataMap::new(),
+                    });
                     if let Some(active) = self.active_tool_round.as_mut() {
                         active.background_pending = true;
+                        active.foreground_progressed = true;
                     }
                 }
                 None => {
@@ -1090,6 +1305,15 @@ where
                     let active = self.active_tool_round.take().ok_or_else(|| {
                         LoopError::InvalidState("missing active tool round".into())
                     })?;
+                    if let Some(step) = self.take_next_unsurfaced_approval_interrupt() {
+                        return Ok(Some(step));
+                    }
+                    if let Some(step) = self.pending_auth_interrupt() {
+                        return Ok(Some(step));
+                    }
+                    if let Some(step) = self.next_unresolved_approval_interrupt() {
+                        return Ok(Some(step));
+                    }
                     if active.background_pending && !active.foreground_progressed {
                         return Ok(None);
                     }
@@ -1287,6 +1511,12 @@ where
 
         if let Some(step) = self.continue_active_tool_round().await? {
             Ok(step)
+        } else if let Some(step) = self.take_next_unsurfaced_approval_interrupt() {
+            Ok(step)
+        } else if let Some(step) = self.pending_auth_interrupt() {
+            Ok(step)
+        } else if let Some(step) = self.next_unresolved_approval_interrupt() {
+            Ok(step)
         } else {
             self.drive_turn(pending.turn_id, false).await
         }
@@ -1342,6 +1572,12 @@ where
 
         if let Some(step) = self.continue_active_tool_round().await? {
             Ok(step)
+        } else if let Some(step) = self.take_next_unsurfaced_approval_interrupt() {
+            Ok(step)
+        } else if let Some(step) = self.pending_auth_interrupt() {
+            Ok(step)
+        } else if let Some(step) = self.next_unresolved_approval_interrupt() {
+            Ok(step)
         } else {
             self.drive_turn(pending.turn_id, false).await
         }
@@ -1373,7 +1609,7 @@ where
     ///
     /// Returns [`LoopError::InvalidState`] if an interrupt is still unresolved.
     pub fn submit_input(&mut self, input: Vec<Item>) -> Result<(), LoopError> {
-        if self.state != DriverState::Idle {
+        if self.has_pending_interrupts() {
             return Err(LoopError::InvalidState(
                 "cannot submit input while an interrupt is pending".into(),
             ));
@@ -1395,18 +1631,47 @@ where
     /// # Errors
     ///
     /// Returns [`LoopError::InvalidState`] if no approval is pending.
-    pub fn resolve_approval(&mut self, decision: ApprovalDecision) -> Result<(), LoopError> {
-        let Some(pending) = self.pending_approval.as_mut() else {
-            return Err(LoopError::InvalidState(
-                "no approval request is pending".into(),
-            ));
+    pub fn resolve_approval_for(
+        &mut self,
+        call_id: ToolCallId,
+        decision: ApprovalDecision,
+    ) -> Result<(), LoopError> {
+        let Some(pending) = self.pending_approvals.get_mut(&call_id) else {
+            return Err(LoopError::InvalidState(format!(
+                "no approval request is pending for call {}",
+                call_id.0
+            )));
         };
         pending.decision = Some(decision.clone());
-        self.state = DriverState::Idle;
         self.emit(AgentEvent::ApprovalResolved {
             approved: matches!(decision, ApprovalDecision::Approve),
         });
         Ok(())
+    }
+
+    /// Resolve a pending [`LoopInterrupt::ApprovalRequest`] when exactly one
+    /// approval is outstanding.
+    pub fn resolve_approval(&mut self, decision: ApprovalDecision) -> Result<(), LoopError> {
+        let mut unresolved = self
+            .pending_approval_order
+            .iter()
+            .filter(|call_id| {
+                self.pending_approvals
+                    .get(*call_id)
+                    .is_some_and(|pending| pending.decision.is_none())
+            })
+            .cloned();
+        let Some(call_id) = unresolved.next() else {
+            return Err(LoopError::InvalidState(
+                "no approval request is pending".into(),
+            ));
+        };
+        if unresolved.next().is_some() {
+            return Err(LoopError::InvalidState(
+                "multiple approvals are pending; use resolve_approval_for".into(),
+            ));
+        }
+        self.resolve_approval_for(call_id, decision)
     }
 
     /// Resolve a pending [`LoopInterrupt::AuthRequest`].
@@ -1429,7 +1694,6 @@ where
             ));
         }
         pending.resolution = Some(resolution.clone());
-        self.state = DriverState::Idle;
         self.emit(AgentEvent::AuthResolved {
             provided: matches!(resolution, AuthResolution::Provided { .. }),
         });
@@ -1460,24 +1724,6 @@ where
     /// Returns [`LoopError::InvalidState`] if called while an unresolved
     /// interrupt is pending, or propagates provider / tool / compaction errors.
     pub async fn next(&mut self) -> Result<LoopStep, LoopError> {
-        if self.state != DriverState::Idle {
-            return Err(LoopError::InvalidState(
-                "cannot advance while an interrupt is pending".into(),
-            ));
-        }
-
-        if self
-            .pending_approval
-            .as_ref()
-            .is_some_and(|pending| pending.decision.is_some())
-        {
-            let pending = self
-                .pending_approval
-                .take()
-                .ok_or_else(|| LoopError::InvalidState("missing pending approval state".into()))?;
-            return self.resume_after_approval(pending).await;
-        }
-
         if self
             .pending_auth
             .as_ref()
@@ -1488,6 +1734,22 @@ where
                 .take()
                 .ok_or_else(|| LoopError::InvalidState("missing pending auth state".into()))?;
             return self.resume_after_auth(pending).await;
+        }
+
+        if let Some(pending) = self.take_next_resolved_approval() {
+            return self.resume_after_approval(pending).await;
+        }
+
+        if let Some(step) = self.take_next_unsurfaced_approval_interrupt() {
+            return Ok(step);
+        }
+
+        if let Some(step) = self.pending_auth_interrupt() {
+            return Ok(step);
+        }
+
+        if let Some(step) = self.next_unresolved_approval_interrupt() {
+            return Ok(step);
         }
 
         if let Some(step) = self.continue_active_tool_round().await? {
@@ -1646,6 +1908,7 @@ mod tests {
         seen_descriptions: StdArc<StdMutex<Vec<Vec<String>>>>,
     }
     struct MultiToolAdapter;
+    struct DualApprovalAdapter;
 
     struct FakeSession;
     struct SlowSession;
@@ -1653,6 +1916,7 @@ mod tests {
         seen_descriptions: StdArc<StdMutex<Vec<Vec<String>>>>,
     }
     struct MultiToolSession;
+    struct DualApprovalSession;
 
     struct FakeTurn {
         events: VecDeque<ModelTurnEvent>,
@@ -1666,6 +1930,9 @@ mod tests {
         emitted: bool,
     }
     struct MultiToolTurn {
+        events: VecDeque<ModelTurnEvent>,
+    }
+    struct DualApprovalTurn {
         events: VecDeque<ModelTurnEvent>,
     }
 
@@ -1704,6 +1971,15 @@ mod tests {
 
         async fn start_session(&self, _config: SessionConfig) -> Result<Self::Session, LoopError> {
             Ok(MultiToolSession)
+        }
+    }
+
+    #[async_trait]
+    impl ModelAdapter for DualApprovalAdapter {
+        type Session = DualApprovalSession;
+
+        async fn start_session(&self, _config: SessionConfig) -> Result<Self::Session, LoopError> {
+            Ok(DualApprovalSession)
         }
     }
 
@@ -1907,6 +2183,71 @@ mod tests {
     }
 
     #[async_trait]
+    impl ModelSession for DualApprovalSession {
+        type Turn = DualApprovalTurn;
+
+        async fn begin_turn(
+            &mut self,
+            request: TurnRequest,
+            _cancellation: Option<TurnCancellation>,
+        ) -> Result<Self::Turn, LoopError> {
+            let tool_results = request
+                .transcript
+                .iter()
+                .flat_map(|item| item.parts.iter())
+                .filter(|part| matches!(part, Part::ToolResult(_)))
+                .count();
+
+            let events = if tool_results >= 2 {
+                VecDeque::from([ModelTurnEvent::Finished(ModelTurnResult {
+                    finish_reason: FinishReason::Completed,
+                    output_items: vec![Item {
+                        id: None,
+                        kind: ItemKind::Assistant,
+                        parts: vec![Part::Text(TextPart {
+                            text: "both approvals finished".into(),
+                            metadata: MetadataMap::new(),
+                        })],
+                        metadata: MetadataMap::new(),
+                    }],
+                    usage: None,
+                    metadata: MetadataMap::new(),
+                })])
+            } else {
+                let first = agentkit_core::ToolCallPart {
+                    id: ToolCallId::new("call-1"),
+                    name: "echo".into(),
+                    input: json!({ "value": "first" }),
+                    metadata: MetadataMap::new(),
+                };
+                let second = agentkit_core::ToolCallPart {
+                    id: ToolCallId::new("call-2"),
+                    name: "echo".into(),
+                    input: json!({ "value": "second" }),
+                    metadata: MetadataMap::new(),
+                };
+                VecDeque::from([
+                    ModelTurnEvent::ToolCall(first.clone()),
+                    ModelTurnEvent::ToolCall(second.clone()),
+                    ModelTurnEvent::Finished(ModelTurnResult {
+                        finish_reason: FinishReason::ToolCall,
+                        output_items: vec![Item {
+                            id: None,
+                            kind: ItemKind::Assistant,
+                            parts: vec![Part::ToolCall(first), Part::ToolCall(second)],
+                            metadata: MetadataMap::new(),
+                        }],
+                        usage: None,
+                        metadata: MetadataMap::new(),
+                    }),
+                ])
+            };
+
+            Ok(DualApprovalTurn { events })
+        }
+    }
+
+    #[async_trait]
     impl ModelTurn for FakeTurn {
         async fn next_event(
             &mut self,
@@ -1980,6 +2321,16 @@ mod tests {
 
     #[async_trait]
     impl ModelTurn for MultiToolTurn {
+        async fn next_event(
+            &mut self,
+            _cancellation: Option<TurnCancellation>,
+        ) -> Result<Option<ModelTurnEvent>, LoopError> {
+            Ok(self.events.pop_front())
+        }
+    }
+
+    #[async_trait]
+    impl ModelTurn for DualApprovalTurn {
         async fn next_event(
             &mut self,
             _cancellation: Option<TurnCancellation>,
@@ -2143,6 +2494,7 @@ mod tests {
             if request.kind() == "filesystem.read" {
                 return PermissionDecision::RequireApproval(ApprovalRequest {
                     task_id: None,
+                    call_id: None,
                     id: "approval:fs-read".into(),
                     request_kind: request.kind().into(),
                     reason: agentkit_tools_core::ApprovalReason::SensitivePath,
@@ -2457,11 +2809,12 @@ mod tests {
         let result = driver.next().await.unwrap();
 
         match result {
-            LoopStep::Interrupt(LoopInterrupt::AuthRequest(request)) => {
+            LoopStep::Interrupt(LoopInterrupt::AuthRequest(pending)) => {
+                let request = &pending.request;
                 assert!(request.task_id.is_some());
                 assert_eq!(request.provider, "mcp.mock");
                 assert_eq!(request.challenge.get("scope"), Some(&json!("secret.read")));
-                match request.operation {
+                match &request.operation {
                     AuthOperation::ToolCall { tool_name, .. } => {
                         assert_eq!(tool_name, "auth-tool");
                     }
@@ -2738,14 +3091,13 @@ mod tests {
 
         let first = driver.next().await.unwrap();
         match first {
-            LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(request)) => {
-                assert!(request.task_id.is_some());
-                assert_eq!(request.id.0, "approval:fs-read");
+            LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(pending)) => {
+                assert!(pending.request.task_id.is_some());
+                assert_eq!(pending.request.id.0, "approval:fs-read");
+                pending.approve(&mut driver).unwrap();
             }
             other => panic!("unexpected loop step: {other:?}"),
         }
-
-        driver.resolve_approval(ApprovalDecision::Approve).unwrap();
         let second = driver.next().await.unwrap();
         match second {
             LoopStep::Finished(turn) => match &turn.items[0].parts[0] {
@@ -2753,6 +3105,73 @@ mod tests {
                 other => panic!("unexpected part: {other:?}"),
             },
             other => panic!("unexpected loop step after approval: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn loop_tracks_multiple_pending_approvals_by_call_id() {
+        let tools = ToolRegistry::new().with(EchoTool::default());
+        let agent = Agent::builder()
+            .model(DualApprovalAdapter)
+            .tools(tools)
+            .permissions(ApproveFsReads)
+            .build()
+            .unwrap();
+
+        let mut driver = agent
+            .start(SessionConfig {
+                session_id: SessionId::new("session-dual-approval"),
+                metadata: MetadataMap::new(),
+            })
+            .await
+            .unwrap();
+
+        driver
+            .submit_input(vec![Item {
+                id: None,
+                kind: ItemKind::User,
+                parts: vec![Part::Text(TextPart {
+                    text: "run both approvals".into(),
+                    metadata: MetadataMap::new(),
+                })],
+                metadata: MetadataMap::new(),
+            }])
+            .unwrap();
+
+        let pending_first = match driver.next().await.unwrap() {
+            LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(pending)) => {
+                assert_eq!(pending.request.call_id.as_ref().map(|id| id.0.as_str()), Some("call-1"));
+                pending
+            }
+            other => panic!("unexpected first loop step: {other:?}"),
+        };
+
+        let pending_second = match driver.next().await.unwrap() {
+            LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(pending)) => {
+                assert_eq!(pending.request.call_id.as_ref().map(|id| id.0.as_str()), Some("call-2"));
+                pending
+            }
+            other => panic!("unexpected second loop step: {other:?}"),
+        };
+
+        pending_second.approve(&mut driver).unwrap();
+        match driver.next().await.unwrap() {
+            LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(pending)) => {
+                assert_eq!(pending.request.call_id.as_ref().map(|id| id.0.as_str()), Some("call-1"));
+            }
+            other => panic!("unexpected step after approving second request: {other:?}"),
+        }
+
+        pending_first.approve(&mut driver).unwrap();
+        match driver.next().await.unwrap() {
+            LoopStep::Finished(turn) => {
+                assert_eq!(turn.finish_reason, FinishReason::Completed);
+                match &turn.items[0].parts[0] {
+                    Part::Text(text) => assert_eq!(text.text, "both approvals finished"),
+                    other => panic!("unexpected final part: {other:?}"),
+                }
+            }
+            other => panic!("unexpected final loop step: {other:?}"),
         }
     }
 

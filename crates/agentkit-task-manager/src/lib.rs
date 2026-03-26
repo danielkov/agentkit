@@ -83,7 +83,7 @@ pub enum TaskStartOutcome {
 #[derive(Clone, Debug, PartialEq)]
 pub enum TurnTaskUpdate {
     Resolution(Box<TaskResolution>),
-    Detached(TaskId),
+    Detached(TaskSnapshot),
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -178,6 +178,7 @@ trait TaskManagerControl: Send + Sync {
         task_id: TaskId,
         mode: DeliveryMode,
     ) -> Result<(), TaskManagerError>;
+    async fn wait_for_idle(&self);
 }
 
 #[derive(Clone)]
@@ -220,6 +221,11 @@ impl TaskManagerHandle {
         mode: DeliveryMode,
     ) -> Result<(), TaskManagerError> {
         self.inner.set_delivery_mode(task_id, mode).await
+    }
+
+    /// Wait until all running tasks have completed.
+    pub async fn wait_for_idle(&self) {
+        self.inner.wait_for_idle().await
     }
 }
 
@@ -346,6 +352,8 @@ impl TaskManagerControl for HandleState {
     ) -> Result<(), TaskManagerError> {
         Err(TaskManagerError::NotFound(task_id))
     }
+
+    async fn wait_for_idle(&self) {}
 }
 
 pub struct AsyncTaskManager {
@@ -500,7 +508,7 @@ impl TaskManager for AsyncTaskManager {
                             .per_turn_updates
                             .entry(turn_id.clone())
                             .or_default()
-                            .push_back(TurnTaskUpdate::Detached(task_id.clone()));
+                            .push_back(TurnTaskUpdate::Detached(snapshot.clone()));
                         let _ = event_tx.send(TaskEvent::Detached(snapshot));
                         inner.notify.notify_waiters();
                     }
@@ -520,116 +528,70 @@ impl TaskManager for AsyncTaskManager {
                 }
             };
 
-            let mut state = inner.state.lock().await;
-            let Some(record) = state.tasks.get_mut(&task_id_for_future) else {
-                return;
+            let resolution =
+                map_outcome_to_resolution(Some(task_id_for_future.clone()), exec_request, outcome);
+            let completed_result = match &resolution {
+                TaskResolution::Item(item) => item.parts.iter().find_map(|part| match part {
+                    agentkit_core::Part::ToolResult(result) => Some(result.clone()),
+                    _ => None,
+                }),
+                TaskResolution::Approval(_) | TaskResolution::Auth(_) => None,
             };
-            record.running = false;
-            record.completed = true;
-            let snapshot = record.snapshot.clone();
-            let continue_policy = record.continue_policy;
-            let delivery_mode = record.delivery_mode;
-            let current_kind = snapshot.kind;
-            drop(state);
 
-            match map_outcome_to_resolution(Some(task_id_for_future.clone()), exec_request, outcome)
-            {
-                TaskResolution::Item(item) => {
-                    let tool_part = item.parts.iter().find_map(|part| match part {
-                        agentkit_core::Part::ToolResult(result) => Some(result.clone()),
-                        _ => None,
-                    });
-                    let mut state = inner.state.lock().await;
-                    if current_kind == TaskKind::Foreground {
-                        if let Some(count) = state.per_turn_running.get_mut(&turn_id) {
-                            *count = count.saturating_sub(1);
-                            if *count == 0 {
-                                state.per_turn_running.remove(&turn_id);
-                            }
+            let (snapshot, should_request_continue) = {
+                let mut state = inner.state.lock().await;
+                let Some(record) = state.tasks.get_mut(&task_id_for_future) else {
+                    return;
+                };
+                record.running = false;
+                record.completed = true;
+                let snapshot = record.snapshot.clone();
+                let continue_policy = record.continue_policy;
+                let delivery_mode = record.delivery_mode;
+                let current_kind = snapshot.kind;
+
+                if current_kind == TaskKind::Foreground {
+                    if let Some(count) = state.per_turn_running.get_mut(&turn_id) {
+                        *count = count.saturating_sub(1);
+                        if *count == 0 {
+                            state.per_turn_running.remove(&turn_id);
                         }
-                        state
-                            .per_turn_updates
-                            .entry(turn_id.clone())
-                            .or_default()
-                            .push_back(TurnTaskUpdate::Resolution(Box::new(TaskResolution::Item(
-                                item.clone(),
-                            ))));
-                    } else if delivery_mode == DeliveryMode::ToLoop {
-                        state
-                            .pending_loop_updates
-                            .push_back(TaskResolution::Item(item.clone()));
-                    } else {
-                        state.manual_ready_items.push(item.clone());
                     }
-                    drop(state);
-                    if let Some(result) = tool_part {
-                        let _ = event_tx.send(TaskEvent::Completed(snapshot, result));
-                    }
-                    if current_kind == TaskKind::Background
-                        && delivery_mode == DeliveryMode::ToLoop
-                        && continue_policy == ContinuePolicy::RequestContinue
-                    {
-                        let _ = event_tx.send(TaskEvent::ContinueRequested);
+                    state
+                        .per_turn_updates
+                        .entry(turn_id.clone())
+                        .or_default()
+                        .push_back(TurnTaskUpdate::Resolution(Box::new(resolution.clone())));
+                } else {
+                    match &resolution {
+                        TaskResolution::Item(_) if delivery_mode == DeliveryMode::ToLoop => {
+                            state.pending_loop_updates.push_back(resolution.clone());
+                        }
+                        TaskResolution::Approval(_) | TaskResolution::Auth(_)
+                            if delivery_mode == DeliveryMode::ToLoop =>
+                        {
+                            state.pending_loop_updates.push_back(resolution.clone());
+                        }
+                        TaskResolution::Item(item) => {
+                            state.manual_ready_items.push(item.clone());
+                        }
+                        TaskResolution::Approval(_) | TaskResolution::Auth(_) => {}
                     }
                 }
-                TaskResolution::Approval(request) => {
-                    let mut state = inner.state.lock().await;
-                    if current_kind == TaskKind::Foreground {
-                        if let Some(count) = state.per_turn_running.get_mut(&turn_id) {
-                            *count = count.saturating_sub(1);
-                            if *count == 0 {
-                                state.per_turn_running.remove(&turn_id);
-                            }
-                        }
-                        state
-                            .per_turn_updates
-                            .entry(turn_id.clone())
-                            .or_default()
-                            .push_back(TurnTaskUpdate::Resolution(Box::new(
-                                TaskResolution::Approval(request.clone()),
-                            )));
-                    } else if delivery_mode == DeliveryMode::ToLoop {
-                        state
-                            .pending_loop_updates
-                            .push_back(TaskResolution::Approval(request.clone()));
-                    }
-                    drop(state);
-                    if current_kind == TaskKind::Background
+
+                (
+                    snapshot,
+                    current_kind == TaskKind::Background
                         && delivery_mode == DeliveryMode::ToLoop
-                        && continue_policy == ContinuePolicy::RequestContinue
-                    {
-                        let _ = event_tx.send(TaskEvent::ContinueRequested);
-                    }
-                }
-                TaskResolution::Auth(request) => {
-                    let mut state = inner.state.lock().await;
-                    if current_kind == TaskKind::Foreground {
-                        if let Some(count) = state.per_turn_running.get_mut(&turn_id) {
-                            *count = count.saturating_sub(1);
-                            if *count == 0 {
-                                state.per_turn_running.remove(&turn_id);
-                            }
-                        }
-                        state
-                            .per_turn_updates
-                            .entry(turn_id.clone())
-                            .or_default()
-                            .push_back(TurnTaskUpdate::Resolution(Box::new(TaskResolution::Auth(
-                                request.clone(),
-                            ))));
-                    } else if delivery_mode == DeliveryMode::ToLoop {
-                        state
-                            .pending_loop_updates
-                            .push_back(TaskResolution::Auth(request.clone()));
-                    }
-                    drop(state);
-                    if current_kind == TaskKind::Background
-                        && delivery_mode == DeliveryMode::ToLoop
-                        && continue_policy == ContinuePolicy::RequestContinue
-                    {
-                        let _ = event_tx.send(TaskEvent::ContinueRequested);
-                    }
-                }
+                        && continue_policy == ContinuePolicy::RequestContinue,
+                )
+            };
+
+            if let Some(result) = completed_result {
+                let _ = event_tx.send(TaskEvent::Completed(snapshot.clone(), result));
+            }
+            if should_request_continue {
+                let _ = event_tx.send(TaskEvent::ContinueRequested);
             }
             inner.notify.notify_waiters();
         });
@@ -810,6 +772,18 @@ impl TaskManagerControl for AsyncInner {
         record.delivery_mode = mode;
         Ok(())
     }
+
+    async fn wait_for_idle(&self) {
+        loop {
+            {
+                let state = self.state.lock().await;
+                if !state.tasks.values().any(|r| r.running) {
+                    return;
+                }
+            }
+            self.notify.notified().await;
+        }
+    }
 }
 
 fn map_outcome_to_resolution(
@@ -962,6 +936,7 @@ mod tests {
                 Some(TestBehavior::Approval) => ToolExecutionOutcome::Interrupted(
                     ToolInterruption::ApprovalRequired(ApprovalRequest {
                         task_id: None,
+                        call_id: Some(request.call_id.clone()),
                         id: "approval:test".into(),
                         request_kind: "tool.test".into(),
                         reason: ApprovalReason::SensitivePath,
@@ -1367,5 +1342,59 @@ mod tests {
         let updates = manager.take_pending_loop_updates().await.unwrap();
         assert_eq!(updates.resolutions.len(), 1);
         assert!(handle.drain_ready_items().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn wait_for_idle_returns_after_loop_updates_are_queued() {
+        let release = StdArc::new(Notify::new());
+        let entered = StdArc::new(AtomicBool::new(false));
+        let executor: Arc<dyn ToolExecutor> = Arc::new(TestExecutor::new([(
+            "background",
+            TestBehavior::Block {
+                entered: entered.clone(),
+                release: release.clone(),
+                output: "idle-done",
+            },
+        )]));
+        let manager = AsyncTaskManager::new().routing(NameRoutingPolicy::new([(
+            "background",
+            RoutingDecision::Background,
+        )]));
+        let handle = manager.handle();
+        let request = make_request("background", "turn-1", "call-1");
+
+        let outcome = manager
+            .start_task(
+                TaskLaunchRequest {
+                    task_id: None,
+                    request: request.clone(),
+                    approved_request: None,
+                },
+                make_context(executor, &request.turn_id, None),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(outcome, TaskStartOutcome::Pending { .. }));
+
+        let _ = next_event(&handle).await;
+        wait_until_entered(entered.as_ref()).await;
+        release.notify_waiters();
+
+        timeout(Duration::from_secs(1), handle.wait_for_idle())
+            .await
+            .expect("wait_for_idle timed out");
+
+        let updates = manager.take_pending_loop_updates().await.unwrap();
+        assert_eq!(updates.resolutions.len(), 1);
+        match &updates.resolutions[0] {
+            TaskResolution::Item(item) => match &item.parts[0] {
+                Part::ToolResult(result) => {
+                    assert_eq!(result.call_id, request.call_id);
+                    assert_eq!(result.output, ToolOutput::Text("idle-done".into()));
+                }
+                other => panic!("unexpected tool item: {other:?}"),
+            },
+            other => panic!("unexpected pending update: {other:?}"),
+        }
     }
 }

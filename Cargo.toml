@@ -19,6 +19,7 @@ members = [
     "examples/openrouter-context-agent",
     "examples/openrouter-agent-cli",
     "examples/openrouter-compaction-agent",
+    "examples/openrouter-parallel-agent",
     "examples/openrouter-mcp-tool",
     "examples/openrouter-subagent-tool",
 ]

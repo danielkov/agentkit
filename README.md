@@ -114,6 +114,9 @@ cargo run -p openrouter-agent-cli -- --mcp-mock \
 - `openrouter-compaction-agent`
   - structural, semantic, and hybrid compaction
   - semantic compaction uses a nested agent as the backend
+- `openrouter-parallel-agent`
+  - async task manager with foreground fs tools and detach-after-timeout shell tools
+  - `TaskManagerHandle` event stream printed to stderr
 - `openrouter-agent-cli`
   - combined example using context, tools, shell, MCP, compaction, and reporting
 

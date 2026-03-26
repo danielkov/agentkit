@@ -957,6 +957,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "openrouter-parallel-agent"
+version = "0.1.0"
+dependencies = [
+ "agentkit-core",
+ "agentkit-loop",
+ "agentkit-provider-openrouter",
+ "agentkit-reporting",
+ "agentkit-task-manager",
+ "agentkit-tool-fs",
+ "agentkit-tool-shell",
+ "agentkit-tools-core",
+ "dotenvy",
+ "tokio",
+]
+
+[[package]]
 name = "openrouter-subagent-tool"
 version = "0.1.0"
 dependencies = [
