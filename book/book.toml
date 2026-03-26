@@ -1,0 +1,9 @@
+[book]
+title = "agentkit"
+description = "A Rust toolkit for building LLM agent applications"
+authors = ["Daniel Kovacs"]
+language = "en"
+src = "src"
+
+[output.html]
+git-repository-url = "https://github.com/danielkov/agentkit"
