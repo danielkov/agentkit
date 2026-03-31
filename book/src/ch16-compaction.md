@@ -142,6 +142,107 @@ After (10 items):
 
 The model lost the early conversation but retains the system prompt, project context, and the most recent work. This is usually a good trade-off — the model's attention is strongest on recent items anyway.
 
+## Compaction vs prompt caching
+
+Compaction and prompt caching both operate on the turn request, but they optimize for different things:
+
+- **Prompt caching** tries to reuse an unchanged serialized prefix from earlier turns
+- **Compaction** deliberately changes the serialized transcript to make it shorter
+
+That means compaction often invalidates the cache prefix even when the conversation is still logically continuous.
+
+Consider the actual prompt prefix sent to the provider:
+
+```text
+Before compaction:
+
+  [system]
+  [context]
+  [user 1]
+  [assistant 1]
+  [tool result 1]
+  [user 2]
+  [assistant 2]
+  [user 3]
+
+  cacheable prefix for turn N:
+  └───────────────────────────────────────────────┘
+
+
+After compaction:
+
+  [system]                       ← still present
+  [context]                      ← still present
+  [compaction summary]           ← new item, replaces older history
+  [assistant 2]
+  [user 3]
+
+  new cacheable prefix for turn N+1:
+  └─────────────────────────────┘
+```
+
+Provider-side caches are keyed on the exact prompt prefix, not the semantic meaning of the conversation. These changes all tend to invalidate an existing cache entry:
+
+- dropping reasoning parts
+- removing failed tool results
+- trimming old user/assistant/tool items
+- replacing many old items with a single summary item
+- reordering or refreshing context items
+
+### What survives compaction
+
+After compaction, only the compacted transcript is part of future conversation history from the model's perspective.
+
+| Retained                                       | Dropped                                       |
+| ---------------------------------------------- | --------------------------------------------- |
+| Preserved `System` items                       | Reasoning blocks                              |
+| Preserved `Context` items                      | Failed tool results                           |
+| Recent user/assistant/tool items that survived | Older conversation items past the keep window |
+| Summary items from semantic compaction         | Raw items replaced by a summary               |
+
+The provider-side cache itself is not conversation history — it is transport state owned by the provider. It can accelerate reuse of a prompt prefix, but it does not extend the model's memory. If compaction removes or rewrites earlier items, those items are gone from the request even if an older provider cache entry still exists.
+
+### The trade-off
+
+Compaction can reduce cache hit rates in exchange for keeping the session under the context window.
+
+That trade-off is often still correct:
+
+- without compaction, the session may stop fitting at all
+- with compaction, the transcript becomes shorter and cheaper even if an old cache prefix is no longer reusable
+- preserved system/context prefixes still give the cache some stable surface area
+
+In practice:
+
+- structural compaction usually causes smaller cache disruptions
+- semantic compaction causes larger cache disruptions because it replaces many items with a new summary
+- long-lived context items and stable tool schemas are still good cache anchors
+
+This does not mean all caching efficiency is lost after compaction. The typical sequence:
+
+1. the old cacheable prefix becomes invalid because the transcript changed
+2. the compacted transcript is sent on the next turn
+3. that new, shorter transcript becomes the new cacheable prefix
+4. subsequent turns reuse the compacted prefix until the next compaction cycle
+
+Compaction behaves like a cache reset followed by a new stable baseline.
+
+```text
+turn N-1:
+  long history prefix                          ← cached
+
+turn N:
+  compaction runs
+  compacted transcript sent                    ← old cache no longer matches
+
+turn N+1, N+2, N+3:
+  same compacted transcript prefix reused      ← new cache hits accumulate
+```
+
+This is one reason semantic compaction can still be efficient overall. The summary item may replace a large unstable history with a much smaller durable prefix that is cheap to resend and easy to cache for the next several turns.
+
+This is why caching is configured separately from compaction in agentkit. Compaction decides what the transcript should be. Caching then operates on whatever transcript remains. For the cache model itself, see [Chapter 15](./ch15-caching.md).
+
 ## Loop integration
 
 When compaction fires:

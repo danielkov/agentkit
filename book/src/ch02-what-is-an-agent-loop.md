@@ -192,7 +192,7 @@ let mut driver = agent
     .await?;
 ```
 
-The `cache` field configures provider-side prompt caching for the session. It is optional, but most long-running agents should set it deliberately. The full model is covered in [Chapter 15](./ch15-caching.md).
+The `cache` field configures prompt caching for the session. It is optional, but most long-running agents benefit from setting it. See [Chapter 15](./ch15-caching.md) for the full cache request shape.
 
 **Submit input** — construct an `Item` with `ItemKind::User` and a `TextPart`:
 

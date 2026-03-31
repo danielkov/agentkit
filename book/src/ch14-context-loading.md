@@ -26,7 +26,7 @@ With context:
   Model: writes idiomatic code that follows project conventions
 ```
 
-Caching fits naturally after context loading: once system prompts and context items become stable prefixes, later turns can reuse them efficiently. The next chapter covers that prompt caching layer before we move on to compaction.
+Once system prompts and context items are stable, they form a reusable prefix for every turn. The next chapter covers prompt caching — the transport optimization that exploits this stability.
 
 ## ContextLoader
 

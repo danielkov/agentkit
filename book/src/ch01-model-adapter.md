@@ -735,7 +735,7 @@ if let LoopStep::Finished(result) = driver.next().await? {
 }
 ```
 
-The `cache` field is the session-level prompt caching policy. It is request-level configuration, not transcript data. See [Chapter 15: Prompt caching](./ch15-caching.md) for the model, provider mapping, and per-turn overrides.
+The `cache` field is the session-level prompt caching policy — request-level configuration, not transcript data. See [Chapter 15: Prompt caching](./ch15-caching.md) for the full cache request shape, provider mapping, and per-turn overrides.
 
 No tools are registered, so the model returns text and the driver finishes after a single turn. This is the simplest way to use agentkit — a typed HTTP client for chat completions with provider abstraction. The agent loop, covered in the next chapter, adds tool execution and iteration on top.
 

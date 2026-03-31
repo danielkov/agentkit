@@ -131,14 +131,14 @@ let agent = Agent::builder()
 
 agentkit ships six provider crates:
 
-| Crate                                                                                                                 | Auth             | Hooks used                           |
-| --------------------------------------------------------------------------------------------------------------------- | ---------------- | ------------------------------------ |
+| Crate                                                                                                                 | Auth             | Hooks used                             |
+| --------------------------------------------------------------------------------------------------------------------- | ---------------- | -------------------------------------- |
 | [`agentkit-provider-openrouter`](https://github.com/danielkov/agentkit/tree/main/crates/agentkit-provider-openrouter) | Bearer + headers | auth, cache mapping, error check, cost |
-| `agentkit-provider-openai`                                                                                            | Bearer           | auth, cache mapping                  |
-| `agentkit-provider-ollama`                                                                                            | none             | None                                 |
-| `agentkit-provider-vllm`                                                                                              | optional Bearer  | `preprocess_request` (optional auth) |
-| `agentkit-provider-groq`                                                                                              | Bearer           | `preprocess_request` (auth)          |
-| `agentkit-provider-mistral`                                                                                           | Bearer           | `preprocess_request` (auth)          |
+| `agentkit-provider-openai`                                                                                            | Bearer           | auth, cache mapping                    |
+| `agentkit-provider-ollama`                                                                                            | none             | None                                   |
+| `agentkit-provider-vllm`                                                                                              | optional Bearer  | `preprocess_request` (optional auth)   |
+| `agentkit-provider-groq`                                                                                              | Bearer           | `preprocess_request` (auth)            |
+| `agentkit-provider-mistral`                                                                                           | Bearer           | `preprocess_request` (auth)            |
 
 Ollama is the simplest — no auth, no hooks. OpenRouter is the most complex — it uses auth headers, prompt-cache mapping, 200-with-error handling, and response enrichment.
 

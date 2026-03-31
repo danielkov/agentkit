@@ -135,7 +135,7 @@ Each step in the walkthrough above maps to a chapter:
 | -------------------- | -------------------------------------------------------------------------------------------------------- |
 | 1. Input submission  | [Ch 6: Driving the loop](./ch06-driving-the-loop.md)                                                     |
 | 2. Compaction check  | [Ch 16: Transcript compaction](./ch16-compaction.md)                                                     |
-| 3. Turn construction | [Ch 5: The model adapter boundary](./ch05-model-adapter.md), [Ch 15: Prompt caching](./ch15-caching.md) |
+| 3. Turn construction | [Ch 5: The model adapter boundary](./ch05-model-adapter.md), [Ch 15: Prompt caching](./ch15-caching.md)  |
 | 4. Model invocation  | [Ch 1: Talking to models](./ch01-model-adapter.md), [Ch 4: Streaming](./ch04-streaming-and-deltas.md)    |
 | 5. Tool call (read)  | [Ch 11: Filesystem tools](./ch11-filesystem-tools.md)                                                    |
 | 6. Permission check  | [Ch 10: Permissions](./ch10-permissions.md)                                                              |

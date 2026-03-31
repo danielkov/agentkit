@@ -4,7 +4,7 @@ Prompt caching reduces cost and latency by reusing stable prefixes of a turn req
 
 ## Why caching lives at the request level
 
-Caching is not transcript meaning. The transcript is the conversation itself: system prompts, user messages, tool calls, tool results, and context items. Caching is a transport optimization applied when a turn is sent to a provider.
+Caching is a transport optimization, not transcript semantics. The transcript is the conversation itself: system prompts, user messages, tool calls, tool results, and context items. Caching is applied when a turn is sent to a provider.
 
 That distinction is why agentkit models caching on `SessionConfig` and `TurnRequest`, not on `Item` or `Part`.
 
@@ -65,19 +65,17 @@ pub struct PromptCacheRequest {
 }
 ```
 
-### What each field means
+### Field semantics
 
-- `mode`
-  - `Disabled` means "do not send cache hints for this turn."
-  - `BestEffort` means "use caching if the provider or adapter can support it."
-  - `Required` means "fail the turn if the cache request cannot be honored."
-- `strategy`
-  - `Automatic` means the adapter should use native provider behavior when available, or emulate it internally when it can.
-  - `Explicit` means the host wants concrete cache boundaries.
-- `retention`
-  - A provider-neutral hint for short-lived vs extended retention.
-- `key`
-  - An optional stable cache key for providers that support one.
+| Field       | Variant      | Meaning                                                                |
+| ----------- | ------------ | ---------------------------------------------------------------------- |
+| `mode`      | `Disabled`   | Do not send cache hints for this turn                                  |
+|             | `BestEffort` | Use caching if the provider supports it; degrade silently otherwise    |
+|             | `Required`   | Fail the turn if the cache request cannot be honored                   |
+| `strategy`  | `Automatic`  | Let the adapter use native provider behavior, or emulate it internally |
+|             | `Explicit`   | The host specifies concrete cache boundaries                           |
+| `retention` |              | Provider-neutral hint for short-lived vs extended retention            |
+| `key`       |              | Optional stable cache key for providers that support one               |
 
 ## Session defaults
 
@@ -107,14 +105,12 @@ This says:
 
 ### `None` vs `Disabled`
 
-These are different:
+These have different semantics:
 
-- `cache: None`
-  - the host expresses no cache preference
-  - adapters do not add cache-specific request fields on agentkit's behalf
-  - provider-native automatic caching may still happen
-- `cache: Some(PromptCacheRequest { mode: PromptCacheMode::Disabled, ... })`
-  - the host is explicitly disabling cache controls from agentkit for that session or turn
+| Value                                     | Meaning                                                                                                   |
+| ----------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| `cache: None`                             | No cache preference — adapters don't add cache fields; provider-native automatic caching may still happen |
+| `cache: Some(... { mode: Disabled, .. })` | Explicitly disable cache controls from agentkit for this session or turn                                  |
 
 ## Automatic strategy
 
@@ -217,7 +213,7 @@ That gives adapters three implementation choices:
 2. synthesize explicit cache headers or request fields from the normalized request
 3. ignore unsupported cache requests in `BestEffort` mode, or error in `Required` mode
 
-This is the key architectural point: agentkit keeps the host-facing API stable while letting each provider adapter choose the correct wire format.
+This is the architectural boundary: agentkit keeps the host-facing API stable while each provider adapter chooses the correct wire format.
 
 ## Reporting cache usage
 
@@ -258,3 +254,5 @@ SessionConfig {
 ```
 
 Then reach for explicit breakpoints only when you need to control exact cache boundaries.
+
+> **Crate:** Prompt caching types live in [`agentkit-core`](https://github.com/danielkov/agentkit/tree/main/crates/agentkit-core). Session and turn-level cache handling is in [`agentkit-loop`](https://github.com/danielkov/agentkit/tree/main/crates/agentkit-loop). Provider-specific cache mapping is in each [`agentkit-provider-*`](https://github.com/danielkov/agentkit/tree/main/crates) crate.
