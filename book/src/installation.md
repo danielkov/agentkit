@@ -17,7 +17,7 @@ Or add it to your `Cargo.toml`:
 agentkit = "0.1"
 ```
 
-## Feature flags
+## Minimal dependency set
 
 By default, agentkit enables: `core`, `capabilities`, `tools`, `task-manager`, `loop`, and `reporting`.
 
@@ -28,9 +28,7 @@ To keep your build lean, disable defaults and pick only what you need:
 agentkit = { version = "0.1", default-features = false, features = ["core", "loop"] }
 ```
 
-Optional features: `compaction`, `context`, `mcp`, `provider-openrouter`, `tool-fs`, `tool-shell`.
-
-See [Feature flags](./feature-flags.md) for details.
+See the [Feature flags reference](./feature-flags.md) for the full list.
 
 ## Building from source
 
@@ -42,15 +40,17 @@ cargo build
 
 ## Running the examples
 
-1. Create a `.env` file in the repo root:
+The examples use OpenRouter as the model provider. Create a `.env` file in the repo root:
 
 ```env
 OPENROUTER_API_KEY=your_key_here
 OPENROUTER_MODEL=openrouter/hunter-alpha
 ```
 
-2. Run an example:
+Then run any example:
 
 ```sh
 cargo run -p openrouter-chat -- "hello"
 ```
+
+The examples are referenced throughout this book. Each chapter points to the relevant example that exercises the concepts being discussed.

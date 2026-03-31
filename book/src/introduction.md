@@ -1,72 +1,35 @@
-# agentkit
+# Introduction
 
-`agentkit` is a Rust toolkit for building LLM agent applications such as coding agents, assistant CLIs, and multi-agent tools.
+This book is a technical guide to building LLM agent applications in Rust. It uses agentkit — a modular toolkit split into small, composable crates — as both the teaching vehicle and a production-ready library you can integrate into your own projects.
 
-The project is intentionally split into small crates behind feature flags so hosts can pull in only the pieces they need.
+It is a progressive walkthrough of the design decisions, trade-offs, and implementation patterns behind a working agent system. By the end, you should be able to:
 
-## Current status
+- Integrate agentkit into your own applications
+- Understand _why_ each abstraction exists and what alternatives were considered
+- Build your own agent toolkit from scratch if you prefer
 
-`agentkit` includes working implementations for:
+## What agentkit is
 
-- normalized transcript, content-part, and delta types
-- a runtime-agnostic loop driver with blocking interrupts for approval, auth, and input
-- trait-based tools, permissions, approvals, and auth handoff
-- built-in filesystem and shell tools
-- context loading for `AGENTS.md` and skills directories
-- MCP transports, discovery, tool/resource/prompt adapters, auth replay, and lifecycle management
-- reporting observers
-- compaction triggers, strategy pipelines, and backend-driven semantic compaction
-- async task management with foreground/background scheduling, routing policies, and detach-after-timeout
-- optional turn cancellation with resumable sessions
-- an OpenRouter provider adapter
+`agentkit` is a Rust toolkit for building LLM agent applications: coding agents, assistant CLIs, multi-agent orchestration tools, and anything else that runs a model in a loop with tools.
 
-## Installation
+The project is split into small crates behind feature flags. You pull in only what you need. The core loop is runtime-agnostic. Tool crates, MCP integration, and provider adapters add functionality at the edges.
 
-Add `agentkit` to your project:
+## How this book is structured
 
-```sh
-cargo add agentkit
-```
+The book follows the dependency graph of a real agent system, bottom-up:
 
-Or add it to your `Cargo.toml` directly:
+**Part I: The agent loop** starts with the fundamental question — what is an agent loop? — and builds up from transcript types through streaming, model adapters, the driver, and interrupt-based control flow. This is the foundation everything else rests on.
 
-```toml
-[dependencies]
-agentkit = "0.1"
-```
+**Part II: Tools and safety** introduces the capability and tool abstraction layers, the permission system, built-in filesystem and shell tools, and how to write your own. Safety is a first-class concern, not an afterthought.
 
-Enable only the features you need:
+**Part III: Context, compaction, and memory** covers how agents load project context and how to manage transcript growth through compaction strategies.
 
-```toml
-[dependencies]
-agentkit = { version = "0.1", default-features = false, features = ["core", "tools", "loop"] }
-```
+**Part IV: Integration and extensibility** covers MCP server integration, async task management for parallel tool execution, reporting and observability, and provider adapter implementation.
 
-See [Feature flags](./feature-flags.md) for the full list.
+**Part V: Building a coding agent** ties everything together by walking through the architecture of a complete coding agent — the kind of tool you use every day when you use Claude Code or Codex CLI.
 
-## Minimal composition
+## Who this is for
 
-The smallest useful assembly is a model adapter, a tool registry, a permission checker, and a loop observer:
+This book assumes you are comfortable with Rust and have a working understanding of async programming. You do not need prior experience with LLM APIs, but familiarity with the basic concept of chat completions (system/user/assistant messages, tool calling) will help.
 
-```rust
-let agent = Agent::builder()
-    .model(adapter)
-    .tools(agentkit_tool_fs::registry())
-    .permissions(my_permissions)
-    .observer(my_reporter)
-    .build()?;
-
-let mut driver = agent
-    .start(SessionConfig {
-        session_id: SessionId::new("demo"),
-        metadata: MetadataMap::new(),
-    })
-    .await?;
-
-driver.submit_input(vec![system_item, user_item])?;
-
-match driver.next().await? {
-    LoopStep::Finished(result) => { /* render output */ }
-    LoopStep::Interrupt(interrupt) => { /* approval, auth, or input */ }
-}
-```
+If you are evaluating agent frameworks, this book will give you enough depth to make an informed decision. If you are building your own agent system, it covers the design constraints you are likely to encounter.

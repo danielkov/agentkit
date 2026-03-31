@@ -1,0 +1,171 @@
+# Provider adapters
+
+Chapter 1 built an adapter from scratch for a hypothetical non-standard API, then introduced the `CompletionsAdapter` for OpenAI-compatible providers. This chapter goes deeper on the `CompletionsProvider` pattern that most real providers use.
+
+## Two paths to an adapter
+
+```text
+Path 1: Implement ModelAdapter/ModelSession/ModelTurn directly
+  └── For non-standard APIs (custom REST, gRPC, WebSocket)
+  └── Full control, full responsibility
+  └── ~200-500 lines of translation code
+
+Path 2: Implement CompletionsProvider (via agentkit-adapter-completions)
+  └── For OpenAI-compatible chat completions APIs
+  └── ~50-100 lines: config + hooks
+  └── Transcript conversion, tool serialization, streaming, error handling — all handled
+```
+
+Most providers speak the [OpenAI chat completions format](https://platform.openai.com/docs/api-reference/chat) (or close variants). For these, `CompletionsProvider` is the right choice. It handles the ~1000 lines of translation that every completions-compatible adapter needs.
+
+## The CompletionsProvider trait
+
+```rust
+pub trait CompletionsProvider: Send + Sync + Clone {
+    type Config: Serialize + Clone + Send + Sync;
+
+    fn provider_name(&self) -> &str;
+    fn endpoint_url(&self) -> &str;
+    fn config(&self) -> &Self::Config;
+
+    // Hooks — defaults pass through unchanged:
+    fn preprocess_request(&self, builder: RequestBuilder) -> RequestBuilder { builder }
+    fn preprocess_response(&self, _status: StatusCode, _body: &str) -> Result<(), LoopError> { Ok(()) }
+    fn postprocess_response(&self, _usage: &mut Option<Usage>, _metadata: &mut MetadataMap, _raw: &Value) {}
+}
+```
+
+The trait has three required methods (name, URL, config) and three optional hooks. Here's what each hook is for:
+
+```text
+Request lifecycle with hooks:
+
+  TurnRequest
+       │
+       ▼
+  Build JSON body (transcript → messages, tools → tools array)
+  Merge Config fields into body
+       │
+       ├── preprocess_request(builder) ← add auth headers, custom headers
+       │
+       ▼
+  HTTP POST to endpoint_url()
+       │
+       ▼
+  Read response
+       │
+       ├── preprocess_response(status, body) ← check for API errors in 200 responses
+       │
+       ▼
+  Parse into ModelTurnEvents
+       │
+       ├── postprocess_response(usage, metadata, raw) ← extract provider-specific fields
+       │
+       ▼
+  Return events to loop
+```
+
+## What CompletionsAdapter handles
+
+The generic `CompletionsAdapter<P>` handles all the common work:
+
+| Concern                          | Implementation                                       |
+| -------------------------------- | ---------------------------------------------------- |
+| `Vec<Item>` → `messages[]`       | Maps all `ItemKind` and `Part` variants              |
+| `Vec<ToolSpec>` → `tools[]`      | Converts name, description, JSON Schema              |
+| Multimodal content encoding      | Images as `image_url`, audio as `input_audio`        |
+| `P::Config` → request body       | Serialize and merge fields                           |
+| SSE stream parsing               | Chunk reassembly, delta emission                     |
+| Tool call accumulation           | Collect streaming JSON fragments into complete calls |
+| `finish_reason` → `FinishReason` | Map provider strings to enum variants                |
+| `usage` → `Usage`                | Map token counts and cost                            |
+| Cancellation                     | Race HTTP future against `TurnCancellation`          |
+| Error status codes               | Convert 4xx/5xx into `LoopError`                     |
+
+## The Config associated type
+
+The `Config` type is where providers differ most. Each provider has different parameter names and supported options:
+
+| Provider | max_tokens field        | Extra fields                            |
+| -------- | ----------------------- | --------------------------------------- |
+| OpenAI   | `max_completion_tokens` | `frequency_penalty`, `presence_penalty` |
+| Ollama   | `num_predict`           | `top_k`                                 |
+| Mistral  | `max_tokens`            | —                                       |
+| Groq     | `max_completion_tokens` | —                                       |
+| vLLM     | `max_tokens`            | —                                       |
+
+By making `Config` an associated type with `Serialize`, each provider declares exactly the fields it supports with their correct names. The adapter serializes the struct and merges it into the request body — no field name mapping needed.
+
+## Building a provider: the pattern
+
+Every provider crate follows the same structure:
+
+```text
+agentkit-provider-{name}/
+  src/lib.rs
+    ├── {Name}Config         // User-facing config (with_temperature, from_env, etc.)
+    ├── {Name}RequestConfig  // Serializable request fields (#[serde(skip_serializing_if)])
+    ├── {Name}Provider       // CompletionsProvider impl
+    └── {Name}Adapter        // Newtype over CompletionsAdapter<{Name}Provider>
+                             // Implements ModelAdapter by delegation
+```
+
+The user-facing API:
+
+```rust
+let adapter = OllamaAdapter::new(
+    OllamaConfig::new("llama3.1:8b")
+        .with_temperature(0.0)
+        .with_num_predict(4096),
+)?;
+
+let agent = Agent::builder()
+    .model(adapter)
+    .build()?;
+```
+
+## Available providers
+
+agentkit ships six provider crates:
+
+| Crate                                                                                                                 | Auth             | Hooks used                           |
+| --------------------------------------------------------------------------------------------------------------------- | ---------------- | ------------------------------------ |
+| [`agentkit-provider-openrouter`](https://github.com/danielkov/agentkit/tree/main/crates/agentkit-provider-openrouter) | Bearer + headers | All three (auth, error check, cost)  |
+| `agentkit-provider-openai`                                                                                            | Bearer           | `preprocess_request` (auth)          |
+| `agentkit-provider-ollama`                                                                                            | none             | None                                 |
+| `agentkit-provider-vllm`                                                                                              | optional Bearer  | `preprocess_request` (optional auth) |
+| `agentkit-provider-groq`                                                                                              | Bearer           | `preprocess_request` (auth)          |
+| `agentkit-provider-mistral`                                                                                           | Bearer           | `preprocess_request` (auth)          |
+
+Ollama is the simplest — no auth, no hooks. OpenRouter is the most complex — all three hooks handle auth headers, 200-with-error responses, and cost extraction.
+
+## When to implement ModelAdapter directly
+
+Use the raw traits when:
+
+- The provider doesn't speak the OpenAI chat completions format
+- The provider uses WebSocket or gRPC instead of HTTP
+- The provider has server-side session state
+- You need streaming behavior that SSE doesn't support
+
+For WebSocket-based providers:
+
+- `start_session` opens the connection
+- `begin_turn` sends a continuation frame (not the full transcript)
+- `next_event` reads from the live connection
+- Session cleanup on drop
+
+## Testing adapters
+
+Whether you use `CompletionsProvider` or implement the raw traits, the normalization contract is the same. Test these guarantees:
+
+1. Text completion → correct `Delta` sequence ending with `CommitPart` and `Finished`
+2. Tool calls → `ToolCallPart` with valid IDs and parseable JSON input
+3. Multiple tool calls → one `ToolCall` event per call
+4. Token limit → `FinishReason::MaxTokens`
+5. Cancellation → clean `LoopError::Cancelled`
+6. Usage → non-zero, plausible token counts
+
+For `CompletionsProvider` implementations, you mostly need to test the hooks — the generic adapter handles everything else. Mock the HTTP layer with a test server that returns known SSE responses.
+
+> **Crate:** [`agentkit-adapter-completions`](https://github.com/danielkov/agentkit/tree/main/crates/agentkit-adapter-completions) — the generic adapter. [`agentkit-provider-*`](https://github.com/danielkov/agentkit/tree/main/crates) — provider-specific implementations.
