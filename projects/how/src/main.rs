@@ -1,3 +1,5 @@
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::process::Command;
 use std::time::Duration;
@@ -21,8 +23,16 @@ use crossterm::{
 };
 use serde_json::{Value, json};
 
-const DEFAULT_MODEL: &str = "anthropic/claude-sonnet-4";
+const DEFAULT_MODEL: &str = "anthropic/claude-sonnet-4.6";
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+fn prompt_cache_key(model: &str, prompt: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    env!("CARGO_PKG_VERSION").hash(&mut hasher);
+    model.hash(&mut hasher);
+    prompt.hash(&mut hasher);
+    format!("how:{}:{:016x}", env!("CARGO_PKG_VERSION"), hasher.finish())
+}
 
 // ─── Terminal guard ───────────────────────────────────────────────────────────
 
@@ -491,9 +501,13 @@ async fn run_agent(
         .build()?;
 
     let mut driver = agent
-        .start(SessionConfig::new("how").with_cache(
-            PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
-        ))
+        .start(
+            SessionConfig::new("how").with_cache(
+                PromptCacheRequest::automatic()
+                    .with_retention(PromptCacheRetention::Short)
+                    .with_key(prompt_cache_key(&model, &prompt)),
+            ),
+        )
         .await?;
 
     driver
