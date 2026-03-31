@@ -1,12 +1,30 @@
 //! Groq model adapter for the agentkit agent loop.
 //!
-//! Connects to the [Groq](https://groq.com) chat completions API.
+//! This crate provides [`GroqAdapter`] and [`GroqConfig`] for connecting
+//! the agent loop to the [Groq](https://groq.com) chat completions API,
+//! which serves open-source models on custom LPU hardware.
+//! It is built on the generic [`agentkit_adapter_completions`] crate.
+//!
+//! # Quick start
 //!
 //! ```rust,ignore
+//! use agentkit_loop::{Agent, SessionConfig};
 //! use agentkit_provider_groq::{GroqAdapter, GroqConfig};
 //!
-//! let adapter = GroqAdapter::new(GroqConfig::from_env()?)?;
-//! let agent = Agent::builder().model(adapter).build()?;
+//! #[tokio::main]
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     let config = GroqConfig::from_env()?;
+//!     let adapter = GroqAdapter::new(config)?;
+//!
+//!     let agent = Agent::builder()
+//!         .model(adapter)
+//!         .build()?;
+//!
+//!     let mut driver = agent
+//!         .start(SessionConfig::new("demo"))
+//!         .await?;
+//!     Ok(())
+//! }
 //! ```
 
 use agentkit_adapter_completions::{
@@ -20,17 +38,37 @@ use thiserror::Error;
 const DEFAULT_ENDPOINT: &str = "https://api.groq.com/openai/v1/chat/completions";
 
 /// Configuration for connecting to the Groq API.
+///
+/// Build one with [`GroqConfig::new`] for explicit values, or
+/// [`GroqConfig::from_env`] to read from environment variables.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use agentkit_provider_groq::GroqConfig;
+///
+/// let config = GroqConfig::new("gsk_...", "llama-3.3-70b-versatile")
+///     .with_temperature(0.0)
+///     .with_max_completion_tokens(4096);
+/// ```
 #[derive(Clone, Debug)]
 pub struct GroqConfig {
+    /// Groq API key (starts with `gsk_`).
     pub api_key: String,
+    /// Model identifier, e.g. `"llama-3.3-70b-versatile"` or `"llama-3.1-8b-instant"`.
     pub model: String,
+    /// Chat completions endpoint URL. Defaults to the Groq production URL.
     pub base_url: String,
+    /// Sampling temperature (0.0 = deterministic, higher = more creative).
     pub temperature: Option<f32>,
+    /// Maximum number of completion tokens the model may generate.
     pub max_completion_tokens: Option<u32>,
+    /// Nucleus sampling parameter.
     pub top_p: Option<f32>,
 }
 
 impl GroqConfig {
+    /// Creates a new configuration with the given API key and model identifier.
     pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
             api_key: api_key.into(),
@@ -42,26 +80,37 @@ impl GroqConfig {
         }
     }
 
+    /// Overrides the default chat completions endpoint URL.
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
         self.base_url = url.into();
         self
     }
 
+    /// Sets the sampling temperature (0.0 for deterministic output).
     pub fn with_temperature(mut self, v: f32) -> Self {
         self.temperature = Some(v);
         self
     }
 
+    /// Sets the maximum number of tokens the model may generate per turn.
     pub fn with_max_completion_tokens(mut self, v: u32) -> Self {
         self.max_completion_tokens = Some(v);
         self
     }
 
+    /// Sets the nucleus sampling parameter.
     pub fn with_top_p(mut self, v: f32) -> Self {
         self.top_p = Some(v);
         self
     }
 
+    /// Builds a configuration from environment variables.
+    ///
+    /// | Variable | Required | Default |
+    /// |---|---|---|
+    /// | `GROQ_API_KEY` | yes | -- |
+    /// | `GROQ_MODEL` | no | `llama-3.1-8b-instant` |
+    /// | `GROQ_BASE_URL` | no | `https://api.groq.com/openai/v1/chat/completions` |
     pub fn from_env() -> Result<Self, GroqError> {
         let api_key =
             std::env::var("GROQ_API_KEY").map_err(|_| GroqError::MissingEnv("GROQ_API_KEY"))?;
@@ -77,6 +126,7 @@ impl GroqConfig {
     }
 }
 
+/// Request parameters serialized into the Groq request body.
 #[derive(Clone, Debug, Serialize)]
 pub struct GroqRequestConfig {
     pub model: String,
@@ -88,6 +138,7 @@ pub struct GroqRequestConfig {
     pub top_p: Option<f32>,
 }
 
+/// The Groq provider, implementing [`CompletionsProvider`].
 #[derive(Clone, Debug)]
 pub struct GroqProvider {
     api_key: String,
@@ -130,13 +181,34 @@ impl CompletionsProvider for GroqProvider {
     }
 }
 
+/// Model adapter that connects the agentkit agent loop to Groq.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use agentkit_loop::Agent;
+/// use agentkit_provider_groq::{GroqAdapter, GroqConfig};
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let adapter = GroqAdapter::new(GroqConfig::from_env()?)?;
+///
+/// let agent = Agent::builder()
+///     .model(adapter)
+///     .build()?;
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Clone)]
 pub struct GroqAdapter(CompletionsAdapter<GroqProvider>);
 
+/// An active session with the Groq API.
 pub type GroqSession = CompletionsSession<GroqProvider>;
+
+/// A completed turn from the Groq API.
 pub type GroqTurn = CompletionsTurn;
 
 impl GroqAdapter {
+    /// Creates a new adapter from the given configuration.
     pub fn new(config: GroqConfig) -> Result<Self, GroqError> {
         let provider = GroqProvider::from(config);
         Ok(Self(CompletionsAdapter::new(provider)?))
@@ -152,11 +224,14 @@ impl ModelAdapter for GroqAdapter {
     }
 }
 
+/// Errors produced by the Groq adapter.
 #[derive(Debug, Error)]
 pub enum GroqError {
+    /// A required environment variable is not set.
     #[error("missing environment variable {0}")]
     MissingEnv(&'static str),
 
+    /// An error from the generic completions adapter.
     #[error(transparent)]
     Completions(#[from] CompletionsError),
 }

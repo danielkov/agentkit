@@ -1,12 +1,32 @@
 //! Mistral model adapter for the agentkit agent loop.
 //!
-//! Connects to the [Mistral AI](https://mistral.ai) chat completions API.
+//! This crate provides [`MistralAdapter`] and [`MistralConfig`] for connecting
+//! the agent loop to the [Mistral AI](https://mistral.ai) chat completions API.
+//! It is built on the generic [`agentkit_adapter_completions`] crate.
+//!
+//! Note: Mistral uses `max_tokens` instead of the `max_completion_tokens` field
+//! used by most other OpenAI-compatible APIs.
+//!
+//! # Quick start
 //!
 //! ```rust,ignore
+//! use agentkit_loop::{Agent, SessionConfig};
 //! use agentkit_provider_mistral::{MistralAdapter, MistralConfig};
 //!
-//! let adapter = MistralAdapter::new(MistralConfig::from_env()?)?;
-//! let agent = Agent::builder().model(adapter).build()?;
+//! #[tokio::main]
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     let config = MistralConfig::from_env()?;
+//!     let adapter = MistralAdapter::new(config)?;
+//!
+//!     let agent = Agent::builder()
+//!         .model(adapter)
+//!         .build()?;
+//!
+//!     let mut driver = agent
+//!         .start(SessionConfig::new("demo"))
+//!         .await?;
+//!     Ok(())
+//! }
 //! ```
 
 use agentkit_adapter_completions::{
@@ -20,17 +40,38 @@ use thiserror::Error;
 const DEFAULT_ENDPOINT: &str = "https://api.mistral.ai/v1/chat/completions";
 
 /// Configuration for connecting to the Mistral API.
+///
+/// Build one with [`MistralConfig::new`] for explicit values, or
+/// [`MistralConfig::from_env`] to read from environment variables.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use agentkit_provider_mistral::MistralConfig;
+///
+/// let config = MistralConfig::new("sk-...", "mistral-large-latest")
+///     .with_temperature(0.0)
+///     .with_max_tokens(4096);
+/// ```
 #[derive(Clone, Debug)]
 pub struct MistralConfig {
+    /// Mistral API key.
     pub api_key: String,
+    /// Model identifier, e.g. `"mistral-large-latest"` or `"mistral-small-latest"`.
     pub model: String,
+    /// Chat completions endpoint URL. Defaults to the Mistral production URL.
     pub base_url: String,
+    /// Sampling temperature (0.0 = deterministic, higher = more creative).
     pub temperature: Option<f32>,
+    /// Maximum number of tokens the model may generate. Mistral uses `max_tokens`
+    /// rather than `max_completion_tokens`.
     pub max_tokens: Option<u32>,
+    /// Nucleus sampling parameter.
     pub top_p: Option<f32>,
 }
 
 impl MistralConfig {
+    /// Creates a new configuration with the given API key and model identifier.
     pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
             api_key: api_key.into(),
@@ -42,26 +83,37 @@ impl MistralConfig {
         }
     }
 
+    /// Overrides the default chat completions endpoint URL.
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
         self.base_url = url.into();
         self
     }
 
+    /// Sets the sampling temperature (0.0 for deterministic output).
     pub fn with_temperature(mut self, v: f32) -> Self {
         self.temperature = Some(v);
         self
     }
 
+    /// Sets the maximum number of tokens the model may generate per turn.
     pub fn with_max_tokens(mut self, v: u32) -> Self {
         self.max_tokens = Some(v);
         self
     }
 
+    /// Sets the nucleus sampling parameter.
     pub fn with_top_p(mut self, v: f32) -> Self {
         self.top_p = Some(v);
         self
     }
 
+    /// Builds a configuration from environment variables.
+    ///
+    /// | Variable | Required | Default |
+    /// |---|---|---|
+    /// | `MISTRAL_API_KEY` | yes | -- |
+    /// | `MISTRAL_MODEL` | no | `mistral-small-latest` |
+    /// | `MISTRAL_BASE_URL` | no | `https://api.mistral.ai/v1/chat/completions` |
     pub fn from_env() -> Result<Self, MistralError> {
         let api_key = std::env::var("MISTRAL_API_KEY")
             .map_err(|_| MistralError::MissingEnv("MISTRAL_API_KEY"))?;
@@ -78,6 +130,8 @@ impl MistralConfig {
     }
 }
 
+/// Request parameters serialized into the Mistral request body.
+///
 /// Mistral uses `max_tokens` instead of `max_completion_tokens`.
 #[derive(Clone, Debug, Serialize)]
 pub struct MistralRequestConfig {
@@ -90,6 +144,7 @@ pub struct MistralRequestConfig {
     pub top_p: Option<f32>,
 }
 
+/// The Mistral provider, implementing [`CompletionsProvider`].
 #[derive(Clone, Debug)]
 pub struct MistralProvider {
     api_key: String,
@@ -132,13 +187,34 @@ impl CompletionsProvider for MistralProvider {
     }
 }
 
+/// Model adapter that connects the agentkit agent loop to Mistral.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use agentkit_loop::Agent;
+/// use agentkit_provider_mistral::{MistralAdapter, MistralConfig};
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let adapter = MistralAdapter::new(MistralConfig::from_env()?)?;
+///
+/// let agent = Agent::builder()
+///     .model(adapter)
+///     .build()?;
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Clone)]
 pub struct MistralAdapter(CompletionsAdapter<MistralProvider>);
 
+/// An active session with the Mistral API.
 pub type MistralSession = CompletionsSession<MistralProvider>;
+
+/// A completed turn from the Mistral API.
 pub type MistralTurn = CompletionsTurn;
 
 impl MistralAdapter {
+    /// Creates a new adapter from the given configuration.
     pub fn new(config: MistralConfig) -> Result<Self, MistralError> {
         let provider = MistralProvider::from(config);
         Ok(Self(CompletionsAdapter::new(provider)?))
@@ -154,11 +230,14 @@ impl ModelAdapter for MistralAdapter {
     }
 }
 
+/// Errors produced by the Mistral adapter.
 #[derive(Debug, Error)]
 pub enum MistralError {
+    /// A required environment variable is not set.
     #[error("missing environment variable {0}")]
     MissingEnv(&'static str),
 
+    /// An error from the generic completions adapter.
     #[error(transparent)]
     Completions(#[from] CompletionsError),
 }

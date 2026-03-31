@@ -1,13 +1,32 @@
 //! vLLM model adapter for the agentkit agent loop.
 //!
-//! Connects to a [vLLM](https://docs.vllm.ai) server via its
-//! OpenAI-compatible chat completions endpoint.
+//! This crate provides [`VllmAdapter`] and [`VllmConfig`] for connecting
+//! the agent loop to a [vLLM](https://docs.vllm.ai) server via its
+//! OpenAI-compatible chat completions endpoint. It is built on the generic
+//! [`agentkit_adapter_completions`] crate.
+//!
+//! An API key is optional — vLLM servers can run with or without authentication.
+//!
+//! # Quick start
 //!
 //! ```rust,ignore
+//! use agentkit_loop::{Agent, SessionConfig};
 //! use agentkit_provider_vllm::{VllmAdapter, VllmConfig};
 //!
-//! let adapter = VllmAdapter::new(VllmConfig::new("meta-llama/Llama-3.1-8B-Instruct"))?;
-//! let agent = Agent::builder().model(adapter).build()?;
+//! #[tokio::main]
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     let config = VllmConfig::new("meta-llama/Llama-3.1-8B-Instruct");
+//!     let adapter = VllmAdapter::new(config)?;
+//!
+//!     let agent = Agent::builder()
+//!         .model(adapter)
+//!         .build()?;
+//!
+//!     let mut driver = agent
+//!         .start(SessionConfig::new("demo"))
+//!         .await?;
+//!     Ok(())
+//! }
 //! ```
 
 use agentkit_adapter_completions::{
@@ -21,17 +40,39 @@ use thiserror::Error;
 const DEFAULT_ENDPOINT: &str = "http://localhost:8000/v1/chat/completions";
 
 /// Configuration for connecting to a vLLM server.
+///
+/// An API key is only required if the vLLM server was started with
+/// `--api-key`. Build one with [`VllmConfig::new`] for explicit values,
+/// or [`VllmConfig::from_env`] to read from environment variables.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use agentkit_provider_vllm::VllmConfig;
+///
+/// let config = VllmConfig::new("meta-llama/Llama-3.1-8B-Instruct")
+///     .with_base_url("http://gpu-server:8000/v1/chat/completions")
+///     .with_temperature(0.0);
+/// ```
 #[derive(Clone, Debug)]
 pub struct VllmConfig {
+    /// HuggingFace model identifier served by the vLLM instance,
+    /// e.g. `"meta-llama/Llama-3.1-8B-Instruct"`.
     pub model: String,
+    /// Chat completions endpoint URL. Defaults to `http://localhost:8000/v1/chat/completions`.
     pub base_url: String,
+    /// Optional API key, required only if the vLLM server enforces authentication.
     pub api_key: Option<String>,
+    /// Sampling temperature (0.0 = deterministic, higher = more creative).
     pub temperature: Option<f32>,
+    /// Maximum number of completion tokens the model may generate.
     pub max_completion_tokens: Option<u32>,
+    /// Nucleus sampling parameter.
     pub top_p: Option<f32>,
 }
 
 impl VllmConfig {
+    /// Creates a new configuration with the given model identifier.
     pub fn new(model: impl Into<String>) -> Self {
         Self {
             model: model.into(),
@@ -43,31 +84,43 @@ impl VllmConfig {
         }
     }
 
+    /// Overrides the default chat completions endpoint URL.
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
         self.base_url = url.into();
         self
     }
 
+    /// Sets the API key for authenticated vLLM servers.
     pub fn with_api_key(mut self, key: impl Into<String>) -> Self {
         self.api_key = Some(key.into());
         self
     }
 
+    /// Sets the sampling temperature (0.0 for deterministic output).
     pub fn with_temperature(mut self, v: f32) -> Self {
         self.temperature = Some(v);
         self
     }
 
+    /// Sets the maximum number of tokens the model may generate per turn.
     pub fn with_max_completion_tokens(mut self, v: u32) -> Self {
         self.max_completion_tokens = Some(v);
         self
     }
 
+    /// Sets the nucleus sampling parameter.
     pub fn with_top_p(mut self, v: f32) -> Self {
         self.top_p = Some(v);
         self
     }
 
+    /// Builds a configuration from environment variables.
+    ///
+    /// | Variable | Required | Default |
+    /// |---|---|---|
+    /// | `VLLM_MODEL` | yes | -- |
+    /// | `VLLM_BASE_URL` | no | `http://localhost:8000/v1/chat/completions` |
+    /// | `VLLM_API_KEY` | no | -- |
     pub fn from_env() -> Result<Self, VllmError> {
         let model = std::env::var("VLLM_MODEL").map_err(|_| VllmError::MissingEnv("VLLM_MODEL"))?;
 
@@ -84,6 +137,7 @@ impl VllmConfig {
     }
 }
 
+/// Request parameters serialized into the vLLM request body.
 #[derive(Clone, Debug, Serialize)]
 pub struct VllmRequestConfig {
     pub model: String,
@@ -95,6 +149,7 @@ pub struct VllmRequestConfig {
     pub top_p: Option<f32>,
 }
 
+/// The vLLM provider, implementing [`CompletionsProvider`].
 #[derive(Clone, Debug)]
 pub struct VllmProvider {
     base_url: String,
@@ -139,13 +194,36 @@ impl CompletionsProvider for VllmProvider {
     }
 }
 
+/// Model adapter that connects the agentkit agent loop to a vLLM server.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use agentkit_loop::Agent;
+/// use agentkit_provider_vllm::{VllmAdapter, VllmConfig};
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let adapter = VllmAdapter::new(
+///     VllmConfig::new("meta-llama/Llama-3.1-8B-Instruct"),
+/// )?;
+///
+/// let agent = Agent::builder()
+///     .model(adapter)
+///     .build()?;
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Clone)]
 pub struct VllmAdapter(CompletionsAdapter<VllmProvider>);
 
+/// An active session with a vLLM server.
 pub type VllmSession = CompletionsSession<VllmProvider>;
+
+/// A completed turn from a vLLM server.
 pub type VllmTurn = CompletionsTurn;
 
 impl VllmAdapter {
+    /// Creates a new adapter from the given configuration.
     pub fn new(config: VllmConfig) -> Result<Self, VllmError> {
         let provider = VllmProvider::from(config);
         Ok(Self(CompletionsAdapter::new(provider)?))
@@ -161,11 +239,14 @@ impl ModelAdapter for VllmAdapter {
     }
 }
 
+/// Errors produced by the vLLM adapter.
 #[derive(Debug, Error)]
 pub enum VllmError {
+    /// A required environment variable is not set.
     #[error("missing environment variable {0}")]
     MissingEnv(&'static str),
 
+    /// An error from the generic completions adapter.
     #[error(transparent)]
     Completions(#[from] CompletionsError),
 }

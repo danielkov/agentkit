@@ -16,15 +16,15 @@ Use it when OpenRouter is the backing model provider for your agent runtime.
 
 Set the following environment variables before calling `OpenRouterConfig::from_env()`:
 
-| Variable | Required | Default |
-|---|---|---|
-| `OPENROUTER_API_KEY` | yes | -- |
-| `OPENROUTER_MODEL` | no | `openrouter/auto` |
-| `OPENROUTER_BASE_URL` | no | `https://openrouter.ai/api/v1/chat/completions` |
-| `OPENROUTER_APP_NAME` | no | -- |
-| `OPENROUTER_SITE_URL` | no | -- |
-| `OPENROUTER_MAX_COMPLETION_TOKENS` | no | -- |
-| `OPENROUTER_TEMPERATURE` | no | -- |
+| Variable                           | Required | Default                                         |
+| ---------------------------------- | -------- | ----------------------------------------------- |
+| `OPENROUTER_API_KEY`               | yes      | --                                              |
+| `OPENROUTER_MODEL`                 | no       | `openrouter/auto`                               |
+| `OPENROUTER_BASE_URL`              | no       | `https://openrouter.ai/api/v1/chat/completions` |
+| `OPENROUTER_APP_NAME`              | no       | --                                              |
+| `OPENROUTER_SITE_URL`              | no       | --                                              |
+| `OPENROUTER_MAX_COMPLETION_TOKENS` | no       | --                                              |
+| `OPENROUTER_TEMPERATURE`           | no       | --                                              |
 
 ## Examples
 

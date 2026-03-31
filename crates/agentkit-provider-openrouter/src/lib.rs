@@ -185,7 +185,7 @@ impl OpenRouterConfig {
 
 // --- Request config (serialised into the request body) ---
 
-/// Strongly-typed request parameters for OpenRouter.
+/// Request parameters serialized into the OpenRouter request body.
 #[derive(Clone, Debug, Serialize)]
 pub struct OpenRouterRequestConfig {
     /// Model identifier.

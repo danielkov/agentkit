@@ -1,12 +1,29 @@
 //! OpenAI model adapter for the agentkit agent loop.
 //!
-//! Connects to the [OpenAI](https://platform.openai.com) chat completions API.
+//! This crate provides [`OpenAIAdapter`] and [`OpenAIConfig`] for connecting
+//! the agent loop to the [OpenAI](https://platform.openai.com) chat completions
+//! API. It is built on the generic [`agentkit_adapter_completions`] crate.
+//!
+//! # Quick start
 //!
 //! ```rust,ignore
+//! use agentkit_loop::{Agent, SessionConfig};
 //! use agentkit_provider_openai::{OpenAIAdapter, OpenAIConfig};
 //!
-//! let adapter = OpenAIAdapter::new(OpenAIConfig::from_env()?)?;
-//! let agent = Agent::builder().model(adapter).build()?;
+//! #[tokio::main]
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     let config = OpenAIConfig::from_env()?;
+//!     let adapter = OpenAIAdapter::new(config)?;
+//!
+//!     let agent = Agent::builder()
+//!         .model(adapter)
+//!         .build()?;
+//!
+//!     let mut driver = agent
+//!         .start(SessionConfig::new("demo"))
+//!         .await?;
+//!     Ok(())
+//! }
 //! ```
 
 use agentkit_adapter_completions::{
@@ -25,19 +42,42 @@ use thiserror::Error;
 const DEFAULT_ENDPOINT: &str = "https://api.openai.com/v1/chat/completions";
 
 /// Configuration for connecting to the OpenAI API.
+///
+/// Holds credentials, model selection, and optional request parameters.
+/// Build one with [`OpenAIConfig::new`] for explicit values, or
+/// [`OpenAIConfig::from_env`] to read from environment variables.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use agentkit_provider_openai::OpenAIConfig;
+///
+/// let config = OpenAIConfig::new("sk-...", "gpt-4o")
+///     .with_temperature(0.0)
+///     .with_max_completion_tokens(4096);
+/// ```
 #[derive(Clone, Debug)]
 pub struct OpenAIConfig {
+    /// OpenAI API key (starts with `sk-`).
     pub api_key: String,
+    /// Model identifier, e.g. `"gpt-4o"` or `"gpt-4o-mini"`.
     pub model: String,
+    /// Chat completions endpoint URL. Defaults to the OpenAI production URL.
     pub base_url: String,
+    /// Sampling temperature (0.0 = deterministic, higher = more creative).
     pub temperature: Option<f32>,
+    /// Maximum number of completion tokens the model may generate.
     pub max_completion_tokens: Option<u32>,
+    /// Nucleus sampling parameter.
     pub top_p: Option<f32>,
+    /// Penalizes tokens based on how often they appear in the output so far.
     pub frequency_penalty: Option<f32>,
+    /// Penalizes tokens based on whether they have appeared at all.
     pub presence_penalty: Option<f32>,
 }
 
 impl OpenAIConfig {
+    /// Creates a new configuration with the given API key and model identifier.
     pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
             api_key: api_key.into(),
@@ -51,36 +91,51 @@ impl OpenAIConfig {
         }
     }
 
+    /// Overrides the default chat completions endpoint URL.
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
         self.base_url = url.into();
         self
     }
 
+    /// Sets the sampling temperature (0.0 for deterministic output).
     pub fn with_temperature(mut self, v: f32) -> Self {
         self.temperature = Some(v);
         self
     }
 
+    /// Sets the maximum number of tokens the model may generate per turn.
     pub fn with_max_completion_tokens(mut self, v: u32) -> Self {
         self.max_completion_tokens = Some(v);
         self
     }
 
+    /// Sets the nucleus sampling parameter.
     pub fn with_top_p(mut self, v: f32) -> Self {
         self.top_p = Some(v);
         self
     }
 
+    /// Sets the frequency penalty (penalizes repeated tokens).
     pub fn with_frequency_penalty(mut self, v: f32) -> Self {
         self.frequency_penalty = Some(v);
         self
     }
 
+    /// Sets the presence penalty (penalizes tokens that have already appeared).
     pub fn with_presence_penalty(mut self, v: f32) -> Self {
         self.presence_penalty = Some(v);
         self
     }
 
+    /// Builds a configuration from environment variables.
+    ///
+    /// Reads the following variables:
+    ///
+    /// | Variable | Required | Default |
+    /// |---|---|---|
+    /// | `OPENAI_API_KEY` | yes | -- |
+    /// | `OPENAI_MODEL` | no | `gpt-4o` |
+    /// | `OPENAI_BASE_URL` | no | `https://api.openai.com/v1/chat/completions` |
     pub fn from_env() -> Result<Self, OpenAIError> {
         let api_key = std::env::var("OPENAI_API_KEY")
             .map_err(|_| OpenAIError::MissingEnv("OPENAI_API_KEY"))?;
@@ -96,6 +151,7 @@ impl OpenAIConfig {
     }
 }
 
+/// Request parameters serialized into the OpenAI request body.
 #[derive(Clone, Debug, Serialize)]
 pub struct OpenAIRequestConfig {
     pub model: String,
@@ -111,6 +167,7 @@ pub struct OpenAIRequestConfig {
     pub presence_penalty: Option<f32>,
 }
 
+/// The OpenAI provider, implementing [`CompletionsProvider`].
 #[derive(Clone, Debug)]
 pub struct OpenAIProvider {
     api_key: String,
@@ -210,13 +267,34 @@ impl CompletionsProvider for OpenAIProvider {
     }
 }
 
+/// Model adapter that connects the agentkit agent loop to OpenAI.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use agentkit_loop::Agent;
+/// use agentkit_provider_openai::{OpenAIAdapter, OpenAIConfig};
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let adapter = OpenAIAdapter::new(OpenAIConfig::from_env()?)?;
+///
+/// let agent = Agent::builder()
+///     .model(adapter)
+///     .build()?;
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Clone)]
 pub struct OpenAIAdapter(CompletionsAdapter<OpenAIProvider>);
 
+/// An active session with the OpenAI API.
 pub type OpenAISession = CompletionsSession<OpenAIProvider>;
+
+/// A completed turn from the OpenAI API.
 pub type OpenAITurn = CompletionsTurn;
 
 impl OpenAIAdapter {
+    /// Creates a new adapter from the given configuration.
     pub fn new(config: OpenAIConfig) -> Result<Self, OpenAIError> {
         let provider = OpenAIProvider::from(config);
         Ok(Self(CompletionsAdapter::new(provider)?))
@@ -232,11 +310,14 @@ impl ModelAdapter for OpenAIAdapter {
     }
 }
 
+/// Errors produced by the OpenAI adapter.
 #[derive(Debug, Error)]
 pub enum OpenAIError {
+    /// A required environment variable is not set.
     #[error("missing environment variable {0}")]
     MissingEnv(&'static str),
 
+    /// An error from the generic completions adapter.
     #[error(transparent)]
     Completions(#[from] CompletionsError),
 }
