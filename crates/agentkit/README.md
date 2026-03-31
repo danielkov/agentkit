@@ -28,7 +28,7 @@ Add agentkit with the features you need:
 
 ```toml
 [dependencies]
-agentkit = { version = "0.1", features = ["provider-openrouter", "tool-fs", "tool-shell"] }
+agentkit = { version = "0.2", features = ["provider-openrouter", "tool-fs", "tool-shell"] }
 tokio = { version = "1", features = ["full"] }
 ```
 
