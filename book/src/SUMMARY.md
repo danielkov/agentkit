@@ -29,20 +29,21 @@
 # Part III: Context, compaction, and memory
 
 - [Context loading](./ch14-context-loading.md)
-- [Transcript compaction](./ch15-compaction.md)
+- [Prompt caching](./ch15-caching.md)
+- [Transcript compaction](./ch16-compaction.md)
 
 # Part IV: Integration and extensibility
 
-- [MCP integration](./ch16-mcp.md)
-- [Task management and parallelism](./ch17-task-management.md)
-- [Reporting and observability](./ch18-reporting.md)
-- [Provider adapters](./ch19-provider-adapters.md)
+- [MCP integration](./ch17-mcp.md)
+- [Task management and parallelism](./ch18-task-management.md)
+- [Reporting and observability](./ch19-reporting.md)
+- [Provider adapters](./ch20-provider-adapters.md)
 
 # Part V: Building a coding agent
 
-- [Architecture of a coding agent](./ch20-coding-agent-architecture.md)
-- [The interactive CLI](./ch21-interactive-cli.md)
-- [Putting it all together](./ch22-putting-it-together.md)
+- [Architecture of a coding agent](./ch21-coding-agent-architecture.md)
+- [The interactive CLI](./ch22-interactive-cli.md)
+- [Putting it all together](./ch23-putting-it-together.md)
 
 ---
 

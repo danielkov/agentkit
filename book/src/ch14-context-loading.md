@@ -26,6 +26,8 @@ With context:
   Model: writes idiomatic code that follows project conventions
 ```
 
+Caching fits naturally after context loading: once system prompts and context items become stable prefixes, later turns can reuse them efficiently. The next chapter covers that prompt caching layer before we move on to compaction.
+
 ## ContextLoader
 
 The loader combines multiple context sources and produces `Vec<Item>` with `ItemKind::Context`:

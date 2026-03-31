@@ -2,7 +2,7 @@
 
 This final chapter traces the complete path of a user request through the system, from keystroke to completed turn, touching every layer we've covered.
 
-This is the payoff chapter. Every type, trait, and design decision from the previous 21 chapters appears here in context. If something below is unfamiliar, the cross-reference tells you where to look.
+This is the payoff chapter. Every type, trait, and design decision from the previous 22 chapters appears here in context. If something below is unfamiliar, the cross-reference tells you where to look.
 
 ## The scenario
 
@@ -34,6 +34,7 @@ The driver builds a `TurnRequest` containing:
 
 - The working transcript (system prompt, context items, conversation history)
 - Tool specs from the registry (fs.read_file, fs.write_file, fs.replace_in_file, shell.exec, etc.)
+- The normalized prompt cache request for the turn
 
 ### 4. Model invocation
 
@@ -133,14 +134,14 @@ Each step in the walkthrough above maps to a chapter:
 | Step                 | Chapter                                                                                                  |
 | -------------------- | -------------------------------------------------------------------------------------------------------- |
 | 1. Input submission  | [Ch 6: Driving the loop](./ch06-driving-the-loop.md)                                                     |
-| 2. Compaction check  | [Ch 15: Transcript compaction](./ch15-compaction.md)                                                     |
-| 3. Turn construction | [Ch 5: The model adapter boundary](./ch05-model-adapter.md)                                              |
+| 2. Compaction check  | [Ch 16: Transcript compaction](./ch16-compaction.md)                                                     |
+| 3. Turn construction | [Ch 5: The model adapter boundary](./ch05-model-adapter.md), [Ch 15: Prompt caching](./ch15-caching.md) |
 | 4. Model invocation  | [Ch 1: Talking to models](./ch01-model-adapter.md), [Ch 4: Streaming](./ch04-streaming-and-deltas.md)    |
 | 5. Tool call (read)  | [Ch 11: Filesystem tools](./ch11-filesystem-tools.md)                                                    |
 | 6. Permission check  | [Ch 10: Permissions](./ch10-permissions.md)                                                              |
 | 7. Tool call (edit)  | [Ch 11: Filesystem tools](./ch11-filesystem-tools.md)                                                    |
-| 8. Tool call (shell) | [Ch 12: Shell execution](./ch12-shell-execution.md), [Ch 17: Task management](./ch17-task-management.md) |
-| 9. Streaming text    | [Ch 4: Streaming and deltas](./ch04-streaming-and-deltas.md), [Ch 18: Reporting](./ch18-reporting.md)    |
+| 8. Tool call (shell) | [Ch 12: Shell execution](./ch12-shell-execution.md), [Ch 18: Task management](./ch18-task-management.md) |
+| 9. Streaming text    | [Ch 4: Streaming and deltas](./ch04-streaming-and-deltas.md), [Ch 19: Reporting](./ch19-reporting.md)    |
 | 10. Turn completion  | [Ch 6: Driving the loop](./ch06-driving-the-loop.md)                                                     |
 
 ## Where to go from here

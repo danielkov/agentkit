@@ -176,15 +176,15 @@ An adapter's job is two translations:
 
 ```text
 agentkit → provider (request):
-  Vec<Item> ──▶ messages[]
-  Vec<ToolSpec> ──▶ tools[]
-  SessionConfig ──▶ auth headers, model field
+  Vec<Item>                         ──▶ messages[]
+  Vec<ToolSpec>                     ──▶ tools[]
+  SessionConfig / TurnRequest.cache ──▶ auth headers, model field, cache controls
 
 provider → agentkit (response):
-  choices[0].message ──▶ Item { kind: Assistant, parts: [...] }
+  choices[0].message            ──▶ Item { kind: Assistant, parts: [...] }
   choices[0].message.tool_calls ──▶ ToolCallPart per call
-  usage ──▶ Usage { tokens: TokenUsage { ... } }
-  finish_reason ──▶ FinishReason
+  usage                         ──▶ Usage { tokens: TokenUsage { ... } }
+  finish_reason                 ──▶ FinishReason
 ```
 
 The rest of this chapter shows how these translations map to agentkit's adapter traits.
@@ -243,6 +243,7 @@ pub struct TurnRequest {
     pub transcript: Vec<Item>,
     pub available_tools: Vec<ToolSpec>,
     pub metadata: MetadataMap,
+    pub cache: Option<PromptCacheRequest>,
 }
 ```
 
@@ -704,6 +705,12 @@ let mut driver = agent
     .start(SessionConfig {
         session_id: SessionId::new("one-shot"),
         metadata: MetadataMap::new(),
+        cache: Some(PromptCacheRequest {
+            mode: PromptCacheMode::BestEffort,
+            strategy: PromptCacheStrategy::Automatic,
+            retention: Some(PromptCacheRetention::Short),
+            key: None,
+        }),
     })
     .await?;
 
@@ -727,6 +734,8 @@ if let LoopStep::Finished(result) = driver.next().await? {
     }
 }
 ```
+
+The `cache` field is the session-level prompt caching policy. It is request-level configuration, not transcript data. See [Chapter 15: Prompt caching](./ch15-caching.md) for the model, provider mapping, and per-turn overrides.
 
 No tools are registered, so the model returns text and the driver finishes after a single turn. This is the simplest way to use agentkit — a typed HTTP client for chat completions with provider abstraction. The agent loop, covered in the next chapter, adds tool execution and iteration on top.
 

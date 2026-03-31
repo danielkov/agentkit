@@ -156,6 +156,7 @@ TurnRequest {
     transcript: self.transcript.clone(),
     available_tools: self.tool_executor.specs(),
     metadata: MetadataMap::new(),
+    cache: self.next_turn_cache.take().or_else(|| self.default_cache.clone()),
 }
 ```
 

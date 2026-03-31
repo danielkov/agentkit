@@ -48,7 +48,7 @@ One structured JSON object per event, newline-delimited. Useful for audit logs, 
 
 ### UsageReporter
 
-Aggregates token usage across a session: input tokens, output tokens, reasoning tokens, cached input tokens, estimated cost. Exposes query methods for per-turn and cumulative totals.
+Aggregates token usage across a session: input tokens, output tokens, reasoning tokens, cached input tokens, cache write tokens, estimated cost. Exposes query methods for per-turn and cumulative totals.
 
 ### TranscriptReporter
 

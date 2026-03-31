@@ -51,8 +51,8 @@ pub struct ToolRequest {
     pub call_id: ToolCallId,
     pub tool_name: ToolName,
     pub input: Value,
-    pub session_id: Option<SessionId>,
-    pub turn_id: Option<TurnId>,
+    pub session_id: SessionId,
+    pub turn_id: TurnId,
     pub metadata: MetadataMap,
 }
 ```
@@ -73,8 +73,7 @@ The result wraps a `ToolResultPart` (from `agentkit-core`) with execution metada
 
 ```rust
 pub struct ToolContext<'a> {
-    pub session_id: &'a SessionId,
-    pub turn_id: &'a TurnId,
+    pub capability: CapabilityContext<'a>,
     pub permissions: &'a dyn PermissionChecker,
     pub resources: &'a dyn ToolResources,
     pub cancellation: Option<TurnCancellation>,

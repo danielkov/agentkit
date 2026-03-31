@@ -118,7 +118,7 @@ The part types cover the full range of content that flows through an agent:
 | `Reasoning`  | Chain-of-thought, thinking blocks | Model's internal reasoning    |
 | `ToolCall`   | Model requests a tool invocation  | `fs.read_file("src/main.rs")` |
 | `ToolResult` | Tool execution output             | `"fn main() { ... }"`         |
-| `Custom`     | Provider-specific extensions      | Anthropic cache control       |
+| `Custom`     | Provider-specific extensions      | Raw provider-specific content |
 
 ### Design decision: comprehensive multimodal from day one
 
@@ -326,6 +326,7 @@ pub struct TokenUsage {
     pub output_tokens: u64,
     pub reasoning_tokens: Option<u64>,
     pub cached_input_tokens: Option<u64>,
+    pub cache_write_input_tokens: Option<u64>,
 }
 
 pub struct CostUsage {
@@ -335,7 +336,7 @@ pub struct CostUsage {
 }
 ```
 
-Not all providers report all fields. `TokenUsage` uses `Option` for fields that only some providers support (reasoning tokens, cached input tokens). The `Usage` struct itself wraps both token and cost in `Option` because some providers report one without the other.
+Not all providers report all fields. `TokenUsage` uses `Option` for fields that only some providers support (reasoning tokens, cached input tokens, cache write tokens). The `Usage` struct itself wraps both token and cost in `Option` because some providers report one without the other.
 
 Finish reasons are normalized to a small, stable enum:
 

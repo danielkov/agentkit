@@ -148,6 +148,7 @@ pub struct TurnRequest {
     pub transcript: Vec<Item>,
     pub available_tools: Vec<ToolSpec>,
     pub metadata: MetadataMap,
+    pub cache: Option<PromptCacheRequest>,
 }
 ```
 
@@ -155,7 +156,9 @@ The loop owns `TurnRequest` construction. The host doesn't rebuild model-facing 
 
 `available_tools` contains the tool specifications from the registry. The adapter converts these into the provider's tool schema format (typically `{ "type": "function", "function": { ... } }`).
 
-`metadata` is a pass-through for per-turn options. The host can set provider-specific parameters here (temperature overrides, model switches) without the loop needing to understand them.
+`metadata` is a pass-through for per-turn options. The host can set provider-specific parameters here without the loop needing to understand them.
+
+`cache` is the normalized prompt caching request for the turn. The adapter maps it into provider-native controls or explicit cache headers. That mapping is covered in [Chapter 15](./ch15-caching.md).
 
 ## Cancellation threading
 

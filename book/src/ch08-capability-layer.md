@@ -248,7 +248,7 @@ This layer is public and extensible, but it is not the primary extension point f
 | Add a custom tool that the model can call | `Tool` trait ([ch09](./ch09-tool-system.md)) |
 | Expose data for context loading           | `ResourceProvider`                           |
 | Expose parameterized prompt templates     | `PromptProvider`                             |
-| Integrate an MCP server                   | `CapabilityProvider` ([ch16](./ch16-mcp.md)) |
+| Integrate an MCP server                   | `CapabilityProvider` ([ch17](./ch17-mcp.md)) |
 | Build something that doesn't fit above    | `Invocable` directly                         |
 
 Most users implement `Tool`. The capability traits matter when you're integrating MCP servers, building custom data sources, or working on the framework itself.

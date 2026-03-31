@@ -101,7 +101,7 @@ With ForegroundThenDetachAfter(5s):
       └── when build finishes, result appears in next turn
 ```
 
-This integration is covered in detail in [Chapter 17](./ch17-task-management.md).
+This integration is covered in detail in [Chapter 18](./ch18-task-management.md).
 
 ## Security considerations
 

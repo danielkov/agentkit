@@ -30,12 +30,13 @@ pub trait CompletionsProvider: Send + Sync + Clone {
 
     // Hooks — defaults pass through unchanged:
     fn preprocess_request(&self, builder: RequestBuilder) -> RequestBuilder { builder }
+    fn apply_prompt_cache(&self, body: &mut Map<String, Value>, request: &TurnRequest) -> Result<(), LoopError> { Ok(()) }
     fn preprocess_response(&self, _status: StatusCode, _body: &str) -> Result<(), LoopError> { Ok(()) }
     fn postprocess_response(&self, _usage: &mut Option<Usage>, _metadata: &mut MetadataMap, _raw: &Value) {}
 }
 ```
 
-The trait has three required methods (name, URL, config) and three optional hooks. Here's what each hook is for:
+The trait has three required methods (name, URL, config) and four optional hooks. Here's what each hook is for:
 
 ```text
 Request lifecycle with hooks:
@@ -47,6 +48,8 @@ Request lifecycle with hooks:
   Merge Config fields into body
        │
        ├── preprocess_request(builder) ← add auth headers, custom headers
+       │
+       ├── apply_prompt_cache(body, request) ← map normalized cache requests
        │
        ▼
   HTTP POST to endpoint_url()
@@ -130,14 +133,14 @@ agentkit ships six provider crates:
 
 | Crate                                                                                                                 | Auth             | Hooks used                           |
 | --------------------------------------------------------------------------------------------------------------------- | ---------------- | ------------------------------------ |
-| [`agentkit-provider-openrouter`](https://github.com/danielkov/agentkit/tree/main/crates/agentkit-provider-openrouter) | Bearer + headers | All three (auth, error check, cost)  |
-| `agentkit-provider-openai`                                                                                            | Bearer           | `preprocess_request` (auth)          |
+| [`agentkit-provider-openrouter`](https://github.com/danielkov/agentkit/tree/main/crates/agentkit-provider-openrouter) | Bearer + headers | auth, cache mapping, error check, cost |
+| `agentkit-provider-openai`                                                                                            | Bearer           | auth, cache mapping                  |
 | `agentkit-provider-ollama`                                                                                            | none             | None                                 |
 | `agentkit-provider-vllm`                                                                                              | optional Bearer  | `preprocess_request` (optional auth) |
 | `agentkit-provider-groq`                                                                                              | Bearer           | `preprocess_request` (auth)          |
 | `agentkit-provider-mistral`                                                                                           | Bearer           | `preprocess_request` (auth)          |
 
-Ollama is the simplest — no auth, no hooks. OpenRouter is the most complex — all three hooks handle auth headers, 200-with-error responses, and cost extraction.
+Ollama is the simplest — no auth, no hooks. OpenRouter is the most complex — it uses auth headers, prompt-cache mapping, 200-with-error handling, and response enrichment.
 
 ## When to implement ModelAdapter directly
 

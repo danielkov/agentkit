@@ -182,9 +182,17 @@ let mut driver = agent
     .start(SessionConfig {
         session_id: SessionId::new("openrouter-chat"),
         metadata: MetadataMap::new(),
+        cache: Some(PromptCacheRequest {
+            mode: PromptCacheMode::BestEffort,
+            strategy: PromptCacheStrategy::Automatic,
+            retention: Some(PromptCacheRetention::Short),
+            key: None,
+        }),
     })
     .await?;
 ```
+
+The `cache` field configures provider-side prompt caching for the session. It is optional, but most long-running agents should set it deliberately. The full model is covered in [Chapter 15](./ch15-caching.md).
 
 **Submit input** — construct an `Item` with `ItemKind::User` and a `TextPart`:
 
