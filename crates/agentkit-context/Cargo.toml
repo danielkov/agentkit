@@ -10,7 +10,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-agentkit-core = { version = "0.1.0", path = "../agentkit-core" }
+agentkit-core = { version = "0.2.0", path = "../agentkit-core" }
 async-fs = "2.2.0"
 async-trait.workspace = true
 serde_json.workspace = true
