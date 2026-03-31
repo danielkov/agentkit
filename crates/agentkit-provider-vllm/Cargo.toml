@@ -2,6 +2,7 @@
 description = "vLLM provider adapter for agentkit."
 homepage.workspace = true
 name = "agentkit-provider-vllm"
+readme = "README.md"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

@@ -2,6 +2,7 @@
 description = "OpenAI provider adapter for agentkit."
 homepage.workspace = true
 name = "agentkit-provider-openai"
+readme = "README.md"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
