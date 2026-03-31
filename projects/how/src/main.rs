@@ -3,13 +3,14 @@ use std::process::Command;
 use std::time::Duration;
 
 use agentkit_core::{
-    CancellationController, FinishReason, Item, ItemKind, MetadataMap, Part, SessionId, TextPart,
-    ToolOutput, ToolResultPart,
+    CancellationController, FinishReason, Item, ItemKind, Part, ToolOutput, ToolResultPart,
 };
-use agentkit_loop::{Agent, LoopInterrupt, LoopStep, SessionConfig};
+use agentkit_loop::{
+    Agent, LoopInterrupt, LoopStep, PromptCacheRequest, PromptCacheRetention, SessionConfig,
+};
 use agentkit_provider_openrouter::{OpenRouterAdapter, OpenRouterConfig};
 use agentkit_tools_core::{
-    Tool, ToolContext, ToolError, ToolName, ToolRegistry, ToolRequest, ToolResult, ToolSpec,
+    Tool, ToolContext, ToolError, ToolRegistry, ToolRequest, ToolResult, ToolSpec,
 };
 use crossterm::{
     cursor,
@@ -491,32 +492,15 @@ async fn run_agent(
         .build()?;
 
     let mut driver = agent
-        .start(SessionConfig {
-            session_id: SessionId::new("how"),
-            metadata: MetadataMap::new(),
-        })
+        .start(SessionConfig::new("how").with_cache(
+            PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
+        ))
         .await?;
 
     driver
         .submit_input(vec![
-            Item {
-                id: None,
-                kind: ItemKind::System,
-                parts: vec![Part::Text(TextPart {
-                    text: system_prompt(),
-                    metadata: MetadataMap::new(),
-                })],
-                metadata: MetadataMap::new(),
-            },
-            Item {
-                id: None,
-                kind: ItemKind::User,
-                parts: vec![Part::Text(TextPart {
-                    text: prompt,
-                    metadata: MetadataMap::new(),
-                })],
-                metadata: MetadataMap::new(),
-            },
+            Item::text(ItemKind::System, system_prompt()),
+            Item::text(ItemKind::User, prompt),
         ])
         .map_err(|e| AgentError::Other(e.into()))?;
 
@@ -730,22 +714,20 @@ struct IsAvailableTool;
 impl Tool for IsAvailableTool {
     fn spec(&self) -> &ToolSpec {
         static SPEC: std::sync::LazyLock<ToolSpec> = std::sync::LazyLock::new(|| {
-            ToolSpec {
-            name: ToolName::new("is_available"),
-            description: "Check if a command is available on the system. Pass a single command name (e.g. \"rg\"). Returns \"yes\" or \"no\".".into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "string",
-                        "description": "The command name to check"
-                    }
-                },
-                "required": ["command"]
-            }),
-            annotations: Default::default(),
-            metadata: MetadataMap::new(),
-        }
+            ToolSpec::new(
+                "is_available",
+                "Check if a command is available on the system. Pass a single command name (e.g. \"rg\"). Returns \"yes\" or \"no\".",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "The command name to check"
+                        }
+                    },
+                    "required": ["command"]
+                }),
+            )
         });
         &SPEC
     }
@@ -767,15 +749,9 @@ impl Tool for IsAvailableTool {
             .map(|o| o.status.success())
             .unwrap_or(false);
 
-        Ok(ToolResult {
-            result: ToolResultPart {
-                call_id: request.call_id,
-                output: ToolOutput::Text(if available { "yes" } else { "no" }.into()),
-                is_error: false,
-                metadata: MetadataMap::new(),
-            },
-            duration: None,
-            metadata: MetadataMap::new(),
-        })
+        Ok(ToolResult::new(ToolResultPart::success(
+            request.call_id,
+            ToolOutput::text(if available { "yes" } else { "no" }),
+        )))
     }
 }

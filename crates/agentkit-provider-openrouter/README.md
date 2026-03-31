@@ -31,8 +31,7 @@ Set the following environment variables before calling `OpenRouterConfig::from_e
 ### Minimal chat agent
 
 ```rust,no_run
-use agentkit_core::SessionId;
-use agentkit_loop::{Agent, SessionConfig};
+use agentkit_loop::{Agent, PromptCacheRequest, PromptCacheRetention, SessionConfig};
 use agentkit_provider_openrouter::{OpenRouterAdapter, OpenRouterConfig};
 
 # #[tokio::main]
@@ -46,10 +45,11 @@ let agent = Agent::builder()
     .build()?;
 
 let mut driver = agent
-    .start(SessionConfig {
-        session_id: SessionId::new("demo"),
-        metadata: Default::default(),
-    })
+    .start(
+        SessionConfig::new("demo").with_cache(
+            PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
+        ),
+    )
     .await?;
 
 let step = driver.next().await?;

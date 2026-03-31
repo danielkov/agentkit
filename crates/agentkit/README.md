@@ -37,8 +37,10 @@ tokio = { version = "1", features = ["full"] }
 ### Minimal agent with OpenRouter
 
 ```rust,no_run
-use agentkit::core::{Item, ItemKind, MetadataMap, Part, SessionId, TextPart};
-use agentkit::loop_::{Agent, LoopStep, SessionConfig};
+use agentkit::core::{Item, ItemKind};
+use agentkit::loop_::{
+    Agent, LoopStep, PromptCacheRequest, PromptCacheRetention, SessionConfig,
+};
 use agentkit::provider_openrouter::{OpenRouterAdapter, OpenRouterConfig};
 use agentkit::reporting::StdoutReporter;
 
@@ -53,22 +55,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     let mut driver = agent
-        .start(SessionConfig {
-            session_id: SessionId::new("demo"),
-            metadata: MetadataMap::new(),
-        })
+        .start(
+            SessionConfig::new("demo").with_cache(
+                PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
+            ),
+        )
         .await?;
 
     // Submit a user message and drive the loop to completion.
-    driver.submit_input(vec![Item {
-        id: None,
-        kind: ItemKind::User,
-        parts: vec![Part::Text(TextPart {
-            text: "What is the capital of France?".into(),
-            metadata: MetadataMap::new(),
-        })],
-        metadata: MetadataMap::new(),
-    }])?;
+    driver.submit_input(vec![Item::text(
+        ItemKind::User,
+        "What is the capital of France?",
+    )])?;
 
     loop {
         match driver.next().await? {
@@ -100,8 +98,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ### Agent with filesystem and shell tools
 
 ```rust,no_run
-use agentkit::core::{MetadataMap, SessionId};
-use agentkit::loop_::{Agent, SessionConfig};
+use agentkit::loop_::{Agent, PromptCacheRequest, PromptCacheRetention, SessionConfig};
 use agentkit::reporting::{CompositeReporter, StdoutReporter, UsageReporter};
 use agentkit::provider_openrouter::{OpenRouterAdapter, OpenRouterConfig};
 use agentkit::tools::ToolRegistry;
@@ -123,10 +120,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     let _driver = agent
-        .start(SessionConfig {
-            session_id: SessionId::new("coding-agent"),
-            metadata: MetadataMap::new(),
-        })
+        .start(
+            SessionConfig::new("coding-agent").with_cache(
+                PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
+            ),
+        )
         .await?;
 
     Ok(())

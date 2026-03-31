@@ -30,7 +30,6 @@
 //!     CapabilityContext, CapabilityError, CapabilityName, Invocable,
 //!     InvocableOutput, InvocableRequest, InvocableResult, InvocableSpec,
 //! };
-//! use agentkit_core::MetadataMap;
 //! use async_trait::async_trait;
 //! use serde_json::json;
 //!
@@ -42,17 +41,16 @@
 //! impl Echo {
 //!     fn new() -> Self {
 //!         Self {
-//!             spec: InvocableSpec {
-//!                 name: CapabilityName::new("echo"),
-//!                 description: "Return the input unchanged".into(),
-//!                 input_schema: json!({
+//!             spec: InvocableSpec::new(
+//!                 CapabilityName::new("echo"),
+//!                 "Return the input unchanged",
+//!                 json!({
 //!                     "type": "object",
 //!                     "properties": {
 //!                         "message": { "type": "string" }
 //!                     }
 //!                 }),
-//!                 metadata: MetadataMap::new(),
-//!             },
+//!             ),
 //!         }
 //!     }
 //! }
@@ -68,10 +66,7 @@
 //!         request: InvocableRequest,
 //!         _ctx: &mut CapabilityContext<'_>,
 //!     ) -> Result<InvocableResult, CapabilityError> {
-//!         Ok(InvocableResult {
-//!             output: InvocableOutput::Structured(request.input.clone()),
-//!             metadata: MetadataMap::new(),
-//!         })
+//!         Ok(InvocableResult::structured(request.input.clone()))
 //!     }
 //! }
 //!
@@ -147,21 +142,19 @@ capability_id!(PromptId, "Unique identifier for a prompt template.");
 ///
 /// ```rust
 /// use agentkit_capabilities::{CapabilityName, InvocableSpec};
-/// use agentkit_core::MetadataMap;
 /// use serde_json::json;
 ///
-/// let spec = InvocableSpec {
-///     name: CapabilityName::new("search"),
-///     description: "Search the codebase for a pattern".into(),
-///     input_schema: json!({
+/// let spec = InvocableSpec::new(
+///     CapabilityName::new("search"),
+///     "Search the codebase for a pattern",
+///     json!({
 ///         "type": "object",
 ///         "properties": {
 ///             "query": { "type": "string" }
 ///         },
 ///         "required": ["query"]
 ///     }),
-///     metadata: MetadataMap::new(),
-/// };
+/// );
 ///
 /// assert_eq!(spec.name.as_str(), "search");
 /// ```
@@ -177,6 +170,28 @@ pub struct InvocableSpec {
     pub input_schema: Value,
     /// Arbitrary key-value metadata attached to the spec.
     pub metadata: MetadataMap,
+}
+
+impl InvocableSpec {
+    /// Builds an invocable spec with empty metadata.
+    pub fn new(
+        name: impl Into<CapabilityName>,
+        description: impl Into<String>,
+        input_schema: Value,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            input_schema,
+            metadata: MetadataMap::new(),
+        }
+    }
+
+    /// Replaces the spec metadata.
+    pub fn with_metadata(mut self, metadata: MetadataMap) -> Self {
+        self.metadata = metadata;
+        self
+    }
 }
 
 /// A request to execute an [`Invocable`] capability.
@@ -196,6 +211,36 @@ pub struct InvocableRequest {
     pub metadata: MetadataMap,
 }
 
+impl InvocableRequest {
+    /// Builds an invocable request with no session or turn ids.
+    pub fn new(input: Value) -> Self {
+        Self {
+            input,
+            session_id: None,
+            turn_id: None,
+            metadata: MetadataMap::new(),
+        }
+    }
+
+    /// Sets the session id.
+    pub fn with_session(mut self, session_id: impl Into<SessionId>) -> Self {
+        self.session_id = Some(session_id.into());
+        self
+    }
+
+    /// Sets the turn id.
+    pub fn with_turn(mut self, turn_id: impl Into<TurnId>) -> Self {
+        self.turn_id = Some(turn_id.into());
+        self
+    }
+
+    /// Replaces the request metadata.
+    pub fn with_metadata(mut self, metadata: MetadataMap) -> Self {
+        self.metadata = metadata;
+        self
+    }
+}
+
 /// The result of executing an [`Invocable`] capability.
 ///
 /// Returned by [`Invocable::invoke`] on success.  The `output` field carries
@@ -208,6 +253,42 @@ pub struct InvocableResult {
     /// Arbitrary key-value metadata about the execution (e.g. latency, cache
     /// status).
     pub metadata: MetadataMap,
+}
+
+impl InvocableResult {
+    /// Builds an invocable result with empty metadata.
+    pub fn new(output: InvocableOutput) -> Self {
+        Self {
+            output,
+            metadata: MetadataMap::new(),
+        }
+    }
+
+    /// Builds a plain-text result.
+    pub fn text(text: impl Into<String>) -> Self {
+        Self::new(InvocableOutput::Text(text.into()))
+    }
+
+    /// Builds a structured result.
+    pub fn structured(value: Value) -> Self {
+        Self::new(InvocableOutput::Structured(value))
+    }
+
+    /// Builds an items result.
+    pub fn items(items: Vec<Item>) -> Self {
+        Self::new(InvocableOutput::Items(items))
+    }
+
+    /// Builds a data-reference result.
+    pub fn data(data: DataRef) -> Self {
+        Self::new(InvocableOutput::Data(data))
+    }
+
+    /// Replaces the result metadata.
+    pub fn with_metadata(mut self, metadata: MetadataMap) -> Self {
+        self.metadata = metadata;
+        self
+    }
 }
 
 /// The output payload of an [`Invocable`] execution.
@@ -247,6 +328,37 @@ pub struct ResourceDescriptor {
     pub metadata: MetadataMap,
 }
 
+impl ResourceDescriptor {
+    /// Builds a resource descriptor with no description or mime type.
+    pub fn new(id: impl Into<ResourceId>, name: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+            description: None,
+            mime_type: None,
+            metadata: MetadataMap::new(),
+        }
+    }
+
+    /// Sets the description.
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    /// Sets the mime type.
+    pub fn with_mime_type(mut self, mime_type: impl Into<String>) -> Self {
+        self.mime_type = Some(mime_type.into());
+        self
+    }
+
+    /// Replaces the descriptor metadata.
+    pub fn with_metadata(mut self, metadata: MetadataMap) -> Self {
+        self.metadata = metadata;
+        self
+    }
+}
+
 /// The payload returned when a resource is read.
 ///
 /// Obtained by calling [`ResourceProvider::read_resource`] with a
@@ -258,6 +370,22 @@ pub struct ResourceContents {
     pub data: DataRef,
     /// Arbitrary key-value metadata about the read (e.g. ETag, last-modified).
     pub metadata: MetadataMap,
+}
+
+impl ResourceContents {
+    /// Builds resource contents with empty metadata.
+    pub fn new(data: DataRef) -> Self {
+        Self {
+            data,
+            metadata: MetadataMap::new(),
+        }
+    }
+
+    /// Replaces the contents metadata.
+    pub fn with_metadata(mut self, metadata: MetadataMap) -> Self {
+        self.metadata = metadata;
+        self
+    }
 }
 
 /// Describes a prompt template that a [`PromptProvider`] can render.
@@ -278,6 +406,31 @@ pub struct PromptDescriptor {
     pub metadata: MetadataMap,
 }
 
+impl PromptDescriptor {
+    /// Builds a prompt descriptor with no description and empty metadata.
+    pub fn new(id: impl Into<PromptId>, name: impl Into<String>, input_schema: Value) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+            description: None,
+            input_schema,
+            metadata: MetadataMap::new(),
+        }
+    }
+
+    /// Sets the description.
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    /// Replaces the descriptor metadata.
+    pub fn with_metadata(mut self, metadata: MetadataMap) -> Self {
+        self.metadata = metadata;
+        self
+    }
+}
+
 /// The rendered output of a prompt template.
 ///
 /// Returned by [`PromptProvider::get_prompt`] after applying the provided
@@ -289,6 +442,22 @@ pub struct PromptContents {
     pub items: Vec<Item>,
     /// Arbitrary key-value metadata about the rendering.
     pub metadata: MetadataMap,
+}
+
+impl PromptContents {
+    /// Builds prompt contents with empty metadata.
+    pub fn new(items: Vec<Item>) -> Self {
+        Self {
+            items,
+            metadata: MetadataMap::new(),
+        }
+    }
+
+    /// Replaces the contents metadata.
+    pub fn with_metadata(mut self, metadata: MetadataMap) -> Self {
+        self.metadata = metadata;
+        self
+    }
 }
 
 /// Shared execution context passed to all capability invocations.
@@ -344,7 +513,6 @@ pub struct CapabilityContext<'a> {
 ///     CapabilityContext, CapabilityError, CapabilityName, Invocable,
 ///     InvocableOutput, InvocableRequest, InvocableResult, InvocableSpec,
 /// };
-/// use agentkit_core::MetadataMap;
 /// use async_trait::async_trait;
 /// use serde_json::json;
 ///
@@ -355,12 +523,11 @@ pub struct CapabilityContext<'a> {
 /// impl CurrentTime {
 ///     fn new() -> Self {
 ///         Self {
-///             spec: InvocableSpec {
-///                 name: CapabilityName::new("current_time"),
-///                 description: "Return the current UTC time".into(),
-///                 input_schema: json!({ "type": "object" }),
-///                 metadata: MetadataMap::new(),
-///             },
+///             spec: InvocableSpec::new(
+///                 CapabilityName::new("current_time"),
+///                 "Return the current UTC time",
+///                 json!({ "type": "object" }),
+///             ),
 ///         }
 ///     }
 /// }
@@ -376,10 +543,7 @@ pub struct CapabilityContext<'a> {
 ///         _request: InvocableRequest,
 ///         _ctx: &mut CapabilityContext<'_>,
 ///     ) -> Result<InvocableResult, CapabilityError> {
-///         Ok(InvocableResult {
-///             output: InvocableOutput::Text("2026-03-22T12:00:00Z".into()),
-///             metadata: MetadataMap::new(),
-///         })
+///         Ok(InvocableResult::text("2026-03-22T12:00:00Z"))
 ///     }
 /// }
 /// ```

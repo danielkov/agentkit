@@ -3,8 +3,11 @@ use std::error::Error;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use agentkit_core::{Item, ItemKind, MetadataMap, Part, SessionId, TextPart};
-use agentkit_loop::{Agent, AgentEvent, LoopInterrupt, LoopObserver, LoopStep, SessionConfig};
+use agentkit_core::{Item, ItemKind, Part};
+use agentkit_loop::{
+    Agent, AgentEvent, LoopInterrupt, LoopObserver, LoopStep, PromptCacheRequest,
+    PromptCacheRetention, SessionConfig,
+};
 use agentkit_mcp::{
     McpServerConfig, McpServerId, McpServerManager, McpTransportBinding, StdioTransportConfig,
 };
@@ -61,10 +64,9 @@ pub async fn run_probe_with_command(
         .build()?;
 
     let mut driver = agent
-        .start(SessionConfig {
-            session_id: SessionId::new("openrouter-mcp-tool"),
-            metadata: MetadataMap::new(),
-        })
+        .start(SessionConfig::new("openrouter-mcp-tool").with_cache(
+            PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
+        ))
         .await?;
 
     driver.submit_input(vec![
@@ -238,15 +240,7 @@ impl LoopObserver for RecordingObserver {
 }
 
 fn text_item(kind: ItemKind, text: &str) -> Item {
-    Item {
-        id: None,
-        kind,
-        parts: vec![Part::Text(TextPart {
-            text: text.into(),
-            metadata: MetadataMap::new(),
-        })],
-        metadata: MetadataMap::new(),
-    }
+    Item::text(kind, text)
 }
 
 async fn run_to_completion<S>(

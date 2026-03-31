@@ -8,8 +8,7 @@
 //! # Quick start
 //!
 //! ```rust,ignore
-//! use agentkit_core::SessionId;
-//! use agentkit_loop::{Agent, SessionConfig};
+//! use agentkit_loop::{Agent, PromptCacheRequest, PromptCacheRetention, SessionConfig};
 //! use agentkit_provider_openrouter::{OpenRouterAdapter, OpenRouterConfig};
 //!
 //! #[tokio::main]
@@ -22,10 +21,11 @@
 //!         .build()?;
 //!
 //!     let mut driver = agent
-//!         .start(SessionConfig {
-//!             session_id: SessionId::new("demo"),
-//!             metadata: Default::default(),
-//!         })
+//!         .start(
+//!             SessionConfig::new("demo").with_cache(
+//!                 PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
+//!             ),
+//!         )
 //!         .await?;
 //!     Ok(())
 //! }
@@ -34,8 +34,11 @@
 use agentkit_adapter_completions::{
     CompletionsAdapter, CompletionsError, CompletionsProvider, CompletionsSession, CompletionsTurn,
 };
-use agentkit_core::{CostUsage, MetadataMap, Usage};
-use agentkit_loop::{LoopError, ModelAdapter, SessionConfig};
+use agentkit_core::{CostUsage, Item, ItemKind, MetadataMap, Part, Usage};
+use agentkit_loop::{
+    LoopError, ModelAdapter, PromptCacheBreakpoint, PromptCacheMode, PromptCacheRequest,
+    PromptCacheRetention, PromptCacheStrategy, SessionConfig, TurnRequest,
+};
 use async_trait::async_trait;
 use serde::Serialize;
 use serde_json::Value;
@@ -255,6 +258,60 @@ impl CompletionsProvider for OpenRouterProvider {
         builder
     }
 
+    fn apply_prompt_cache(
+        &self,
+        body: &mut serde_json::Map<String, Value>,
+        request: &TurnRequest,
+    ) -> Result<(), LoopError> {
+        let Some(cache) = &request.cache else {
+            return Ok(());
+        };
+        if matches!(cache.mode, PromptCacheMode::Disabled) {
+            return Ok(());
+        }
+
+        match &cache.strategy {
+            PromptCacheStrategy::Automatic => {
+                if model_supports_openrouter_explicit_cache(&self.request_config.model) {
+                    let breakpoints = plan_automatic_prompt_cache_breakpoints(request);
+                    return apply_openrouter_explicit_cache_breakpoints(
+                        body,
+                        &request.transcript,
+                        cache,
+                        &breakpoints,
+                    );
+                }
+
+                if matches!(cache.mode, PromptCacheMode::Required) {
+                    return Err(LoopError::Provider(format!(
+                        "OpenRouter model {} does not support automatic prompt caching controls",
+                        self.request_config.model
+                    )));
+                }
+
+                Ok(())
+            }
+            PromptCacheStrategy::Explicit { breakpoints } => {
+                if !model_supports_openrouter_explicit_cache(&self.request_config.model) {
+                    if matches!(cache.mode, PromptCacheMode::Required) {
+                        return Err(LoopError::Provider(format!(
+                            "OpenRouter model {} does not support explicit prompt cache breakpoints",
+                            self.request_config.model
+                        )));
+                    }
+                    return Ok(());
+                }
+
+                apply_openrouter_explicit_cache_breakpoints(
+                    body,
+                    &request.transcript,
+                    cache,
+                    breakpoints,
+                )
+            }
+        }
+    }
+
     fn preprocess_response(
         &self,
         _status: reqwest::StatusCode,
@@ -304,6 +361,331 @@ impl CompletionsProvider for OpenRouterProvider {
             metadata.insert("openrouter.refusal".into(), Value::String(refusal.into()));
         }
     }
+}
+
+fn model_supports_openrouter_explicit_cache(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    model.starts_with("anthropic/") || model.contains("claude")
+}
+
+fn openrouter_cache_control(retention: Option<PromptCacheRetention>) -> Value {
+    match retention.unwrap_or(PromptCacheRetention::Default) {
+        PromptCacheRetention::Default | PromptCacheRetention::Short => {
+            serde_json::json!({ "type": "ephemeral" })
+        }
+        PromptCacheRetention::Extended => {
+            serde_json::json!({ "type": "ephemeral", "ttl": "1h" })
+        }
+    }
+}
+
+fn plan_automatic_prompt_cache_breakpoints(request: &TurnRequest) -> Vec<PromptCacheBreakpoint> {
+    let mut breakpoints = Vec::new();
+
+    if !request.available_tools.is_empty() {
+        breakpoints.push(PromptCacheBreakpoint::ToolsEnd);
+    }
+
+    if let Some(index) = request
+        .transcript
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, item)| {
+            matches!(
+                item.kind,
+                ItemKind::System | ItemKind::Developer | ItemKind::Context
+            )
+        })
+        .map(|(index, _)| index)
+    {
+        breakpoints.push(PromptCacheBreakpoint::TranscriptItemEnd { index });
+    }
+
+    if let Some(index) = stable_history_prefix_end(&request.transcript) {
+        breakpoints.push(PromptCacheBreakpoint::TranscriptItemEnd { index });
+    }
+
+    dedupe_breakpoints(breakpoints)
+}
+
+fn stable_history_prefix_end(transcript: &[Item]) -> Option<usize> {
+    if transcript.is_empty() {
+        return None;
+    }
+
+    let mut boundary = transcript.len();
+    while boundary > 0
+        && matches!(
+            transcript[boundary - 1].kind,
+            ItemKind::User | ItemKind::Tool
+        )
+    {
+        boundary -= 1;
+    }
+
+    if boundary > 0 {
+        Some(boundary - 1)
+    } else {
+        transcript.len().checked_sub(1)
+    }
+}
+
+fn dedupe_breakpoints(breakpoints: Vec<PromptCacheBreakpoint>) -> Vec<PromptCacheBreakpoint> {
+    let mut deduped = Vec::new();
+    for breakpoint in breakpoints {
+        if !deduped.contains(&breakpoint) {
+            deduped.push(breakpoint);
+        }
+    }
+    deduped
+}
+
+fn apply_openrouter_explicit_cache_breakpoints(
+    body: &mut serde_json::Map<String, Value>,
+    transcript: &[Item],
+    cache: &PromptCacheRequest,
+    breakpoints: &[PromptCacheBreakpoint],
+) -> Result<(), LoopError> {
+    let cache_control = openrouter_cache_control(cache.retention);
+    let selected = if breakpoints.len() > 4 {
+        &breakpoints[breakpoints.len() - 4..]
+    } else {
+        breakpoints
+    };
+
+    let mut unsupported = Vec::new();
+
+    for breakpoint in selected {
+        let applied = match breakpoint {
+            PromptCacheBreakpoint::ToolsEnd => {
+                apply_cache_control_to_last_tool(body, cache_control.clone())
+            }
+            PromptCacheBreakpoint::TranscriptItemEnd { index } => {
+                resolve_item_message_end(transcript, *index).is_some_and(|message_index| {
+                    apply_cache_control_to_message(
+                        body,
+                        transcript,
+                        *index,
+                        message_index,
+                        None,
+                        cache_control.clone(),
+                    )
+                })
+            }
+            PromptCacheBreakpoint::TranscriptPartEnd {
+                item_index,
+                part_index,
+            } => resolve_part_message_target(transcript, *item_index, *part_index).is_some_and(
+                |(message_index, content_part_index)| {
+                    apply_cache_control_to_message(
+                        body,
+                        transcript,
+                        *item_index,
+                        message_index,
+                        content_part_index,
+                        cache_control.clone(),
+                    )
+                },
+            ),
+        };
+
+        if !applied {
+            unsupported.push(format!("{breakpoint:?}"));
+        }
+    }
+
+    if !unsupported.is_empty() && matches!(cache.mode, PromptCacheMode::Required) {
+        return Err(LoopError::Provider(format!(
+            "OpenRouter could not apply required cache breakpoints: {}",
+            unsupported.join(", ")
+        )));
+    }
+
+    Ok(())
+}
+
+fn apply_cache_control_to_last_tool(
+    body: &mut serde_json::Map<String, Value>,
+    cache_control: Value,
+) -> bool {
+    let Some(Value::Array(tools)) = body.get_mut("tools") else {
+        return false;
+    };
+    let Some(Value::Object(tool)) = tools.last_mut() else {
+        return false;
+    };
+    tool.insert("cache_control".into(), cache_control);
+    true
+}
+
+fn resolve_item_message_end(transcript: &[Item], target_index: usize) -> Option<usize> {
+    let mut message_index = 0usize;
+
+    for (item_index, item) in transcript.iter().enumerate() {
+        if item.kind == ItemKind::Tool {
+            let tool_result_count = item
+                .parts
+                .iter()
+                .filter(|part| matches!(part, agentkit_core::Part::ToolResult(_)))
+                .count();
+            if item_index == target_index {
+                return tool_result_count
+                    .checked_sub(1)
+                    .map(|offset| message_index + offset);
+            }
+            message_index += tool_result_count;
+        } else {
+            if item_index == target_index {
+                return Some(message_index);
+            }
+            message_index += 1;
+        }
+    }
+
+    None
+}
+
+fn resolve_part_message_target(
+    transcript: &[Item],
+    target_item_index: usize,
+    target_part_index: usize,
+) -> Option<(usize, Option<usize>)> {
+    let mut message_index = 0usize;
+
+    for (item_index, item) in transcript.iter().enumerate() {
+        if item.kind == ItemKind::Tool {
+            for (part_index, part) in item.parts.iter().enumerate() {
+                if matches!(part, agentkit_core::Part::ToolResult(_)) {
+                    if item_index == target_item_index && part_index == target_part_index {
+                        return Some((message_index, Some(0)));
+                    }
+                    message_index += 1;
+                }
+            }
+            continue;
+        }
+
+        if item_index == target_item_index {
+            return Some((message_index, Some(target_part_index)));
+        }
+
+        message_index += 1;
+    }
+
+    None
+}
+
+fn apply_cache_control_to_message(
+    body: &mut serde_json::Map<String, Value>,
+    transcript: &[Item],
+    transcript_item_index: usize,
+    message_index: usize,
+    content_part_index: Option<usize>,
+    cache_control: Value,
+) -> bool {
+    let Some(Value::Array(messages)) = body.get_mut("messages") else {
+        return false;
+    };
+    let Some(Value::Object(message)) = messages.get_mut(message_index) else {
+        return false;
+    };
+
+    let original_content = match message.get("content").cloned() {
+        Some(content) => content,
+        None => return false,
+    };
+
+    let Some(item) = transcript.get(transcript_item_index) else {
+        return false;
+    };
+
+    let (mut blocks, part_mapping) = match message_content_to_blocks(item, original_content.clone())
+    {
+        Some(value) => value,
+        None => return false,
+    };
+
+    let target_block_index = match content_part_index {
+        Some(part_index) => part_mapping.iter().position(|mapped| *mapped == part_index),
+        None => blocks.len().checked_sub(1),
+    };
+
+    let Some(block_index) = target_block_index else {
+        message.insert("content".into(), original_content);
+        return false;
+    };
+
+    let Some(Value::Object(block)) = blocks.get_mut(block_index) else {
+        message.insert("content".into(), original_content);
+        return false;
+    };
+    block.insert("cache_control".into(), cache_control);
+    message.insert("content".into(), Value::Array(blocks));
+    true
+}
+
+fn message_content_to_blocks(item: &Item, content: Value) -> Option<(Vec<Value>, Vec<usize>)> {
+    match content {
+        Value::Array(blocks) => {
+            let mapping = if item.kind == ItemKind::Tool {
+                vec![0; blocks.len()]
+            } else {
+                cacheable_content_part_indices(item)
+            };
+            Some((blocks, mapping))
+        }
+        Value::String(text) => {
+            if item.kind == ItemKind::Tool {
+                return Some((
+                    vec![serde_json::json!({
+                        "type": "text",
+                        "text": text,
+                    })],
+                    vec![0],
+                ));
+            }
+
+            if item.parts.len() != 1 {
+                return None;
+            }
+
+            Some((
+                vec![serde_json::json!({
+                    "type": "text",
+                    "text": text,
+                })],
+                vec![0],
+            ))
+        }
+        Value::Null => None,
+        other => Some((vec![other], vec![0])),
+    }
+}
+
+fn cacheable_content_part_indices(item: &Item) -> Vec<usize> {
+    item.parts
+        .iter()
+        .enumerate()
+        .filter_map(|(index, part)| match item.kind {
+            ItemKind::System | ItemKind::Developer | ItemKind::Context => match part {
+                Part::Text(_) | Part::Structured(_) => Some(index),
+                Part::Reasoning(reasoning) if reasoning.summary.is_some() => Some(index),
+                _ => None,
+            },
+            ItemKind::User => match part {
+                Part::Text(_) | Part::Structured(_) | Part::Media(_) | Part::File(_) => Some(index),
+                Part::Reasoning(reasoning) if reasoning.summary.is_some() => Some(index),
+                _ => None,
+            },
+            ItemKind::Assistant => match part {
+                Part::Text(_) | Part::Structured(_) => Some(index),
+                Part::Reasoning(reasoning) if reasoning.summary.is_some() => Some(index),
+                _ => None,
+            },
+            ItemKind::Tool => None,
+        })
+        .collect()
 }
 
 // --- Adapter newtype (preserves the existing public API) ---
@@ -375,4 +757,155 @@ pub enum OpenRouterError {
     /// An error from the generic completions adapter.
     #[error(transparent)]
     Completions(#[from] CompletionsError),
+}
+
+#[cfg(test)]
+mod tests {
+    use agentkit_core::{Item, ItemKind, MetadataMap, Part, SessionId, TextPart, TurnId};
+
+    use super::*;
+
+    fn empty_turn_request(transcript: Vec<Item>, cache: Option<PromptCacheRequest>) -> TurnRequest {
+        TurnRequest {
+            session_id: SessionId::new("session"),
+            turn_id: TurnId::new("turn-1"),
+            transcript,
+            available_tools: Vec::new(),
+            cache,
+            metadata: MetadataMap::new(),
+        }
+    }
+
+    #[test]
+    fn openrouter_maps_automatic_cache_request_for_claude_models() {
+        let provider = OpenRouterProvider::from(OpenRouterConfig::new(
+            "sk-or-test",
+            "anthropic/claude-sonnet-4.6",
+        ));
+        let mut body = serde_json::Map::new();
+        body.insert(
+            "messages".into(),
+            Value::Array(vec![
+                serde_json::json!({
+                    "role": "system",
+                    "content": "system prompt"
+                }),
+                serde_json::json!({
+                    "role": "user",
+                    "content": "latest input"
+                }),
+            ]),
+        );
+        body.insert("tools".into(), Value::Array(Vec::new()));
+
+        provider
+            .apply_prompt_cache(
+                &mut body,
+                &empty_turn_request(
+                    vec![
+                        Item {
+                            id: None,
+                            kind: ItemKind::System,
+                            parts: vec![Part::Text(TextPart {
+                                text: "system prompt".into(),
+                                metadata: MetadataMap::new(),
+                            })],
+                            metadata: MetadataMap::new(),
+                        },
+                        Item {
+                            id: None,
+                            kind: ItemKind::User,
+                            parts: vec![Part::Text(TextPart {
+                                text: "latest input".into(),
+                                metadata: MetadataMap::new(),
+                            })],
+                            metadata: MetadataMap::new(),
+                        },
+                    ],
+                    Some(
+                        PromptCacheRequest::best_effort(PromptCacheStrategy::Automatic)
+                            .with_retention(PromptCacheRetention::Extended),
+                    ),
+                ),
+            )
+            .unwrap();
+
+        assert_eq!(
+            body.get("messages"),
+            Some(&Value::Array(vec![
+                serde_json::json!({
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "system prompt",
+                            "cache_control": {
+                                "type": "ephemeral",
+                                "ttl": "1h",
+                            }
+                        }
+                    ]
+                }),
+                serde_json::json!({
+                    "role": "user",
+                    "content": "latest input"
+                }),
+            ]))
+        );
+    }
+
+    #[test]
+    fn openrouter_applies_explicit_breakpoint_to_message_content() {
+        let provider = OpenRouterProvider::from(OpenRouterConfig::new(
+            "sk-or-test",
+            "anthropic/claude-sonnet-4.6",
+        ));
+        let mut body = serde_json::Map::new();
+        body.insert(
+            "messages".into(),
+            Value::Array(vec![serde_json::json!({
+                "role": "user",
+                "content": "hello"
+            })]),
+        );
+        body.insert("tools".into(), Value::Array(Vec::new()));
+
+        provider
+            .apply_prompt_cache(
+                &mut body,
+                &empty_turn_request(
+                    vec![Item {
+                        id: None,
+                        kind: ItemKind::User,
+                        parts: vec![Part::Text(TextPart {
+                            text: "hello".into(),
+                            metadata: MetadataMap::new(),
+                        })],
+                        metadata: MetadataMap::new(),
+                    }],
+                    Some(PromptCacheRequest::required(
+                        PromptCacheStrategy::Explicit {
+                            breakpoints: vec![PromptCacheBreakpoint::TranscriptItemEnd {
+                                index: 0,
+                            }],
+                        },
+                    )),
+                ),
+            )
+            .unwrap();
+
+        assert_eq!(
+            body.get("messages"),
+            Some(&Value::Array(vec![serde_json::json!({
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "hello",
+                        "cache_control": { "type": "ephemeral" }
+                    }
+                ]
+            })]))
+        );
+    }
 }

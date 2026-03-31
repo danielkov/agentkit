@@ -15,7 +15,7 @@ sessions.
 
 ```rust,no_run
 use agentkit_context::{AgentsMd, ContextLoader};
-use agentkit_core::{Item, ItemKind, MetadataMap, Part, TextPart};
+use agentkit_core::{Item, ItemKind};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -33,25 +33,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Context items are ordinary transcript entries (ItemKind::Context).
     // Prepend them to the input alongside a system prompt and user message,
     // then submit everything to the agent loop.
-    let mut input = vec![Item {
-        id: None,
-        kind: ItemKind::System,
-        parts: vec![Part::Text(TextPart {
-            text: "You are a helpful assistant.".into(),
-            metadata: MetadataMap::new(),
-        })],
-        metadata: MetadataMap::new(),
-    }];
+    let mut input = vec![Item::text(ItemKind::System, "You are a helpful assistant.")];
     input.extend(context_items);
-    input.push(Item {
-        id: None,
-        kind: ItemKind::User,
-        parts: vec![Part::Text(TextPart {
-            text: "What are the project guidelines?".into(),
-            metadata: MetadataMap::new(),
-        })],
-        metadata: MetadataMap::new(),
-    });
+    input.push(Item::text(
+        ItemKind::User,
+        "What are the project guidelines?",
+    ));
 
     println!("transcript has {} items", input.len());
     Ok(())

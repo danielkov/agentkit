@@ -131,10 +131,11 @@ let agent = Agent::builder()
     .build()?;
 
 let mut driver = agent
-    .start(SessionConfig {
-        session_id: SessionId::new("demo"),
-        metadata: MetadataMap::new(),
-    })
+    .start(
+        SessionConfig::new("demo").with_cache(
+            PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
+        ),
+    )
     .await?;
 
 driver.submit_input(vec![system_item, user_item])?;

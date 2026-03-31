@@ -1,13 +1,14 @@
 use std::error::Error;
 use std::sync::{Arc, Mutex};
 
-use agentkit_core::{
-    Item, ItemKind, MetadataMap, Part, SessionId, TextPart, ToolOutput, ToolResultPart,
+use agentkit_core::{Item, ItemKind, Part, ToolOutput, ToolResultPart};
+use agentkit_loop::{
+    Agent, AgentEvent, LoopInterrupt, LoopObserver, LoopStep, PromptCacheRequest,
+    PromptCacheRetention, SessionConfig,
 };
-use agentkit_loop::{Agent, AgentEvent, LoopInterrupt, LoopObserver, LoopStep, SessionConfig};
 use agentkit_provider_openrouter::{OpenRouterAdapter, OpenRouterConfig};
 use agentkit_tools_core::{
-    PermissionChecker, PermissionDecision, Tool, ToolAnnotations, ToolContext, ToolError, ToolName,
+    PermissionChecker, PermissionDecision, Tool, ToolAnnotations, ToolContext, ToolError,
     ToolRegistry, ToolRequest, ToolResult, ToolSpec,
 };
 use async_trait::async_trait;
@@ -48,10 +49,9 @@ pub async fn run_probe(secret: &str, prompt: Option<&str>) -> Result<ProbeRun, B
         .build()?;
 
     let mut driver = agent
-        .start(SessionConfig {
-            session_id: SessionId::new("openrouter-subagent-tool"),
-            metadata: MetadataMap::new(),
-        })
+        .start(SessionConfig::new("openrouter-subagent-tool").with_cache(
+            PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
+        ))
         .await?;
 
     driver.submit_input(vec![
@@ -120,10 +120,10 @@ impl SubagentTool {
     fn new(adapter: OpenRouterAdapter, secret: &str) -> Self {
         Self {
             adapter,
-            spec: ToolSpec {
-                name: ToolName::new("Subagent"),
-                description: "Run a focused sub-agent that has access to private context unavailable to the root agent.".into(),
-                input_schema: json!({
+            spec: ToolSpec::new(
+                "Subagent",
+                "Run a focused sub-agent that has access to private context unavailable to the root agent.",
+                json!({
                     "type": "object",
                     "properties": {
                         "prompt": { "type": "string" }
@@ -131,9 +131,8 @@ impl SubagentTool {
                     "required": ["prompt"],
                     "additionalProperties": false
                 }),
-                annotations: ToolAnnotations::default(),
-                metadata: MetadataMap::new(),
-            },
+            )
+            .with_annotations(ToolAnnotations::new()),
             system_prompt_template: format!(
                 "You are a sealed sub-agent.\nThe private launch code is {secret}.\nThe root agent does not know this code.\nIf the user asks for the launch code, answer with exactly {secret} and no other text."
             ),
@@ -167,13 +166,15 @@ impl Tool for SubagentTool {
             .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
 
         let mut driver = agent
-            .start(SessionConfig {
-                session_id: SessionId::new(format!(
+            .start(
+                SessionConfig::new(format!(
                     "{}-subagent-{}",
                     request.session_id, request.call_id
-                )),
-                metadata: MetadataMap::new(),
-            })
+                ))
+                .with_cache(
+                    PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
+                ),
+            )
             .await
             .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
 
@@ -188,29 +189,15 @@ impl Tool for SubagentTool {
             .await
             .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
 
-        Ok(ToolResult {
-            result: ToolResultPart {
-                call_id: request.call_id,
-                output: ToolOutput::Text(output),
-                is_error: false,
-                metadata: MetadataMap::new(),
-            },
-            duration: None,
-            metadata: MetadataMap::new(),
-        })
+        Ok(ToolResult::new(ToolResultPart::success(
+            request.call_id,
+            ToolOutput::text(output),
+        )))
     }
 }
 
 fn text_item(kind: ItemKind, text: &str) -> Item {
-    Item {
-        id: None,
-        kind,
-        parts: vec![Part::Text(TextPart {
-            text: text.into(),
-            metadata: MetadataMap::new(),
-        })],
-        metadata: MetadataMap::new(),
-    }
+    Item::text(kind, text)
 }
 
 async fn run_to_completion<S>(

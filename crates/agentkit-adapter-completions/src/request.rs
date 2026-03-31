@@ -36,6 +36,10 @@ pub(crate) fn build_request_body<P: CompletionsProvider>(
     );
     body.insert("user".into(), Value::String(request.session_id.0.clone()));
 
+    provider
+        .apply_prompt_cache(&mut body, request)
+        .map_err(|error| CompletionsError::Protocol(error.to_string()))?;
+
     Ok(Value::Object(body))
 }
 
@@ -266,5 +270,82 @@ fn part_kind(part: &Part) -> PartKind {
         Part::ToolCall(_) => PartKind::ToolCall,
         Part::ToolResult(_) => PartKind::ToolResult,
         Part::Custom(_) => PartKind::Custom,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::OnceLock;
+
+    use agentkit_core::{Item, ItemKind, MetadataMap, Part, SessionId, TextPart, TurnId};
+    use agentkit_loop::{LoopError, PromptCacheRequest, PromptCacheStrategy, TurnRequest};
+    use serde::Serialize;
+
+    use super::*;
+
+    #[derive(Clone, Serialize)]
+    struct TestConfig {
+        model: String,
+    }
+
+    #[derive(Clone)]
+    struct TestProvider;
+
+    impl CompletionsProvider for TestProvider {
+        type Config = TestConfig;
+
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+
+        fn endpoint_url(&self) -> &str {
+            "https://example.test/v1/chat/completions"
+        }
+
+        fn config(&self) -> &Self::Config {
+            static CONFIG: OnceLock<TestConfig> = OnceLock::new();
+            CONFIG.get_or_init(|| TestConfig {
+                model: "test-model".into(),
+            })
+        }
+
+        fn apply_prompt_cache(
+            &self,
+            body: &mut serde_json::Map<String, Value>,
+            request: &TurnRequest,
+        ) -> Result<(), LoopError> {
+            if request.cache.is_some() {
+                body.insert("cache_hook".into(), Value::Bool(true));
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn build_request_body_applies_provider_cache_hook() {
+        let body = build_request_body(
+            &TestProvider,
+            &TurnRequest {
+                session_id: SessionId::new("session"),
+                turn_id: TurnId::new("turn-1"),
+                transcript: vec![Item {
+                    id: None,
+                    kind: ItemKind::User,
+                    parts: vec![Part::Text(TextPart {
+                        text: "hello".into(),
+                        metadata: MetadataMap::new(),
+                    })],
+                    metadata: MetadataMap::new(),
+                }],
+                available_tools: Vec::new(),
+                cache: Some(PromptCacheRequest::best_effort(
+                    PromptCacheStrategy::Automatic,
+                )),
+                metadata: MetadataMap::new(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(body.get("cache_hook"), Some(&Value::Bool(true)));
     }
 }

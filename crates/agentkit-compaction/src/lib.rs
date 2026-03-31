@@ -58,6 +58,45 @@ pub struct CompactionRequest {
     pub metadata: MetadataMap,
 }
 
+impl CompactionRequest {
+    /// Builds a compaction request without an associated turn id.
+    pub fn new(
+        session_id: impl Into<SessionId>,
+        transcript: Vec<Item>,
+        reason: CompactionReason,
+    ) -> Self {
+        Self {
+            session_id: session_id.into(),
+            turn_id: None,
+            transcript,
+            reason,
+            metadata: MetadataMap::new(),
+        }
+    }
+
+    /// Builds a compaction request for a specific turn.
+    pub fn for_turn(
+        session_id: impl Into<SessionId>,
+        turn_id: impl Into<TurnId>,
+        transcript: Vec<Item>,
+        reason: CompactionReason,
+    ) -> Self {
+        Self::new(session_id, transcript, reason).with_turn_id(turn_id)
+    }
+
+    /// Sets the turn id.
+    pub fn with_turn_id(mut self, turn_id: impl Into<TurnId>) -> Self {
+        self.turn_id = Some(turn_id.into());
+        self
+    }
+
+    /// Replaces the request metadata.
+    pub fn with_metadata(mut self, metadata: MetadataMap) -> Self {
+        self.metadata = metadata;
+        self
+    }
+}
+
 /// Output of a [`CompactionStrategy`].
 ///
 /// Contains the compacted transcript along with metadata about what changed.
@@ -69,6 +108,23 @@ pub struct CompactionResult {
     pub replaced_items: usize,
     /// Metadata produced by the strategy (e.g. summarisation statistics).
     pub metadata: MetadataMap,
+}
+
+impl CompactionResult {
+    /// Builds a compaction result with empty metadata.
+    pub fn new(transcript: Vec<Item>, replaced_items: usize) -> Self {
+        Self {
+            transcript,
+            replaced_items,
+            metadata: MetadataMap::new(),
+        }
+    }
+
+    /// Replaces the result metadata.
+    pub fn with_metadata(mut self, metadata: MetadataMap) -> Self {
+        self.metadata = metadata;
+        self
+    }
 }
 
 /// Request sent to a [`CompactionBackend`] asking it to summarise a set of
@@ -87,6 +143,45 @@ pub struct SummaryRequest {
     pub metadata: MetadataMap,
 }
 
+impl SummaryRequest {
+    /// Builds a summary request without an associated turn id.
+    pub fn new(
+        session_id: impl Into<SessionId>,
+        items: Vec<Item>,
+        reason: CompactionReason,
+    ) -> Self {
+        Self {
+            session_id: session_id.into(),
+            turn_id: None,
+            items,
+            reason,
+            metadata: MetadataMap::new(),
+        }
+    }
+
+    /// Builds a summary request for a specific turn.
+    pub fn for_turn(
+        session_id: impl Into<SessionId>,
+        turn_id: impl Into<TurnId>,
+        items: Vec<Item>,
+        reason: CompactionReason,
+    ) -> Self {
+        Self::new(session_id, items, reason).with_turn_id(turn_id)
+    }
+
+    /// Sets the turn id.
+    pub fn with_turn_id(mut self, turn_id: impl Into<TurnId>) -> Self {
+        self.turn_id = Some(turn_id.into());
+        self
+    }
+
+    /// Replaces the request metadata.
+    pub fn with_metadata(mut self, metadata: MetadataMap) -> Self {
+        self.metadata = metadata;
+        self
+    }
+}
+
 /// Response from a [`CompactionBackend`] containing the summarised items.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SummaryResult {
@@ -94,6 +189,22 @@ pub struct SummaryResult {
     pub items: Vec<Item>,
     /// Metadata produced during summarisation (e.g. token counts).
     pub metadata: MetadataMap,
+}
+
+impl SummaryResult {
+    /// Builds a summary result with empty metadata.
+    pub fn new(items: Vec<Item>) -> Self {
+        Self {
+            items,
+            metadata: MetadataMap::new(),
+        }
+    }
+
+    /// Replaces the result metadata.
+    pub fn with_metadata(mut self, metadata: MetadataMap) -> Self {
+        self.metadata = metadata;
+        self
+    }
 }
 
 /// Decides whether compaction should run for a given transcript.

@@ -1,8 +1,10 @@
 use std::env;
 use std::io;
 
-use agentkit_core::{Item, ItemKind, MetadataMap, Part, SessionId, TextPart};
-use agentkit_loop::{Agent, LoopInterrupt, LoopStep, SessionConfig};
+use agentkit_core::{Item, ItemKind, MetadataMap, Part};
+use agentkit_loop::{
+    Agent, LoopInterrupt, LoopStep, PromptCacheRequest, PromptCacheRetention, SessionConfig,
+};
 use agentkit_provider_openrouter::{OpenRouterAdapter, OpenRouterConfig};
 use agentkit_reporting::{CompositeReporter, StdoutReporter};
 use agentkit_tools_core::{
@@ -50,10 +52,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     let mut driver = agent
-        .start(SessionConfig {
-            session_id: SessionId::new("openrouter-coding-agent"),
-            metadata: MetadataMap::new(),
-        })
+        .start(SessionConfig::new("openrouter-coding-agent").with_cache(
+            PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
+        ))
         .await?;
 
     driver.submit_input(vec![system_item(), user_item(&prompt)])?;
@@ -61,27 +62,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn system_item() -> Item {
-    Item {
-        id: None,
-        kind: ItemKind::System,
-        parts: vec![Part::Text(TextPart {
-            text: SYSTEM_PROMPT.into(),
-            metadata: MetadataMap::new(),
-        })],
-        metadata: MetadataMap::new(),
-    }
+    Item::text(ItemKind::System, SYSTEM_PROMPT)
 }
 
 fn user_item(prompt: &str) -> Item {
-    Item {
-        id: None,
-        kind: ItemKind::User,
-        parts: vec![Part::Text(TextPart {
-            text: prompt.into(),
-            metadata: MetadataMap::new(),
-        })],
-        metadata: MetadataMap::new(),
-    }
+    Item::text(ItemKind::User, prompt)
 }
 
 async fn run_to_completion<S>(

@@ -13,7 +13,10 @@ use agentkit_adapter_completions::{
     CompletionsAdapter, CompletionsError, CompletionsProvider, CompletionsSession, CompletionsTurn,
 };
 use agentkit_core::{MetadataMap, Usage};
-use agentkit_loop::{LoopError, ModelAdapter, SessionConfig};
+use agentkit_loop::{
+    LoopError, ModelAdapter, PromptCacheMode, PromptCacheRetention, PromptCacheStrategy,
+    SessionConfig, TurnRequest,
+};
 use async_trait::async_trait;
 use serde::Serialize;
 use serde_json::Value;
@@ -151,6 +154,41 @@ impl CompletionsProvider for OpenAIProvider {
             .header("User-Agent", "agentkit-provider-openai/0.1.0")
     }
 
+    fn apply_prompt_cache(
+        &self,
+        body: &mut serde_json::Map<String, Value>,
+        request: &TurnRequest,
+    ) -> Result<(), LoopError> {
+        let Some(cache) = &request.cache else {
+            return Ok(());
+        };
+        if matches!(cache.mode, PromptCacheMode::Disabled) {
+            return Ok(());
+        }
+
+        if let Some(key) = &cache.key {
+            body.insert("prompt_cache_key".into(), Value::String(key.clone()));
+        }
+
+        if let Some(retention) = cache.retention {
+            let value = match retention {
+                PromptCacheRetention::Default | PromptCacheRetention::Short => "in_memory",
+                PromptCacheRetention::Extended => "24h",
+            };
+            body.insert("prompt_cache_retention".into(), Value::String(value.into()));
+        }
+
+        if matches!(cache.strategy, PromptCacheStrategy::Explicit { .. })
+            && matches!(cache.mode, PromptCacheMode::Required)
+        {
+            return Err(LoopError::Provider(
+                "OpenAI chat completions does not support explicit cache breakpoints".into(),
+            ));
+        }
+
+        Ok(())
+    }
+
     fn postprocess_response(
         &self,
         _usage: &mut Option<Usage>,
@@ -201,4 +239,73 @@ pub enum OpenAIError {
 
     #[error(transparent)]
     Completions(#[from] CompletionsError),
+}
+
+#[cfg(test)]
+mod tests {
+    use agentkit_core::{MetadataMap, SessionId, TurnId};
+
+    use super::*;
+
+    fn empty_turn_request(cache: Option<agentkit_loop::PromptCacheRequest>) -> TurnRequest {
+        TurnRequest {
+            session_id: SessionId::new("session"),
+            turn_id: TurnId::new("turn-1"),
+            transcript: Vec::new(),
+            available_tools: Vec::new(),
+            cache,
+            metadata: MetadataMap::new(),
+        }
+    }
+
+    #[test]
+    fn openai_maps_automatic_cache_request() {
+        let provider = OpenAIProvider::from(OpenAIConfig::new("sk-test", "gpt-5.1"));
+        let mut body = serde_json::Map::new();
+
+        provider
+            .apply_prompt_cache(
+                &mut body,
+                &empty_turn_request(Some(
+                    agentkit_loop::PromptCacheRequest::best_effort(PromptCacheStrategy::Automatic)
+                        .with_key("cache-key")
+                        .with_retention(PromptCacheRetention::Extended),
+                )),
+            )
+            .unwrap();
+
+        assert_eq!(
+            body.get("prompt_cache_key"),
+            Some(&Value::String("cache-key".into()))
+        );
+        assert_eq!(
+            body.get("prompt_cache_retention"),
+            Some(&Value::String("24h".into()))
+        );
+    }
+
+    #[test]
+    fn openai_rejects_required_explicit_breakpoints() {
+        let provider = OpenAIProvider::from(OpenAIConfig::new("sk-test", "gpt-5.1"));
+        let mut body = serde_json::Map::new();
+
+        let error = provider
+            .apply_prompt_cache(
+                &mut body,
+                &empty_turn_request(Some(agentkit_loop::PromptCacheRequest::required(
+                    PromptCacheStrategy::Explicit {
+                        breakpoints: vec![
+                            agentkit_loop::PromptCacheBreakpoint::TranscriptItemEnd { index: 0 },
+                        ],
+                    },
+                ))),
+            )
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("does not support explicit cache breakpoints")
+        );
+    }
 }

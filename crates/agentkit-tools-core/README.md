@@ -35,19 +35,17 @@ struct ReadFileTool {
 impl ReadFileTool {
     fn new() -> Self {
         Self {
-            spec: ToolSpec {
-                name: ToolName::new("read_file"),
-                description: "Read a file from the local filesystem".into(),
-                input_schema: json!({
+            spec: ToolSpec::new(
+                "read_file",
+                "Read a file from the local filesystem",
+                json!({
                     "type": "object",
                     "properties": {
                         "path": { "type": "string", "description": "Absolute file path" }
                     },
                     "required": ["path"]
                 }),
-                annotations: Default::default(),
-                metadata: MetadataMap::new(),
-            },
+            ),
         }
     }
 }
@@ -80,16 +78,10 @@ impl Tool for ReadFileTool {
         let path = request.input["path"].as_str().unwrap();
         let content = std::fs::read_to_string(path)
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
-        Ok(ToolResult {
-            result: ToolResultPart {
-                call_id: request.call_id,
-                output: ToolOutput::Text(content),
-                is_error: false,
-                metadata: MetadataMap::new(),
-            },
-            duration: None,
-            metadata: MetadataMap::new(),
-        })
+        Ok(ToolResult::new(ToolResultPart::success(
+            request.call_id,
+            ToolOutput::text(content),
+        )))
     }
 }
 ```
@@ -118,16 +110,10 @@ impl Tool for EchoTool {
     async fn invoke(
         &self, request: ToolRequest, _ctx: &mut ToolContext<'_>,
     ) -> Result<ToolResult, ToolError> {
-        Ok(ToolResult {
-            result: ToolResultPart {
-                call_id: request.call_id,
-                output: ToolOutput::Structured(json!({ "ok": true })),
-                is_error: false,
-                metadata: MetadataMap::new(),
-            },
-            duration: None,
-            metadata: MetadataMap::new(),
-        })
+        Ok(ToolResult::new(ToolResultPart::success(
+            request.call_id,
+            ToolOutput::structured(json!({ "ok": true })),
+        )))
     }
 }
 
@@ -144,13 +130,7 @@ impl PermissionChecker for AllowAll {
 # #[tokio::main]
 # async fn main() {
 let registry = ToolRegistry::new().with(EchoTool {
-    spec: ToolSpec {
-        name: ToolName::new("echo"),
-        description: "Return a fixed payload".into(),
-        input_schema: json!({ "type": "object" }),
-        annotations: Default::default(),
-        metadata: MetadataMap::new(),
-    },
+    spec: ToolSpec::new("echo", "Return a fixed payload", json!({ "type": "object" })),
 });
 
 let executor = BasicToolExecutor::new(registry);
@@ -168,14 +148,13 @@ let mut ctx = ToolContext {
 
 let outcome = executor
     .execute(
-        ToolRequest {
-            call_id: "call-1".into(),
-            tool_name: ToolName::new("echo"),
-            input: json!({}),
-            session_id: SessionId::new("s1"),
-            turn_id: TurnId::new("t1"),
-            metadata: MetadataMap::new(),
-        },
+        ToolRequest::new(
+            "call-1",
+            "echo",
+            json!({}),
+            SessionId::new("s1"),
+            TurnId::new("t1"),
+        ),
         &mut ctx,
     )
     .await;

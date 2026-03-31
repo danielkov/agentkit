@@ -8,8 +8,10 @@ use agentkit_compaction::{
     ItemCountTrigger, KeepRecentStrategy,
 };
 use agentkit_context::{AgentsMd, ContextLoader};
-use agentkit_core::{Item, ItemKind, MetadataMap, Part, SessionId, TextPart};
-use agentkit_loop::{Agent, LoopInterrupt, LoopStep, SessionConfig};
+use agentkit_core::{Item, ItemKind, MetadataMap, Part};
+use agentkit_loop::{
+    Agent, LoopInterrupt, LoopStep, PromptCacheRequest, PromptCacheRetention, SessionConfig,
+};
 use agentkit_mcp::{
     McpServerConfig, McpServerId, McpServerManager, McpTransportBinding, StdioTransportConfig,
 };
@@ -127,10 +129,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .build()?;
 
     let mut driver = agent
-        .start(SessionConfig {
-            session_id: SessionId::new("openrouter-agent-cli"),
-            metadata: MetadataMap::new(),
-        })
+        .start(SessionConfig::new("openrouter-agent-cli").with_cache(
+            PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
+        ))
         .await?;
 
     let mut input = vec![text_item(ItemKind::System, SYSTEM_PROMPT)];
@@ -198,15 +199,7 @@ fn merge_registry(target: &mut ToolRegistry, source: ToolRegistry) {
 }
 
 fn text_item(kind: ItemKind, text: &str) -> Item {
-    Item {
-        id: None,
-        kind,
-        parts: vec![Part::Text(TextPart {
-            text: text.into(),
-            metadata: MetadataMap::new(),
-        })],
-        metadata: MetadataMap::new(),
-    }
+    Item::text(kind, text)
 }
 
 async fn run_to_completion<S>(

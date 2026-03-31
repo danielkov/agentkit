@@ -202,6 +202,10 @@ fn map_usage(usage: Option<ResponseUsage>) -> Option<Usage> {
                 .prompt_tokens_details
                 .as_ref()
                 .and_then(|details| details.cached_tokens),
+            cache_write_input_tokens: usage
+                .prompt_tokens_details
+                .as_ref()
+                .and_then(|details| details.cache_write_tokens),
         }),
         cost: None,
         metadata: MetadataMap::new(),
@@ -298,6 +302,7 @@ pub(crate) struct ResponseUsage {
 #[derive(Debug, Deserialize, Clone, Copy)]
 pub(crate) struct ResponsePromptTokenDetails {
     pub cached_tokens: Option<u64>,
+    pub cache_write_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy)]

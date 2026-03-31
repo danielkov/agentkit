@@ -30,7 +30,6 @@ use agentkit_capabilities::{
     CapabilityContext, CapabilityError, CapabilityName, Invocable, InvocableOutput,
     InvocableRequest, InvocableResult, InvocableSpec,
 };
-use agentkit_core::MetadataMap;
 use async_trait::async_trait;
 use serde_json::json;
 
@@ -42,10 +41,10 @@ struct CodeSearch {
 impl CodeSearch {
     fn new() -> Self {
         Self {
-            spec: InvocableSpec {
-                name: CapabilityName::new("code_search"),
-                description: "Search the codebase for a regex pattern".into(),
-                input_schema: json!({
+            spec: InvocableSpec::new(
+                CapabilityName::new("code_search"),
+                "Search the codebase for a regex pattern",
+                json!({
                     "type": "object",
                     "properties": {
                         "pattern": { "type": "string" },
@@ -53,8 +52,7 @@ impl CodeSearch {
                     },
                     "required": ["pattern"]
                 }),
-                metadata: MetadataMap::new(),
-            },
+            ),
         }
     }
 }
@@ -77,10 +75,7 @@ impl Invocable for CodeSearch {
         // In a real implementation you would run the search here.
         let results = format!("Found 3 matches for `{pattern}`");
 
-        Ok(InvocableResult {
-            output: InvocableOutput::Text(results),
-            metadata: MetadataMap::new(),
-        })
+        Ok(InvocableResult::text(results))
     }
 }
 ```

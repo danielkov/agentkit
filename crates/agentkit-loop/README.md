@@ -15,8 +15,10 @@ Use it as the central coordinator between model providers, tool execution, and a
 ## Quick start
 
 ```rust,no_run
-use agentkit_core::{Item, ItemKind, MetadataMap, Part, SessionId, TextPart};
-use agentkit_loop::{Agent, LoopStep, SessionConfig};
+use agentkit_core::{Item, ItemKind};
+use agentkit_loop::{
+    Agent, LoopStep, PromptCacheRequest, PromptCacheRetention, SessionConfig,
+};
 use agentkit_provider_openrouter::{OpenRouterAdapter, OpenRouterConfig};
 
 # #[tokio::main]
@@ -31,22 +33,15 @@ let agent = Agent::builder()
 
 // 3. Start a session to get a LoopDriver
 let mut driver = agent
-    .start(SessionConfig {
-        session_id: SessionId::new("demo"),
-        metadata: MetadataMap::new(),
-    })
+    .start(
+        SessionConfig::new("demo").with_cache(
+            PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
+        ),
+    )
     .await?;
 
 // 4. Submit user input and drive the loop
-driver.submit_input(vec![Item {
-    id: None,
-    kind: ItemKind::User,
-    parts: vec![Part::Text(TextPart {
-        text: "Hello, agent!".into(),
-        metadata: MetadataMap::new(),
-    })],
-    metadata: MetadataMap::new(),
-}])?;
+driver.submit_input(vec![Item::text(ItemKind::User, "Hello, agent!")])?;
 
 loop {
     match driver.next().await? {

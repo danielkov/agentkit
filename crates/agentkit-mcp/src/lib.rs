@@ -216,6 +216,25 @@ impl McpServerConfig {
             metadata: MetadataMap::new(),
         }
     }
+
+    /// Creates a stdio-backed server configuration.
+    pub fn stdio(id: impl Into<String>, command: impl Into<String>) -> Self {
+        Self::new(
+            id,
+            McpTransportBinding::Stdio(StdioTransportConfig::new(command)),
+        )
+    }
+
+    /// Creates an SSE-backed server configuration.
+    pub fn sse(id: impl Into<String>, url: impl Into<String>) -> Self {
+        Self::new(id, McpTransportBinding::Sse(SseTransportConfig::new(url)))
+    }
+
+    /// Replaces the configuration metadata.
+    pub fn with_metadata(mut self, metadata: MetadataMap) -> Self {
+        self.metadata = metadata;
+        self
+    }
 }
 
 /// A single JSON-RPC frame exchanged with an MCP server.

@@ -21,28 +21,12 @@
 //! # Example
 //!
 //! ```rust
-//! use agentkit_core::{Item, ItemKind, MetadataMap, Part, TextPart};
+//! use agentkit_core::{Item, ItemKind};
 //!
 //! // Build a minimal transcript to feed into the agent loop.
 //! let transcript = vec![
-//!     Item {
-//!         id: None,
-//!         kind: ItemKind::System,
-//!         parts: vec![Part::Text(TextPart {
-//!             text: "You are a coding assistant.".into(),
-//!             metadata: MetadataMap::new(),
-//!         })],
-//!         metadata: MetadataMap::new(),
-//!     },
-//!     Item {
-//!         id: None,
-//!         kind: ItemKind::User,
-//!         parts: vec![Part::Text(TextPart {
-//!             text: "What files are in this repo?".into(),
-//!             metadata: MetadataMap::new(),
-//!         })],
-//!         metadata: MetadataMap::new(),
-//!     },
+//!     Item::text(ItemKind::System, "You are a coding assistant."),
+//!     Item::text(ItemKind::User, "What files are in this repo?"),
 //! ];
 //!
 //! assert_eq!(transcript[0].kind, ItemKind::System);
@@ -374,17 +358,9 @@ impl TurnCancellation {
 /// # Example
 ///
 /// ```rust
-/// use agentkit_core::{Item, ItemKind, MetadataMap, Part, TextPart};
+/// use agentkit_core::{Item, ItemKind};
 ///
-/// let user_msg = Item {
-///     id: None,
-///     kind: ItemKind::User,
-///     parts: vec![Part::Text(TextPart {
-///         text: "List the workspace crates.".into(),
-///         metadata: MetadataMap::new(),
-///     })],
-///     metadata: MetadataMap::new(),
-/// };
+/// let user_msg = Item::text(ItemKind::User, "List the workspace crates.");
 ///
 /// assert_eq!(user_msg.kind, ItemKind::User);
 /// assert_eq!(user_msg.parts.len(), 1);
@@ -399,6 +375,41 @@ pub struct Item {
     pub parts: Vec<Part>,
     /// Arbitrary key-value metadata for this item.
     pub metadata: MetadataMap,
+}
+
+impl Item {
+    /// Builds an item with the given role and parts.
+    pub fn new(kind: ItemKind, parts: Vec<Part>) -> Self {
+        Self {
+            id: None,
+            kind,
+            parts,
+            metadata: MetadataMap::new(),
+        }
+    }
+
+    /// Builds a single-text-part item.
+    pub fn text(kind: ItemKind, text: impl Into<String>) -> Self {
+        Self::new(kind, vec![Part::Text(TextPart::new(text))])
+    }
+
+    /// Sets the item identifier.
+    pub fn with_id(mut self, id: impl Into<MessageId>) -> Self {
+        self.id = Some(id.into());
+        self
+    }
+
+    /// Replaces the item metadata.
+    pub fn with_metadata(mut self, metadata: MetadataMap) -> Self {
+        self.metadata = metadata;
+        self
+    }
+
+    /// Appends one part to the item.
+    pub fn push_part(mut self, part: Part) -> Self {
+        self.parts.push(part);
+        self
+    }
 }
 
 /// The role of an [`Item`] in the transcript.
@@ -430,20 +441,16 @@ pub enum ItemKind {
 /// # Example
 ///
 /// ```rust
-/// use agentkit_core::{MetadataMap, Part, TextPart, ToolCallId, ToolCallPart};
+/// use agentkit_core::{Part, ToolCallPart};
 /// use serde_json::json;
 ///
 /// let parts: Vec<Part> = vec![
-///     Part::Text(TextPart {
-///         text: "Reading the config file...".into(),
-///         metadata: MetadataMap::new(),
-///     }),
-///     Part::ToolCall(ToolCallPart {
-///         id: ToolCallId::new("call-42"),
-///         name: "fs.read_file".into(),
-///         input: json!({ "path": "config.toml" }),
-///         metadata: MetadataMap::new(),
-///     }),
+///     Part::text("Reading the config file..."),
+///     Part::ToolCall(ToolCallPart::new(
+///         "call-42",
+///         "fs.read_file",
+///         json!({ "path": "config.toml" }),
+///     )),
 /// ];
 ///
 /// assert!(matches!(parts[0], Part::Text(_)));
@@ -467,6 +474,33 @@ pub enum Part {
     ToolResult(ToolResultPart),
     /// A provider-specific part that does not fit the standard variants.
     Custom(CustomPart),
+}
+
+impl Part {
+    /// Builds a text part.
+    pub fn text(text: impl Into<String>) -> Self {
+        Self::Text(TextPart::new(text))
+    }
+
+    /// Builds a media part.
+    pub fn media(modality: Modality, mime_type: impl Into<String>, data: DataRef) -> Self {
+        Self::Media(MediaPart::new(modality, mime_type, data))
+    }
+
+    /// Builds a file part.
+    pub fn file(data: DataRef) -> Self {
+        Self::File(FilePart::new(data))
+    }
+
+    /// Builds a structured part.
+    pub fn structured(value: Value) -> Self {
+        Self::Structured(StructuredPart::new(value))
+    }
+
+    /// Builds a reasoning-summary part.
+    pub fn reasoning(summary: impl Into<String>) -> Self {
+        Self::Reasoning(ReasoningPart::summary(summary))
+    }
 }
 
 /// Discriminant for [`Part`] variants, used in streaming [`Delta`]s.
@@ -501,12 +535,9 @@ pub enum PartKind {
 /// # Example
 ///
 /// ```rust
-/// use agentkit_core::{MetadataMap, TextPart};
+/// use agentkit_core::TextPart;
 ///
-/// let part = TextPart {
-///     text: "Hello, world!".into(),
-///     metadata: MetadataMap::new(),
-/// };
+/// let part = TextPart::new("Hello, world!");
 /// assert_eq!(part.text, "Hello, world!");
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -515,6 +546,22 @@ pub struct TextPart {
     pub text: String,
     /// Arbitrary key-value metadata.
     pub metadata: MetadataMap,
+}
+
+impl TextPart {
+    /// Builds a text part with empty metadata.
+    pub fn new(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            metadata: MetadataMap::new(),
+        }
+    }
+
+    /// Replaces the text-part metadata.
+    pub fn with_metadata(mut self, metadata: MetadataMap) -> Self {
+        self.metadata = metadata;
+        self
+    }
 }
 
 /// Binary or encoded media content (image, audio, video).
@@ -531,6 +578,24 @@ pub struct MediaPart {
     pub data: DataRef,
     /// Arbitrary key-value metadata.
     pub metadata: MetadataMap,
+}
+
+impl MediaPart {
+    /// Builds a media part with empty metadata.
+    pub fn new(modality: Modality, mime_type: impl Into<String>, data: DataRef) -> Self {
+        Self {
+            modality,
+            mime_type: mime_type.into(),
+            data,
+            metadata: MetadataMap::new(),
+        }
+    }
+
+    /// Replaces the media-part metadata.
+    pub fn with_metadata(mut self, metadata: MetadataMap) -> Self {
+        self.metadata = metadata;
+        self
+    }
 }
 
 /// The kind of media carried by a [`MediaPart`].
@@ -562,6 +627,28 @@ pub enum DataRef {
     Handle(ArtifactId),
 }
 
+impl DataRef {
+    /// Stores UTF-8 text inline.
+    pub fn inline_text(text: impl Into<String>) -> Self {
+        Self::InlineText(text.into())
+    }
+
+    /// Stores bytes inline.
+    pub fn inline_bytes(bytes: impl Into<Vec<u8>>) -> Self {
+        Self::InlineBytes(bytes.into())
+    }
+
+    /// References externally hosted content by URI.
+    pub fn uri(uri: impl Into<String>) -> Self {
+        Self::Uri(uri.into())
+    }
+
+    /// References content through an artifact handle.
+    pub fn handle(id: impl Into<ArtifactId>) -> Self {
+        Self::Handle(id.into())
+    }
+}
+
 /// A file attachment within an [`Item`].
 ///
 /// Files are distinct from [`MediaPart`] in that they carry an optional
@@ -578,6 +665,41 @@ pub struct FilePart {
     pub metadata: MetadataMap,
 }
 
+impl FilePart {
+    /// Builds an unnamed file part with empty metadata.
+    pub fn new(data: DataRef) -> Self {
+        Self {
+            name: None,
+            mime_type: None,
+            data,
+            metadata: MetadataMap::new(),
+        }
+    }
+
+    /// Builds a named file part with empty metadata.
+    pub fn named(name: impl Into<String>, data: DataRef) -> Self {
+        Self::new(data).with_name(name)
+    }
+
+    /// Sets the file name.
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
+    /// Sets the file mime type.
+    pub fn with_mime_type(mut self, mime_type: impl Into<String>) -> Self {
+        self.mime_type = Some(mime_type.into());
+        self
+    }
+
+    /// Replaces the file-part metadata.
+    pub fn with_metadata(mut self, metadata: MetadataMap) -> Self {
+        self.metadata = metadata;
+        self
+    }
+}
+
 /// Structured JSON content, optionally paired with a JSON Schema for validation.
 ///
 /// Providers that support structured output (e.g. function-calling mode) may
@@ -590,6 +712,29 @@ pub struct StructuredPart {
     pub schema: Option<Value>,
     /// Arbitrary key-value metadata.
     pub metadata: MetadataMap,
+}
+
+impl StructuredPart {
+    /// Builds a structured part with empty metadata and no schema.
+    pub fn new(value: Value) -> Self {
+        Self {
+            value,
+            schema: None,
+            metadata: MetadataMap::new(),
+        }
+    }
+
+    /// Sets the optional schema.
+    pub fn with_schema(mut self, schema: Value) -> Self {
+        self.schema = Some(schema);
+        self
+    }
+
+    /// Replaces the structured-part metadata.
+    pub fn with_metadata(mut self, metadata: MetadataMap) -> Self {
+        self.metadata = metadata;
+        self
+    }
 }
 
 /// Model reasoning or chain-of-thought output.
@@ -609,6 +754,41 @@ pub struct ReasoningPart {
     pub metadata: MetadataMap,
 }
 
+impl ReasoningPart {
+    /// Builds a readable reasoning summary.
+    pub fn summary(summary: impl Into<String>) -> Self {
+        Self {
+            summary: Some(summary.into()),
+            data: None,
+            redacted: false,
+            metadata: MetadataMap::new(),
+        }
+    }
+
+    /// Builds a redacted readable reasoning summary.
+    pub fn redacted_summary(summary: impl Into<String>) -> Self {
+        Self::summary(summary).with_redacted(true)
+    }
+
+    /// Sets the optional reasoning data reference.
+    pub fn with_data(mut self, data: DataRef) -> Self {
+        self.data = Some(data);
+        self
+    }
+
+    /// Sets whether the reasoning content was redacted.
+    pub fn with_redacted(mut self, redacted: bool) -> Self {
+        self.redacted = redacted;
+        self
+    }
+
+    /// Replaces the reasoning-part metadata.
+    pub fn with_metadata(mut self, metadata: MetadataMap) -> Self {
+        self.metadata = metadata;
+        self
+    }
+}
+
 /// A tool invocation request emitted by the model.
 ///
 /// The agent loop receives this part, executes the named tool, and appends a
@@ -617,15 +797,10 @@ pub struct ReasoningPart {
 /// # Example
 ///
 /// ```rust
-/// use agentkit_core::{MetadataMap, ToolCallId, ToolCallPart};
+/// use agentkit_core::ToolCallPart;
 /// use serde_json::json;
 ///
-/// let call = ToolCallPart {
-///     id: ToolCallId::new("call-7"),
-///     name: "fs.read_file".into(),
-///     input: json!({ "path": "src/main.rs" }),
-///     metadata: MetadataMap::new(),
-/// };
+/// let call = ToolCallPart::new("call-7", "fs.read_file", json!({ "path": "src/main.rs" }));
 ///
 /// assert_eq!(call.name, "fs.read_file");
 /// ```
@@ -641,6 +816,24 @@ pub struct ToolCallPart {
     pub metadata: MetadataMap,
 }
 
+impl ToolCallPart {
+    /// Builds a tool-call part with empty metadata.
+    pub fn new(id: impl Into<ToolCallId>, name: impl Into<String>, input: Value) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+            input,
+            metadata: MetadataMap::new(),
+        }
+    }
+
+    /// Replaces the tool-call metadata.
+    pub fn with_metadata(mut self, metadata: MetadataMap) -> Self {
+        self.metadata = metadata;
+        self
+    }
+}
+
 /// The result of executing a tool, sent back to the model.
 ///
 /// Each `ToolResultPart` references the [`ToolCallPart`] it answers via
@@ -649,14 +842,9 @@ pub struct ToolCallPart {
 /// # Example
 ///
 /// ```rust
-/// use agentkit_core::{MetadataMap, ToolCallId, ToolOutput, ToolResultPart};
+/// use agentkit_core::{ToolOutput, ToolResultPart};
 ///
-/// let result = ToolResultPart {
-///     call_id: ToolCallId::new("call-7"),
-///     output: ToolOutput::Text("fn main() { ... }".into()),
-///     is_error: false,
-///     metadata: MetadataMap::new(),
-/// };
+/// let result = ToolResultPart::success("call-7", ToolOutput::text("fn main() { ... }"));
 ///
 /// assert!(!result.is_error);
 /// ```
@@ -670,6 +858,35 @@ pub struct ToolResultPart {
     pub is_error: bool,
     /// Arbitrary key-value metadata.
     pub metadata: MetadataMap,
+}
+
+impl ToolResultPart {
+    /// Builds a successful tool-result part with empty metadata.
+    pub fn success(call_id: impl Into<ToolCallId>, output: ToolOutput) -> Self {
+        Self {
+            call_id: call_id.into(),
+            output,
+            is_error: false,
+            metadata: MetadataMap::new(),
+        }
+    }
+
+    /// Builds an error tool-result part with empty metadata.
+    pub fn error(call_id: impl Into<ToolCallId>, output: ToolOutput) -> Self {
+        Self::success(call_id, output).with_is_error(true)
+    }
+
+    /// Sets the error flag explicitly.
+    pub fn with_is_error(mut self, is_error: bool) -> Self {
+        self.is_error = is_error;
+        self
+    }
+
+    /// Replaces the tool-result metadata.
+    pub fn with_metadata(mut self, metadata: MetadataMap) -> Self {
+        self.metadata = metadata;
+        self
+    }
 }
 
 /// The payload returned by a tool execution.
@@ -688,6 +905,28 @@ pub enum ToolOutput {
     Files(Vec<FilePart>),
 }
 
+impl ToolOutput {
+    /// Builds plain-text tool output.
+    pub fn text(text: impl Into<String>) -> Self {
+        Self::Text(text.into())
+    }
+
+    /// Builds structured tool output.
+    pub fn structured(value: Value) -> Self {
+        Self::Structured(value)
+    }
+
+    /// Builds multipart tool output.
+    pub fn parts(parts: Vec<Part>) -> Self {
+        Self::Parts(parts)
+    }
+
+    /// Builds file-based tool output.
+    pub fn files(files: Vec<FilePart>) -> Self {
+        Self::Files(files)
+    }
+}
+
 /// A provider-specific content part that does not fit the standard variants.
 ///
 /// Use this for extensions or experimental features that have not been
@@ -702,6 +941,36 @@ pub struct CustomPart {
     pub value: Option<Value>,
     /// Arbitrary key-value metadata.
     pub metadata: MetadataMap,
+}
+
+impl CustomPart {
+    /// Builds a custom part with empty metadata.
+    pub fn new(kind: impl Into<String>) -> Self {
+        Self {
+            kind: kind.into(),
+            data: None,
+            value: None,
+            metadata: MetadataMap::new(),
+        }
+    }
+
+    /// Sets the custom part data reference.
+    pub fn with_data(mut self, data: DataRef) -> Self {
+        self.data = Some(data);
+        self
+    }
+
+    /// Sets the custom part structured value.
+    pub fn with_value(mut self, value: Value) -> Self {
+        self.value = Some(value);
+        self
+    }
+
+    /// Replaces the custom-part metadata.
+    pub fn with_metadata(mut self, metadata: MetadataMap) -> Self {
+        self.metadata = metadata;
+        self
+    }
 }
 
 /// An incremental update emitted while a model turn is streaming.
@@ -780,18 +1049,13 @@ pub enum Delta {
 /// # Example
 ///
 /// ```rust
-/// use agentkit_core::{MetadataMap, TokenUsage, Usage};
+/// use agentkit_core::{TokenUsage, Usage};
 ///
-/// let usage = Usage {
-///     tokens: Some(TokenUsage {
-///         input_tokens: 1500,
-///         output_tokens: 200,
-///         reasoning_tokens: None,
-///         cached_input_tokens: Some(1000),
-///     }),
-///     cost: None,
-///     metadata: MetadataMap::new(),
-/// };
+/// let usage = Usage::new(
+///     TokenUsage::new(1500, 200)
+///         .with_cached_input_tokens(1000)
+///         .with_cache_write_input_tokens(1200),
+/// );
 ///
 /// let tokens = usage.tokens.as_ref().unwrap();
 /// assert_eq!(tokens.input_tokens, 1500);
@@ -806,6 +1070,29 @@ pub struct Usage {
     pub metadata: MetadataMap,
 }
 
+impl Usage {
+    /// Builds a usage record with token counts and no cost.
+    pub fn new(tokens: TokenUsage) -> Self {
+        Self {
+            tokens: Some(tokens),
+            cost: None,
+            metadata: MetadataMap::new(),
+        }
+    }
+
+    /// Sets the cost information.
+    pub fn with_cost(mut self, cost: CostUsage) -> Self {
+        self.cost = Some(cost);
+        self
+    }
+
+    /// Replaces the usage metadata.
+    pub fn with_metadata(mut self, metadata: MetadataMap) -> Self {
+        self.metadata = metadata;
+        self
+    }
+}
+
 /// Token counts broken down by direction and special categories.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenUsage {
@@ -817,6 +1104,39 @@ pub struct TokenUsage {
     pub reasoning_tokens: Option<u64>,
     /// Input tokens served from the provider's prompt cache, if reported.
     pub cached_input_tokens: Option<u64>,
+    /// Input tokens written into the provider's prompt cache, if reported.
+    pub cache_write_input_tokens: Option<u64>,
+}
+
+impl TokenUsage {
+    /// Builds token usage with required input and output counts.
+    pub fn new(input_tokens: u64, output_tokens: u64) -> Self {
+        Self {
+            input_tokens,
+            output_tokens,
+            reasoning_tokens: None,
+            cached_input_tokens: None,
+            cache_write_input_tokens: None,
+        }
+    }
+
+    /// Sets reasoning token count.
+    pub fn with_reasoning_tokens(mut self, reasoning_tokens: u64) -> Self {
+        self.reasoning_tokens = Some(reasoning_tokens);
+        self
+    }
+
+    /// Sets cached input token count.
+    pub fn with_cached_input_tokens(mut self, cached_input_tokens: u64) -> Self {
+        self.cached_input_tokens = Some(cached_input_tokens);
+        self
+    }
+
+    /// Sets cache-write input token count.
+    pub fn with_cache_write_input_tokens(mut self, cache_write_input_tokens: u64) -> Self {
+        self.cache_write_input_tokens = Some(cache_write_input_tokens);
+        self
+    }
 }
 
 /// Monetary cost for a single model turn.
@@ -828,6 +1148,23 @@ pub struct CostUsage {
     pub currency: String,
     /// An optional provider-specific cost string for display purposes.
     pub provider_amount: Option<String>,
+}
+
+impl CostUsage {
+    /// Builds cost usage with no provider-specific display string.
+    pub fn new(amount: f64, currency: impl Into<String>) -> Self {
+        Self {
+            amount,
+            currency: currency.into(),
+            provider_amount: None,
+        }
+    }
+
+    /// Sets the optional provider-specific display value.
+    pub fn with_provider_amount(mut self, provider_amount: impl Into<String>) -> Self {
+        self.provider_amount = Some(provider_amount.into());
+        self
+    }
 }
 
 /// The reason a model turn ended.

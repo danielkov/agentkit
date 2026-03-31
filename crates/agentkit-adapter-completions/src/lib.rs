@@ -55,6 +55,7 @@ pub use crate::error::CompletionsError;
 /// All have default implementations that pass through unchanged:
 ///
 /// - [`preprocess_request`](CompletionsProvider::preprocess_request) — add auth headers, custom user-agent, etc.
+/// - [`apply_prompt_cache`](CompletionsProvider::apply_prompt_cache) — map normalized cache requests into provider request fields
 /// - [`preprocess_response`](CompletionsProvider::preprocess_response) — inspect/reject raw response before parsing
 /// - [`postprocess_response`](CompletionsProvider::postprocess_response) — enrich parsed usage/metadata from raw response
 pub trait CompletionsProvider: Send + Sync + Clone {
@@ -82,6 +83,20 @@ pub trait CompletionsProvider: Send + Sync + Clone {
     /// The default implementation passes the builder through unchanged.
     fn preprocess_request(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         builder
+    }
+
+    /// Hook to map a normalized prompt cache request into the provider's JSON
+    /// request body.
+    ///
+    /// Called after the adapter has constructed the standard chat-completions
+    /// payload. Providers can inspect [`TurnRequest::cache`] and mutate the
+    /// request body accordingly.
+    fn apply_prompt_cache(
+        &self,
+        _body: &mut serde_json::Map<String, Value>,
+        _request: &TurnRequest,
+    ) -> Result<(), LoopError> {
+        Ok(())
     }
 
     /// Hook to inspect the raw HTTP response before deserialisation.

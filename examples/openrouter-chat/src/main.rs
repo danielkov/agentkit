@@ -1,9 +1,9 @@
 use std::io::{self, Write};
 
-use agentkit_core::{
-    CancellationController, Item, ItemKind, MetadataMap, Part, SessionId, TextPart,
+use agentkit_core::{CancellationController, Item, ItemKind, Part};
+use agentkit_loop::{
+    Agent, LoopInterrupt, LoopStep, PromptCacheRequest, PromptCacheRetention, SessionConfig,
 };
-use agentkit_loop::{Agent, LoopInterrupt, LoopStep, SessionConfig};
 use agentkit_provider_openrouter::{OpenRouterAdapter, OpenRouterConfig};
 
 #[tokio::main]
@@ -17,10 +17,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .cancellation(cancellation.handle())
         .build()?;
     let mut driver = agent
-        .start(SessionConfig {
-            session_id: SessionId::new("openrouter-chat"),
-            metadata: MetadataMap::new(),
-        })
+        .start(SessionConfig::new("openrouter-chat").with_cache(
+            PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
+        ))
         .await?;
 
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -79,15 +78,7 @@ fn submit_user_prompt<S>(
 where
     S: agentkit_loop::ModelSession,
 {
-    driver.submit_input(vec![Item {
-        id: None,
-        kind: ItemKind::User,
-        parts: vec![Part::Text(TextPart {
-            text: prompt.into(),
-            metadata: MetadataMap::new(),
-        })],
-        metadata: MetadataMap::new(),
-    }])?;
+    driver.submit_input(vec![Item::text(ItemKind::User, prompt)])?;
 
     Ok(())
 }

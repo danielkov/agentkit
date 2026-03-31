@@ -99,6 +99,58 @@ pub struct ToolAnnotations {
     pub supports_streaming_hint: bool,
 }
 
+impl ToolAnnotations {
+    /// Builds the default advisory flags.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Marks the tool as read-only.
+    pub fn read_only() -> Self {
+        Self::default().with_read_only(true)
+    }
+
+    /// Marks the tool as destructive.
+    pub fn destructive() -> Self {
+        Self::default().with_destructive(true)
+    }
+
+    /// Marks the tool as requiring approval.
+    pub fn needs_approval() -> Self {
+        Self::default().with_needs_approval(true)
+    }
+
+    /// Marks the tool as supporting streaming.
+    pub fn streaming() -> Self {
+        Self::default().with_supports_streaming(true)
+    }
+
+    pub fn with_read_only(mut self, read_only_hint: bool) -> Self {
+        self.read_only_hint = read_only_hint;
+        self
+    }
+
+    pub fn with_destructive(mut self, destructive_hint: bool) -> Self {
+        self.destructive_hint = destructive_hint;
+        self
+    }
+
+    pub fn with_idempotent(mut self, idempotent_hint: bool) -> Self {
+        self.idempotent_hint = idempotent_hint;
+        self
+    }
+
+    pub fn with_needs_approval(mut self, needs_approval_hint: bool) -> Self {
+        self.needs_approval_hint = needs_approval_hint;
+        self
+    }
+
+    pub fn with_supports_streaming(mut self, supports_streaming_hint: bool) -> Self {
+        self.supports_streaming_hint = supports_streaming_hint;
+        self
+    }
+}
+
 /// Declarative specification of a tool's identity, schema, and behavioural hints.
 ///
 /// Every [`Tool`] implementation exposes a `ToolSpec` that the framework uses to
@@ -107,14 +159,13 @@ pub struct ToolAnnotations {
 /// # Example
 ///
 /// ```rust
-/// use agentkit_core::MetadataMap;
 /// use agentkit_tools_core::{ToolAnnotations, ToolName, ToolSpec};
 /// use serde_json::json;
 ///
-/// let spec = ToolSpec {
-///     name: ToolName::new("grep_search"),
-///     description: "Search files by regex pattern".into(),
-///     input_schema: json!({
+/// let spec = ToolSpec::new(
+///     ToolName::new("grep_search"),
+///     "Search files by regex pattern",
+///     json!({
 ///         "type": "object",
 ///         "properties": {
 ///             "pattern": { "type": "string" },
@@ -122,12 +173,8 @@ pub struct ToolAnnotations {
 ///         },
 ///         "required": ["pattern"]
 ///     }),
-///     annotations: ToolAnnotations {
-///         read_only_hint: true,
-///         ..Default::default()
-///     },
-///     metadata: MetadataMap::new(),
-/// };
+/// )
+/// .with_annotations(ToolAnnotations::read_only());
 /// ```
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ToolSpec {
@@ -141,6 +188,35 @@ pub struct ToolSpec {
     pub annotations: ToolAnnotations,
     /// Arbitrary key-value pairs for framework extensions.
     pub metadata: MetadataMap,
+}
+
+impl ToolSpec {
+    /// Builds a tool spec with default annotations and empty metadata.
+    pub fn new(
+        name: impl Into<ToolName>,
+        description: impl Into<String>,
+        input_schema: Value,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            input_schema,
+            annotations: ToolAnnotations::default(),
+            metadata: MetadataMap::new(),
+        }
+    }
+
+    /// Replaces the tool annotations.
+    pub fn with_annotations(mut self, annotations: ToolAnnotations) -> Self {
+        self.annotations = annotations;
+        self
+    }
+
+    /// Replaces the tool metadata.
+    pub fn with_metadata(mut self, metadata: MetadataMap) -> Self {
+        self.metadata = metadata;
+        self
+    }
 }
 
 /// An incoming request to execute a tool.
@@ -164,6 +240,32 @@ pub struct ToolRequest {
     pub metadata: MetadataMap,
 }
 
+impl ToolRequest {
+    /// Builds a tool request with empty metadata.
+    pub fn new(
+        call_id: impl Into<ToolCallId>,
+        tool_name: impl Into<ToolName>,
+        input: Value,
+        session_id: impl Into<SessionId>,
+        turn_id: impl Into<TurnId>,
+    ) -> Self {
+        Self {
+            call_id: call_id.into(),
+            tool_name: tool_name.into(),
+            input,
+            session_id: session_id.into(),
+            turn_id: turn_id.into(),
+            metadata: MetadataMap::new(),
+        }
+    }
+
+    /// Replaces the request metadata.
+    pub fn with_metadata(mut self, metadata: MetadataMap) -> Self {
+        self.metadata = metadata;
+        self
+    }
+}
+
 /// The output produced by a successful tool invocation.
 ///
 /// Returned from [`Tool::invoke`] and wrapped by [`ToolExecutionOutcome::Completed`]
@@ -176,6 +278,29 @@ pub struct ToolResult {
     pub duration: Option<Duration>,
     /// Arbitrary key-value pairs for framework extensions.
     pub metadata: MetadataMap,
+}
+
+impl ToolResult {
+    /// Builds a tool result with no duration and empty metadata.
+    pub fn new(result: ToolResultPart) -> Self {
+        Self {
+            result,
+            duration: None,
+            metadata: MetadataMap::new(),
+        }
+    }
+
+    /// Sets the measured duration.
+    pub fn with_duration(mut self, duration: Duration) -> Self {
+        self.duration = Some(duration);
+        self
+    }
+
+    /// Replaces the result metadata.
+    pub fn with_metadata(mut self, metadata: MetadataMap) -> Self {
+        self.metadata = metadata;
+        self
+    }
 }
 
 /// Trait for dependency injection into tool implementations.
@@ -388,6 +513,44 @@ pub struct ApprovalRequest {
     pub metadata: MetadataMap,
 }
 
+impl ApprovalRequest {
+    /// Builds an approval request with no task or call id.
+    pub fn new(
+        id: impl Into<ApprovalId>,
+        request_kind: impl Into<String>,
+        reason: ApprovalReason,
+        summary: impl Into<String>,
+    ) -> Self {
+        Self {
+            task_id: None,
+            call_id: None,
+            id: id.into(),
+            request_kind: request_kind.into(),
+            reason,
+            summary: summary.into(),
+            metadata: MetadataMap::new(),
+        }
+    }
+
+    /// Sets the associated task id.
+    pub fn with_task_id(mut self, task_id: impl Into<TaskId>) -> Self {
+        self.task_id = Some(task_id.into());
+        self
+    }
+
+    /// Sets the associated tool call id.
+    pub fn with_call_id(mut self, call_id: impl Into<ToolCallId>) -> Self {
+        self.call_id = Some(call_id.into());
+        self
+    }
+
+    /// Replaces the approval metadata.
+    pub fn with_metadata(mut self, metadata: MetadataMap) -> Self {
+        self.metadata = metadata;
+        self
+    }
+}
+
 /// The user's response to an [`ApprovalRequest`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ApprovalDecision {
@@ -417,6 +580,35 @@ pub struct AuthRequest {
     pub operation: AuthOperation,
     /// Provider-specific challenge data (e.g. OAuth URLs, scopes).
     pub challenge: MetadataMap,
+}
+
+impl AuthRequest {
+    /// Builds an auth request with no task id and empty challenge metadata.
+    pub fn new(
+        id: impl Into<String>,
+        provider: impl Into<String>,
+        operation: AuthOperation,
+    ) -> Self {
+        Self {
+            task_id: None,
+            id: id.into(),
+            provider: provider.into(),
+            operation,
+            challenge: MetadataMap::new(),
+        }
+    }
+
+    /// Sets the associated task id.
+    pub fn with_task_id(mut self, task_id: impl Into<TaskId>) -> Self {
+        self.task_id = Some(task_id.into());
+        self
+    }
+
+    /// Replaces the auth challenge payload.
+    pub fn with_challenge(mut self, challenge: MetadataMap) -> Self {
+        self.challenge = challenge;
+        self
+    }
 }
 
 /// Describes the operation that triggered an [`AuthRequest`].
@@ -501,6 +693,19 @@ pub enum AuthResolution {
 }
 
 impl AuthResolution {
+    /// Builds a successful auth resolution.
+    pub fn provided(request: AuthRequest, credentials: MetadataMap) -> Self {
+        Self::Provided {
+            request,
+            credentials,
+        }
+    }
+
+    /// Builds a cancelled auth resolution.
+    pub fn cancelled(request: AuthRequest) -> Self {
+        Self::Cancelled { request }
+    }
+
     /// Returns a reference to the underlying [`AuthRequest`] regardless of
     /// the resolution variant.
     pub fn request(&self) -> &AuthRequest {
@@ -1364,13 +1569,11 @@ impl PermissionPolicy for McpServerPolicy {
 /// impl TimeTool {
 ///     fn new() -> Self {
 ///         Self {
-///             spec: ToolSpec {
-///                 name: ToolName::new("current_time"),
-///                 description: "Returns the current UTC time".into(),
-///                 input_schema: json!({ "type": "object" }),
-///                 annotations: Default::default(),
-///                 metadata: MetadataMap::new(),
-///             },
+///             spec: ToolSpec::new(
+///                 ToolName::new("current_time"),
+///                 "Returns the current UTC time",
+///                 json!({ "type": "object" }),
+///             ),
 ///         }
 ///     }
 /// }
@@ -1386,16 +1589,10 @@ impl PermissionPolicy for McpServerPolicy {
 ///         request: ToolRequest,
 ///         _ctx: &mut ToolContext<'_>,
 ///     ) -> Result<ToolResult, ToolError> {
-///         Ok(ToolResult {
-///             result: ToolResultPart {
-///                 call_id: request.call_id,
-///                 output: ToolOutput::Text("2026-03-22T12:00:00Z".into()),
-///                 is_error: false,
-///                 metadata: MetadataMap::new(),
-///             },
-///             duration: None,
-///             metadata: MetadataMap::new(),
-///         })
+///         Ok(ToolResult::new(ToolResultPart::success(
+///             request.call_id,
+///             ToolOutput::text("2026-03-22T12:00:00Z"),
+///         )))
 ///     }
 /// }
 /// ```
@@ -1458,7 +1655,6 @@ pub trait Tool: Send + Sync {
 ///
 /// ```rust
 /// use agentkit_tools_core::ToolRegistry;
-/// # use agentkit_core::MetadataMap;
 /// # use agentkit_tools_core::{Tool, ToolContext, ToolError, ToolName, ToolRequest, ToolResult, ToolSpec};
 /// # use async_trait::async_trait;
 /// # use serde_json::json;
@@ -1470,13 +1666,11 @@ pub trait Tool: Send + Sync {
 /// # }
 ///
 /// let registry = ToolRegistry::new()
-///     .with(NoopTool(ToolSpec {
-///         name: ToolName::new("noop"),
-///         description: "Does nothing".into(),
-///         input_schema: json!({"type": "object"}),
-///         annotations: Default::default(),
-///         metadata: MetadataMap::new(),
-///     }));
+///     .with(NoopTool(ToolSpec::new(
+///         ToolName::new("noop"),
+///         "Does nothing",
+///         json!({"type": "object"}),
+///     )));
 ///
 /// assert!(registry.get(&ToolName::new("noop")).is_some());
 /// assert_eq!(registry.specs().len(), 1);
@@ -1539,12 +1733,12 @@ impl ToolSpec {
     /// Converts this spec into an [`InvocableSpec`] for use with the
     /// capability layer.
     pub fn as_invocable_spec(&self) -> InvocableSpec {
-        InvocableSpec {
-            name: CapabilityName::new(self.name.0.clone()),
-            description: self.description.clone(),
-            input_schema: self.input_schema.clone(),
-            metadata: self.metadata.clone(),
-        }
+        InvocableSpec::new(
+            CapabilityName::new(self.name.0.clone()),
+            self.description.clone(),
+            self.input_schema.clone(),
+        )
+        .with_metadata(self.metadata.clone())
     }
 }
 

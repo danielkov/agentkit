@@ -38,8 +38,10 @@
 //! model finishes its turn.
 //!
 //! ```rust,ignore
-//! use agentkit::core::{Item, ItemKind, MetadataMap, Part, SessionId, TextPart};
-//! use agentkit::loop_::{Agent, LoopStep, SessionConfig};
+//! use agentkit::core::{Item, ItemKind};
+//! use agentkit::loop_::{
+//!     Agent, LoopStep, PromptCacheRequest, PromptCacheRetention, SessionConfig,
+//! };
 //! use agentkit::provider_openrouter::{OpenRouterAdapter, OpenRouterConfig};
 //! use agentkit::reporting::StdoutReporter;
 //!
@@ -53,21 +55,17 @@
 //!         .build()?;
 //!
 //!     let mut driver = agent
-//!         .start(SessionConfig {
-//!             session_id: SessionId::new("demo"),
-//!             metadata: MetadataMap::new(),
-//!         })
+//!         .start(
+//!             SessionConfig::new("demo").with_cache(
+//!                 PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
+//!             ),
+//!         )
 //!         .await?;
 //!
-//!     driver.submit_input(vec![Item {
-//!         id: None,
-//!         kind: ItemKind::User,
-//!         parts: vec![Part::Text(TextPart {
-//!             text: "What is the capital of France?".into(),
-//!             metadata: MetadataMap::new(),
-//!         })],
-//!         metadata: MetadataMap::new(),
-//!     }])?;
+//!     driver.submit_input(vec![Item::text(
+//!         ItemKind::User,
+//!         "What is the capital of France?",
+//!     )])?;
 //!
 //!     loop {
 //!         match driver.next().await? {

@@ -243,6 +243,8 @@ pub struct UsageTotals {
     pub reasoning_tokens: u64,
     /// Total input tokens served from the provider's cache.
     pub cached_input_tokens: u64,
+    /// Total input tokens written into the provider's cache.
+    pub cache_write_input_tokens: u64,
 }
 
 /// Accumulated monetary cost across all events seen by a [`UsageReporter`].
@@ -319,6 +321,8 @@ impl UsageReporter {
             self.summary.totals.reasoning_tokens += tokens.reasoning_tokens.unwrap_or_default();
             self.summary.totals.cached_input_tokens +=
                 tokens.cached_input_tokens.unwrap_or_default();
+            self.summary.totals.cache_write_input_tokens +=
+                tokens.cache_write_input_tokens.unwrap_or_default();
         }
         if let Some(cost) = &usage.cost {
             let totals = self.summary.cost.get_or_insert_with(CostTotals::default);
@@ -654,12 +658,14 @@ fn format_usage(usage: &Usage) -> String {
             output_tokens,
             reasoning_tokens,
             cached_input_tokens,
+            cache_write_input_tokens,
         }) => format!(
-            "input={} output={} reasoning={} cached_input={}",
+            "input={} output={} reasoning={} cached_input={} cache_write_input={}",
             input_tokens,
             output_tokens,
             reasoning_tokens.unwrap_or_default(),
-            cached_input_tokens.unwrap_or_default()
+            cached_input_tokens.unwrap_or_default(),
+            cache_write_input_tokens.unwrap_or_default()
         ),
         None => "no token usage".into(),
     }
@@ -681,6 +687,7 @@ mod tests {
                 output_tokens: 5,
                 reasoning_tokens: Some(2),
                 cached_input_tokens: Some(1),
+                cache_write_input_tokens: Some(7),
             }),
             cost: None,
             metadata: MetadataMap::new(),
@@ -696,6 +703,7 @@ mod tests {
                     output_tokens: 4,
                     reasoning_tokens: Some(1),
                     cached_input_tokens: None,
+                    cache_write_input_tokens: None,
                 }),
                 cost: None,
                 metadata: MetadataMap::new(),
@@ -711,6 +719,7 @@ mod tests {
         assert_eq!(summary.totals.output_tokens, 9);
         assert_eq!(summary.totals.reasoning_tokens, 3);
         assert_eq!(summary.totals.cached_input_tokens, 1);
+        assert_eq!(summary.totals.cache_write_input_tokens, 7);
     }
 
     #[test]

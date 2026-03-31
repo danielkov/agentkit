@@ -20,25 +20,12 @@ user messages, and context documents are all items; the loop appends assistant
 and tool items as the turn progresses.
 
 ```rust
-use agentkit_core::{Item, ItemKind, MetadataMap, Part, TextPart};
-
-/// Helper used throughout examples below.
-fn text_item(kind: ItemKind, text: &str) -> Item {
-    Item {
-        id: None,
-        kind,
-        parts: vec![Part::Text(TextPart {
-            text: text.into(),
-            metadata: MetadataMap::new(),
-        })],
-        metadata: MetadataMap::new(),
-    }
-}
+use agentkit_core::{Item, ItemKind};
 
 let transcript = vec![
-    text_item(ItemKind::System, "You are a careful coding agent."),
-    text_item(ItemKind::Context, "Project uses Rust 1.80, workspace has 12 crates."),
-    text_item(ItemKind::User, "Summarize the release notes."),
+    Item::text(ItemKind::System, "You are a careful coding agent."),
+    Item::text(ItemKind::Context, "Project uses Rust 1.80, workspace has 12 crates."),
+    Item::text(ItemKind::User, "Summarize the release notes."),
 ];
 
 assert_eq!(transcript.len(), 3);
@@ -53,31 +40,25 @@ to the transcript as a `Tool` item so the model can observe the result.
 
 ```rust
 use agentkit_core::{
-    Item, ItemKind, MetadataMap, Part, TextPart, ToolCallId,
-    ToolCallPart, ToolOutput, ToolResultPart,
+    Item, ItemKind, Part, ToolCallId, ToolCallPart, ToolOutput, ToolResultPart,
 };
 use serde_json::json;
 
 // The model asks to read a file.
-let tool_call = ToolCallPart {
-    id: ToolCallId::new("call-1"),
-    name: "fs.read_file".into(),
-    input: json!({ "path": "CHANGELOG.md" }),
-    metadata: MetadataMap::new(),
-};
+let tool_call = ToolCallPart::new(
+    ToolCallId::new("call-1"),
+    "fs.read_file",
+    json!({ "path": "CHANGELOG.md" }),
+);
 
 // After execution, the tool executor produces a result item.
-let tool_result_item = Item {
-    id: None,
-    kind: ItemKind::Tool,
-    parts: vec![Part::ToolResult(ToolResultPart {
-        call_id: tool_call.id.clone(),
-        output: ToolOutput::Text("## v0.3.0\n- Added compaction.".into()),
-        is_error: false,
-        metadata: MetadataMap::new(),
-    })],
-    metadata: MetadataMap::new(),
-};
+let tool_result_item = Item::new(
+    ItemKind::Tool,
+    vec![Part::ToolResult(ToolResultPart::success(
+        tool_call.id.clone(),
+        ToolOutput::text("## v0.3.0\n- Added compaction."),
+    ))],
+);
 
 assert!(matches!(tool_result_item.parts[0], Part::ToolResult(_)));
 ```
@@ -89,22 +70,14 @@ model providers. Reporters and compaction triggers inspect these values to
 decide when to summarize or stop.
 
 ```rust
-use agentkit_core::{CostUsage, MetadataMap, TokenUsage, Usage};
+use agentkit_core::{CostUsage, TokenUsage, Usage};
 
-let turn_usage = Usage {
-    tokens: Some(TokenUsage {
-        input_tokens: 1200,
-        output_tokens: 350,
-        reasoning_tokens: Some(50),
-        cached_input_tokens: Some(800),
-    }),
-    cost: Some(CostUsage {
-        amount: 0.0042,
-        currency: "USD".into(),
-        provider_amount: None,
-    }),
-    metadata: MetadataMap::new(),
-};
+let turn_usage = Usage::new(
+    TokenUsage::new(1200, 350)
+        .with_reasoning_tokens(50)
+        .with_cached_input_tokens(800),
+)
+.with_cost(CostUsage::new(0.0042, "USD"));
 
 let tokens = turn_usage.tokens.as_ref().unwrap();
 assert_eq!(tokens.input_tokens + tokens.output_tokens, 1550);
@@ -119,7 +92,7 @@ returns `FinishReason::Cancelled` when triggered.
 ```rust,no_run
 use agentkit_core::CancellationController;
 use agentkit_loop::{Agent, LoopStep, SessionConfig};
-use agentkit_core::{FinishReason, ItemKind, MetadataMap, SessionId};
+use agentkit_core::FinishReason;
 use agentkit_provider_openrouter::{OpenRouterAdapter, OpenRouterConfig};
 
 # async fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -130,10 +103,7 @@ let agent = Agent::builder()
     .build()?;
 
 let mut driver = agent
-    .start(SessionConfig {
-        session_id: SessionId::new("demo"),
-        metadata: MetadataMap::new(),
-    })
+    .start(SessionConfig::new("demo"))
     .await?;
 
 // Ctrl-C fires the interrupt, cancelling the in-flight turn.

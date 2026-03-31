@@ -8,10 +8,13 @@ use agentkit_compaction::{
     SummarizeOlderStrategy, SummaryRequest, SummaryResult,
 };
 use agentkit_core::{
-    Item, ItemKind, MetadataMap, Part, ReasoningPart, SessionId, TextPart, ToolCallId, ToolOutput,
-    ToolResultPart, TurnCancellation,
+    Item, ItemKind, MetadataMap, Part, ReasoningPart, ToolCallId, ToolOutput, ToolResultPart,
+    TurnCancellation,
 };
-use agentkit_loop::{Agent, AgentEvent, LoopInterrupt, LoopObserver, LoopStep, SessionConfig};
+use agentkit_loop::{
+    Agent, AgentEvent, LoopInterrupt, LoopObserver, LoopStep, PromptCacheRequest,
+    PromptCacheRetention, SessionConfig,
+};
 use agentkit_provider_openrouter::{OpenRouterAdapter, OpenRouterConfig};
 use agentkit_tools_core::{PermissionChecker, PermissionDecision};
 use async_trait::async_trait;
@@ -112,10 +115,11 @@ pub async fn run_mode(
         .build()?;
 
     let mut driver = agent
-        .start(SessionConfig {
-            session_id: SessionId::new(format!("openrouter-compaction-agent-{mode}")),
-            metadata: MetadataMap::new(),
-        })
+        .start(
+            SessionConfig::new(format!("openrouter-compaction-agent-{mode}")).with_cache(
+                PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
+            ),
+        )
         .await?;
 
     let prompt = prompt.unwrap_or(DEFAULT_PROMPT).to_owned();
@@ -384,14 +388,16 @@ impl CompactionBackend for NestedLoopCompactionBackend {
             .map_err(|error| agentkit_compaction::CompactionError::Failed(error.to_string()))?;
 
         let mut driver = agent
-            .start(SessionConfig {
-                session_id: SessionId::new(format!(
+            .start(
+                SessionConfig::new(format!(
                     "{}-compactor-{}",
                     request.session_id,
                     request.turn_id.clone().unwrap_or_else(|| "manual".into())
-                )),
-                metadata: MetadataMap::new(),
-            })
+                ))
+                .with_cache(
+                    PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
+                ),
+            )
             .await
             .map_err(|error| agentkit_compaction::CompactionError::Failed(error.to_string()))?;
 
@@ -491,63 +497,33 @@ impl PermissionChecker for AllowAll {
 }
 
 fn text_item(kind: ItemKind, text: &str) -> Item {
-    Item {
-        id: None,
-        kind,
-        parts: vec![Part::Text(TextPart {
-            text: text.into(),
-            metadata: MetadataMap::new(),
-        })],
-        metadata: MetadataMap::new(),
-    }
+    Item::text(kind, text)
 }
 
 fn context_item(title: &str, text: &str) -> Item {
     let mut metadata = MetadataMap::new();
     metadata.insert("title".into(), title.into());
-    Item {
-        id: None,
-        kind: ItemKind::Context,
-        parts: vec![Part::Text(TextPart {
-            text: text.into(),
-            metadata: MetadataMap::new(),
-        })],
-        metadata,
-    }
+    Item::text(ItemKind::Context, text).with_metadata(metadata)
 }
 
 fn assistant_with_reasoning(reasoning: &str, text: &str) -> Item {
-    Item {
-        id: None,
-        kind: ItemKind::Assistant,
-        parts: vec![
-            Part::Reasoning(ReasoningPart {
-                summary: Some(reasoning.into()),
-                data: None,
-                redacted: false,
-                metadata: MetadataMap::new(),
-            }),
-            Part::Text(TextPart {
-                text: text.into(),
-                metadata: MetadataMap::new(),
-            }),
+    Item::new(
+        ItemKind::Assistant,
+        vec![
+            Part::Reasoning(ReasoningPart::summary(reasoning)),
+            Part::text(text),
         ],
-        metadata: MetadataMap::new(),
-    }
+    )
 }
 
 fn failed_tool_item(text: &str) -> Item {
-    Item {
-        id: None,
-        kind: ItemKind::Tool,
-        parts: vec![Part::ToolResult(ToolResultPart {
-            call_id: ToolCallId::new("failed-tool"),
-            output: ToolOutput::Text(text.into()),
-            is_error: true,
-            metadata: MetadataMap::new(),
-        })],
-        metadata: MetadataMap::new(),
-    }
+    Item::new(
+        ItemKind::Tool,
+        vec![Part::ToolResult(ToolResultPart::error(
+            ToolCallId::new("failed-tool"),
+            ToolOutput::text(text),
+        ))],
+    )
 }
 
 fn render_items(items: &[Item]) -> String {

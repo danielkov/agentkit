@@ -28,10 +28,7 @@
 //! # Example
 //!
 //! ```rust,no_run
-//! use agentkit_core::SessionId;
-//! use agentkit_loop::{Agent, SessionConfig};
-//! # // Trait import needed for .start()
-//! # use agentkit_core::MetadataMap;
+//! use agentkit_loop::{Agent, PromptCacheRequest, PromptCacheRetention, SessionConfig};
 //!
 //! # async fn example<M: agentkit_loop::ModelAdapter>(adapter: M) -> Result<(), agentkit_loop::LoopError> {
 //! let agent = Agent::builder()
@@ -39,10 +36,11 @@
 //!     .build()?;
 //!
 //! let mut driver = agent
-//!     .start(SessionConfig {
-//!         session_id: SessionId::new("demo"),
-//!         metadata: MetadataMap::new(),
-//!     })
+//!     .start(
+//!         SessionConfig::new("demo").with_cache(
+//!             PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
+//!         ),
+//!     )
 //!     .await?;
 //! # Ok(())
 //! # }
@@ -86,13 +84,11 @@ const USER_CANCELLED_REASON: &str = "user_cancelled";
 /// # Example
 ///
 /// ```rust
-/// use agentkit_core::{MetadataMap, SessionId};
-/// use agentkit_loop::SessionConfig;
+/// use agentkit_loop::{PromptCacheRequest, PromptCacheRetention, SessionConfig};
 ///
-/// let config = SessionConfig {
-///     session_id: SessionId::new("my-session"),
-///     metadata: MetadataMap::new(),
-/// };
+/// let config = SessionConfig::new("my-session").with_cache(
+///     PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
+/// );
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionConfig {
@@ -100,6 +96,245 @@ pub struct SessionConfig {
     pub session_id: SessionId,
     /// Arbitrary key-value metadata forwarded to the model adapter.
     pub metadata: MetadataMap,
+    /// Default provider-side prompt caching policy for turns in this session.
+    pub cache: Option<PromptCacheRequest>,
+}
+
+impl SessionConfig {
+    /// Builds a session config with empty metadata and no cache policy.
+    pub fn new(session_id: impl Into<SessionId>) -> Self {
+        Self {
+            session_id: session_id.into(),
+            metadata: MetadataMap::new(),
+            cache: None,
+        }
+    }
+
+    /// Replaces the session metadata map.
+    pub fn with_metadata(mut self, metadata: MetadataMap) -> Self {
+        self.metadata = metadata;
+        self
+    }
+
+    /// Sets the default prompt cache request for the session.
+    pub fn with_cache(mut self, cache: PromptCacheRequest) -> Self {
+        self.cache = Some(cache);
+        self
+    }
+
+    /// Clears any default prompt cache request for the session.
+    pub fn without_cache(mut self) -> Self {
+        self.cache = None;
+        self
+    }
+}
+
+/// Strength of a prompt-cache request.
+///
+/// `BestEffort` lets adapters ignore unsupported controls while still using
+/// any provider-native automatic caching they support. `Required` upgrades
+/// unsupported cache requests into provider errors.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PromptCacheMode {
+    /// Disable prompt caching for this request.
+    Disabled,
+    /// Use caching when the provider can honor the request.
+    #[default]
+    BestEffort,
+    /// Fail the turn if the provider cannot honor the request.
+    Required,
+}
+
+/// High-level provider-neutral cache retention hint.
+///
+/// Providers map this to their native controls. For example, OpenAI maps
+/// `Short` to in-memory retention while OpenRouter Anthropic models map it to
+/// the default 5-minute ephemeral cache.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PromptCacheRetention {
+    /// Use the provider's default cache retention.
+    Default,
+    /// Prefer the provider's short-lived cache retention mode.
+    Short,
+    /// Prefer the provider's longest generally available cache retention mode.
+    Extended,
+}
+
+/// Provider-neutral prompt caching strategy.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PromptCacheStrategy {
+    /// Let the provider decide the cacheable prefix automatically.
+    Automatic,
+    /// Apply explicit cache breakpoints to selected prefix boundaries.
+    Explicit {
+        /// Cache breakpoints in transcript/tool order.
+        breakpoints: Vec<PromptCacheBreakpoint>,
+    },
+}
+
+impl Default for PromptCacheStrategy {
+    fn default() -> Self {
+        Self::Automatic
+    }
+}
+
+impl PromptCacheStrategy {
+    /// Uses the provider's native automatic cache behavior when available, or
+    /// any adapter-provided automatic planning fallback.
+    pub fn automatic() -> Self {
+        Self::Automatic
+    }
+
+    /// Uses explicit cache breakpoints.
+    pub fn explicit(breakpoints: impl IntoIterator<Item = PromptCacheBreakpoint>) -> Self {
+        Self::Explicit {
+            breakpoints: breakpoints.into_iter().collect(),
+        }
+    }
+}
+
+/// Prefix boundary that a provider should cache when using explicit caching.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PromptCacheBreakpoint {
+    /// Cache the tool schema prefix through the last available tool.
+    ToolsEnd,
+    /// Cache through the end of the transcript item at `index`.
+    TranscriptItemEnd { index: usize },
+    /// Cache through the specific transcript part.
+    ///
+    /// Not every adapter can target every part precisely; unsupported
+    /// fine-grained breakpoints become best-effort no-ops unless the request is
+    /// marked [`PromptCacheMode::Required`].
+    TranscriptPartEnd {
+        item_index: usize,
+        part_index: usize,
+    },
+}
+
+impl PromptCacheBreakpoint {
+    /// Cache the tool schema prefix through the last available tool.
+    pub fn tools_end() -> Self {
+        Self::ToolsEnd
+    }
+
+    /// Cache through the end of a transcript item.
+    pub fn transcript_item_end(index: usize) -> Self {
+        Self::TranscriptItemEnd { index }
+    }
+
+    /// Cache through a specific part within a transcript item.
+    pub fn transcript_part_end(item_index: usize, part_index: usize) -> Self {
+        Self::TranscriptPartEnd {
+            item_index,
+            part_index,
+        }
+    }
+}
+
+/// Prompt caching request sent alongside a turn.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptCacheRequest {
+    /// Strength of the caching request.
+    pub mode: PromptCacheMode,
+    /// Automatic or explicit caching strategy.
+    pub strategy: PromptCacheStrategy,
+    /// Optional provider-neutral retention hint.
+    pub retention: Option<PromptCacheRetention>,
+    /// Optional provider cache key or routing key.
+    pub key: Option<String>,
+}
+
+impl PromptCacheRequest {
+    /// Builds a best-effort automatic cache request.
+    pub fn automatic() -> Self {
+        Self::best_effort(PromptCacheStrategy::automatic())
+    }
+
+    /// Builds a required automatic cache request.
+    pub fn automatic_required() -> Self {
+        Self::required(PromptCacheStrategy::automatic())
+    }
+
+    /// Builds a best-effort explicit cache request.
+    pub fn explicit(breakpoints: impl IntoIterator<Item = PromptCacheBreakpoint>) -> Self {
+        Self::best_effort(PromptCacheStrategy::explicit(breakpoints))
+    }
+
+    /// Builds a required explicit cache request.
+    pub fn explicit_required(breakpoints: impl IntoIterator<Item = PromptCacheBreakpoint>) -> Self {
+        Self::required(PromptCacheStrategy::explicit(breakpoints))
+    }
+
+    /// Builds a disabled cache request.
+    pub fn disabled() -> Self {
+        Self {
+            mode: PromptCacheMode::Disabled,
+            strategy: PromptCacheStrategy::Automatic,
+            retention: None,
+            key: None,
+        }
+    }
+
+    /// Builds a best-effort cache request with the given strategy.
+    pub fn best_effort(strategy: PromptCacheStrategy) -> Self {
+        Self {
+            mode: PromptCacheMode::BestEffort,
+            strategy,
+            retention: None,
+            key: None,
+        }
+    }
+
+    /// Builds a required cache request with the given strategy.
+    pub fn required(strategy: PromptCacheStrategy) -> Self {
+        Self {
+            mode: PromptCacheMode::Required,
+            strategy,
+            retention: None,
+            key: None,
+        }
+    }
+
+    /// Overrides the request mode.
+    pub fn with_mode(mut self, mode: PromptCacheMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// Overrides the request strategy.
+    pub fn with_strategy(mut self, strategy: PromptCacheStrategy) -> Self {
+        self.strategy = strategy;
+        self
+    }
+
+    /// Applies a provider-neutral retention hint.
+    pub fn with_retention(mut self, retention: PromptCacheRetention) -> Self {
+        self.retention = Some(retention);
+        self
+    }
+
+    /// Applies a provider cache key or routing key.
+    pub fn with_key(mut self, key: impl Into<String>) -> Self {
+        self.key = Some(key.into());
+        self
+    }
+
+    /// Clears any provider-neutral retention hint.
+    pub fn without_retention(mut self) -> Self {
+        self.retention = None;
+        self
+    }
+
+    /// Clears any provider cache key or routing key.
+    pub fn without_key(mut self) -> Self {
+        self.key = None;
+        self
+    }
+
+    /// Returns true when caching should be active for this request.
+    pub fn is_enabled(&self) -> bool {
+        !matches!(self.mode, PromptCacheMode::Disabled)
+    }
 }
 
 /// Payload sent to the model at the start of each turn.
@@ -117,6 +352,8 @@ pub struct TurnRequest {
     pub transcript: Vec<Item>,
     /// Tool specifications the model may invoke during this turn.
     pub available_tools: Vec<ToolSpec>,
+    /// Provider-side prompt caching request for this turn.
+    pub cache: Option<PromptCacheRequest>,
     /// Per-turn metadata (e.g. provider hints).
     pub metadata: MetadataMap,
 }
@@ -646,8 +883,9 @@ struct ActiveToolRound {
 /// # Example
 ///
 /// ```rust,no_run
-/// use agentkit_core::{MetadataMap, SessionId};
-/// use agentkit_loop::{Agent, SessionConfig, LoopStep};
+/// use agentkit_loop::{
+///     Agent, LoopStep, PromptCacheRequest, PromptCacheRetention, SessionConfig,
+/// };
 /// use agentkit_tools_core::ToolRegistry;
 ///
 /// # async fn example<M: agentkit_loop::ModelAdapter>(adapter: M) -> Result<(), agentkit_loop::LoopError> {
@@ -657,10 +895,11 @@ struct ActiveToolRound {
 ///     .build()?;
 ///
 /// let mut driver = agent
-///     .start(SessionConfig {
-///         session_id: SessionId::new("s1"),
-///         metadata: MetadataMap::new(),
-///     })
+///     .start(
+///         SessionConfig::new("s1").with_cache(
+///             PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
+///         ),
+///     )
 ///     .await?;
 ///
 /// // Submit input and advance
@@ -700,10 +939,13 @@ where
     /// Returns [`LoopError`] if the model adapter fails to create a session.
     pub async fn start(self, config: SessionConfig) -> Result<LoopDriver<M::Session>, LoopError> {
         let session_id = config.session_id.clone();
+        let default_cache = config.cache.clone();
         let session = self.model.start_session(config).await?;
         let tool_executor = Arc::new(BasicToolExecutor::new(self.tools.clone()));
         let mut driver = LoopDriver {
             session_id: session_id.clone(),
+            default_cache,
+            next_turn_cache: None,
             session: Some(session),
             tool_executor,
             task_manager: self.task_manager,
@@ -861,19 +1103,11 @@ where
 /// # Example
 ///
 /// ```rust,no_run
-/// use agentkit_core::{Item, ItemKind, MetadataMap, Part, TextPart};
+/// use agentkit_core::{Item, ItemKind};
 /// use agentkit_loop::{LoopDriver, LoopStep};
 ///
 /// # async fn drive<S: agentkit_loop::ModelSession>(driver: &mut LoopDriver<S>) -> Result<(), agentkit_loop::LoopError> {
-/// driver.submit_input(vec![Item {
-///     id: None,
-///     kind: ItemKind::User,
-///     parts: vec![Part::Text(TextPart {
-///         text: "Hello!".into(),
-///         metadata: MetadataMap::new(),
-///     })],
-///     metadata: MetadataMap::new(),
-/// }])?;
+/// driver.submit_input(vec![Item::text(ItemKind::User, "Hello!")])?;
 ///
 /// let step = driver.next().await?;
 /// match step {
@@ -891,6 +1125,8 @@ where
     S: ModelSession,
 {
     session_id: SessionId,
+    default_cache: Option<PromptCacheRequest>,
+    next_turn_cache: Option<PromptCacheRequest>,
     session: Option<S>,
     tool_executor: Arc<dyn ToolExecutor>,
     task_manager: Arc<dyn TaskManager>,
@@ -1350,6 +1586,10 @@ where
             turn_id: turn_id.clone(),
             transcript: self.transcript.clone(),
             available_tools: self.tool_executor.specs(),
+            cache: self
+                .next_turn_cache
+                .take()
+                .or_else(|| self.default_cache.clone()),
             metadata: MetadataMap::new(),
         };
 
@@ -1610,6 +1850,31 @@ where
         });
         self.pending_input.extend(input);
         Ok(())
+    }
+
+    /// Override the prompt cache request for the next model turn.
+    ///
+    /// The override is consumed the next time the driver starts a model turn.
+    /// Session-level defaults still apply to later turns.
+    pub fn set_next_turn_cache(&mut self, cache: PromptCacheRequest) -> Result<(), LoopError> {
+        if self.has_pending_interrupts() {
+            return Err(LoopError::InvalidState(
+                "cannot update next-turn cache while an interrupt is pending".into(),
+            ));
+        }
+        self.next_turn_cache = Some(cache);
+        Ok(())
+    }
+
+    /// Enqueue user input and set a prompt cache override for the next model
+    /// turn in one call.
+    pub fn submit_input_with_cache(
+        &mut self,
+        input: Vec<Item>,
+        cache: PromptCacheRequest,
+    ) -> Result<(), LoopError> {
+        self.set_next_turn_cache(cache)?;
+        self.submit_input(input)
     }
 
     /// Resolve a pending [`LoopInterrupt::ApprovalRequest`].
@@ -1896,6 +2161,7 @@ mod tests {
     struct SlowAdapter;
     struct RecordingAdapter {
         seen_descriptions: StdArc<StdMutex<Vec<Vec<String>>>>,
+        seen_caches: StdArc<StdMutex<Vec<Option<PromptCacheRequest>>>>,
     }
     struct MultiToolAdapter;
     struct DualApprovalAdapter;
@@ -1904,6 +2170,7 @@ mod tests {
     struct SlowSession;
     struct RecordingSession {
         seen_descriptions: StdArc<StdMutex<Vec<Vec<String>>>>,
+        seen_caches: StdArc<StdMutex<Vec<Option<PromptCacheRequest>>>>,
     }
     struct MultiToolSession;
     struct DualApprovalSession;
@@ -1951,6 +2218,7 @@ mod tests {
         async fn start_session(&self, _config: SessionConfig) -> Result<Self::Session, LoopError> {
             Ok(RecordingSession {
                 seen_descriptions: self.seen_descriptions.clone(),
+                seen_caches: self.seen_caches.clone(),
             })
         }
     }
@@ -2101,6 +2369,7 @@ mod tests {
                 .map(|tool| tool.description.clone())
                 .collect::<Vec<_>>();
             self.seen_descriptions.lock().unwrap().push(descriptions);
+            self.seen_caches.lock().unwrap().push(request.cache.clone());
 
             Ok(RecordingTurn { emitted: false })
         }
@@ -2694,6 +2963,7 @@ mod tests {
             .start(SessionConfig {
                 session_id: SessionId::new("session-1"),
                 metadata: MetadataMap::new(),
+                cache: None,
             })
             .await
             .unwrap();
@@ -2739,6 +3009,7 @@ mod tests {
             .start(SessionConfig {
                 session_id: SessionId::new("session-2"),
                 metadata: MetadataMap::new(),
+                cache: None,
             })
             .await
             .unwrap();
@@ -2780,6 +3051,7 @@ mod tests {
             .start(SessionConfig {
                 session_id: SessionId::new("session-3"),
                 metadata: MetadataMap::new(),
+                cache: None,
             })
             .await
             .unwrap();
@@ -2842,6 +3114,7 @@ mod tests {
             .start(SessionConfig {
                 session_id: SessionId::new("session-background"),
                 metadata: MetadataMap::new(),
+                cache: None,
             })
             .await
             .unwrap();
@@ -2904,6 +3177,7 @@ mod tests {
             .start(SessionConfig {
                 session_id: SessionId::new("session-cancel"),
                 metadata: MetadataMap::new(),
+                cache: None,
             })
             .await
             .unwrap();
@@ -2999,6 +3273,7 @@ mod tests {
             .start(SessionConfig {
                 session_id: SessionId::new("session-mixed-cancel"),
                 metadata: MetadataMap::new(),
+                cache: None,
             })
             .await
             .unwrap();
@@ -3063,6 +3338,7 @@ mod tests {
             .start(SessionConfig {
                 session_id: SessionId::new("session-approval"),
                 metadata: MetadataMap::new(),
+                cache: None,
             })
             .await
             .unwrap();
@@ -3112,6 +3388,7 @@ mod tests {
             .start(SessionConfig {
                 session_id: SessionId::new("session-dual-approval"),
                 metadata: MetadataMap::new(),
+                cache: None,
             })
             .await
             .unwrap();
@@ -3193,6 +3470,7 @@ mod tests {
             .start(SessionConfig {
                 session_id: SessionId::new("session-4"),
                 metadata: MetadataMap::new(),
+                cache: None,
             })
             .await
             .unwrap();
@@ -3230,6 +3508,7 @@ mod tests {
         let agent = Agent::builder()
             .model(RecordingAdapter {
                 seen_descriptions: seen_descriptions.clone(),
+                seen_caches: StdArc::new(StdMutex::new(Vec::new())),
             })
             .tools(tools)
             .permissions(AllowAllPermissions)
@@ -3240,6 +3519,7 @@ mod tests {
             .start(SessionConfig {
                 session_id: SessionId::new("session-dynamic-tools"),
                 metadata: MetadataMap::new(),
+                cache: None,
             })
             .await
             .unwrap();
@@ -3267,5 +3547,99 @@ mod tests {
         assert_eq!(seen_descriptions.len(), 2);
         assert_eq!(seen_descriptions[0], vec!["dynamic version 1".to_string()]);
         assert_eq!(seen_descriptions[1], vec!["dynamic version 2".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn loop_passes_session_default_and_next_turn_cache_requests() {
+        let seen_caches = StdArc::new(StdMutex::new(Vec::new()));
+        let agent = Agent::builder()
+            .model(RecordingAdapter {
+                seen_descriptions: StdArc::new(StdMutex::new(Vec::new())),
+                seen_caches: seen_caches.clone(),
+            })
+            .permissions(AllowAllPermissions)
+            .build()
+            .unwrap();
+
+        let default_cache = PromptCacheRequest::best_effort(PromptCacheStrategy::Automatic)
+            .with_retention(PromptCacheRetention::Short);
+        let override_cache = PromptCacheRequest::required(PromptCacheStrategy::Explicit {
+            breakpoints: vec![PromptCacheBreakpoint::TranscriptItemEnd { index: 0 }],
+        });
+
+        let mut driver = agent
+            .start(SessionConfig {
+                session_id: SessionId::new("session-cache"),
+                metadata: MetadataMap::new(),
+                cache: Some(default_cache.clone()),
+            })
+            .await
+            .unwrap();
+
+        driver
+            .submit_input(vec![Item {
+                id: None,
+                kind: ItemKind::User,
+                parts: vec![Part::Text(TextPart {
+                    text: "first".into(),
+                    metadata: MetadataMap::new(),
+                })],
+                metadata: MetadataMap::new(),
+            }])
+            .unwrap();
+        let _ = driver.next().await.unwrap();
+
+        driver
+            .submit_input_with_cache(
+                vec![Item {
+                    id: None,
+                    kind: ItemKind::User,
+                    parts: vec![Part::Text(TextPart {
+                        text: "second".into(),
+                        metadata: MetadataMap::new(),
+                    })],
+                    metadata: MetadataMap::new(),
+                }],
+                override_cache.clone(),
+            )
+            .unwrap();
+        let _ = driver.next().await.unwrap();
+
+        let seen = seen_caches.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0], Some(default_cache));
+        assert_eq!(seen[1], Some(override_cache));
+    }
+
+    #[test]
+    fn convenience_cache_builders_construct_expected_defaults() {
+        let cache = PromptCacheRequest::automatic()
+            .with_retention(PromptCacheRetention::Short)
+            .with_key("workspace:demo");
+        let session = SessionConfig::new("demo").with_cache(cache.clone());
+
+        assert_eq!(session.session_id, SessionId::new("demo"));
+        assert_eq!(session.cache, Some(cache));
+
+        let explicit = PromptCacheRequest::explicit([
+            PromptCacheBreakpoint::tools_end(),
+            PromptCacheBreakpoint::transcript_item_end(2),
+            PromptCacheBreakpoint::transcript_part_end(3, 1),
+        ]);
+
+        assert_eq!(explicit.mode, PromptCacheMode::BestEffort);
+        assert_eq!(
+            explicit.strategy,
+            PromptCacheStrategy::Explicit {
+                breakpoints: vec![
+                    PromptCacheBreakpoint::ToolsEnd,
+                    PromptCacheBreakpoint::TranscriptItemEnd { index: 2 },
+                    PromptCacheBreakpoint::TranscriptPartEnd {
+                        item_index: 3,
+                        part_index: 1,
+                    },
+                ],
+            }
+        );
     }
 }

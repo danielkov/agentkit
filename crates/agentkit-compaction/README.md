@@ -53,7 +53,7 @@ use agentkit_compaction::{
     DropReasoningStrategy, ItemCountTrigger, SummarizeOlderStrategy, SummaryRequest,
     SummaryResult,
 };
-use agentkit_core::{Item, ItemKind, MetadataMap, Part, TextPart, TurnCancellation};
+use agentkit_core::{Item, ItemKind, TurnCancellation};
 use async_trait::async_trait;
 
 struct MyBackend;
@@ -67,18 +67,7 @@ impl CompactionBackend for MyBackend {
     ) -> Result<SummaryResult, CompactionError> {
         // Call your LLM here to produce a summary.
         let summary_text = format!("Summary of {} items", request.items.len());
-        Ok(SummaryResult {
-            items: vec![Item {
-                id: None,
-                kind: ItemKind::Context,
-                parts: vec![Part::Text(TextPart {
-                    text: summary_text,
-                    metadata: MetadataMap::new(),
-                })],
-                metadata: MetadataMap::new(),
-            }],
-            metadata: MetadataMap::new(),
-        })
+        Ok(SummaryResult::new(vec![Item::text(ItemKind::Context, summary_text)]))
     }
 }
 
