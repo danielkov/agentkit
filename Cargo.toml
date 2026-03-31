@@ -8,7 +8,13 @@ members = [
     "crates/agentkit-task-manager",
     "crates/agentkit-loop",
     "crates/agentkit",
+    "crates/agentkit-adapter-completions",
     "crates/agentkit-provider-openrouter",
+    "crates/agentkit-provider-openai",
+    "crates/agentkit-provider-ollama",
+    "crates/agentkit-provider-vllm",
+    "crates/agentkit-provider-groq",
+    "crates/agentkit-provider-mistral",
     "crates/agentkit-reporting",
     "crates/agentkit-tool-fs",
     "crates/agentkit-tool-shell",
@@ -22,6 +28,7 @@ members = [
     "examples/openrouter-parallel-agent",
     "examples/openrouter-mcp-tool",
     "examples/openrouter-subagent-tool",
+    "projects/how",
 ]
 resolver = "2"
 
@@ -36,7 +43,7 @@ version = "0.1.0"
 [workspace.dependencies]
 async-trait = "0.1.89"
 dotenvy = "0.15.7"
-reqwest = { version = "0.12.24", default-features = false, features = ["json", "rustls-tls", "stream"] }
+reqwest = { version = "0.13.2", default-features = false, features = ["json", "rustls", "stream"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 thiserror = "2.0.17"

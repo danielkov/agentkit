@@ -201,16 +201,55 @@ pub use agentkit_context as context;
 #[cfg(feature = "mcp")]
 pub use agentkit_mcp as mcp;
 
+/// Generic chat completions adapter base.
+///
+/// Provides [`adapter_completions::CompletionsProvider`] and
+/// [`adapter_completions::CompletionsAdapter`] for building provider crates
+/// with minimal boilerplate.
+///
+/// Requires the `adapter-completions` feature.
+#[cfg(feature = "adapter-completions")]
+pub use agentkit_adapter_completions as adapter_completions;
+
 /// OpenRouter [`loop_::ModelAdapter`] implementation.
 ///
 /// Provides [`provider_openrouter::OpenRouterAdapter`] and
 /// [`provider_openrouter::OpenRouterConfig`] for connecting the agent loop to
 /// any model available through the [OpenRouter](https://openrouter.ai) API.
-/// Supports streaming, tool calls, usage reporting, and cancellation.
 ///
 /// Requires the `provider-openrouter` feature.
 #[cfg(feature = "provider-openrouter")]
 pub use agentkit_provider_openrouter as provider_openrouter;
+
+/// OpenAI [`loop_::ModelAdapter`] implementation.
+///
+/// Requires the `provider-openai` feature.
+#[cfg(feature = "provider-openai")]
+pub use agentkit_provider_openai as provider_openai;
+
+/// Ollama [`loop_::ModelAdapter`] implementation.
+///
+/// Requires the `provider-ollama` feature.
+#[cfg(feature = "provider-ollama")]
+pub use agentkit_provider_ollama as provider_ollama;
+
+/// vLLM [`loop_::ModelAdapter`] implementation.
+///
+/// Requires the `provider-vllm` feature.
+#[cfg(feature = "provider-vllm")]
+pub use agentkit_provider_vllm as provider_vllm;
+
+/// Groq [`loop_::ModelAdapter`] implementation.
+///
+/// Requires the `provider-groq` feature.
+#[cfg(feature = "provider-groq")]
+pub use agentkit_provider_groq as provider_groq;
+
+/// Mistral [`loop_::ModelAdapter`] implementation.
+///
+/// Requires the `provider-mistral` feature.
+#[cfg(feature = "provider-mistral")]
+pub use agentkit_provider_mistral as provider_mistral;
 
 /// Filesystem tools: read, write, edit, move, delete, list, and mkdir.
 ///
@@ -262,8 +301,18 @@ pub mod prelude {
     pub use crate::loop_::*;
     #[cfg(feature = "mcp")]
     pub use crate::mcp::*;
+    #[cfg(feature = "provider-groq")]
+    pub use crate::provider_groq::*;
+    #[cfg(feature = "provider-mistral")]
+    pub use crate::provider_mistral::*;
+    #[cfg(feature = "provider-ollama")]
+    pub use crate::provider_ollama::*;
+    #[cfg(feature = "provider-openai")]
+    pub use crate::provider_openai::*;
     #[cfg(feature = "provider-openrouter")]
     pub use crate::provider_openrouter::*;
+    #[cfg(feature = "provider-vllm")]
+    pub use crate::provider_vllm::*;
     #[cfg(feature = "reporting")]
     pub use crate::reporting::*;
     #[cfg(feature = "task-manager")]

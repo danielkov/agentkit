@@ -8,24 +8,58 @@ The umbrella crate `agentkit` re-exports subcrates behind feature flags.
   - enables `agentkit-core`
 - `compaction`
   - enables `agentkit-compaction`
+  - implies `core`
 - `capabilities`
   - enables `agentkit-capabilities`
+  - implies `core`
 - `context`
   - enables `agentkit-context`
+  - implies `core`
 - `tools`
   - enables `agentkit-tools-core`
+  - implies `capabilities`
+- `task-manager`
+  - enables `agentkit-task-manager`
+  - implies `tools`
 - `loop`
   - enables `agentkit-loop`
+  - implies `tools`, `task-manager`
 - `mcp`
   - enables `agentkit-mcp`
+  - implies `capabilities`, `tools`
+- `adapter-completions`
+  - enables `agentkit-adapter-completions`
+  - implies `loop`
+- `provider-groq`
+  - enables `agentkit-provider-groq`
+  - implies `adapter-completions`
+- `provider-mistral`
+  - enables `agentkit-provider-mistral`
+  - implies `adapter-completions`
+- `provider-ollama`
+  - enables `agentkit-provider-ollama`
+  - implies `adapter-completions`
+- `provider-openai`
+  - enables `agentkit-provider-openai`
+  - implies `adapter-completions`
 - `provider-openrouter`
   - enables `agentkit-provider-openrouter`
+  - implies `adapter-completions`
+- `provider-vllm`
+  - enables `agentkit-provider-vllm`
+  - implies `adapter-completions`
 - `reporting`
   - enables `agentkit-reporting`
+  - implies `loop`
 - `tool-fs`
   - enables `agentkit-tool-fs`
+  - implies `tools`
 - `tool-shell`
   - enables `agentkit-tool-shell`
+  - implies `tools`
+- `tool-skills`
+  - enables `agentkit-tool-skills`
+  - implies `tools`
 
 ## Default flags
 
@@ -66,3 +100,8 @@ OpenRouter-backed example host:
 
 - everything needed for the host
 - `provider-openrouter`
+
+OpenAI-compatible provider (e.g. Groq, Mistral, vLLM, Ollama):
+
+- everything needed for the host
+- `provider-groq` / `provider-mistral` / `provider-vllm` / `provider-ollama`

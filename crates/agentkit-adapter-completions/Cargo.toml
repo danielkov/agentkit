@@ -1,25 +1,22 @@
 [package]
-description = "Agent Skills tool for progressive skill discovery and activation in agentkit."
+description = "Generic OpenAI-compatible chat completions adapter for agentkit."
 homepage.workspace = true
-name = "agentkit-tool-skills"
+name = "agentkit-adapter-completions"
 readme = "README.md"
-repository.workspace = true
-version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 rust-version.workspace = true
+version.workspace = true
 
 [dependencies]
 agentkit-core = { version = "0.1.0", path = "../agentkit-core" }
+agentkit-loop = { version = "0.1.0", path = "../agentkit-loop" }
 agentkit-tools-core = { version = "0.1.0", path = "../agentkit-tools-core" }
-async-fs = "2.2.0"
 async-trait.workspace = true
-futures-lite = "2.6.1"
+base64.workspace = true
+futures-util.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-serde-saphyr = "0.0.23"
 thiserror.workspace = true
-
-[dev-dependencies]
-agentkit-capabilities = { version = "0.1.0", path = "../agentkit-capabilities" }
-tokio.workspace = true

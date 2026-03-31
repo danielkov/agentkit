@@ -16,9 +16,16 @@ The umbrella crate `agentkit` re-exports subcrates behind feature flags.
 - `compaction` — `agentkit-compaction`
 - `context` — `agentkit-context`
 - `mcp` — `agentkit-mcp`
+- `adapter-completions` — `agentkit-adapter-completions`
+- `provider-groq` — `agentkit-provider-groq`
+- `provider-mistral` — `agentkit-provider-mistral`
+- `provider-ollama` — `agentkit-provider-ollama`
+- `provider-openai` — `agentkit-provider-openai`
 - `provider-openrouter` — `agentkit-provider-openrouter`
+- `provider-vllm` — `agentkit-provider-vllm`
 - `tool-fs` — `agentkit-tool-fs`
 - `tool-shell` — `agentkit-tool-shell`
+- `tool-skills` — `agentkit-tool-skills`
 
 ## Typical combinations
 

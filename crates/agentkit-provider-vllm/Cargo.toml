@@ -1,8 +1,7 @@
 [package]
-description = "OpenRouter provider adapter for agentkit."
+description = "vLLM provider adapter for agentkit."
 homepage.workspace = true
-name = "agentkit-provider-openrouter"
-readme = "README.md"
+name = "agentkit-provider-vllm"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

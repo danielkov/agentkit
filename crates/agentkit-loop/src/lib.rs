@@ -59,8 +59,8 @@ use agentkit_core::{
     TextPart, ToolCallId, ToolCallPart, ToolOutput, ToolResultPart, TurnCancellation, Usage,
 };
 use agentkit_task_manager::{
-    PendingLoopUpdates, SimpleTaskManager, TaskApproval, TaskAuth, TaskLaunchRequest,
-    TaskManager, TaskResolution, TaskStartContext, TaskStartOutcome, TurnTaskUpdate,
+    PendingLoopUpdates, SimpleTaskManager, TaskApproval, TaskAuth, TaskLaunchRequest, TaskManager,
+    TaskResolution, TaskStartContext, TaskStartOutcome, TurnTaskUpdate,
 };
 #[cfg(test)]
 use agentkit_tools_core::ToolContext;
@@ -368,10 +368,7 @@ impl std::ops::Deref for PendingApproval {
 
 impl PendingApproval {
     /// Approve the pending tool call.
-    pub fn approve<S: ModelSession>(
-        self,
-        driver: &mut LoopDriver<S>,
-    ) -> Result<(), LoopError> {
+    pub fn approve<S: ModelSession>(self, driver: &mut LoopDriver<S>) -> Result<(), LoopError> {
         let call_id = self
             .request
             .call_id
@@ -380,10 +377,7 @@ impl PendingApproval {
     }
 
     /// Deny the pending tool call.
-    pub fn deny<S: ModelSession>(
-        self,
-        driver: &mut LoopDriver<S>,
-    ) -> Result<(), LoopError> {
+    pub fn deny<S: ModelSession>(self, driver: &mut LoopDriver<S>) -> Result<(), LoopError> {
         let call_id = self
             .request
             .call_id
@@ -401,9 +395,12 @@ impl PendingApproval {
             .request
             .call_id
             .ok_or_else(|| LoopError::InvalidState("pending approval is missing call id".into()))?;
-        driver.resolve_approval_for(call_id, ApprovalDecision::Deny {
-            reason: Some(reason.into()),
-        })
+        driver.resolve_approval_for(
+            call_id,
+            ApprovalDecision::Deny {
+                reason: Some(reason.into()),
+            },
+        )
     }
 }
 
@@ -454,10 +451,7 @@ impl PendingAuth {
     }
 
     /// Cancel the auth flow.
-    pub fn cancel<S: ModelSession>(
-        self,
-        driver: &mut LoopDriver<S>,
-    ) -> Result<(), LoopError> {
+    pub fn cancel<S: ModelSession>(self, driver: &mut LoopDriver<S>) -> Result<(), LoopError> {
         driver.resolve_auth(AuthResolution::Cancelled {
             request: self.request,
         })
@@ -963,11 +957,7 @@ where
         self.pending_auth.is_some() || !self.pending_approvals.is_empty()
     }
 
-    fn enqueue_pending_approval(
-        &mut self,
-        turn_id: &agentkit_core::TurnId,
-        task: TaskApproval,
-    ) {
+    fn enqueue_pending_approval(&mut self, turn_id: &agentkit_core::TurnId, task: TaskApproval) {
         let call_id = task.tool_request.call_id.clone();
         let call = ToolCallPart {
             id: call_id.clone(),
@@ -3140,7 +3130,10 @@ mod tests {
 
         let pending_first = match driver.next().await.unwrap() {
             LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(pending)) => {
-                assert_eq!(pending.request.call_id.as_ref().map(|id| id.0.as_str()), Some("call-1"));
+                assert_eq!(
+                    pending.request.call_id.as_ref().map(|id| id.0.as_str()),
+                    Some("call-1")
+                );
                 pending
             }
             other => panic!("unexpected first loop step: {other:?}"),
@@ -3148,7 +3141,10 @@ mod tests {
 
         let pending_second = match driver.next().await.unwrap() {
             LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(pending)) => {
-                assert_eq!(pending.request.call_id.as_ref().map(|id| id.0.as_str()), Some("call-2"));
+                assert_eq!(
+                    pending.request.call_id.as_ref().map(|id| id.0.as_str()),
+                    Some("call-2")
+                );
                 pending
             }
             other => panic!("unexpected second loop step: {other:?}"),
@@ -3157,7 +3153,10 @@ mod tests {
         pending_second.approve(&mut driver).unwrap();
         match driver.next().await.unwrap() {
             LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(pending)) => {
-                assert_eq!(pending.request.call_id.as_ref().map(|id| id.0.as_str()), Some("call-1"));
+                assert_eq!(
+                    pending.request.call_id.as_ref().map(|id| id.0.as_str()),
+                    Some("call-1")
+                );
             }
             other => panic!("unexpected step after approving second request: {other:?}"),
         }
