@@ -342,14 +342,14 @@ impl CompletionsProvider for OpenRouterProvider {
         metadata: &mut MetadataMap,
         raw_response: &Value,
     ) {
-        if let Some(cost) = raw_response.pointer("/usage/cost").and_then(Value::as_f64) {
-            if let Some(usage) = usage {
-                usage.cost = Some(CostUsage {
-                    amount: cost,
-                    currency: "USD".into(),
-                    provider_amount: None,
-                });
-            }
+        if let Some(cost) = raw_response.pointer("/usage/cost").and_then(Value::as_f64)
+            && let Some(usage) = usage
+        {
+            usage.cost = Some(CostUsage {
+                amount: cost,
+                currency: "USD".into(),
+                provider_amount: None,
+            });
         }
         if let Some(model) = raw_response.get("model").and_then(Value::as_str) {
             metadata.insert("openrouter.model".into(), Value::String(model.into()));

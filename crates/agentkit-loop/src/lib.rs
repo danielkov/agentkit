@@ -161,21 +161,16 @@ pub enum PromptCacheRetention {
 }
 
 /// Provider-neutral prompt caching strategy.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum PromptCacheStrategy {
     /// Let the provider decide the cacheable prefix automatically.
+    #[default]
     Automatic,
     /// Apply explicit cache breakpoints to selected prefix boundaries.
     Explicit {
         /// Cache breakpoints in transcript/tool order.
         breakpoints: Vec<PromptCacheBreakpoint>,
     },
-}
-
-impl Default for PromptCacheStrategy {
-    fn default() -> Self {
-        Self::Automatic
-    }
 }
 
 impl PromptCacheStrategy {

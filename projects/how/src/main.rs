@@ -425,13 +425,12 @@ async fn spin_while_thinking(
             _ = tokio::time::sleep(Duration::from_millis(80)) => {
                 // Drain key events for Ctrl+C
                 while event::poll(Duration::ZERO).unwrap_or(false) {
-                    if let Ok(Event::Key(key)) = event::read() {
-                        if key.code == KeyCode::Char('c')
+                    if let Ok(Event::Key(key)) = event::read()
+                        && key.code == KeyCode::Char('c')
                             && key.modifiers.contains(KeyModifiers::CONTROL)
                         {
                             cancel.interrupt();
                         }
-                    }
                 }
 
                 let dot = SPINNER[frame % SPINNER.len()];
