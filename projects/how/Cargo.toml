@@ -1,5 +1,5 @@
 [package]
-name = "how"
+name = "how-cli"
 description = "Ask your terminal how to do things."
 edition.workspace = true
 license.workspace = true
