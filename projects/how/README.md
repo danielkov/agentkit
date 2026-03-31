@@ -1,9 +1,8 @@
 # how-cli
 
-`how` is a small terminal assistant that turns a natural-language task into one
-or more shell commands, lets you pick the best one, and then runs it.
+`how` is a small terminal assistant that turns a natural-language task into one or more shell commands, lets you pick the best one, and then runs it.
 
-It is built on AgentKit and currently uses OpenRouter as its model backend.
+It is built on [`agentkit`](https://github.com/danielkov/agentkit) and currently uses OpenRouter as its model backend.
 
 ## What it does
 
@@ -16,17 +15,9 @@ It is built on AgentKit and currently uses OpenRouter as its model backend.
 
 ## Demo
 
-### Demo 1
-
-<video src="./assets/demo-1.mov" controls muted playsinline></video>
-
-[Open demo 1](./assets/demo-1.mov)
-
-### Demo 2
-
 <video src="./assets/demo-2.mov" controls muted playsinline></video>
 
-[Open demo 2](./assets/demo-2.mov)
+[Open the demo recording](./assets/demo-2.mov)
 
 ## Install
 
@@ -103,8 +94,5 @@ candidate commands to stdout instead of opening the picker.
 ## Notes
 
 - The model is asked to return shell commands only, with no prose.
-- The built-in `is_available` tool lets the model avoid suggesting commands
-  that are not installed on the current machine.
-- Prompt caching is enabled with a short retention policy and a prompt-derived
-  cache key so retries of similar requests can reuse provider-side cache state
-  without collapsing unrelated prompts together.
+- The built-in `is_available` tool lets the model avoid suggesting commands that are not installed on the current machine.
+- Prompt caching is enabled with a short retention policy and a prompt-derived cache key so retries of similar requests can reuse provider-side cache state without collapsing unrelated prompts together.
