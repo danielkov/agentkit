@@ -482,7 +482,7 @@ Recommended execution flow:
    - host calls `submit_input`
    - loop continues
 10. if no input is available when the host asks the driver to continue:
-   - return `LoopInterrupt::AwaitingInput`
+    - return `LoopInterrupt::AwaitingInput`
 
 ## Error handling
 

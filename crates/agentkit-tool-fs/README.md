@@ -7,14 +7,14 @@ filesystem, plus a policy layer that can enforce rules like "read before write."
 
 ## Tools
 
-| Tool name            | Description                                       |
-| -------------------- | ------------------------------------------------- |
-| `fs.read_file`       | Read a UTF-8 file, optionally a line range        |
-| `fs.write_file`      | Write UTF-8 text, creating parent dirs if needed  |
-| `fs.replace_in_file` | Find-and-replace exact text in a file             |
-| `fs.move`            | Move or rename a file or directory                |
-| `fs.delete`          | Delete a file or directory                        |
-| `fs.list_directory`  | List entries in a directory                       |
+| Tool name             | Description                                      |
+| --------------------- | ------------------------------------------------ |
+| `fs.read_file`        | Read a UTF-8 file, optionally a line range       |
+| `fs.write_file`       | Write UTF-8 text, creating parent dirs if needed |
+| `fs.replace_in_file`  | Find-and-replace exact text in a file            |
+| `fs.move`             | Move or rename a file or directory               |
+| `fs.delete`           | Delete a file or directory                       |
+| `fs.list_directory`   | List entries in a directory                      |
 | `fs.create_directory` | Create a directory (and parents)                 |
 
 ## Quick start

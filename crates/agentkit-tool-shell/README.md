@@ -49,7 +49,7 @@ assert!(reg.specs().iter().any(|s| s.name.0 == "shell.exec"));
 ## Executing a command with `BasicToolExecutor`
 
 The following example shows how to build a tool request, execute it through the
-standard `BasicToolExecutor`, and inspect the result.  A trivial "allow-all"
+standard `BasicToolExecutor`, and inspect the result. A trivial "allow-all"
 permission checker is used for brevity -- production code should use
 `CommandPolicy` or a custom `PermissionChecker`.
 

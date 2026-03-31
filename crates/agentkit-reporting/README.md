@@ -8,13 +8,13 @@ to the loop and they react to every `AgentEvent` that flows through it.
 
 ## Included reporters
 
-| Reporter | Purpose |
-|---|---|
-| `StdoutReporter` | Human-readable bracketed log lines (`[turn] started ...`) |
-| `JsonlReporter` | Machine-readable newline-delimited JSON envelopes |
-| `UsageReporter` | Aggregated token counts and cost totals |
-| `TranscriptReporter` | Growing snapshot of conversation items |
-| `CompositeReporter` | Fan-out wrapper that forwards events to multiple reporters |
+| Reporter             | Purpose                                                    |
+| -------------------- | ---------------------------------------------------------- |
+| `StdoutReporter`     | Human-readable bracketed log lines (`[turn] started ...`)  |
+| `JsonlReporter`      | Machine-readable newline-delimited JSON envelopes          |
+| `UsageReporter`      | Aggregated token counts and cost totals                    |
+| `TranscriptReporter` | Growing snapshot of conversation items                     |
+| `CompositeReporter`  | Fan-out wrapper that forwards events to multiple reporters |
 
 ## Quick start
 
