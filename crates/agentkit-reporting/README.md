@@ -86,6 +86,80 @@ let file = File::create("events.jsonl").expect("open file");
 let reporter = JsonlReporter::new(BufWriter::new(file));
 ```
 
+## Adapter reporters
+
+For expensive or async reporting, wrap an inner reporter in one of the
+provided adapters:
+
+| Adapter            | Purpose                                              |
+| ------------------ | ---------------------------------------------------- |
+| `BufferedReporter` | Enqueues events and flushes in batches               |
+| `ChannelReporter`  | Forwards events to another thread via `mpsc::Sender` |
+| `TracingReporter`  | Emits `tracing` events (requires `tracing` feature)  |
+
+```rust
+use agentkit_reporting::{BufferedReporter, JsonlReporter};
+
+// Flush to the JSONL writer every 128 events instead of one-at-a-time.
+let reporter = BufferedReporter::new(
+    JsonlReporter::new(Vec::new()).with_flush_each_event(false),
+    128,
+);
+```
+
+```rust
+use agentkit_reporting::ChannelReporter;
+
+let (reporter, rx) = ChannelReporter::pair();
+
+std::thread::spawn(move || {
+    while let Ok(event) = rx.recv() {
+        println!("{event:?}");
+    }
+});
+
+// Pass `reporter` to the agent loop.
+```
+
+### TracingReporter
+
+`TracingReporter` bridges agent events into the `tracing` ecosystem. It
+is gated behind the `tracing` feature to keep the dependency opt-in:
+
+```toml
+agentkit-reporting = { version = "0.2.1", features = ["tracing"] }
+```
+
+```rust,ignore
+use agentkit_reporting::TracingReporter;
+
+let reporter = TracingReporter::new();
+```
+
+Events are emitted under the `"agentkit"` target at levels that match
+their severity (INFO for lifecycle, DEBUG for usage/compaction, TRACE for
+content deltas, WARN/ERROR for problems).
+
+## Failure policy
+
+Reporter failures are non-fatal by default. For reporters that can fail
+(I/O, channel sends), implement `FallibleObserver` and wrap it in a
+`PolicyReporter` to choose how errors are handled:
+
+| Policy       | Behaviour                           |
+| ------------ | ----------------------------------- |
+| `Ignore`     | Silently discard errors (default)   |
+| `Log`        | Print errors to stderr              |
+| `Accumulate` | Collect errors for later inspection |
+| `FailFast`   | Panic on first error                |
+
+```rust
+use agentkit_reporting::{ChannelReporter, FailurePolicy, PolicyReporter};
+
+let (reporter, rx) = ChannelReporter::pair();
+let reporter = PolicyReporter::new(reporter, FailurePolicy::Log);
+```
+
 ## Error handling
 
 `JsonlReporter` and `StdoutReporter` never panic on write failures.
