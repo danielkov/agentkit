@@ -14,7 +14,7 @@ Or add it to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-agentkit = "0.2"
+agentkit = "0.2.2"
 ```
 
 ## Minimal dependency set
@@ -25,7 +25,7 @@ To keep your build lean, disable defaults and pick only what you need:
 
 ```toml
 [dependencies]
-agentkit = { version = "0.2", default-features = false, features = ["core", "loop"] }
+agentkit = { version = "0.2.2", default-features = false, features = ["core", "loop"] }
 ```
 
 See the [Feature flags reference](./feature-flags.md) for the full list.

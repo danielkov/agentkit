@@ -246,9 +246,10 @@ impl CompletionsProvider for OpenRouterProvider {
     }
 
     fn preprocess_request(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        let mut builder = builder
-            .bearer_auth(&self.api_key)
-            .header("User-Agent", "agentkit-provider-openrouter/0.1.0");
+        let mut builder = builder.bearer_auth(&self.api_key).header(
+            "User-Agent",
+            concat!("agentkit-provider-openrouter/", env!("CARGO_PKG_VERSION")),
+        );
         if let Some(app_name) = &self.app_name {
             builder = builder.header("X-Title", app_name);
         }

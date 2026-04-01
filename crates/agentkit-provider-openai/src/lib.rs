@@ -206,9 +206,10 @@ impl CompletionsProvider for OpenAIProvider {
     }
 
     fn preprocess_request(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        builder
-            .bearer_auth(&self.api_key)
-            .header("User-Agent", "agentkit-provider-openai/0.1.0")
+        builder.bearer_auth(&self.api_key).header(
+            "User-Agent",
+            concat!("agentkit-provider-openai/", env!("CARGO_PKG_VERSION")),
+        )
     }
 
     fn apply_prompt_cache(

@@ -4,7 +4,7 @@ Model Context Protocol integration for agentkit.
 
 This crate covers:
 
-- stdio and SSE MCP transports
+- stdio, Streamable HTTP, and legacy SSE MCP transports
 - server configuration and lifecycle management
 - discovery of MCP tools, resources, and prompts
 - adapters that expose MCP servers as agentkit tools and capabilities
@@ -113,21 +113,21 @@ let capability_provider = manager.capability_provider();
 # }
 ```
 
-## SSE transport
+## Streamable HTTP transport
 
-For remote MCP servers exposed over HTTP, use the SSE transport:
+For modern remote MCP servers exposed over HTTP, use the Streamable HTTP transport:
 
 ```rust,no_run
 use agentkit_mcp::{
-    McpServerConfig, McpServerManager, McpTransportBinding, SseTransportConfig,
+    McpServerConfig, McpServerManager, McpTransportBinding, StreamableHttpTransportConfig,
 };
 
 # #[tokio::main]
 # async fn main() -> Result<(), Box<dyn std::error::Error>> {
 let mut manager = McpServerManager::new().with_server(McpServerConfig::new(
     "remote",
-    McpTransportBinding::Sse(
-        SseTransportConfig::new("https://mcp.example.com/sse")
+    McpTransportBinding::StreamableHttp(
+        StreamableHttpTransportConfig::new("https://mcp.example.com/mcp")
             .with_header("Authorization", "Bearer tok_abc123"),
     ),
 ));
@@ -136,6 +136,16 @@ let handles = manager.connect_all().await?;
 # Ok(())
 # }
 ```
+
+The transport captures the negotiated MCP protocol version from `initialize`,
+propagates `MCP-Protocol-Version` and `MCP-Session-Id` headers on subsequent
+requests, accepts either JSON or SSE POST responses, and resumes SSE streams
+with `Last-Event-ID` when needed.
+
+## Legacy SSE transport
+
+For older MCP servers that still expose the deprecated HTTP+SSE transport, the
+crate keeps `McpTransportBinding::Sse` and `SseTransportConfig`.
 
 ## Lifecycle management
 

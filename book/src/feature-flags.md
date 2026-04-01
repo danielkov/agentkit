@@ -32,13 +32,13 @@ The umbrella crate `agentkit` re-exports subcrates behind feature flags.
 **Minimal orchestration:**
 
 ```toml
-agentkit = { version = "0.2", features = ["core", "capabilities", "tools", "loop"] }
+agentkit = { version = "0.2.2", features = ["core", "capabilities", "tools", "loop"] }
 ```
 
 **Coding agent:**
 
 ```toml
-agentkit = { version = "0.2", features = [
+agentkit = { version = "0.2.2", features = [
     "core", "capabilities", "context", "tools",
     "loop", "tool-fs", "tool-shell", "reporting",
 ] }
@@ -47,7 +47,7 @@ agentkit = { version = "0.2", features = [
 **MCP-enabled agent:**
 
 ```toml
-agentkit = { version = "0.2", features = [
+agentkit = { version = "0.2.2", features = [
     "core", "capabilities", "context", "tools",
     "loop", "tool-fs", "tool-shell", "reporting", "mcp",
 ] }
@@ -56,7 +56,7 @@ agentkit = { version = "0.2", features = [
 **OpenRouter-backed example host:**
 
 ```toml
-agentkit = { version = "0.2", features = [
+agentkit = { version = "0.2.2", features = [
     "core", "capabilities", "tools", "loop",
     "reporting", "provider-openrouter",
 ] }

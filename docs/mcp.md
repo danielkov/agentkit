@@ -86,7 +86,8 @@ The transport layer should be pluggable.
 Built-in transports for v1 should be:
 
 - stdio
-- SSE
+- Streamable HTTP
+- legacy SSE compatibility
 
 Hosts should also be able to provide their own transport implementation.
 
@@ -144,7 +145,8 @@ pub struct McpServerConfig {
 `McpTransportBinding` should support:
 
 - built-in stdio transport configuration
-- built-in SSE transport configuration
+- built-in Streamable HTTP transport configuration
+- built-in legacy SSE transport configuration
 - host-provided custom transport factories
 
 This gives you a transport-agnostic surface without closing the door on user-defined transports.
@@ -163,7 +165,7 @@ pub trait McpTransport: Send {
 }
 ```
 
-The built-in stdio and SSE implementations should just be default `McpTransportFactory` implementations.
+The built-in stdio, Streamable HTTP, and legacy SSE implementations should just be default `McpTransportFactory` implementations.
 
 ## 2. Server manager
 

@@ -44,7 +44,7 @@ pub struct McpServerConfig {
 }
 ```
 
-Built-in transports: **stdio** (local child process) and **SSE** (HTTP streaming). Custom transports implement the `McpTransportFactory` trait.
+Built-in transports: **stdio** (local child process), **Streamable HTTP** (modern remote MCP), and **legacy SSE** (deprecated HTTP+SSE compatibility). Custom transports implement the `McpTransportFactory` trait.
 
 ## Discovery
 
@@ -121,10 +121,11 @@ pub trait McpTransport: Send {
 
 Built-in transports:
 
-| Transport | Connection                              | Use case            |
-| --------- | --------------------------------------- | ------------------- |
-| stdio     | Spawn child process, pipe stdin/stdout  | Local tool servers  |
-| SSE       | HTTP connection with server-sent events | Remote tool servers |
+| Transport       | Connection                              | Use case                   |
+| --------------- | --------------------------------------- | -------------------------- |
+| stdio           | Spawn child process, pipe stdin/stdout  | Local tool servers         |
+| Streamable HTTP | HTTP POST with JSON or SSE responses    | Modern remote tool servers |
+| SSE             | HTTP connection with server-sent events | Legacy remote tool servers |
 
 The rest of agentkit doesn't know whether a server is reached via stdio, TCP, or WebSocket. The transport is configured in `McpServerConfig` and the MCP manager handles the connection lifecycle.
 
@@ -139,16 +140,20 @@ Agent process ──── stdin ────▶ MCP server process
 
 This is how tools like GitHub's MCP server, filesystem tools, and database connectors typically run. The server starts on demand and exits when the agent disconnects.
 
-### SSE transport
+### Streamable HTTP transport
 
-For remote MCP servers that run as HTTP services. The agent connects via HTTP and receives responses as server-sent events:
+For modern remote MCP servers that run as HTTP services. The agent sends JSON-RPC over HTTP POST, receives either JSON or SSE responses, and tracks negotiated session/protocol headers:
 
 ```text
 Agent ──── HTTP POST ────▶ Remote MCP server
-      ◀── SSE stream ────
+      ◀── JSON or SSE ───
 ```
 
-This is used for shared MCP servers that serve multiple agents or run in cloud infrastructure.
+If an SSE response stream is interrupted before the matching response arrives, the client can resume with `Last-Event-ID`.
+
+### Legacy SSE transport
+
+For older MCP servers that still use the deprecated HTTP+SSE transport, `agentkit-mcp` also keeps the original SSE endpoint flow.
 
 ## The full picture
 

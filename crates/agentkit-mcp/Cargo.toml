@@ -10,9 +10,9 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-agentkit-capabilities = { version = "0.2.1", path = "../agentkit-capabilities" }
-agentkit-core = { version = "0.2.1", path = "../agentkit-core" }
-agentkit-tools-core = { version = "0.2.1", path = "../agentkit-tools-core" }
+agentkit-capabilities = { version = "0.2.2", path = "../agentkit-capabilities" }
+agentkit-core = { version = "0.2.2", path = "../agentkit-core" }
+agentkit-tools-core = { version = "0.2.2", path = "../agentkit-tools-core" }
 async-trait.workspace = true
 futures-util = "0.3.31"
 reqwest.workspace = true

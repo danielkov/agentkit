@@ -1,8 +1,9 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use agentkit_capabilities::{
     CapabilityContext, CapabilityError, CapabilityName, CapabilityProvider, Invocable,
@@ -19,7 +20,7 @@ use agentkit_tools_core::{
 };
 use async_trait::async_trait;
 use futures_util::TryStreamExt;
-use reqwest::{Client, Url};
+use reqwest::{Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -27,7 +28,12 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
+use tokio::time::sleep;
 use tokio_util::io::StreamReader;
+
+const MCP_LATEST_PROTOCOL_VERSION: &str = "2025-11-25";
+const MCP_SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
+    &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
 /// Unique identifier for a registered MCP server.
 ///
@@ -156,16 +162,56 @@ impl SseTransportConfig {
     }
 }
 
+/// Configuration for an MCP server that communicates over Streamable HTTP.
+///
+/// Use this transport for modern remote MCP servers that expose a single HTTP
+/// endpoint supporting JSON-RPC over POST, with optional SSE responses for
+/// streaming server messages.
+///
+/// # Example
+///
+/// ```rust
+/// use agentkit_mcp::StreamableHttpTransportConfig;
+///
+/// let config = StreamableHttpTransportConfig::new("https://mcp.example.com/mcp")
+///     .with_header("Authorization", "Bearer tok_abc123");
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamableHttpTransportConfig {
+    /// The MCP endpoint URL to connect to.
+    pub url: String,
+    /// Additional HTTP headers sent with every request (e.g. authentication tokens).
+    pub headers: Vec<(String, String)>,
+}
+
+impl StreamableHttpTransportConfig {
+    /// Creates a new Streamable HTTP transport configuration for the given MCP endpoint.
+    pub fn new(url: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            headers: Vec::new(),
+        }
+    }
+
+    /// Adds an HTTP header to include with every request. Returns `self` for chaining.
+    pub fn with_header(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.push((key.into(), value.into()));
+        self
+    }
+}
+
 /// Selects which transport an MCP server should use.
 ///
 /// This enum is passed into [`McpServerConfig`] and determines how the client will
-/// communicate with the MCP server. The two built-in options are [`Stdio`](Self::Stdio)
-/// and [`Sse`](Self::Sse); use [`Custom`](Self::Custom) to provide your own
-/// [`McpTransportFactory`].
+/// communicate with the MCP server. The built-in options are [`Stdio`](Self::Stdio),
+/// [`StreamableHttp`](Self::StreamableHttp), and the legacy [`Sse`](Self::Sse);
+/// use [`Custom`](Self::Custom) to provide your own [`McpTransportFactory`].
 #[derive(Clone)]
 pub enum McpTransportBinding {
     /// Communicate over the child process's stdin/stdout.
     Stdio(StdioTransportConfig),
+    /// Communicate over the MCP Streamable HTTP transport.
+    StreamableHttp(StreamableHttpTransportConfig),
     /// Communicate over HTTP Server-Sent Events.
     Sse(SseTransportConfig),
     /// A user-supplied transport factory.
@@ -228,6 +274,14 @@ impl McpServerConfig {
     /// Creates an SSE-backed server configuration.
     pub fn sse(id: impl Into<String>, url: impl Into<String>) -> Self {
         Self::new(id, McpTransportBinding::Sse(SseTransportConfig::new(url)))
+    }
+
+    /// Creates a Streamable HTTP-backed server configuration.
+    pub fn streamable_http(id: impl Into<String>, url: impl Into<String>) -> Self {
+        Self::new(
+            id,
+            McpTransportBinding::StreamableHttp(StreamableHttpTransportConfig::new(url)),
+        )
     }
 
     /// Replaces the configuration metadata.
@@ -346,11 +400,26 @@ impl SseTransportFactory {
     }
 }
 
+/// Factory that connects to a Streamable HTTP MCP endpoint.
+///
+/// Created from a [`StreamableHttpTransportConfig`]. Each call to
+/// [`connect`](McpTransportFactory::connect) creates a new HTTP-backed MCP session.
+pub struct StreamableHttpTransportFactory {
+    config: StreamableHttpTransportConfig,
+}
+
+impl StreamableHttpTransportFactory {
+    /// Creates a new factory from the given Streamable HTTP transport configuration.
+    pub fn new(config: StreamableHttpTransportConfig) -> Self {
+        Self { config }
+    }
+}
+
 #[async_trait]
 impl McpTransportFactory for SseTransportFactory {
     async fn connect(&self) -> Result<Box<dyn McpTransport>, McpError> {
         let client = Client::builder()
-            .user_agent("agentkit-mcp/0.1.0")
+            .user_agent(concat!("agentkit-mcp/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(McpError::Http)?;
 
@@ -396,6 +465,28 @@ impl McpTransportFactory for SseTransportFactory {
     }
 }
 
+#[async_trait]
+impl McpTransportFactory for StreamableHttpTransportFactory {
+    async fn connect(&self) -> Result<Box<dyn McpTransport>, McpError> {
+        let client = Client::builder()
+            .user_agent(concat!("agentkit-mcp/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .map_err(McpError::Http)?;
+
+        let endpoint_url = Url::parse(&self.config.url)
+            .map_err(|error| McpError::Transport(format!("invalid MCP endpoint URL: {error}")))?;
+
+        Ok(Box::new(StreamableHttpTransport {
+            client,
+            endpoint_url,
+            headers: self.config.headers.clone(),
+            protocol_version: None,
+            session_id: None,
+            pending_frames: VecDeque::new(),
+        }))
+    }
+}
+
 struct StdioTransport {
     child: Child,
     stdin: ChildStdin,
@@ -408,6 +499,15 @@ struct SseTransport {
     headers: Vec<(String, String)>,
     frame_rx: mpsc::UnboundedReceiver<Result<McpFrame, McpError>>,
     read_task: JoinHandle<()>,
+}
+
+struct StreamableHttpTransport {
+    client: Client,
+    endpoint_url: Url,
+    headers: Vec<(String, String)>,
+    protocol_version: Option<String>,
+    session_id: Option<String>,
+    pending_frames: VecDeque<McpFrame>,
 }
 
 #[async_trait]
@@ -484,6 +584,263 @@ impl McpTransport for SseTransport {
     async fn close(&mut self) -> Result<(), McpError> {
         self.read_task.abort();
         Ok(())
+    }
+}
+
+#[async_trait]
+impl McpTransport for StreamableHttpTransport {
+    async fn send(&mut self, message: McpFrame) -> Result<(), McpError> {
+        let is_request = is_jsonrpc_request(&message.value);
+        let request_id = message.value.get("id").cloned();
+        let is_initialize =
+            message.value.get("method").and_then(Value::as_str) == Some("initialize");
+
+        let mut request = self
+            .client
+            .post(self.endpoint_url.clone())
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream");
+
+        request = apply_streamable_http_headers(
+            request,
+            &self.headers,
+            self.protocol_version.as_deref(),
+            self.session_id.as_deref(),
+        );
+
+        let response = request
+            .json(&message.value)
+            .send()
+            .await
+            .map_err(McpError::Http)?;
+
+        if is_initialize {
+            self.capture_session_id(response.headers());
+        }
+
+        let status = response.status();
+        if !status.is_success() {
+            return Err(
+                streamable_http_status_error("Streamable HTTP POST", status, response).await,
+            );
+        }
+
+        if !is_request {
+            return Ok(());
+        }
+
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+
+        if content_type.starts_with("application/json") {
+            let value = response.json::<Value>().await.map_err(McpError::Http)?;
+            self.maybe_update_protocol_version(&message.value, &value)?;
+            self.pending_frames.push_back(McpFrame { value });
+            return Ok(());
+        }
+
+        if !content_type.starts_with("text/event-stream") {
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "<unreadable response body>".into());
+            return Err(McpError::Transport(format!(
+                "unexpected Streamable HTTP response content type {content_type:?}: {body}"
+            )));
+        }
+
+        let request_id = request_id.ok_or_else(|| {
+            McpError::Protocol("JSON-RPC request over Streamable HTTP is missing an id".into())
+        })?;
+        self.collect_streamable_http_response(response, &message.value, &request_id)
+            .await
+    }
+
+    async fn recv(&mut self) -> Result<Option<McpFrame>, McpError> {
+        Ok(self.pending_frames.pop_front())
+    }
+
+    async fn close(&mut self) -> Result<(), McpError> {
+        let Some(session_id) = self.session_id.clone() else {
+            return Ok(());
+        };
+
+        let mut request = self.client.delete(self.endpoint_url.clone());
+        request = apply_streamable_http_headers(
+            request,
+            &self.headers,
+            self.protocol_version.as_deref(),
+            Some(session_id.as_str()),
+        );
+
+        let response = request.send().await.map_err(McpError::Http)?;
+        if response.status().is_success()
+            || response.status() == StatusCode::METHOD_NOT_ALLOWED
+            || response.status() == StatusCode::NOT_FOUND
+        {
+            self.session_id = None;
+            return Ok(());
+        }
+
+        Err(
+            streamable_http_status_error("Streamable HTTP DELETE", response.status(), response)
+                .await,
+        )
+    }
+}
+
+impl StreamableHttpTransport {
+    async fn collect_streamable_http_response(
+        &mut self,
+        response: reqwest::Response,
+        request_message: &Value,
+        request_id: &Value,
+    ) -> Result<(), McpError> {
+        let mut retry_delay = Duration::from_millis(0);
+        let mut last_event_id = None;
+        let mut saw_response = false;
+
+        saw_response |= self
+            .read_streamable_http_events(
+                response,
+                request_message,
+                request_id,
+                &mut last_event_id,
+                &mut retry_delay,
+            )
+            .await?;
+
+        while !saw_response && last_event_id.is_some() {
+            if !retry_delay.is_zero() {
+                sleep(retry_delay).await;
+            }
+
+            let response = self
+                .resume_streamable_http_stream(last_event_id.as_deref().unwrap())
+                .await?;
+            saw_response |= self
+                .read_streamable_http_events(
+                    response,
+                    request_message,
+                    request_id,
+                    &mut last_event_id,
+                    &mut retry_delay,
+                )
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn read_streamable_http_events(
+        &mut self,
+        response: reqwest::Response,
+        request_message: &Value,
+        request_id: &Value,
+        last_event_id: &mut Option<String>,
+        retry_delay: &mut Duration,
+    ) -> Result<bool, McpError> {
+        let stream = response.bytes_stream().map_err(std::io::Error::other);
+        let mut reader = BufReader::new(StreamReader::new(stream));
+        let mut saw_response = false;
+
+        while let Some(event) = read_next_sse_event(&mut reader).await? {
+            if let Some(id) = event.id.clone() {
+                *last_event_id = Some(id);
+            }
+            if let Some(retry_ms) = event.retry_ms {
+                *retry_delay = Duration::from_millis(retry_ms);
+            }
+
+            let Some(frame) = streamable_http_event_to_frame(event)? else {
+                continue;
+            };
+
+            self.maybe_update_protocol_version(request_message, &frame.value)?;
+            if frame.value.get("id") == Some(request_id) {
+                saw_response = true;
+            }
+            self.pending_frames.push_back(frame);
+        }
+
+        Ok(saw_response)
+    }
+
+    async fn resume_streamable_http_stream(
+        &self,
+        last_event_id: &str,
+    ) -> Result<reqwest::Response, McpError> {
+        let mut request = self
+            .client
+            .get(self.endpoint_url.clone())
+            .header("Accept", "text/event-stream")
+            .header("Cache-Control", "no-cache")
+            .header("Last-Event-ID", last_event_id);
+
+        request = apply_streamable_http_headers(
+            request,
+            &self.headers,
+            self.protocol_version.as_deref(),
+            self.session_id.as_deref(),
+        );
+
+        let response = request.send().await.map_err(McpError::Http)?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(
+                streamable_http_status_error("Streamable HTTP GET", status, response).await,
+            );
+        }
+
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        if !content_type.starts_with("text/event-stream") {
+            let content_type = content_type.to_string();
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "<unreadable response body>".into());
+            return Err(McpError::Transport(format!(
+                "Streamable HTTP GET expected text/event-stream, got {content_type:?}: {body}"
+            )));
+        }
+
+        Ok(response)
+    }
+
+    fn maybe_update_protocol_version(
+        &mut self,
+        request_message: &Value,
+        response_value: &Value,
+    ) -> Result<(), McpError> {
+        if request_message.get("method").and_then(Value::as_str) != Some("initialize") {
+            return Ok(());
+        }
+
+        let protocol_version = response_value
+            .get("result")
+            .and_then(|result| result.get("protocolVersion"))
+            .and_then(Value::as_str);
+
+        if let Some(protocol_version) = protocol_version {
+            self.protocol_version = Some(protocol_version.to_string());
+        }
+
+        Ok(())
+    }
+
+    fn capture_session_id(&mut self, headers: &reqwest::header::HeaderMap) {
+        self.session_id = headers
+            .get("MCP-Session-Id")
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.to_string());
     }
 }
 
@@ -631,6 +988,9 @@ impl McpConnection {
             McpTransportBinding::Stdio(binding) => {
                 Arc::new(StdioTransportFactory::new(binding.clone()))
             }
+            McpTransportBinding::StreamableHttp(binding) => {
+                Arc::new(StreamableHttpTransportFactory::new(binding.clone()))
+            }
             McpTransportBinding::Sse(binding) => {
                 Arc::new(SseTransportFactory::new(binding.clone()))
             }
@@ -639,7 +999,10 @@ impl McpConnection {
 
         let mut transport = factory.connect().await?;
         let mut params = serde_json::Map::new();
-        params.insert("protocolVersion".into(), Value::String("2024-11-05".into()));
+        params.insert(
+            "protocolVersion".into(),
+            Value::String(MCP_LATEST_PROTOCOL_VERSION.into()),
+        );
         params.insert("capabilities".into(), json!({}));
         params.insert(
             "clientInfo".into(),
@@ -672,6 +1035,19 @@ impl McpConnection {
                 return Err(McpError::AuthRequired(Box::new(auth_request)));
             }
             return Err(McpError::Invocation(error.to_string()));
+        }
+        let negotiated_protocol_version = init_response
+            .value
+            .get("result")
+            .and_then(|result| result.get("protocolVersion"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                McpError::Protocol("initialize response missing result.protocolVersion".into())
+            })?;
+        if !MCP_SUPPORTED_PROTOCOL_VERSIONS.contains(&negotiated_protocol_version) {
+            return Err(McpError::Protocol(format!(
+                "unsupported MCP protocol version negotiated during initialize: {negotiated_protocol_version}"
+            )));
         }
         transport
             .send(McpFrame {
@@ -2032,38 +2408,22 @@ async fn read_sse_stream<R>(
     R: AsyncBufRead + Unpin,
 {
     let mut endpoint_tx = Some(endpoint_tx);
-    let mut event_name: Option<String> = None;
-    let mut data_lines = Vec::new();
-
     loop {
-        let mut line = String::new();
-        match reader.read_line(&mut line).await {
-            Ok(0) => break,
-            Ok(_) => {
-                let line = line.trim_end_matches(['\r', '\n']);
-                if line.is_empty() {
-                    dispatch_sse_event(
-                        &response_url,
-                        &mut endpoint_tx,
-                        &frame_tx,
-                        event_name.take(),
-                        std::mem::take(&mut data_lines),
-                    );
+        match read_next_sse_event(&mut reader).await {
+            Ok(Some(event)) => {
+                if let Some(endpoint) = legacy_sse_event_to_endpoint(&response_url, &event) {
+                    if let Some(tx) = endpoint_tx.take() {
+                        let _ = tx.send(endpoint);
+                    }
                     continue;
                 }
-                if line.starts_with(':') {
-                    continue;
-                }
-                if let Some(rest) = line.strip_prefix("event:") {
-                    event_name = Some(rest.trim_start().to_string());
-                    continue;
-                }
-                if let Some(rest) = line.strip_prefix("data:") {
-                    data_lines.push(rest.trim_start().to_string());
+
+                if let Some(frame) = legacy_sse_event_to_frame(event) {
+                    let _ = frame_tx.send(frame);
                 }
             }
+            Ok(None) => break,
             Err(error) => {
-                let error = McpError::Io(error);
                 if let Some(tx) = endpoint_tx.take() {
                     let _ = tx.send(Err(error));
                 } else {
@@ -2074,16 +2434,6 @@ async fn read_sse_stream<R>(
         }
     }
 
-    if event_name.is_some() || !data_lines.is_empty() {
-        dispatch_sse_event(
-            &response_url,
-            &mut endpoint_tx,
-            &frame_tx,
-            event_name.take(),
-            std::mem::take(&mut data_lines),
-        );
-    }
-
     if let Some(tx) = endpoint_tx.take() {
         let _ = tx.send(Err(McpError::Transport(
             "SSE stream ended before endpoint event".into(),
@@ -2091,39 +2441,151 @@ async fn read_sse_stream<R>(
     }
 }
 
-fn dispatch_sse_event(
-    response_url: &Url,
-    endpoint_tx: &mut Option<oneshot::Sender<Result<Url, McpError>>>,
-    frame_tx: &mpsc::UnboundedSender<Result<McpFrame, McpError>>,
-    event_name: Option<String>,
-    data_lines: Vec<String>,
-) {
-    if data_lines.is_empty() {
-        return;
-    }
-
-    let event_name = event_name.unwrap_or_else(|| "message".into());
-    let data = data_lines.join("\n");
-
-    if event_name == "endpoint" {
-        if let Some(tx) = endpoint_tx.take() {
-            let _ = tx.send(resolve_sse_endpoint(response_url, &data));
-        }
-        return;
-    }
-
-    if event_name != "message" {
-        return;
-    }
-
-    let value = serde_json::from_str(&data).map_err(McpError::Serialize);
-    let _ = frame_tx.send(value.map(|value| McpFrame { value }));
-}
-
 fn resolve_sse_endpoint(response_url: &Url, endpoint: &str) -> Result<Url, McpError> {
     response_url
         .join(endpoint.trim())
         .map_err(|error| McpError::Transport(format!("invalid SSE endpoint URL: {error}")))
+}
+
+#[derive(Debug)]
+struct SseEvent {
+    event_name: Option<String>,
+    data: String,
+    id: Option<String>,
+    retry_ms: Option<u64>,
+}
+
+async fn read_next_sse_event<R>(reader: &mut R) -> Result<Option<SseEvent>, McpError>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let mut event_name = None;
+    let mut data_lines = Vec::new();
+    let mut id = None;
+    let mut retry_ms = None;
+
+    loop {
+        let mut line = String::new();
+        let read = reader.read_line(&mut line).await.map_err(McpError::Io)?;
+        if read == 0 {
+            if event_name.is_none() && data_lines.is_empty() && id.is_none() && retry_ms.is_none() {
+                return Ok(None);
+            }
+            return Ok(Some(SseEvent {
+                event_name,
+                data: data_lines.join("\n"),
+                id,
+                retry_ms,
+            }));
+        }
+
+        let line = line.trim_end_matches(['\r', '\n']);
+        if line.is_empty() {
+            if event_name.is_none() && data_lines.is_empty() && id.is_none() && retry_ms.is_none() {
+                continue;
+            }
+            return Ok(Some(SseEvent {
+                event_name,
+                data: data_lines.join("\n"),
+                id,
+                retry_ms,
+            }));
+        }
+
+        if line.starts_with(':') {
+            continue;
+        }
+
+        if let Some(rest) = line.strip_prefix("event:") {
+            event_name = Some(rest.trim_start().to_string());
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("data:") {
+            data_lines.push(rest.trim_start().to_string());
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("id:") {
+            id = Some(rest.trim_start().to_string());
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("retry:") {
+            retry_ms = rest.trim_start().parse().ok();
+        }
+    }
+}
+
+fn legacy_sse_event_to_endpoint(
+    response_url: &Url,
+    event: &SseEvent,
+) -> Option<Result<Url, McpError>> {
+    if event.event_name.as_deref() != Some("endpoint") {
+        return None;
+    }
+    if event.data.is_empty() {
+        return Some(Err(McpError::Transport(
+            "legacy SSE endpoint event is missing data".into(),
+        )));
+    }
+    Some(resolve_sse_endpoint(response_url, &event.data))
+}
+
+fn legacy_sse_event_to_frame(event: SseEvent) -> Option<Result<McpFrame, McpError>> {
+    let event_name = event.event_name.unwrap_or_else(|| "message".into());
+    if event_name != "message" || event.data.is_empty() {
+        return None;
+    }
+
+    Some(
+        serde_json::from_str(&event.data)
+            .map_err(McpError::Serialize)
+            .map(|value| McpFrame { value }),
+    )
+}
+
+fn streamable_http_event_to_frame(event: SseEvent) -> Result<Option<McpFrame>, McpError> {
+    let event_name = event.event_name.unwrap_or_else(|| "message".into());
+    if event_name != "message" || event.data.is_empty() {
+        return Ok(None);
+    }
+
+    let value = serde_json::from_str(&event.data).map_err(McpError::Serialize)?;
+    Ok(Some(McpFrame { value }))
+}
+
+fn is_jsonrpc_request(value: &Value) -> bool {
+    value.get("method").is_some() && value.get("id").is_some()
+}
+
+fn apply_streamable_http_headers(
+    mut request: reqwest::RequestBuilder,
+    headers: &[(String, String)],
+    protocol_version: Option<&str>,
+    session_id: Option<&str>,
+) -> reqwest::RequestBuilder {
+    for (key, value) in headers {
+        request = request.header(key, value);
+    }
+
+    if let Some(protocol_version) = protocol_version {
+        request = request.header("MCP-Protocol-Version", protocol_version);
+    }
+    if let Some(session_id) = session_id {
+        request = request.header("MCP-Session-Id", session_id);
+    }
+
+    request
+}
+
+async fn streamable_http_status_error(
+    operation: &str,
+    status: StatusCode,
+    response: reqwest::Response,
+) -> McpError {
+    let body = response
+        .text()
+        .await
+        .unwrap_or_else(|_| "<unreadable response body>".into());
+    McpError::Transport(format!("{operation} failed with status {status}: {body}"))
 }
 
 /// Errors produced by MCP transport, protocol, and lifecycle operations.
@@ -2440,7 +2902,7 @@ mod tests {
     #[tokio::test]
     async fn connection_includes_resolved_auth_in_future_requests() {
         let factory = RecordingTransportFactory::new(vec![vec![
-            json!({ "jsonrpc": "2.0", "id": 0, "result": { "capabilities": {} } }),
+            json!({ "jsonrpc": "2.0", "id": 0, "result": { "protocolVersion": "2025-11-25", "capabilities": {}, "serverInfo": { "name": "recording", "version": "1.0.0" } } }),
             json!({ "jsonrpc": "2.0", "id": 1, "result": { "content": [{ "type": "text", "text": "ok" }] } }),
         ]]);
         let config = McpServerConfig::new(
@@ -2488,7 +2950,7 @@ mod tests {
     #[tokio::test]
     async fn manager_reuses_stored_auth_on_connect() {
         let factory = RecordingTransportFactory::new(vec![vec![
-            json!({ "jsonrpc": "2.0", "id": 0, "result": { "capabilities": {} } }),
+            json!({ "jsonrpc": "2.0", "id": 0, "result": { "protocolVersion": "2025-11-25", "capabilities": {}, "serverInfo": { "name": "recording", "version": "1.0.0" } } }),
             json!({ "jsonrpc": "2.0", "id": 1, "result": { "tools": [] } }),
             json!({ "jsonrpc": "2.0", "id": 2, "result": { "resources": [] } }),
             json!({ "jsonrpc": "2.0", "id": 3, "result": { "prompts": [] } }),
@@ -2537,7 +2999,7 @@ mod tests {
     #[tokio::test]
     async fn manager_resolves_auth_and_replays_resource_read() {
         let factory = RecordingTransportFactory::new(vec![vec![
-            json!({ "jsonrpc": "2.0", "id": 0, "result": { "capabilities": {} } }),
+            json!({ "jsonrpc": "2.0", "id": 0, "result": { "protocolVersion": "2025-11-25", "capabilities": {}, "serverInfo": { "name": "recording", "version": "1.0.0" } } }),
             json!({ "jsonrpc": "2.0", "id": 1, "result": { "tools": [] } }),
             json!({ "jsonrpc": "2.0", "id": 2, "result": { "resources": [] } }),
             json!({ "jsonrpc": "2.0", "id": 3, "result": { "prompts": [] } }),
@@ -2609,7 +3071,7 @@ mod tests {
     #[tokio::test]
     async fn manager_resolves_auth_and_replays_connect() {
         let factory = RecordingTransportFactory::new(vec![vec![
-            json!({ "jsonrpc": "2.0", "id": 0, "result": { "capabilities": {} } }),
+            json!({ "jsonrpc": "2.0", "id": 0, "result": { "protocolVersion": "2025-11-25", "capabilities": {}, "serverInfo": { "name": "recording", "version": "1.0.0" } } }),
             json!({ "jsonrpc": "2.0", "id": 1, "result": { "tools": [] } }),
             json!({ "jsonrpc": "2.0", "id": 2, "result": { "resources": [] } }),
             json!({ "jsonrpc": "2.0", "id": 3, "result": { "prompts": [] } }),
@@ -2713,11 +3175,159 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn streamable_http_connection_tracks_session_and_protocol_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = StdArc::new(StdMutex::new(Vec::new()));
+        let captured = requests.clone();
+
+        let server = tokio::spawn(async move {
+            for _ in 0..4 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buffer = vec![0_u8; 8192];
+                let read = socket.read(&mut buffer).await.unwrap();
+                let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                captured.lock().unwrap().push(request.clone());
+
+                let response = if request.contains("\"method\":\"initialize\"") {
+                    let body = "{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"serverInfo\":{\"name\":\"remote\",\"version\":\"1.0.0\"}}}";
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nMCP-Session-Id: session-123\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                } else if request.contains("\"method\":\"notifications/initialized\"") {
+                    "HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                        .to_string()
+                } else if request.starts_with("DELETE /mcp ") {
+                    "HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                        .to_string()
+                } else {
+                    let body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}";
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                };
+
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let config = McpServerConfig::new(
+            "remote",
+            McpTransportBinding::StreamableHttp(StreamableHttpTransportConfig::new(format!(
+                "http://{address}/mcp"
+            ))),
+        );
+        let connection = McpConnection::connect(&config).await.unwrap();
+        let _ = connection.list_tools().await.unwrap();
+        connection.close().await.unwrap();
+        server.await.unwrap();
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        let normalized = requests
+            .iter()
+            .map(|request| request.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        assert!(requests[0].starts_with("POST /mcp "));
+        assert!(!requests[0].contains("MCP-Session-Id:"));
+        assert!(normalized[1].contains("mcp-session-id: session-123"));
+        assert!(normalized[1].contains("mcp-protocol-version: 2025-11-25"));
+        assert!(normalized[2].contains("mcp-session-id: session-123"));
+        assert!(normalized[2].contains("mcp-protocol-version: 2025-11-25"));
+        assert!(requests[3].starts_with("DELETE /mcp "));
+        assert!(normalized[3].contains("mcp-session-id: session-123"));
+    }
+
+    #[tokio::test]
+    async fn streamable_http_transport_resumes_sse_streams_until_response_arrives() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = StdArc::new(StdMutex::new(Vec::new()));
+        let captured = requests.clone();
+
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buffer = vec![0_u8; 8192];
+                let read = socket.read(&mut buffer).await.unwrap();
+                let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                captured.lock().unwrap().push(request.clone());
+
+                let response = if request.starts_with("POST /mcp ") {
+                    let body = concat!(
+                        "id: evt-1\n",
+                        "event: message\n",
+                        "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{\"phase\":\"stream-start\"}}\n\n"
+                    );
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                } else {
+                    let body = concat!(
+                        "id: evt-2\n",
+                        "event: message\n",
+                        "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}\n\n"
+                    );
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                };
+
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let factory = StreamableHttpTransportFactory::new(StreamableHttpTransportConfig::new(
+            format!("http://{address}/mcp"),
+        ));
+        let mut transport = factory.connect().await.unwrap();
+        transport
+            .send(McpFrame {
+                value: json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/list",
+                    "params": {}
+                }),
+            })
+            .await
+            .unwrap();
+
+        let first = transport.recv().await.unwrap().unwrap();
+        let second = transport.recv().await.unwrap().unwrap();
+        transport.close().await.unwrap();
+        server.await.unwrap();
+
+        assert_eq!(
+            first.value["method"],
+            Value::String("notifications/message".into())
+        );
+        assert_eq!(second.value["result"]["tools"], json!([]));
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].starts_with("POST /mcp "));
+        assert!(requests[1].starts_with("GET /mcp "));
+        assert!(
+            requests[1].contains("last-event-id: evt-1")
+                || requests[1].contains("Last-Event-ID: evt-1")
+        );
+    }
+
+    #[tokio::test]
     async fn server_manager_connects_refreshes_and_aggregates_tools() {
         let alpha = McpServerConfig::new(
             "alpha",
             McpTransportBinding::Custom(Arc::new(FakeTransportFactory::new(vec![vec![
-                json!({ "jsonrpc": "2.0", "id": 0, "result": { "capabilities": {} } }),
+                json!({ "jsonrpc": "2.0", "id": 0, "result": { "protocolVersion": "2025-11-25", "capabilities": {}, "serverInfo": { "name": "alpha", "version": "1.0.0" } } }),
                 json!({ "jsonrpc": "2.0", "id": 1, "result": { "tools": [{ "name": "echo", "description": "Echo", "inputSchema": {"type": "object"} }] } }),
                 json!({ "jsonrpc": "2.0", "id": 2, "result": { "resources": [] } }),
                 json!({ "jsonrpc": "2.0", "id": 3, "result": { "prompts": [] } }),
@@ -2729,7 +3339,7 @@ mod tests {
         let beta = McpServerConfig::new(
             "beta",
             McpTransportBinding::Custom(Arc::new(FakeTransportFactory::new(vec![vec![
-                json!({ "jsonrpc": "2.0", "id": 0, "result": { "capabilities": {} } }),
+                json!({ "jsonrpc": "2.0", "id": 0, "result": { "protocolVersion": "2025-11-25", "capabilities": {}, "serverInfo": { "name": "beta", "version": "1.0.0" } } }),
                 json!({ "jsonrpc": "2.0", "id": 1, "result": { "tools": [{ "name": "search", "description": "Search", "inputSchema": {"type": "object"} }] } }),
                 json!({ "jsonrpc": "2.0", "id": 2, "result": { "resources": [] } }),
                 json!({ "jsonrpc": "2.0", "id": 3, "result": { "prompts": [] } }),

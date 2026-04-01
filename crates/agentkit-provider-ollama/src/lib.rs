@@ -185,7 +185,10 @@ impl CompletionsProvider for OllamaProvider {
     }
 
     fn preprocess_request(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        builder.header("User-Agent", "agentkit-provider-ollama/0.1.0")
+        builder.header(
+            "User-Agent",
+            concat!("agentkit-provider-ollama/", env!("CARGO_PKG_VERSION")),
+        )
     }
 }
 

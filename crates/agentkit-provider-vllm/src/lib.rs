@@ -186,7 +186,10 @@ impl CompletionsProvider for VllmProvider {
     }
 
     fn preprocess_request(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        let builder = builder.header("User-Agent", "agentkit-provider-vllm/0.1.0");
+        let builder = builder.header(
+            "User-Agent",
+            concat!("agentkit-provider-vllm/", env!("CARGO_PKG_VERSION")),
+        );
         match &self.api_key {
             Some(key) => builder.bearer_auth(key),
             None => builder,
