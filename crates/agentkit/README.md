@@ -46,7 +46,7 @@ use agentkit::reporting::StdoutReporter;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config = OpenRouterConfig::from_env()?;
+    let config = OpenRouterConfig::new("sk-or-v1-...", "openrouter/auto");
     let adapter = OpenRouterAdapter::new(config)?;
 
     let agent = Agent::builder()
@@ -105,7 +105,9 @@ use agentkit::tools::ToolRegistry;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let adapter = OpenRouterAdapter::new(OpenRouterConfig::from_env()?)?;
+    let adapter = OpenRouterAdapter::new(
+        OpenRouterConfig::new("sk-or-v1-...", "openrouter/auto"),
+    )?;
 
     // Build a tool registry with filesystem and shell tools.
     let mut tools = agentkit::tool_fs::registry();

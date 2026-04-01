@@ -12,7 +12,7 @@ An API key is optional — vLLM servers can run with or without authentication
 
 ## Configuration
 
-Set the following environment variables before calling `VllmConfig::from_env()`:
+Create a config with `VllmConfig::new(model)` and chain `.with_*()` builders for optional parameters. Alternatively, `VllmConfig::from_env()` reads from environment variables:
 
 | Variable        | Required | Default                                     |
 | --------------- | -------- | ------------------------------------------- |

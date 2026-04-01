@@ -14,7 +14,7 @@ Use it when OpenRouter is the backing model provider for your agent runtime.
 
 ## Configuration
 
-Set the following environment variables before calling `OpenRouterConfig::from_env()`:
+Create a config with `OpenRouterConfig::new(api_key, model)` and chain `.with_*()` builders for optional parameters. Alternatively, `OpenRouterConfig::from_env()` reads from environment variables:
 
 | Variable                           | Required | Default                                         |
 | ---------------------------------- | -------- | ----------------------------------------------- |
@@ -36,8 +36,8 @@ use agentkit_provider_openrouter::{OpenRouterAdapter, OpenRouterConfig};
 
 # #[tokio::main]
 # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-// Load API key and model from environment variables.
-let config = OpenRouterConfig::from_env()?;
+let config = OpenRouterConfig::new("sk-or-v1-...", "anthropic/claude-sonnet-4")
+    .with_app_name("my-agent");
 let adapter = OpenRouterAdapter::new(config)?;
 
 let agent = Agent::builder()
@@ -58,7 +58,7 @@ println!("{step:?}");
 # }
 ```
 
-### Explicit configuration with model selection
+### With model parameters
 
 ```rust,no_run
 use agentkit_provider_openrouter::{OpenRouterAdapter, OpenRouterConfig};

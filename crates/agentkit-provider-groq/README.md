@@ -9,7 +9,7 @@ response normalization, and usage reporting for Groq-backed sessions.
 
 ## Configuration
 
-Set the following environment variables before calling `GroqConfig::from_env()`:
+Create a config with `GroqConfig::new(api_key, model)` and chain `.with_*()` builders for optional parameters. Alternatively, `GroqConfig::from_env()` reads from environment variables:
 
 | Variable        | Required | Default                                           |
 | --------------- | -------- | ------------------------------------------------- |
@@ -27,8 +27,7 @@ use agentkit_provider_groq::{GroqAdapter, GroqConfig};
 
 # #[tokio::main]
 # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-// Load API key and model from environment variables.
-let config = GroqConfig::from_env()?;
+let config = GroqConfig::new("gsk_...", "llama-3.3-70b-versatile");
 let adapter = GroqAdapter::new(config)?;
 
 let agent = Agent::builder()
@@ -45,7 +44,7 @@ println!("{step:?}");
 # }
 ```
 
-### Explicit configuration
+### With model parameters
 
 ```rust,no_run
 use agentkit_provider_groq::{GroqAdapter, GroqConfig};

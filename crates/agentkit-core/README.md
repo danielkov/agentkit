@@ -98,7 +98,9 @@ use agentkit_provider_openrouter::{OpenRouterAdapter, OpenRouterConfig};
 # async fn run() -> Result<(), Box<dyn std::error::Error>> {
 let cancellation = CancellationController::new();
 let agent = Agent::builder()
-    .model(OpenRouterAdapter::new(OpenRouterConfig::from_env()?)?)
+    .model(OpenRouterAdapter::new(
+        OpenRouterConfig::new("sk-or-v1-...", "openrouter/auto"),
+    )?)
     .cancellation(cancellation.handle())
     .build()?;
 

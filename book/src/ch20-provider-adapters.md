@@ -106,7 +106,7 @@ Every provider crate follows the same structure:
 ```text
 agentkit-provider-{name}/
   src/lib.rs
-    ├── {Name}Config         // User-facing config (with_temperature, from_env, etc.)
+    ├── {Name}Config         // User-facing config (new, with_temperature, from_env, etc.)
     ├── {Name}RequestConfig  // Serializable request fields (#[serde(skip_serializing_if)])
     ├── {Name}Provider       // CompletionsProvider impl
     └── {Name}Adapter        // Newtype over CompletionsAdapter<{Name}Provider>

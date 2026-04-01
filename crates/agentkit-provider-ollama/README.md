@@ -13,7 +13,7 @@ desired model pulled (e.g. `ollama pull llama3.1:8b`).
 
 ## Configuration
 
-Set the following environment variables before calling `OllamaConfig::from_env()`:
+Create a config with `OllamaConfig::new(model)` and chain `.with_*()` builders for optional parameters. Alternatively, `OllamaConfig::from_env()` reads from environment variables:
 
 | Variable          | Required | Default                                      |
 | ----------------- | -------- | -------------------------------------------- |

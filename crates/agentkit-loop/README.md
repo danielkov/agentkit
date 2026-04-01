@@ -24,7 +24,9 @@ use agentkit_provider_openrouter::{OpenRouterAdapter, OpenRouterConfig};
 # #[tokio::main]
 # async fn main() -> Result<(), Box<dyn std::error::Error>> {
 // 1. Create a model adapter
-let adapter = OpenRouterAdapter::new(OpenRouterConfig::from_env()?)?;
+let adapter = OpenRouterAdapter::new(
+    OpenRouterConfig::new("sk-or-v1-...", "openrouter/auto"),
+)?;
 
 // 2. Build an agent
 let agent = Agent::builder()

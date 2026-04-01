@@ -13,7 +13,7 @@ it directly when assembling a smaller runtime.
 
 ## Configuration
 
-Set the following environment variables before calling `OpenAIConfig::from_env()`:
+Create a config with `OpenAIConfig::new(api_key, model)` and chain `.with_*()` builders for optional parameters. Alternatively, `OpenAIConfig::from_env()` reads from environment variables:
 
 | Variable          | Required | Default                                      |
 | ----------------- | -------- | -------------------------------------------- |
@@ -31,8 +31,7 @@ use agentkit_provider_openai::{OpenAIAdapter, OpenAIConfig};
 
 # #[tokio::main]
 # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-// Load API key and model from environment variables.
-let config = OpenAIConfig::from_env()?;
+let config = OpenAIConfig::new("sk-...", "gpt-4o");
 let adapter = OpenAIAdapter::new(config)?;
 
 let agent = Agent::builder()
@@ -49,7 +48,7 @@ println!("{step:?}");
 # }
 ```
 
-### Explicit configuration
+### With model parameters
 
 ```rust,no_run
 use agentkit_provider_openai::{OpenAIAdapter, OpenAIConfig};

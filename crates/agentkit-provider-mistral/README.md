@@ -12,7 +12,7 @@ used by most other OpenAI-compatible APIs.
 
 ## Configuration
 
-Set the following environment variables before calling `MistralConfig::from_env()`:
+Create a config with `MistralConfig::new(api_key, model)` and chain `.with_*()` builders for optional parameters. Alternatively, `MistralConfig::from_env()` reads from environment variables:
 
 | Variable           | Required | Default                                      |
 | ------------------ | -------- | -------------------------------------------- |
@@ -30,8 +30,7 @@ use agentkit_provider_mistral::{MistralAdapter, MistralConfig};
 
 # #[tokio::main]
 # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-// Load API key and model from environment variables.
-let config = MistralConfig::from_env()?;
+let config = MistralConfig::new("sk-...", "mistral-large-latest");
 let adapter = MistralAdapter::new(config)?;
 
 let agent = Agent::builder()
@@ -48,7 +47,7 @@ println!("{step:?}");
 # }
 ```
 
-### Explicit configuration
+### With model parameters
 
 ```rust,no_run
 use agentkit_provider_mistral::{MistralAdapter, MistralConfig};

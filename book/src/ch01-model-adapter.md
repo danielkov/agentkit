@@ -687,7 +687,7 @@ Using it:
 
 ```rust
 let adapter = OpenRouterAdapter::new(
-    OpenRouterConfig::from_env()?
+    OpenRouterConfig::new("sk-or-v1-...", "anthropic/claude-sonnet-4")
         .with_temperature(0.0)
         .with_max_completion_tokens(4096)
         .with_app_name("my-agent"),
@@ -752,7 +752,7 @@ agentkit ships the following provider crates, all built on `agentkit-adapter-com
 | [`agentkit-provider-groq`](https://github.com/danielkov/agentkit/tree/main/crates/agentkit-provider-groq)             | [Groq](https://groq.com)              | Bearer                  | `api.groq.com/openai/v1/chat/completions` |
 | [`agentkit-provider-mistral`](https://github.com/danielkov/agentkit/tree/main/crates/agentkit-provider-mistral)       | [Mistral](https://mistral.ai)         | Bearer                  | `api.mistral.ai/v1/chat/completions`      |
 
-Each follows the same pattern: a config struct with `from_env()` and fluent builders, a `Serialize` request config, and a `CompletionsProvider` impl. Provider-specific parameters are strongly typed — Ollama has `num_predict` and `top_k`, Mistral uses `max_tokens` instead of `max_completion_tokens`, OpenAI has `frequency_penalty` and `presence_penalty`.
+Each follows the same pattern: a config struct with `new()` fluent builders (and an optional `from_env()` helper), a `Serialize` request config, and a `CompletionsProvider` impl. Provider-specific parameters are strongly typed — Ollama has `num_predict` and `top_k`, Mistral uses `max_tokens` instead of `max_completion_tokens`, OpenAI has `frequency_penalty` and `presence_penalty`.
 
 For providers not listed here, you can either:
 
