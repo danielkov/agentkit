@@ -147,14 +147,16 @@ pub enum ToolInterruption {
 
 Not every execution failure is an error. An approval-required outcome means the tool is valid but needs human confirmation. The loop translates this into an interrupt.
 
-## Preflight actions
+## Preflight permission requests
 
-Tools can optionally expose what they plan to do before execution:
+Tools can expose what they plan to do before execution by overriding `proposed_requests` on the `Tool` trait:
 
 ```rust
-pub trait PreflightTool: Tool {
-    fn proposed_actions(&self, request: &ToolRequest)
-        -> Result<Vec<Box<dyn PermissionRequest>>, ToolError>;
+fn proposed_requests(
+    &self,
+    request: &ToolRequest,
+) -> Result<Vec<Box<dyn PermissionRequest>>, ToolError> {
+    Ok(Vec::new()) // default: no permissions needed
 }
 ```
 
@@ -197,6 +199,7 @@ Model emits ToolCallPart
 │                                  │
 │  5. Error normalization          │
 │     ToolError → ToolResult       │
+│     with ToolResultPart          │
 │     { is_error: true }           │
 └──────────────────────────────────┘
        │
@@ -204,7 +207,7 @@ Model emits ToolCallPart
 ToolExecutionOutcome::Completed(ToolResult)
 ```
 
-Tool errors (file not found, invalid JSON, network failure) are normalized into `ToolResult { is_error: true }` — the model sees the error message as a tool result and can decide to retry, try differently, or report the failure. Errors don't crash the loop or propagate to the host.
+Tool errors (file not found, invalid JSON, network failure) are normalized into a `ToolResult` whose `ToolResultPart` has `is_error: true` — the model sees the error message as a tool result and can decide to retry, try differently, or report the failure. Errors don't crash the loop or propagate to the host.
 
 ## Design decisions
 

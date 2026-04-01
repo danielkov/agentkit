@@ -110,7 +110,7 @@ Before (20 items, trigger threshold: 12):
   [9]  Asst: "The parser contains..."
   [10] User: "Add error handling"
   [11] Asst: (tool_call) fs.replace_in_file
-  [12] Tool: { is_error: true, "old_text not found" }  ← failed
+  [12] Tool: { is_error: true, "search text not found" }  ← failed
   [13] Asst: "Let me try again..."
              (tool_call) fs.replace_in_file
   [14] Tool: "Replacement successful"

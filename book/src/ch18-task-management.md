@@ -57,7 +57,7 @@ Implement `TaskRoutingPolicy` or use a closure:
 
 ```rust
 let task_manager = AsyncTaskManager::new().routing(|req: &ToolRequest| {
-    if req.tool_name.as_ref() == "shell.exec" {
+    if req.tool_name.0 == "shell.exec" {
         RoutingDecision::ForegroundThenDetachAfter(Duration::from_secs(5))
     } else {
         RoutingDecision::Foreground

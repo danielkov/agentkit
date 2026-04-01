@@ -97,7 +97,7 @@ Display tool calls as they happen so the user knows what the agent is doing:
 ```
 → fs.read_file(path: "src/main.rs")
 → fs.replace_in_file(path: "src/main.rs", ...)
-→ shell.exec(executable: "cargo", args: ["build"])
+→ shell.exec(executable: "cargo", argv: ["build"])
 ```
 
 ### Usage reporting
@@ -164,18 +164,18 @@ The key insight: most errors are recoverable. A rate limit resolves after waitin
 
 ### Tool errors
 
-Tool failures are returned to the model as `ToolResult { is_error: true }`. The model sees the error message and can decide to retry, try a different approach, or report the failure. The CLI doesn't need to handle tool errors specially — they're part of the normal conversation flow.
+Tool failures are returned to the model as a `ToolResultPart` with `is_error: true`. The model sees the error message and can decide to retry, try a different approach, or report the failure. The CLI doesn't need to handle tool errors specially — they're part of the normal conversation flow.
 
 ```text
 Tool error flow (handled entirely within the loop):
 
   Model: ToolCall(fs.read_file, { path: "main.rs" })
-  Tool:  ToolResult { is_error: true, output: "File not found" }
+  Tool:  ToolResultPart { is_error: true, output: "File not found" }
   Model: "The file doesn't exist in the current directory. Let me check..."
-  Model: ToolCall(shell.exec, { executable: "find", args: [".", "-name", "main.rs"] })
-  Tool:  ToolResult { output: "./src/main.rs" }
+  Model: ToolCall(shell.exec, { executable: "find", argv: [".", "-name", "main.rs"] })
+  Tool:  ToolResultPart { output: "./src/main.rs" }
   Model: ToolCall(fs.read_file, { path: "./src/main.rs" })
-  Tool:  ToolResult { output: "fn main() { ... }" }
+  Tool:  ToolResultPart { output: "fn main() { ... }" }
 
   The host never saw the error — the model handled it autonomously.
 ```

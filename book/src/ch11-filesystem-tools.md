@@ -83,7 +83,7 @@ With read-before-write:
   Model: ToolCall(fs.read_file, { path: "src/parser.rs" })
   → Success: file contents returned
 
-  Model: ToolCall(fs.replace_in_file, { path: "src/parser.rs", old: "...", new: "..." })
+  Model: ToolCall(fs.replace_in_file, { path: "src/parser.rs", find: "...", replace: "..." })
   → Success: targeted edit
 ```
 
@@ -104,9 +104,9 @@ fs.read_file({ path: "src/main.rs", from: 50, to: 75 })
 
 ### `fs.replace_in_file`
 
-Accepts a `path`, `old_text`, and `new_text`. Reads the file, performs the replacement, writes the result. This is the primary editing tool — it's more precise than full-file writes because the model only needs to specify the changed region.
+Accepts a `path`, `find`, `replace`, and an optional `replace_all` boolean. Reads the file, performs the replacement, writes the result. This is the primary editing tool — it's more precise than full-file writes because the model only needs to specify the changed region.
 
-The replacement is exact string matching, not regex. If `old_text` doesn't appear in the file, the tool returns an error. If it appears more than once, the tool may replace the first occurrence or return an error depending on configuration — this avoids accidental mass edits.
+The replacement is exact string matching, not regex. If the search text doesn't appear in the file, the tool returns an error. When `replace_all` is false (the default), only the first occurrence is replaced — this avoids accidental mass edits.
 
 ### `fs.write_file`
 
@@ -118,13 +118,13 @@ Returns the contents of a directory. Useful for the model to explore project str
 
 ### Error handling
 
-Filesystem errors (file not found, permission denied, etc.) are returned as `ToolResult` with `is_error: true`. They are not panics or exceptions. The model sees the error message and can decide what to do — try a different path, ask the user, or give up.
+Filesystem errors (file not found, permission denied, etc.) are returned as a `ToolResult` whose `ToolResultPart` has `is_error: true`. They are not panics or exceptions. The model sees the error message and can decide what to do — try a different path, ask the user, or give up.
 
 ```text
 Error flow:
 
   fs.read_file({ path: "nonexistent.rs" })
-  → ToolResult { is_error: true, output: "File not found: nonexistent.rs" }
+  → ToolResult { result: ToolResultPart { is_error: true, output: "File not found: nonexistent.rs", .. }, .. }
   → Model: "The file doesn't exist. Let me check the directory structure..."
   → fs.list_directory({ path: "src/" })
   → Model finds the correct file name and retries

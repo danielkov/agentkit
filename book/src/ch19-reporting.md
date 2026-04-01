@@ -60,9 +60,9 @@ Fans out events to multiple child reporters:
 
 ```rust
 let reporter = CompositeReporter::new()
-    .with(StdoutReporter::new())
-    .with(JsonlReporter::new(file))
-    .with(UsageReporter::new());
+    .with_observer(StdoutReporter::new(std::io::stderr()))
+    .with_observer(JsonlReporter::new(file))
+    .with_observer(UsageReporter::new());
 ```
 
 ## Adapter reporters

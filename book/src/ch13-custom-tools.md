@@ -89,21 +89,24 @@ async fn invoke(&self, request: ToolRequest, ctx: &mut ToolContext<'_>) -> Resul
     let resources = ctx.resources;
 
     // Access session identity
-    let session_id = ctx.session_id;
+    let session_id = ctx.capability.session_id;
 
     // ...
 }
 ```
 
-## Adding preflight actions
+## Adding preflight permission requests
 
-For tools with side effects, implement `PreflightTool` to expose proposed actions before execution:
+For tools with side effects, override `proposed_requests` on the `Tool` trait to expose proposed actions before execution:
 
 ```rust
-impl PreflightTool for DeployTool {
-    fn proposed_actions(&self, request: &ToolRequest)
-        -> Result<Vec<Box<dyn PermissionRequest>>, ToolError>
-    {
+impl Tool for DeployTool {
+    fn spec(&self) -> &ToolSpec { &self.spec }
+
+    fn proposed_requests(
+        &self,
+        request: &ToolRequest,
+    ) -> Result<Vec<Box<dyn PermissionRequest>>, ToolError> {
         let env = request.input["environment"].as_str().unwrap_or("unknown");
         Ok(vec![Box::new(DeployPermissionRequest {
             environment: env.to_string(),
@@ -111,6 +114,9 @@ impl PreflightTool for DeployTool {
             metadata: MetadataMap::new(),
         })])
     }
+
+    async fn invoke(&self, request: ToolRequest, ctx: &mut ToolContext<'_>)
+        -> Result<ToolResult, ToolError> { /* ... */ }
 }
 ```
 
@@ -165,7 +171,7 @@ Outer agent (orchestrator):
          ▼
   Inner agent (researcher):
     Model: ToolCall(fs.read_file, { path: "src/lib.rs" })
-    Model: ToolCall(shell.exec, { executable: "grep", args: ["-r", "unsafe", "src/"] })
+    Model: ToolCall(shell.exec, { executable: "grep", argv: ["-r", "unsafe", "src/"] })
     Model: "Found 3 uses of unsafe in parser.rs, codec.rs, and ffi.rs..."
          │
          ▼

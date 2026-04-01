@@ -15,7 +15,7 @@ let registry = agentkit_tool_shell::registry();
 | Field        | Type               | Required | Description             |
 | ------------ | ------------------ | -------- | ----------------------- |
 | `executable` | `string`           | yes      | Program to run          |
-| `args`       | `[string]`         | no       | Command-line arguments  |
+| `argv`       | `[string]`         | no       | Command-line arguments  |
 | `cwd`        | `string`           | no       | Working directory       |
 | `env`        | `{string: string}` | no       | Environment variables   |
 | `timeout_ms` | `integer`          | no       | Timeout in milliseconds |
@@ -42,10 +42,10 @@ Before spawning a process, the tool emits a `ShellPermissionRequest`:
 ```rust
 pub struct ShellPermissionRequest {
     pub executable: String,
-    pub args: Vec<String>,
+    pub argv: Vec<String>,
     pub cwd: Option<PathBuf>,
     pub env_keys: Vec<String>,
-    pub timeout: Option<Duration>,
+    pub metadata: MetadataMap,
 }
 ```
 
@@ -84,7 +84,7 @@ Shell execution is where the agent loop interacts most visibly with the outside 
 ```text
 Sequential (SimpleTaskManager):
 
-  Model: ToolCall(shell.exec, { executable: "cargo", args: ["build"] })
+  Model: ToolCall(shell.exec, { executable: "cargo", argv: ["build"] })
   Driver: execute inline, wait for completion (10 seconds)
   Driver: append result to transcript
   Driver: start next model turn
@@ -92,11 +92,11 @@ Sequential (SimpleTaskManager):
 
 With ForegroundThenDetachAfter(5s):
 
-  Model: ToolCall(shell.exec, { executable: "cargo", args: ["build"] })
+  Model: ToolCall(shell.exec, { executable: "cargo", argv: ["build"] })
   Driver: start executing, wait up to 5 seconds
   └── if finishes in 3s → result appended, loop continues normally
   └── if still running at 5s → detach to background
-      └── model receives "task detached" notification
+      └── model receives a synthetic tool result: "task is running in the background"
       └── model continues its turn (e.g. reads another file)
       └── when build finishes, result appears in next turn
 ```

@@ -38,10 +38,9 @@ let tools = agentkit_tool_fs::registry()
     .merge(agentkit_tool_shell::registry());
 
 // 2. Configure permissions
-let permissions = CompositePermissionChecker::new()
-    .with_policy(PathPolicy::workspace(workspace_root))
-    .with_policy(CommandPolicy::new().require_approval_for_unknown(true))
-    .with_fallback(PermissionDecision::Deny(default_denial()));
+let permissions = CompositePermissionChecker::new(PermissionDecision::Deny(default_denial()))
+    .with_policy(PathPolicy::new().allow_root(workspace_root))
+    .with_policy(CommandPolicy::new().require_approval_for_unknown(true));
 
 // 3. Configure compaction
 let compaction = CompactionConfig::new(
@@ -55,7 +54,7 @@ let compaction = CompactionConfig::new(
 
 // 4. Configure task management
 let task_manager = AsyncTaskManager::new().routing(|req: &ToolRequest| {
-    if req.tool_name.as_ref() == "shell.exec" {
+    if req.tool_name.0 == "shell.exec" {
         RoutingDecision::ForegroundThenDetachAfter(Duration::from_secs(10))
     } else {
         RoutingDecision::Foreground
@@ -64,8 +63,8 @@ let task_manager = AsyncTaskManager::new().routing(|req: &ToolRequest| {
 
 // 5. Configure reporting
 let reporter = CompositeReporter::new()
-    .with(StdoutReporter::new())
-    .with(UsageReporter::new());
+    .with_observer(StdoutReporter::new(std::io::stderr()))
+    .with_observer(UsageReporter::new());
 
 // 6. Load context
 let context_items = ContextLoader::new()
@@ -75,7 +74,7 @@ let context_items = ContextLoader::new()
 
 // 7. Assemble the agent
 let agent = Agent::builder()
-    .model(OpenRouterAdapter::new(api_key, model))
+    .model(OpenRouterAdapter::new(OpenRouterConfig::new(api_key, model))?)
     .tools(tools)
     .permissions(permissions)
     .compaction(compaction)

@@ -115,7 +115,7 @@ After resolution, the host calls `next()` again. If approved, the tool executes 
     └── tool executes → result appended → loop resumes
                     OR
 5b. host calls pending.deny(driver)
-    └── denial sent to model as ToolResult { is_error: true, output: "Permission denied: ..." }
+    └── denial sent to model as ToolResultPart { is_error: true, output: "Permission denied: ..." }
     └── model sees the error and may try a different approach
 ```
 
