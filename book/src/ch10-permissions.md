@@ -110,6 +110,7 @@ Precedence rules:
 let checker = CompositePermissionChecker::new(PermissionDecision::Deny(default_denial()))
     .with_policy(PathPolicy::new()
         .allow_root("/workspace")
+        .read_only_root("/workspace/vendor")
         .protect_root("/workspace/.env")
         .protect_root("/workspace/secrets/"))
     .with_policy(CommandPolicy::new()
@@ -133,6 +134,10 @@ Request: FileSystem::Read("/workspace/src/main.rs")
 
 Request: FileSystem::Write("/workspace/.env")
   PathPolicy:    /workspace/.env is denied → Deny
+  Result: Deny ✗ (short-circuit)
+
+Request: FileSystem::Edit("/workspace/vendor/lib.rs")
+  PathPolicy:    /workspace/vendor is read-only → Deny
   Result: Deny ✗ (short-circuit)
 
 Request: Shell("curl", ["https://evil.com"])

@@ -1196,11 +1196,13 @@ impl PermissionPolicy for CustomKindPolicy {
 ///
 /// let policy = PathPolicy::new()
 ///     .allow_root("/workspace/project")
+///     .read_only_root("/workspace/project/vendor")
 ///     .protect_root("/workspace/project/.env")
 ///     .require_approval_outside_allowed(true);
 /// ```
 pub struct PathPolicy {
     allowed_roots: Vec<PathBuf>,
+    read_only_roots: Vec<PathBuf>,
     protected_roots: Vec<PathBuf>,
     require_approval_outside_allowed: bool,
 }
@@ -1211,6 +1213,7 @@ impl PathPolicy {
     pub fn new() -> Self {
         Self {
             allowed_roots: Vec::new(),
+            read_only_roots: Vec::new(),
             protected_roots: Vec::new(),
             require_approval_outside_allowed: true,
         }
@@ -1219,6 +1222,12 @@ impl PathPolicy {
     /// Adds a directory tree that filesystem operations are allowed to target.
     pub fn allow_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.allowed_roots.push(root.into());
+        self
+    }
+
+    /// Adds a directory tree that may be read or listed but not mutated.
+    pub fn read_only_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.read_only_roots.push(root.into());
         self
     }
 
@@ -1268,6 +1277,15 @@ impl PermissionPolicy for PathPolicy {
             .map(|p| std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf()))
             .collect();
 
+        let mutates = matches!(
+            fs,
+            FileSystemPermissionRequest::Write { .. }
+                | FileSystemPermissionRequest::Edit { .. }
+                | FileSystemPermissionRequest::Delete { .. }
+                | FileSystemPermissionRequest::Move { .. }
+                | FileSystemPermissionRequest::CreateDir { .. }
+        );
+
         if candidate_paths.iter().any(|path| {
             self.protected_roots
                 .iter()
@@ -1276,6 +1294,20 @@ impl PermissionPolicy for PathPolicy {
             return PolicyMatch::Deny(PermissionDenial {
                 code: PermissionCode::PathNotAllowed,
                 message: format!("path access denied for {}", fs.summary()),
+                metadata: fs.metadata().clone(),
+            });
+        }
+
+        if mutates
+            && candidate_paths.iter().any(|path| {
+                self.read_only_roots
+                    .iter()
+                    .any(|root| path.starts_with(root))
+            })
+        {
+            return PolicyMatch::Deny(PermissionDenial {
+                code: PermissionCode::PathNotAllowed,
+                message: format!("path is read-only for {}", fs.summary()),
                 metadata: fs.metadata().clone(),
             });
         }
@@ -1720,6 +1752,19 @@ impl ToolRegistry {
         self.tools.values().cloned().collect()
     }
 
+    /// Merges all tools from another registry into this one, consuming it.
+    ///
+    /// Supports builder-style chaining:
+    ///
+    /// ```ignore
+    /// let registry = agentkit_tool_fs::registry()
+    ///     .merge(agentkit_tool_shell::registry());
+    /// ```
+    pub fn merge(mut self, other: Self) -> Self {
+        self.tools.extend(other.tools);
+        self
+    }
+
     /// Returns the [`ToolSpec`] for every registered tool.
     pub fn specs(&self) -> Vec<ToolSpec> {
         self.tools
@@ -2149,6 +2194,55 @@ mod tests {
         match policy.evaluate(&request) {
             PolicyMatch::Deny(denial) => {
                 assert_eq!(denial.code, PermissionCode::CommandNotAllowed);
+            }
+            other => panic!("unexpected policy match: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn path_policy_allows_reads_under_read_only_roots() {
+        let policy = PathPolicy::new().read_only_root("/workspace/vendor");
+        let request = FileSystemPermissionRequest::Read {
+            path: PathBuf::from("/workspace/vendor/lib.rs"),
+            metadata: MetadataMap::new(),
+        };
+
+        match policy.evaluate(&request) {
+            PolicyMatch::NoOpinion | PolicyMatch::Allow => {}
+            other => panic!("unexpected policy match: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn path_policy_denies_mutations_under_read_only_roots() {
+        let policy = PathPolicy::new().read_only_root("/workspace/vendor");
+        let request = FileSystemPermissionRequest::Edit {
+            path: PathBuf::from("/workspace/vendor/lib.rs"),
+            metadata: MetadataMap::new(),
+        };
+
+        match policy.evaluate(&request) {
+            PolicyMatch::Deny(denial) => {
+                assert_eq!(denial.code, PermissionCode::PathNotAllowed);
+                assert!(denial.message.contains("read-only"));
+            }
+            other => panic!("unexpected policy match: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn path_policy_denies_moves_into_read_only_roots() {
+        let policy = PathPolicy::new().read_only_root("/workspace/vendor");
+        let request = FileSystemPermissionRequest::Move {
+            from: PathBuf::from("/workspace/src/lib.rs"),
+            to: PathBuf::from("/workspace/vendor/lib.rs"),
+            metadata: MetadataMap::new(),
+        };
+
+        match policy.evaluate(&request) {
+            PolicyMatch::Deny(denial) => {
+                assert_eq!(denial.code, PermissionCode::PathNotAllowed);
+                assert!(denial.message.contains("read-only"));
             }
             other => panic!("unexpected policy match: {other:?}"),
         }
