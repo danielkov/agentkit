@@ -10,8 +10,8 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-agentkit-core = { version = "0.2.0", path = "../agentkit-core" }
-agentkit-tools-core = { version = "0.2.0", path = "../agentkit-tools-core" }
+agentkit-core = { version = "0.2.1", path = "../agentkit-core" }
+agentkit-tools-core = { version = "0.2.1", path = "../agentkit-tools-core" }
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -19,4 +19,4 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["process", "time"] }
 
 [dev-dependencies]
-agentkit-capabilities = { version = "0.2.0", path = "../agentkit-capabilities" }
+agentkit-capabilities = { version = "0.2.1", path = "../agentkit-capabilities" }
