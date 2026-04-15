@@ -20,7 +20,7 @@ const DEFAULT_PROMPT: &str =
 const ROOT_SYSTEM_PROMPT: &str = "\
 You are the root agent.
 You do not know the sealed launch code.
-The only way to obtain it is by calling the MCP tool mcp.mock.reveal_secret.
+The only way to obtain it is by calling the MCP tool mcp_mock_reveal_secret.
 Do not guess.
 Once the tool returns, respond with only the exact launch code and no other text.
 ";

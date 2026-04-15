@@ -14,7 +14,7 @@ async fn root_agent_retrieves_secret_via_mcp_tool() {
     assert!(
         run.tool_calls
             .iter()
-            .any(|name| name == "mcp.mock.reveal_secret"),
+            .any(|name| name == "mcp_mock_reveal_secret"),
         "expected the root agent to call the MCP tool, saw {:?}",
         run.tool_calls
     );

@@ -1418,7 +1418,9 @@ impl McpConnection {
 /// Adapter that exposes an MCP tool as an [`Invocable`] for the capabilities system.
 ///
 /// This is the capabilities-layer adapter. For the tool-layer adapter, see
-/// [`McpToolAdapter`]. Names are prefixed with `mcp.<server_id>.<tool_name>`.
+/// [`McpToolAdapter`]. Names are prefixed with `mcp_<server_id>_<tool_name>`
+/// so they satisfy provider validators that only allow `[a-zA-Z0-9_-]`
+/// (e.g. Anthropic on Vertex).
 pub struct McpInvocable {
     connection: Arc<McpConnection>,
     descriptor: McpToolDescriptor,
@@ -1435,7 +1437,7 @@ impl McpInvocable {
     pub fn new(connection: Arc<McpConnection>, descriptor: McpToolDescriptor) -> Self {
         let spec = InvocableSpec {
             name: CapabilityName::new(format!(
-                "mcp.{}.{}",
+                "mcp_{}_{}",
                 connection.server_id(),
                 descriptor.name
             )),
@@ -2032,7 +2034,7 @@ impl McpServerManager {
     /// Builds a combined [`ToolRegistry`] containing [`McpToolAdapter`]s for every
     /// tool discovered across all connected servers.
     ///
-    /// Tool names are prefixed as `mcp.<server_id>.<tool_name>`.
+    /// Tool names are prefixed as `mcp_<server_id>_<tool_name>`.
     pub fn tool_registry(&self) -> ToolRegistry {
         self.connections
             .values()
@@ -2063,7 +2065,7 @@ impl McpServerManager {
 ///
 /// This is the tool-layer adapter for the tool registry. For the capabilities-layer
 /// adapter, see [`McpInvocable`]. Tool names are prefixed as
-/// `mcp.<server_id>.<tool_name>`.
+/// `mcp_<server_id>_<tool_name>`.
 ///
 /// # Example
 ///
@@ -2094,7 +2096,7 @@ impl McpToolAdapter {
         descriptor: McpToolDescriptor,
     ) -> Self {
         let spec = ToolSpec {
-            name: ToolName::new(format!("mcp.{}.{}", server_id, descriptor.name)),
+            name: ToolName::new(format!("mcp_{}_{}", server_id, descriptor.name)),
             description: descriptor
                 .description
                 .clone()
@@ -2392,7 +2394,7 @@ fn auth_operation_for_method(
 }
 
 fn normalize_mcp_tool_name(server_id: &McpServerId, tool_name: &str) -> String {
-    let prefix = format!("mcp.{server_id}.");
+    let prefix = format!("mcp_{server_id}_");
     tool_name
         .strip_prefix(&prefix)
         .unwrap_or(tool_name)
@@ -2743,7 +2745,7 @@ mod tests {
             .invoke(
                 ToolRequest {
                     call_id: "call-1".into(),
-                    tool_name: ToolName::new("mcp.fake.echo"),
+                    tool_name: ToolName::new("mcp_fake_echo"),
                     input: json!({}),
                     session_id: "session-1".into(),
                     turn_id: "turn-1".into(),
@@ -2827,7 +2829,7 @@ mod tests {
             .invoke(
                 ToolRequest {
                     call_id: "call-1".into(),
-                    tool_name: ToolName::new("mcp.fake.echo"),
+                    tool_name: ToolName::new("mcp_fake_echo"),
                     input: json!({}),
                     session_id: "session-1".into(),
                     turn_id: "turn-1".into(),
@@ -3357,7 +3359,7 @@ mod tests {
                 .into_iter()
                 .map(|spec| spec.name.0)
                 .collect::<Vec<_>>(),
-            vec!["mcp.alpha.echo".to_string(), "mcp.beta.search".to_string()]
+            vec!["mcp_alpha_echo".to_string(), "mcp_beta_search".to_string()]
         );
 
         let refreshed = manager
