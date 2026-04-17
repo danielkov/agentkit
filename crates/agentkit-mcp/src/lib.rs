@@ -481,7 +481,7 @@ fn resolve_http_client(configured: Option<&Http>) -> Result<Http, McpError> {
     }
     #[cfg(feature = "reqwest-client")]
     {
-        agentkit_http::reqwest::Client::builder()
+        reqwest::Client::builder()
             .user_agent(concat!("agentkit-mcp/", env!("CARGO_PKG_VERSION")))
             .build()
             .map(Http::new)

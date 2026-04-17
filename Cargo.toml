@@ -30,6 +30,7 @@ members = [
     "examples/openrouter-mcp-tool",
     "examples/openrouter-subagent-tool",
     "examples/mcp-reference-interop",
+    "examples/mcp-dynamic-auth",
     "projects/how",
 ]
 resolver = "2"

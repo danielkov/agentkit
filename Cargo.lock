@@ -98,6 +98,7 @@ dependencies = [
  "futures-util",
  "http",
  "reqwest",
+ "reqwest-middleware",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -130,6 +131,7 @@ dependencies = [
  "agentkit-tools-core",
  "async-trait",
  "futures-util",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -1457,6 +1459,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
+name = "mcp-dynamic-auth"
+version = "0.2.3"
+dependencies = [
+ "agentkit-http",
+ "agentkit-mcp",
+ "async-trait",
+ "axum",
+ "http",
+ "reqwest",
+ "reqwest-middleware",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "mcp-reference-interop"
 version = "0.2.3"
 dependencies = [
@@ -1964,6 +1981,20 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-streams",
  "web-sys",
+]
+
+[[package]]
+name = "reqwest-middleware"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "199dda04a536b532d0cc04d7979e39b1c763ea749bf91507017069c00b96056f"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "http",
+ "reqwest",
+ "thiserror 2.0.18",
+ "tower-service",
 ]
 
 [[package]]

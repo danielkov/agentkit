@@ -11,7 +11,7 @@ rust-version.workspace = true
 
 [features]
 default = ["reqwest-client"]
-reqwest-client = ["agentkit-http/reqwest-client"]
+reqwest-client = ["agentkit-http/reqwest-client", "dep:reqwest"]
 
 [dependencies]
 agentkit-capabilities = { version = "0.2.3", path = "../agentkit-capabilities" }
@@ -26,3 +26,4 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "net", "process", "sync", "time"] }
 tokio-util = { version = "0.7.16", features = ["io"] }
+reqwest = { workspace = true, optional = true }

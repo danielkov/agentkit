@@ -13,15 +13,15 @@ mod response;
 #[cfg(feature = "reqwest-client")]
 mod reqwest_impl;
 
+#[cfg(feature = "reqwest-middleware-client")]
+mod reqwest_middleware_impl;
+
 pub use client::{Http, HttpClient};
 pub use error::{BoxError, HttpError};
 pub use request::{HttpRequest, HttpRequestBuilder};
 pub use response::{BodyStream, HttpResponse};
 
 pub use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, header};
-
-#[cfg(feature = "reqwest-client")]
-pub use reqwest;
 
 #[cfg(test)]
 mod tests {
