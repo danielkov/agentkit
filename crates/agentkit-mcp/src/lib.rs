@@ -14,13 +14,15 @@ use agentkit_capabilities::{
 use agentkit_core::{
     DataRef, Item, ItemKind, MetadataMap, Part, TextPart, ToolOutput, ToolResultPart,
 };
+use agentkit_http::{
+    HeaderMap, Http, HttpError, HttpRequestBuilder, HttpResponse, StatusCode, header as http_header,
+};
 use agentkit_tools_core::{
     AuthOperation, AuthRequest, AuthResolution, Tool, ToolAnnotations, ToolContext, ToolError,
     ToolName, ToolRegistry, ToolRequest, ToolResult, ToolSpec,
 };
 use async_trait::async_trait;
 use futures_util::TryStreamExt;
-use reqwest::{Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -30,6 +32,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tokio_util::io::StreamReader;
+use url::Url;
 
 const MCP_LATEST_PROTOCOL_VERSION: &str = "2025-11-25";
 const MCP_SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
@@ -130,20 +133,17 @@ impl StdioTransportConfig {
 /// SSE stream to the given URL, receives an `endpoint` event pointing to the POST
 /// endpoint, and then exchanges JSON-RPC messages over that endpoint.
 ///
-/// # Example
-///
-/// ```rust
-/// use agentkit_mcp::SseTransportConfig;
-///
-/// let config = SseTransportConfig::new("https://mcp.example.com/sse")
-///     .with_header("Authorization", "Bearer tok_abc123");
-/// ```
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Auth headers and other per-request customisation live on the [`Http`] client
+/// — either via `reqwest::ClientBuilder::default_headers` or a custom
+/// [`agentkit_http::HttpClient`] implementation — passed in through
+/// [`with_client`](Self::with_client).
+#[derive(Clone, Debug)]
 pub struct SseTransportConfig {
     /// The SSE endpoint URL to connect to.
     pub url: String,
-    /// Additional HTTP headers sent with every request (e.g. authentication tokens).
-    pub headers: Vec<(String, String)>,
+    /// HTTP client used for all requests on this transport. When `None`, the
+    /// factory builds a default reqwest-backed client with agentkit's user agent.
+    pub client: Option<Http>,
 }
 
 impl SseTransportConfig {
@@ -151,13 +151,15 @@ impl SseTransportConfig {
     pub fn new(url: impl Into<String>) -> Self {
         Self {
             url: url.into(),
-            headers: Vec::new(),
+            client: None,
         }
     }
 
-    /// Adds an HTTP header to include with every request. Returns `self` for chaining.
-    pub fn with_header(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        self.headers.push((key.into(), value.into()));
+    /// Supplies a pre-configured HTTP client. Use this to attach auth headers
+    /// (via `reqwest::ClientBuilder::default_headers`), install retry/tracing
+    /// middleware, or plug in a non-reqwest backend.
+    pub fn with_client(mut self, client: Http) -> Self {
+        self.client = Some(client);
         self
     }
 }
@@ -168,20 +170,15 @@ impl SseTransportConfig {
 /// endpoint supporting JSON-RPC over POST, with optional SSE responses for
 /// streaming server messages.
 ///
-/// # Example
-///
-/// ```rust
-/// use agentkit_mcp::StreamableHttpTransportConfig;
-///
-/// let config = StreamableHttpTransportConfig::new("https://mcp.example.com/mcp")
-///     .with_header("Authorization", "Bearer tok_abc123");
-/// ```
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Auth headers and other per-request customisation live on the [`Http`] client
+/// passed in via [`with_client`](Self::with_client).
+#[derive(Clone, Debug)]
 pub struct StreamableHttpTransportConfig {
     /// The MCP endpoint URL to connect to.
     pub url: String,
-    /// Additional HTTP headers sent with every request (e.g. authentication tokens).
-    pub headers: Vec<(String, String)>,
+    /// HTTP client used for all requests on this transport. When `None`, the
+    /// factory builds a default reqwest-backed client with agentkit's user agent.
+    pub client: Option<Http>,
 }
 
 impl StreamableHttpTransportConfig {
@@ -189,13 +186,14 @@ impl StreamableHttpTransportConfig {
     pub fn new(url: impl Into<String>) -> Self {
         Self {
             url: url.into(),
-            headers: Vec::new(),
+            client: None,
         }
     }
 
-    /// Adds an HTTP header to include with every request. Returns `self` for chaining.
-    pub fn with_header(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        self.headers.push((key.into(), value.into()));
+    /// Supplies a pre-configured HTTP client. See
+    /// [`SseTransportConfig::with_client`] for the typical use cases.
+    pub fn with_client(mut self, client: Http) -> Self {
+        self.client = Some(client);
         self
     }
 }
@@ -418,21 +416,15 @@ impl StreamableHttpTransportFactory {
 #[async_trait]
 impl McpTransportFactory for SseTransportFactory {
     async fn connect(&self) -> Result<Box<dyn McpTransport>, McpError> {
-        let client = Client::builder()
-            .user_agent(concat!("agentkit-mcp/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .map_err(McpError::Http)?;
+        let client = resolve_http_client(self.config.client.as_ref())?;
 
-        let mut request = client
-            .get(&self.config.url)
+        let response = client
+            .get(self.config.url.as_str())
             .header("Accept", "text/event-stream")
-            .header("Cache-Control", "no-cache");
+            .header("Cache-Control", "no-cache")
+            .send()
+            .await?;
 
-        for (key, value) in &self.config.headers {
-            request = request.header(key, value);
-        }
-
-        let response = request.send().await.map_err(McpError::Http)?;
         let status = response.status();
         if !status.is_success() {
             let body = response
@@ -444,7 +436,8 @@ impl McpTransportFactory for SseTransportFactory {
             )));
         }
 
-        let response_url = response.url().clone();
+        let response_url = Url::parse(response.url())
+            .map_err(|error| McpError::Transport(format!("invalid SSE response URL: {error}")))?;
         let stream = response.bytes_stream().map_err(std::io::Error::other);
         let reader = BufReader::new(StreamReader::new(stream));
         let (frame_tx, frame_rx) = mpsc::unbounded_channel();
@@ -458,7 +451,6 @@ impl McpTransportFactory for SseTransportFactory {
         Ok(Box::new(SseTransport {
             client,
             endpoint_url,
-            headers: self.config.headers.clone(),
             frame_rx,
             read_task,
         }))
@@ -468,10 +460,7 @@ impl McpTransportFactory for SseTransportFactory {
 #[async_trait]
 impl McpTransportFactory for StreamableHttpTransportFactory {
     async fn connect(&self) -> Result<Box<dyn McpTransport>, McpError> {
-        let client = Client::builder()
-            .user_agent(concat!("agentkit-mcp/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .map_err(McpError::Http)?;
+        let client = resolve_http_client(self.config.client.as_ref())?;
 
         let endpoint_url = Url::parse(&self.config.url)
             .map_err(|error| McpError::Transport(format!("invalid MCP endpoint URL: {error}")))?;
@@ -479,11 +468,30 @@ impl McpTransportFactory for StreamableHttpTransportFactory {
         Ok(Box::new(StreamableHttpTransport {
             client,
             endpoint_url,
-            headers: self.config.headers.clone(),
             protocol_version: None,
             session_id: None,
             pending_frames: VecDeque::new(),
         }))
+    }
+}
+
+fn resolve_http_client(configured: Option<&Http>) -> Result<Http, McpError> {
+    if let Some(client) = configured {
+        return Ok(client.clone());
+    }
+    #[cfg(feature = "reqwest-client")]
+    {
+        agentkit_http::reqwest::Client::builder()
+            .user_agent(concat!("agentkit-mcp/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .map(Http::new)
+            .map_err(|error| McpError::Http(HttpError::request(error)))
+    }
+    #[cfg(not(feature = "reqwest-client"))]
+    {
+        Err(McpError::Transport(
+            "no HTTP client configured; enable the `reqwest-client` feature or supply one via `with_client`".into(),
+        ))
     }
 }
 
@@ -494,17 +502,15 @@ struct StdioTransport {
 }
 
 struct SseTransport {
-    client: Client,
+    client: Http,
     endpoint_url: Url,
-    headers: Vec<(String, String)>,
     frame_rx: mpsc::UnboundedReceiver<Result<McpFrame, McpError>>,
     read_task: JoinHandle<()>,
 }
 
 struct StreamableHttpTransport {
-    client: Client,
+    client: Http,
     endpoint_url: Url,
-    headers: Vec<(String, String)>,
     protocol_version: Option<String>,
     session_id: Option<String>,
     pending_frames: VecDeque<McpFrame>,
@@ -545,20 +551,13 @@ impl McpTransport for StdioTransport {
 #[async_trait]
 impl McpTransport for SseTransport {
     async fn send(&mut self, message: McpFrame) -> Result<(), McpError> {
-        let mut request = self
+        let response = self
             .client
-            .post(self.endpoint_url.clone())
-            .header("Content-Type", "application/json");
-
-        for (key, value) in &self.headers {
-            request = request.header(key, value);
-        }
-
-        let response = request
+            .post(self.endpoint_url.as_str())
+            .header("Content-Type", "application/json")
             .json(&message.value)
             .send()
-            .await
-            .map_err(McpError::Http)?;
+            .await?;
         let status = response.status();
         if !status.is_success() {
             let body = response
@@ -597,22 +596,17 @@ impl McpTransport for StreamableHttpTransport {
 
         let mut request = self
             .client
-            .post(self.endpoint_url.clone())
+            .post(self.endpoint_url.as_str())
             .header("Content-Type", "application/json")
             .header("Accept", "application/json, text/event-stream");
 
         request = apply_streamable_http_headers(
             request,
-            &self.headers,
             self.protocol_version.as_deref(),
             self.session_id.as_deref(),
         );
 
-        let response = request
-            .json(&message.value)
-            .send()
-            .await
-            .map_err(McpError::Http)?;
+        let response = request.json(&message.value).send().await?;
 
         if is_initialize {
             self.capture_session_id(response.headers());
@@ -631,13 +625,13 @@ impl McpTransport for StreamableHttpTransport {
 
         let content_type = response
             .headers()
-            .get(reqwest::header::CONTENT_TYPE)
+            .get(http_header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .unwrap_or_default()
             .to_string();
 
         if content_type.starts_with("application/json") {
-            let value = response.json::<Value>().await.map_err(McpError::Http)?;
+            let value: Value = response.json().await?;
             self.maybe_update_protocol_version(&message.value, &value)?;
             self.pending_frames.push_back(McpFrame { value });
             return Ok(());
@@ -669,15 +663,14 @@ impl McpTransport for StreamableHttpTransport {
             return Ok(());
         };
 
-        let mut request = self.client.delete(self.endpoint_url.clone());
+        let mut request = self.client.delete(self.endpoint_url.as_str());
         request = apply_streamable_http_headers(
             request,
-            &self.headers,
             self.protocol_version.as_deref(),
             Some(session_id.as_str()),
         );
 
-        let response = request.send().await.map_err(McpError::Http)?;
+        let response = request.send().await?;
         if response.status().is_success()
             || response.status() == StatusCode::METHOD_NOT_ALLOWED
             || response.status() == StatusCode::NOT_FOUND
@@ -696,7 +689,7 @@ impl McpTransport for StreamableHttpTransport {
 impl StreamableHttpTransport {
     async fn collect_streamable_http_response(
         &mut self,
-        response: reqwest::Response,
+        response: HttpResponse,
         request_message: &Value,
         request_id: &Value,
     ) -> Result<(), McpError> {
@@ -738,7 +731,7 @@ impl StreamableHttpTransport {
 
     async fn read_streamable_http_events(
         &mut self,
-        response: reqwest::Response,
+        response: HttpResponse,
         request_message: &Value,
         request_id: &Value,
         last_event_id: &mut Option<String>,
@@ -773,22 +766,21 @@ impl StreamableHttpTransport {
     async fn resume_streamable_http_stream(
         &self,
         last_event_id: &str,
-    ) -> Result<reqwest::Response, McpError> {
+    ) -> Result<HttpResponse, McpError> {
         let mut request = self
             .client
-            .get(self.endpoint_url.clone())
+            .get(self.endpoint_url.as_str())
             .header("Accept", "text/event-stream")
             .header("Cache-Control", "no-cache")
             .header("Last-Event-ID", last_event_id);
 
         request = apply_streamable_http_headers(
             request,
-            &self.headers,
             self.protocol_version.as_deref(),
             self.session_id.as_deref(),
         );
 
-        let response = request.send().await.map_err(McpError::Http)?;
+        let response = request.send().await?;
         let status = response.status();
         if !status.is_success() {
             return Err(
@@ -798,7 +790,7 @@ impl StreamableHttpTransport {
 
         let content_type = response
             .headers()
-            .get(reqwest::header::CONTENT_TYPE)
+            .get(http_header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .unwrap_or_default();
         if !content_type.starts_with("text/event-stream") {
@@ -836,7 +828,7 @@ impl StreamableHttpTransport {
         Ok(())
     }
 
-    fn capture_session_id(&mut self, headers: &reqwest::header::HeaderMap) {
+    fn capture_session_id(&mut self, headers: &HeaderMap) {
         self.session_id = headers
             .get("MCP-Session-Id")
             .and_then(|value| value.to_str().ok())
@@ -2559,15 +2551,10 @@ fn is_jsonrpc_request(value: &Value) -> bool {
 }
 
 fn apply_streamable_http_headers(
-    mut request: reqwest::RequestBuilder,
-    headers: &[(String, String)],
+    mut request: HttpRequestBuilder,
     protocol_version: Option<&str>,
     session_id: Option<&str>,
-) -> reqwest::RequestBuilder {
-    for (key, value) in headers {
-        request = request.header(key, value);
-    }
-
+) -> HttpRequestBuilder {
     if let Some(protocol_version) = protocol_version {
         request = request.header("MCP-Protocol-Version", protocol_version);
     }
@@ -2581,7 +2568,7 @@ fn apply_streamable_http_headers(
 async fn streamable_http_status_error(
     operation: &str,
     status: StatusCode,
-    response: reqwest::Response,
+    response: HttpResponse,
 ) -> McpError {
     let body = response
         .text()
@@ -2596,9 +2583,9 @@ pub enum McpError {
     /// An underlying I/O error (e.g. spawning a child process or reading from a pipe).
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
-    /// An HTTP-level error from the SSE transport.
+    /// An HTTP-level error surfaced by the configured [`agentkit_http::HttpClient`].
     #[error("http error: {0}")]
-    Http(#[from] reqwest::Error),
+    Http(#[from] HttpError),
     /// A JSON serialization or deserialization error.
     #[error("serialization error: {0}")]
     Serialize(#[from] serde_json::Error),

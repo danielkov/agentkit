@@ -27,12 +27,12 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use agentkit_core::{MetadataMap, TurnCancellation, Usage};
+use agentkit_http::{Http, HttpError, HttpRequestBuilder, StatusCode};
 use agentkit_loop::{
     LoopError, ModelAdapter, ModelSession, ModelTurn, ModelTurnEvent, SessionConfig, TurnRequest,
 };
 use async_trait::async_trait;
 use futures_util::future::{Either, select};
-use reqwest::Client;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -81,7 +81,7 @@ pub trait CompletionsProvider: Send + Sync + Clone {
     /// or apply any other request-level customisation.
     ///
     /// The default implementation passes the builder through unchanged.
-    fn preprocess_request(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    fn preprocess_request(&self, builder: HttpRequestBuilder) -> HttpRequestBuilder {
         builder
     }
 
@@ -106,11 +106,7 @@ pub trait CompletionsProvider: Send + Sync + Clone {
     /// response (e.g. for providers that return HTTP 200 with an error payload).
     ///
     /// The default implementation does nothing.
-    fn preprocess_response(
-        &self,
-        _status: reqwest::StatusCode,
-        _body: &str,
-    ) -> Result<(), LoopError> {
+    fn preprocess_response(&self, _status: StatusCode, _body: &str) -> Result<(), LoopError> {
         Ok(())
     }
 
@@ -137,18 +133,19 @@ pub trait CompletionsProvider: Send + Sync + Clone {
 /// [`Agent::builder().model()`](agentkit_loop::Agent::builder).
 #[derive(Clone)]
 pub struct CompletionsAdapter<P: CompletionsProvider> {
-    client: Client,
+    client: Http,
     provider: Arc<P>,
 }
 
 impl<P: CompletionsProvider> CompletionsAdapter<P> {
     /// Creates a new adapter from the given provider.
     ///
-    /// Initialises an HTTP client that will be reused for all sessions and turns.
+    /// Builds a default reqwest-backed HTTP client reused for all sessions and turns.
     pub fn new(provider: P) -> Result<Self, CompletionsError> {
-        let client = Client::builder()
+        let client = reqwest::Client::builder()
             .build()
-            .map_err(CompletionsError::HttpClient)?;
+            .map(Http::new)
+            .map_err(|error| CompletionsError::HttpClient(HttpError::request(error)))?;
 
         Ok(Self {
             client,
@@ -156,10 +153,10 @@ impl<P: CompletionsProvider> CompletionsAdapter<P> {
         })
     }
 
-    /// Creates a new adapter with a pre-existing `reqwest::Client`.
-    ///
-    /// Useful when you need custom TLS configuration, proxies, or connection pooling.
-    pub fn with_client(provider: P, client: Client) -> Self {
+    /// Creates a new adapter with a pre-configured [`Http`] client. Use this to
+    /// attach auth headers via `default_headers`, supply custom TLS/proxies,
+    /// or plug in a non-reqwest backend.
+    pub fn with_client(provider: P, client: Http) -> Self {
         Self {
             client,
             provider: Arc::new(provider),
@@ -171,7 +168,7 @@ impl<P: CompletionsProvider> CompletionsAdapter<P> {
 ///
 /// Created by [`CompletionsAdapter::start_session`](ModelAdapter::start_session).
 pub struct CompletionsSession<P: CompletionsProvider> {
-    client: Client,
+    client: Http,
     provider: Arc<P>,
     _session_config: SessionConfig,
 }

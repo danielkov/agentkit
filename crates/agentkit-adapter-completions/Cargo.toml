@@ -11,6 +11,7 @@ version.workspace = true
 
 [dependencies]
 agentkit-core = { version = "0.2.3", path = "../agentkit-core" }
+agentkit-http = { version = "0.2.3", path = "../agentkit-http" }
 agentkit-loop = { version = "0.2.3", path = "../agentkit-loop" }
 agentkit-tools-core = { version = "0.2.3", path = "../agentkit-tools-core" }
 async-trait.workspace = true

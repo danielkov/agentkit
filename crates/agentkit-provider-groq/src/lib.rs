@@ -174,7 +174,10 @@ impl CompletionsProvider for GroqProvider {
         &self.request_config
     }
 
-    fn preprocess_request(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    fn preprocess_request(
+        &self,
+        builder: agentkit_http::HttpRequestBuilder,
+    ) -> agentkit_http::HttpRequestBuilder {
         builder.bearer_auth(&self.api_key).header(
             "User-Agent",
             concat!("agentkit-provider-groq/", env!("CARGO_PKG_VERSION")),

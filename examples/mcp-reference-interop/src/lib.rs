@@ -333,12 +333,12 @@ async fn capture_transport_exchange(
 
 fn binary_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
-    if let Ok(current) = env::current_exe() {
-        if let Some(dir) = current.parent() {
-            candidates.push(dir.join("mcp-reference-server"));
-            if let Some(parent) = dir.parent() {
-                candidates.push(parent.join("mcp-reference-server"));
-            }
+    if let Ok(current) = env::current_exe()
+        && let Some(dir) = current.parent()
+    {
+        candidates.push(dir.join("mcp-reference-server"));
+        if let Some(parent) = dir.parent() {
+            candidates.push(parent.join("mcp-reference-server"));
         }
     }
     candidates

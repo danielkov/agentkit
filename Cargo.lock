@@ -32,6 +32,7 @@ name = "agentkit-adapter-completions"
 version = "0.2.3"
 dependencies = [
  "agentkit-core",
+ "agentkit-http",
  "agentkit-loop",
  "agentkit-tools-core",
  "async-trait",
@@ -89,6 +90,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentkit-http"
+version = "0.2.3"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "futures-util",
+ "http",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "agentkit-loop"
 version = "0.2.3"
 dependencies = [
@@ -110,15 +126,16 @@ version = "0.2.3"
 dependencies = [
  "agentkit-capabilities",
  "agentkit-core",
+ "agentkit-http",
  "agentkit-tools-core",
  "async-trait",
  "futures-util",
- "reqwest",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
+ "url",
 ]
 
 [[package]]
@@ -127,9 +144,9 @@ version = "0.2.3"
 dependencies = [
  "agentkit-adapter-completions",
  "agentkit-core",
+ "agentkit-http",
  "agentkit-loop",
  "async-trait",
- "reqwest",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -141,9 +158,9 @@ version = "0.2.3"
 dependencies = [
  "agentkit-adapter-completions",
  "agentkit-core",
+ "agentkit-http",
  "agentkit-loop",
  "async-trait",
- "reqwest",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -155,9 +172,9 @@ version = "0.2.3"
 dependencies = [
  "agentkit-adapter-completions",
  "agentkit-core",
+ "agentkit-http",
  "agentkit-loop",
  "async-trait",
- "reqwest",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -169,9 +186,9 @@ version = "0.2.3"
 dependencies = [
  "agentkit-adapter-completions",
  "agentkit-core",
+ "agentkit-http",
  "agentkit-loop",
  "async-trait",
- "reqwest",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -183,9 +200,9 @@ version = "0.2.3"
 dependencies = [
  "agentkit-adapter-completions",
  "agentkit-core",
+ "agentkit-http",
  "agentkit-loop",
  "async-trait",
- "reqwest",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -197,9 +214,9 @@ version = "0.2.3"
 dependencies = [
  "agentkit-adapter-completions",
  "agentkit-core",
+ "agentkit-http",
  "agentkit-loop",
  "async-trait",
- "reqwest",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

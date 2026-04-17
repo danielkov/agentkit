@@ -118,17 +118,25 @@ let capability_provider = manager.capability_provider();
 For modern remote MCP servers exposed over HTTP, use the Streamable HTTP transport:
 
 ```rust,no_run
+use agentkit_http::{Http, HeaderMap, HeaderValue, header::AUTHORIZATION};
 use agentkit_mcp::{
     McpServerConfig, McpServerManager, McpTransportBinding, StreamableHttpTransportConfig,
 };
 
 # #[tokio::main]
 # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+let mut headers = HeaderMap::new();
+headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer tok_abc123"));
+let http = Http::new(
+    reqwest::Client::builder()
+        .default_headers(headers)
+        .build()?,
+);
+
 let mut manager = McpServerManager::new().with_server(McpServerConfig::new(
     "remote",
     McpTransportBinding::StreamableHttp(
-        StreamableHttpTransportConfig::new("https://mcp.example.com/mcp")
-            .with_header("Authorization", "Bearer tok_abc123"),
+        StreamableHttpTransportConfig::new("https://mcp.example.com/mcp").with_client(http),
     ),
 ));
 

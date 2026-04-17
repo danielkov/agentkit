@@ -1,4 +1,5 @@
 use agentkit_core::{ItemKind, Modality, PartKind};
+use agentkit_http::HttpError;
 use thiserror::Error;
 
 /// Errors produced by the generic chat completions adapter.
@@ -6,7 +7,7 @@ use thiserror::Error;
 pub enum CompletionsError {
     /// The underlying HTTP client could not be constructed.
     #[error("failed to build HTTP client: {0}")]
-    HttpClient(reqwest::Error),
+    HttpClient(HttpError),
 
     /// A transcript part is not supported for the given message role.
     #[error("unsupported item part {part_kind:?} for role {role:?}")]

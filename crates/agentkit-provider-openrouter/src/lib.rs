@@ -245,7 +245,10 @@ impl CompletionsProvider for OpenRouterProvider {
         &self.request_config
     }
 
-    fn preprocess_request(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    fn preprocess_request(
+        &self,
+        builder: agentkit_http::HttpRequestBuilder,
+    ) -> agentkit_http::HttpRequestBuilder {
         let mut builder = builder.bearer_auth(&self.api_key).header(
             "User-Agent",
             concat!("agentkit-provider-openrouter/", env!("CARGO_PKG_VERSION")),
@@ -315,7 +318,7 @@ impl CompletionsProvider for OpenRouterProvider {
 
     fn preprocess_response(
         &self,
-        _status: reqwest::StatusCode,
+        _status: agentkit_http::StatusCode,
         body: &str,
     ) -> Result<(), LoopError> {
         #[derive(serde::Deserialize)]
