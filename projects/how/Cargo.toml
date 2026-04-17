@@ -14,10 +14,10 @@ name = "how"
 path = "src/main.rs"
 
 [dependencies]
-agentkit-core = { version = "0.2.3", path = "../../crates/agentkit-core" }
-agentkit-loop = { version = "0.2.3", path = "../../crates/agentkit-loop" }
-agentkit-tools-core = { version = "0.2.3", path = "../../crates/agentkit-tools-core" }
-agentkit-provider-openrouter = { version = "0.2.3", path = "../../crates/agentkit-provider-openrouter" }
+agentkit-core = { version = "0.3.0", path = "../../crates/agentkit-core" }
+agentkit-loop = { version = "0.3.0", path = "../../crates/agentkit-loop" }
+agentkit-tools-core = { version = "0.3.0", path = "../../crates/agentkit-tools-core" }
+agentkit-provider-openrouter = { version = "0.3.0", path = "../../crates/agentkit-provider-openrouter" }
 async-trait.workspace = true
 crossterm = "0.29"
 dotenvy.workspace = true

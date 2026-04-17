@@ -10,8 +10,8 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-agentkit-core = { version = "0.2.3", path = "../agentkit-core" }
-agentkit-tools-core = { version = "0.2.3", path = "../agentkit-tools-core" }
+agentkit-core = { version = "0.3.0", path = "../agentkit-core" }
+agentkit-tools-core = { version = "0.3.0", path = "../agentkit-tools-core" }
 async-trait.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync", "time"] }
