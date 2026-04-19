@@ -13,6 +13,7 @@ dependencies = [
  "agentkit-core",
  "agentkit-loop",
  "agentkit-mcp",
+ "agentkit-provider-anthropic",
  "agentkit-provider-groq",
  "agentkit-provider-mistral",
  "agentkit-provider-ollama",
@@ -138,6 +139,25 @@ dependencies = [
  "tokio",
  "tokio-util",
  "url",
+]
+
+[[package]]
+name = "agentkit-provider-anthropic"
+version = "0.3.0"
+dependencies = [
+ "agentkit-core",
+ "agentkit-http",
+ "agentkit-loop",
+ "agentkit-tools-core",
+ "async-trait",
+ "base64",
+ "bytes",
+ "futures-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]
@@ -354,6 +374,17 @@ name = "anstyle"
 version = "1.0.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "940b3a0ca603d1eade50a4846a2afffd5ef57a9feac2c0e2ec2e14f9ead76000"
+
+[[package]]
+name = "anthropic-chat"
+version = "0.3.0"
+dependencies = [
+ "agentkit-core",
+ "agentkit-loop",
+ "agentkit-provider-anthropic",
+ "dotenvy",
+ "tokio",
+]
 
 [[package]]
 name = "anyhow"

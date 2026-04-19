@@ -25,6 +25,7 @@
 //! | `compaction` | [`compaction`] | Transcript compaction triggers, strategies, and pipelines |
 //! | `context` | [`context`] | `AGENTS.md` discovery and context loading |
 //! | `mcp` | [`mcp`] | Model Context Protocol (MCP) server connections |
+//! | `provider-anthropic` | [`provider_anthropic`] | Anthropic Messages API [`loop_::ModelAdapter`] implementation |
 //! | `provider-openrouter` | [`provider_openrouter`] | OpenRouter [`loop_::ModelAdapter`] implementation |
 //! | `task-manager` | [`task_manager`] | Tool task scheduling: [`task_manager::SimpleTaskManager`], [`task_manager::AsyncTaskManager`] |
 //! | `tool-fs` | [`tool_fs`] | Filesystem tools (read, write, edit, move, delete, list, mkdir) |
@@ -219,6 +220,21 @@ pub use agentkit_adapter_completions as adapter_completions;
 #[cfg(feature = "provider-openrouter")]
 pub use agentkit_provider_openrouter as provider_openrouter;
 
+/// Anthropic Messages API [`loop_::ModelAdapter`] implementation.
+///
+/// Provides [`provider_anthropic::AnthropicAdapter`] and
+/// [`provider_anthropic::AnthropicConfig`] for connecting the agent loop to
+/// Anthropic's `/v1/messages` endpoint. Supports streaming (default),
+/// extended thinking, prompt caching, and server-side tools (web search,
+/// web fetch, code execution) via the
+/// [`provider_anthropic::ServerTool`] trait. Unlike the other providers this
+/// crate does not go through `adapter-completions` — Anthropic's API is not
+/// OpenAI-compatible — so the feature depends on `loop` directly.
+///
+/// Requires the `provider-anthropic` feature.
+#[cfg(feature = "provider-anthropic")]
+pub use agentkit_provider_anthropic as provider_anthropic;
+
 /// OpenAI [`loop_::ModelAdapter`] implementation.
 ///
 /// Requires the `provider-openai` feature.
@@ -299,6 +315,8 @@ pub mod prelude {
     pub use crate::loop_::*;
     #[cfg(feature = "mcp")]
     pub use crate::mcp::*;
+    #[cfg(feature = "provider-anthropic")]
+    pub use crate::provider_anthropic::*;
     #[cfg(feature = "provider-groq")]
     pub use crate::provider_groq::*;
     #[cfg(feature = "provider-mistral")]

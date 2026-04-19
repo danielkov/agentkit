@@ -30,6 +30,10 @@ The umbrella crate `agentkit` re-exports subcrates behind feature flags.
 - `adapter-completions`
   - enables `agentkit-adapter-completions`
   - implies `loop`
+- `provider-anthropic`
+  - enables `agentkit-provider-anthropic`
+  - implies `loop` (Anthropic's API is not OpenAI-compatible, so this adapter
+    bypasses `adapter-completions`)
 - `provider-groq`
   - enables `agentkit-provider-groq`
   - implies `adapter-completions`
@@ -105,3 +109,8 @@ OpenAI-compatible provider (e.g. Groq, Mistral, vLLM, Ollama):
 
 - everything needed for the host
 - `provider-groq` / `provider-mistral` / `provider-vllm` / `provider-ollama`
+
+Anthropic Messages API (streaming, extended thinking, server tools):
+
+- everything needed for the host
+- `provider-anthropic`

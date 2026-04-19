@@ -24,8 +24,30 @@
   - built-in filesystem tools
 - `agentkit-tool-shell`
   - built-in shell tool
+- `agentkit-tool-skills`
+  - progressive Agent Skills discovery and activation
+- `agentkit-http`
+  - HTTP transport abstraction shared by provider crates (`HttpClient`,
+    `Http`, `HttpRequestBuilder`); default reqwest-backed, with optional
+    `reqwest-middleware` client
+- `agentkit-adapter-completions`
+  - generic OpenAI-compatible chat completions adapter base
 - `agentkit-provider-openrouter`
   - OpenRouter model adapter
+- `agentkit-provider-openai`
+  - OpenAI model adapter
+- `agentkit-provider-anthropic`
+  - Anthropic Messages API adapter (implements `ModelAdapter` directly,
+    bypassing `adapter-completions`, because Anthropic's API is not
+    OpenAI-compatible)
+- `agentkit-provider-ollama`
+  - Ollama model adapter
+- `agentkit-provider-vllm`
+  - vLLM model adapter
+- `agentkit-provider-groq`
+  - Groq model adapter
+- `agentkit-provider-mistral`
+  - Mistral model adapter
 - `agentkit`
   - umbrella crate with feature flags
 
