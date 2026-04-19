@@ -37,9 +37,8 @@
 - `agentkit-provider-openai`
   - OpenAI model adapter
 - `agentkit-provider-anthropic`
-  - Anthropic Messages API adapter (implements `ModelAdapter` directly,
-    bypassing `adapter-completions`, because Anthropic's API is not
-    OpenAI-compatible)
+  - Anthropic Messages API adapter; implements `ModelAdapter` directly (the
+    Messages API is not OpenAI-compatible)
 - `agentkit-provider-ollama`
   - Ollama model adapter
 - `agentkit-provider-vllm`

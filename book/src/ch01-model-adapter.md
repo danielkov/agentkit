@@ -446,7 +446,7 @@ pub trait CompletionsProvider: Send + Sync + Clone {
 }
 ```
 
-> The request-builder type is [`agentkit_http::HttpRequestBuilder`](https://github.com/danielkov/agentkit/tree/main/crates/agentkit-http), not `reqwest::RequestBuilder`. Earlier drafts of the provider trait exposed reqwest directly; the `agentkit-http` abstraction now sits between provider crates and the HTTP transport so alternative clients (e.g. `reqwest-middleware`, or a custom `HttpClient` for tests) plug in without provider changes.
+> The request builder is [`agentkit_http::HttpRequestBuilder`](https://github.com/danielkov/agentkit/tree/main/crates/agentkit-http) — a thin transport abstraction over `reqwest`. The default `HttpClient` is reqwest-backed; the `reqwest-middleware` client is available behind an optional feature, and custom impls can be supplied for tests.
 
 The generic `CompletionsAdapter<P>` implements `ModelAdapter` and handles:
 

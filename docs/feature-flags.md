@@ -32,8 +32,8 @@ The umbrella crate `agentkit` re-exports subcrates behind feature flags.
   - implies `loop`
 - `provider-anthropic`
   - enables `agentkit-provider-anthropic`
-  - implies `loop` (Anthropic's API is not OpenAI-compatible, so this adapter
-    bypasses `adapter-completions`)
+  - implies `loop` (the Messages API is not OpenAI-compatible, so this adapter
+    does not go through `adapter-completions`)
 - `provider-groq`
   - enables `agentkit-provider-groq`
   - implies `adapter-completions`

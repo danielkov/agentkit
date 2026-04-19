@@ -133,9 +133,9 @@ cargo run -p openrouter-agent-cli -- --mcp-mock \
 - `openrouter-agent-cli`
   - combined example using context, tools, shell, MCP, compaction, and reporting
 - `anthropic-chat`
-  - streaming REPL against Anthropic's Messages API, showcasing server tools
+  - streaming REPL against Anthropic's Messages API, with server tools
     (`--web-search`, `--web-fetch`, `--code-exec`), extended thinking
-    (`--thinking`), and the streaming / buffered path toggle (`--streaming` /
+    (`--thinking`), and a streaming / buffered toggle (`--streaming` /
     `--no-streaming`)
 
 ## Examples

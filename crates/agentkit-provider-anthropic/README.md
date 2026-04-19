@@ -3,8 +3,8 @@
 Anthropic Messages API provider for [`agentkit`](https://github.com/danielkov/agentkit).
 
 Connects the agent loop to `https://api.anthropic.com/v1/messages` (or any
-compatible endpoint). Non-streaming in this version — streaming will land in a
-follow-up.
+compatible endpoint). Supports streaming, prompt caching, extended thinking,
+and server-side tools (web search, web fetch, code execution).
 
 ## Quick start
 
@@ -38,5 +38,5 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ## Server tools
 
 Known server tools (`WebSearchTool`, `WebFetchTool`, `CodeExecutionTool`, etc.)
-implement the [`ServerTool`] trait. Use [`RawServerTool`] to pass through any
-tool type Anthropic ships before the crate adds first-class support.
+implement the [`ServerTool`] trait. [`RawServerTool`] passes through any tool
+type the crate does not yet cover.
