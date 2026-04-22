@@ -1685,13 +1685,16 @@ dependencies = [
 name = "openrouter-coding-agent"
 version = "0.3.1"
 dependencies = [
+ "agentkit-compaction",
  "agentkit-core",
  "agentkit-loop",
  "agentkit-provider-openrouter",
- "agentkit-reporting",
  "agentkit-tool-fs",
+ "agentkit-tool-shell",
  "agentkit-tools-core",
+ "async-trait",
  "dotenvy",
+ "serde_json",
  "tokio",
 ]
 
