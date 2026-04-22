@@ -40,7 +40,7 @@ cargo build
 
 ## Running the examples
 
-The examples use OpenRouter as the model provider. Create a `.env` file in the repo root:
+Most examples use OpenRouter as the model provider. Create a `.env` file in the repo root:
 
 ```env
 OPENROUTER_API_KEY=your_key_here
@@ -51,6 +51,19 @@ Then run any example:
 
 ```sh
 cargo run -p openrouter-chat -- "hello"
+```
+
+For the Anthropic provider, the `anthropic-chat` example demonstrates
+streaming, server tools, and extended thinking:
+
+```env
+ANTHROPIC_API_KEY=your_key_here
+ANTHROPIC_MODEL=claude-opus-4-7
+ANTHROPIC_MAX_TOKENS=4096
+```
+
+```sh
+cargo run -p anthropic-chat -- --web-search 3 --thinking 2048
 ```
 
 The examples are referenced throughout this book. Each chapter points to the relevant example that exercises the concepts being discussed.

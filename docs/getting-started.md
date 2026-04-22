@@ -12,6 +12,12 @@ Examples:
 - `cargo run -p openrouter-coding-agent -- "Use fs.read_file on ./Cargo.toml and return only the workspace member count as an integer."`
 - `cargo run -p openrouter-agent-cli -- --mcp-mock "Return only the secret from the MCP tool."`
 
+To run the Anthropic example instead, set `ANTHROPIC_API_KEY`,
+`ANTHROPIC_MODEL`, and `ANTHROPIC_MAX_TOKENS` (required by the Messages
+API), then:
+
+- `cargo run -p anthropic-chat -- --web-search 3 --thinking 2048`
+
 ## Minimal composition
 
 The smallest useful assembly is:
@@ -66,3 +72,7 @@ The examples are meant to build up in complexity:
   - structural, semantic, and hybrid compaction with a nested-loop compaction backend
 - `openrouter-agent-cli`
   - combined example: context + tools + shell + MCP + compaction + reporting
+- `anthropic-chat`
+  - interactive REPL against Anthropic's Messages API, exercising streaming,
+    server tools (web search, web fetch, code execution), extended thinking,
+    and the buffered/streaming toggle

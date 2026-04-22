@@ -17,6 +17,7 @@ The umbrella crate `agentkit` re-exports subcrates behind feature flags.
 - `context` — `agentkit-context`
 - `mcp` — `agentkit-mcp`
 - `adapter-completions` — `agentkit-adapter-completions`
+- `provider-anthropic` — `agentkit-provider-anthropic`
 - `provider-groq` — `agentkit-provider-groq`
 - `provider-mistral` — `agentkit-provider-mistral`
 - `provider-ollama` — `agentkit-provider-ollama`
@@ -59,5 +60,14 @@ agentkit = { version = "0.2.2", features = [
 agentkit = { version = "0.2.2", features = [
     "core", "capabilities", "tools", "loop",
     "reporting", "provider-openrouter",
+] }
+```
+
+**Anthropic Messages API host (streaming, extended thinking, server tools):**
+
+```toml
+agentkit = { version = "0.2.2", features = [
+    "core", "capabilities", "tools", "loop",
+    "reporting", "provider-anthropic",
 ] }
 ```

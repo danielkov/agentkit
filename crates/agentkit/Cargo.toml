@@ -17,6 +17,7 @@ agentkit-core = { version = "0.3.0", path = "../agentkit-core", optional = true 
 agentkit-loop = { version = "0.3.0", path = "../agentkit-loop", optional = true }
 agentkit-mcp = { version = "0.3.0", path = "../agentkit-mcp", optional = true }
 agentkit-adapter-completions = { version = "0.3.0", path = "../agentkit-adapter-completions", optional = true }
+agentkit-provider-anthropic = { version = "0.3.0", path = "../agentkit-provider-anthropic", optional = true }
 agentkit-provider-groq = { version = "0.3.0", path = "../agentkit-provider-groq", optional = true }
 agentkit-provider-mistral = { version = "0.3.0", path = "../agentkit-provider-mistral", optional = true }
 agentkit-provider-ollama = { version = "0.3.0", path = "../agentkit-provider-ollama", optional = true }
@@ -41,6 +42,7 @@ task-manager = ["dep:agentkit-task-manager", "tools"]
 loop = ["dep:agentkit-loop", "tools", "task-manager"]
 mcp = ["dep:agentkit-mcp", "capabilities", "tools"]
 adapter-completions = ["dep:agentkit-adapter-completions", "loop"]
+provider-anthropic = ["dep:agentkit-provider-anthropic", "loop"]
 provider-groq = ["dep:agentkit-provider-groq", "adapter-completions"]
 provider-mistral = ["dep:agentkit-provider-mistral", "adapter-completions"]
 provider-ollama = ["dep:agentkit-provider-ollama", "adapter-completions"]

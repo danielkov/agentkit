@@ -20,7 +20,7 @@ The project is intentionally split into small crates behind feature flags so hos
 - optional turn cancellation with resumable sessions
 - prompt caching with automatic and explicit strategies, retention hints, and cache keys
 - a generic completions adapter base for building provider crates
-- provider adapters for OpenRouter, OpenAI, Ollama, vLLM, Groq, and Mistral
+- provider adapters for OpenRouter, OpenAI, Anthropic, Ollama, vLLM, Groq, and Mistral
 
 The repo also ships multiple examples that exercise these pieces end to end.
 
@@ -50,12 +50,16 @@ The repo also ships multiple examples that exercise these pieces end to end.
   - shell execution tool
 - `agentkit-tool-skills`
   - progressive skill discovery and activation
+- `agentkit-http`
+  - HTTP transport abstraction (`HttpClient`, `Http`, `HttpRequestBuilder`) with a default reqwest-backed implementation and an optional `reqwest-middleware` adapter
 - `agentkit-adapter-completions`
   - generic chat completions adapter base for building provider crates
 - `agentkit-provider-openrouter`
   - OpenRouter adapter
 - `agentkit-provider-openai`
   - OpenAI adapter
+- `agentkit-provider-anthropic`
+  - Anthropic Messages API adapter with streaming, prompt caching, extended thinking, and server-side tools (web search, web fetch, code execution)
 - `agentkit-provider-ollama`
   - Ollama adapter
 - `agentkit-provider-vllm`
@@ -128,6 +132,11 @@ cargo run -p openrouter-agent-cli -- --mcp-mock \
   - `TaskManagerHandle` event stream printed to stderr
 - `openrouter-agent-cli`
   - combined example using context, tools, shell, MCP, compaction, and reporting
+- `anthropic-chat`
+  - streaming REPL against Anthropic's Messages API, with server tools
+    (`--web-search`, `--web-fetch`, `--code-exec`), extended thinking
+    (`--thinking`), and a streaming / buffered toggle (`--streaming` /
+    `--no-streaming`)
 
 ## Examples
 
@@ -281,6 +290,7 @@ Optional flags:
 - `adapter-completions`
 - `provider-openrouter`
 - `provider-openai`
+- `provider-anthropic`
 - `provider-ollama`
 - `provider-vllm`
 - `provider-groq`

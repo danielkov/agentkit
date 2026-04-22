@@ -18,6 +18,8 @@ Path 2: Implement CompletionsProvider (via agentkit-adapter-completions)
 
 Most providers speak the [OpenAI chat completions format](https://platform.openai.com/docs/api-reference/chat) (or close variants). For these, `CompletionsProvider` is the right choice. It handles the ~1000 lines of translation that every completions-compatible adapter needs.
 
+[`agentkit-provider-anthropic`](https://github.com/danielkov/agentkit/tree/main/crates/agentkit-provider-anthropic) takes Path 1. Anthropic's `/v1/messages` endpoint has a different shape (top-level `system`, no `tool` role, tool results as content blocks inside user messages, `x-api-key` auth, Anthropic-specific SSE event stream), so it implements `ModelAdapter` directly.
+
 ## The CompletionsProvider trait
 
 ```rust
@@ -29,12 +31,14 @@ pub trait CompletionsProvider: Send + Sync + Clone {
     fn config(&self) -> &Self::Config;
 
     // Hooks — defaults pass through unchanged:
-    fn preprocess_request(&self, builder: RequestBuilder) -> RequestBuilder { builder }
+    fn preprocess_request(&self, builder: HttpRequestBuilder) -> HttpRequestBuilder { builder }
     fn apply_prompt_cache(&self, body: &mut Map<String, Value>, request: &TurnRequest) -> Result<(), LoopError> { Ok(()) }
     fn preprocess_response(&self, _status: StatusCode, _body: &str) -> Result<(), LoopError> { Ok(()) }
     fn postprocess_response(&self, _usage: &mut Option<Usage>, _metadata: &mut MetadataMap, _raw: &Value) {}
 }
 ```
+
+The builder is [`agentkit_http::HttpRequestBuilder`](https://github.com/danielkov/agentkit/tree/main/crates/agentkit-http) — a thin transport abstraction. The default `HttpClient` is reqwest-backed; alternative clients (`reqwest-middleware`, or a test double) can be passed via `CompletionsAdapter::with_client`.
 
 The trait has three required methods (name, URL, config) and four optional hooks. Here's what each hook is for:
 
@@ -129,18 +133,19 @@ let agent = Agent::builder()
 
 ## Available providers
 
-agentkit ships six provider crates:
+agentkit ships seven provider crates. Six go through `CompletionsProvider` (Path 2), and one — Anthropic — implements `ModelAdapter` directly (Path 1):
 
-| Crate                                                                                                                 | Auth             | Hooks used                             |
-| --------------------------------------------------------------------------------------------------------------------- | ---------------- | -------------------------------------- |
-| [`agentkit-provider-openrouter`](https://github.com/danielkov/agentkit/tree/main/crates/agentkit-provider-openrouter) | Bearer + headers | auth, cache mapping, error check, cost |
-| `agentkit-provider-openai`                                                                                            | Bearer           | auth, cache mapping                    |
-| `agentkit-provider-ollama`                                                                                            | none             | None                                   |
-| `agentkit-provider-vllm`                                                                                              | optional Bearer  | `preprocess_request` (optional auth)   |
-| `agentkit-provider-groq`                                                                                              | Bearer           | `preprocess_request` (auth)            |
-| `agentkit-provider-mistral`                                                                                           | Bearer           | `preprocess_request` (auth)            |
+| Crate                                                                                                                 | Path       | Auth                  | Notes                                                                                                 |
+| --------------------------------------------------------------------------------------------------------------------- | ---------- | --------------------- | ----------------------------------------------------------------------------------------------------- |
+| [`agentkit-provider-openrouter`](https://github.com/danielkov/agentkit/tree/main/crates/agentkit-provider-openrouter) | 2 (hooks)  | Bearer + headers      | auth, cache mapping, 200-with-error handling, cost enrichment                                         |
+| `agentkit-provider-openai`                                                                                            | 2 (hooks)  | Bearer                | auth, cache mapping                                                                                   |
+| `agentkit-provider-anthropic`                                                                                         | 1 (direct) | `x-api-key` or Bearer | streaming, extended thinking, server tools, explicit cache-breakpoints, thinking-signature round-trip |
+| `agentkit-provider-ollama`                                                                                            | 2 (hooks)  | none                  | local runtime; no hooks                                                                               |
+| `agentkit-provider-vllm`                                                                                              | 2 (hooks)  | optional Bearer       | `preprocess_request` for optional auth                                                                |
+| `agentkit-provider-groq`                                                                                              | 2 (hooks)  | Bearer                | `preprocess_request` for auth                                                                         |
+| `agentkit-provider-mistral`                                                                                           | 2 (hooks)  | Bearer                | `preprocess_request` for auth                                                                         |
 
-Ollama is the simplest — no auth, no hooks. OpenRouter is the most complex — it uses auth headers, prompt-cache mapping, 200-with-error handling, and response enrichment.
+Ollama is the simplest Path-2 provider — no auth, no hooks. OpenRouter is the most complex Path-2 — auth headers, prompt-cache mapping, 200-with-error handling, response enrichment. Anthropic is the only Path-1 provider; read it if you're building an adapter for a non-OpenAI-compatible API.
 
 ## When to implement ModelAdapter directly
 

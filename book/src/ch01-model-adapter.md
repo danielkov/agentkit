@@ -440,11 +440,13 @@ pub trait CompletionsProvider: Send + Sync + Clone {
     fn config(&self) -> &Self::Config;
 
     // Hooks — defaults pass through unchanged:
-    fn preprocess_request(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder { builder }
+    fn preprocess_request(&self, builder: agentkit_http::HttpRequestBuilder) -> agentkit_http::HttpRequestBuilder { builder }
     fn preprocess_response(&self, _status: StatusCode, _body: &str) -> Result<(), LoopError> { Ok(()) }
     fn postprocess_response(&self, _usage: &mut Option<Usage>, _metadata: &mut MetadataMap, _raw: &Value) {}
 }
 ```
+
+> The request builder is [`agentkit_http::HttpRequestBuilder`](https://github.com/danielkov/agentkit/tree/main/crates/agentkit-http) — a thin transport abstraction over `reqwest`. The default `HttpClient` is reqwest-backed; the `reqwest-middleware` client is available behind an optional feature, and custom impls can be supplied for tests.
 
 The generic `CompletionsAdapter<P>` implements `ModelAdapter` and handles:
 
@@ -629,8 +631,8 @@ impl CompletionsProvider for OpenRouterProvider {
 
     fn preprocess_request(
         &self,
-        builder: reqwest::RequestBuilder,
-    ) -> reqwest::RequestBuilder {
+        builder: agentkit_http::HttpRequestBuilder,
+    ) -> agentkit_http::HttpRequestBuilder {
         let mut builder = builder.bearer_auth(&self.api_key);
         if let Some(app_name) = &self.app_name {
             builder = builder.header("X-Title", app_name);

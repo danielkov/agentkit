@@ -212,7 +212,7 @@ Mock the HTTP layer or use a local test server. Don't test against live provider
 
 `agentkit-loop` is runtime-agnostic — it depends on async traits, not on `tokio` directly. The model adapter traits use [`async_trait`](https://docs.rs/async-trait) and require only `Send`, not any runtime-specific bounds.
 
-In practice, most adapters use `tokio` for HTTP clients (`reqwest`) and SSE parsing. But the loop crate itself can run on any executor — `tokio`, `async-std`, or a custom runtime. This is a deliberate architectural choice: the core loop is portable, while runtime-specific concerns live in leaf crates (provider adapters, task managers).
+In practice, most adapters dispatch HTTP through the [`agentkit-http`](https://github.com/danielkov/agentkit/tree/main/crates/agentkit-http) crate. The default `HttpClient` is reqwest-backed on tokio; a `reqwest-middleware` client is available behind an optional feature, and custom impls can be supplied for tests. The loop crate itself stays executor-agnostic — `tokio`, `async-std`, or a custom runtime all work — because runtime-specific concerns live in leaf crates (provider adapters, task managers).
 
 The [`futures-timer`](https://docs.rs/futures-timer) crate is used for the cancellation polling delay instead of `tokio::time`, keeping the core free of runtime dependencies.
 
