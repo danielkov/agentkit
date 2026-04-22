@@ -18,6 +18,7 @@ The umbrella crate `agentkit` re-exports subcrates behind feature flags.
 - `mcp` — `agentkit-mcp`
 - `adapter-completions` — `agentkit-adapter-completions`
 - `provider-anthropic` — `agentkit-provider-anthropic`
+- `provider-cerebras` — `agentkit-provider-cerebras`
 - `provider-groq` — `agentkit-provider-groq`
 - `provider-mistral` — `agentkit-provider-mistral`
 - `provider-ollama` — `agentkit-provider-ollama`
@@ -71,3 +72,14 @@ agentkit = { version = "0.2.2", features = [
     "reporting", "provider-anthropic",
 ] }
 ```
+
+**Cerebras Inference host (streaming, reasoning, rate-limit snapshot):**
+
+```toml
+agentkit = { version = "0.2.2", features = [
+    "core", "capabilities", "tools", "loop",
+    "reporting", "provider-cerebras",
+] }
+```
+
+The `agentkit-provider-cerebras` crate itself carries granular Cargo features for preview surfaces: `compression` (msgpack + gzip request bodies), `predicted-outputs`, `service-tiers`, `batch` (Files + Batch API), and an `experimental` umbrella that pulls in all three preview flags. Enable them on the provider crate directly when you need them — the umbrella `provider-cerebras` flag wires in the default build.

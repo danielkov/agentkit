@@ -66,4 +66,17 @@ ANTHROPIC_MAX_TOKENS=4096
 cargo run -p anthropic-chat -- --web-search 3 --thinking 2048
 ```
 
+For the Cerebras provider, the `cerebras-chat` REPL covers the chat path
+and the `cerebras-batch` CLI covers the Files + Batch API:
+
+```env
+CEREBRAS_API_KEY=your_key_here
+CEREBRAS_MODEL=gpt-oss-120b
+```
+
+```sh
+cargo run -p cerebras-chat -- --reasoning-effort medium --compression msgpack+gzip
+cargo run -p cerebras-batch -- run ./prompts.json
+```
+
 The examples are referenced throughout this book. Each chapter points to the relevant example that exercises the concepts being discussed.

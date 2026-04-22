@@ -26,6 +26,7 @@
 //! | `context` | [`context`] | `AGENTS.md` discovery and context loading |
 //! | `mcp` | [`mcp`] | Model Context Protocol (MCP) server connections |
 //! | `provider-anthropic` | [`provider_anthropic`] | Anthropic Messages API [`loop_::ModelAdapter`] implementation |
+//! | `provider-cerebras` | [`provider_cerebras`] | Cerebras Inference API [`loop_::ModelAdapter`] implementation |
 //! | `provider-openrouter` | [`provider_openrouter`] | OpenRouter [`loop_::ModelAdapter`] implementation |
 //! | `task-manager` | [`task_manager`] | Tool task scheduling: [`task_manager::SimpleTaskManager`], [`task_manager::AsyncTaskManager`] |
 //! | `tool-fs` | [`tool_fs`] | Filesystem tools (read, write, edit, move, delete, list, mkdir) |
@@ -235,6 +236,22 @@ pub use agentkit_provider_openrouter as provider_openrouter;
 #[cfg(feature = "provider-anthropic")]
 pub use agentkit_provider_anthropic as provider_anthropic;
 
+/// Cerebras Inference API [`loop_::ModelAdapter`] implementation.
+///
+/// Provides [`provider_cerebras::CerebrasAdapter`] and
+/// [`provider_cerebras::CerebrasConfig`] for connecting the agent loop to
+/// Cerebras' `/v1/chat/completions` endpoint. Supports streaming (default),
+/// reasoning, strict JSON Schema output, prompt-cache read telemetry, and —
+/// behind Cargo features — msgpack/gzip request compression, predicted
+/// outputs, service tiers, and the Files + Batch API for async bulk
+/// inference. Like `provider-anthropic` this crate implements `ModelAdapter`
+/// directly rather than going through `adapter-completions`, so the feature
+/// depends on `loop` directly.
+///
+/// Requires the `provider-cerebras` feature.
+#[cfg(feature = "provider-cerebras")]
+pub use agentkit_provider_cerebras as provider_cerebras;
+
 /// OpenAI [`loop_::ModelAdapter`] implementation.
 ///
 /// Requires the `provider-openai` feature.
@@ -316,7 +333,9 @@ pub mod prelude {
     #[cfg(feature = "mcp")]
     pub use crate::mcp::*;
     #[cfg(feature = "provider-anthropic")]
-    pub use crate::provider_anthropic::*;
+    pub use crate::provider_anthropic;
+    #[cfg(feature = "provider-cerebras")]
+    pub use crate::provider_cerebras;
     #[cfg(feature = "provider-groq")]
     pub use crate::provider_groq::*;
     #[cfg(feature = "provider-mistral")]

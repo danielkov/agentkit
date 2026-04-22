@@ -16,6 +16,7 @@ members = [
     "crates/agentkit-provider-groq",
     "crates/agentkit-provider-mistral",
     "crates/agentkit-provider-anthropic",
+    "crates/agentkit-provider-cerebras",
     "crates/agentkit-reporting",
     "crates/agentkit-tool-fs",
     "crates/agentkit-tool-shell",
@@ -23,6 +24,8 @@ members = [
     "crates/agentkit-http",
     "crates/agentkit-mcp",
     "examples/anthropic-chat",
+    "examples/cerebras-batch",
+    "examples/cerebras-chat",
     "examples/openrouter-chat",
     "examples/openrouter-coding-agent",
     "examples/openrouter-context-agent",
@@ -43,7 +46,7 @@ homepage = "https://github.com/danielkov/agentkit"
 license = "MIT"
 repository = "https://github.com/danielkov/agentkit"
 rust-version = "1.88"
-version = "0.3.0"
+version = "0.3.1"
 
 [workspace.dependencies]
 async-trait = "0.1.89"

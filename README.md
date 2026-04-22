@@ -20,7 +20,7 @@ The project is intentionally split into small crates behind feature flags so hos
 - optional turn cancellation with resumable sessions
 - prompt caching with automatic and explicit strategies, retention hints, and cache keys
 - a generic completions adapter base for building provider crates
-- provider adapters for OpenRouter, OpenAI, Anthropic, Ollama, vLLM, Groq, and Mistral
+- provider adapters for OpenRouter, OpenAI, Anthropic, Cerebras, Ollama, vLLM, Groq, and Mistral
 
 The repo also ships multiple examples that exercise these pieces end to end.
 
@@ -60,6 +60,8 @@ The repo also ships multiple examples that exercise these pieces end to end.
   - OpenAI adapter
 - `agentkit-provider-anthropic`
   - Anthropic Messages API adapter with streaming, prompt caching, extended thinking, and server-side tools (web search, web fetch, code execution)
+- `agentkit-provider-cerebras`
+  - Cerebras Inference API adapter with streaming, reasoning, strict JSON schema, compression (msgpack/gzip), predicted outputs, service tiers, and Files + Batch API
 - `agentkit-provider-ollama`
   - Ollama adapter
 - `agentkit-provider-vllm`
@@ -137,6 +139,15 @@ cargo run -p openrouter-agent-cli -- --mcp-mock \
     (`--web-search`, `--web-fetch`, `--code-exec`), extended thinking
     (`--thinking`), and a streaming / buffered toggle (`--streaming` /
     `--no-streaming`)
+- `cerebras-chat`
+  - interactive REPL against Cerebras `/v1/chat/completions`; CLI flags
+    cover every `CerebrasConfig` knob (sampling, reasoning, response
+    format, compression, service tier, predicted outputs, local tools)
+    and slash commands (`/show`, `/usage`, `/ratelimit`, `/headers`,
+    `/models`, `/reset`) surface runtime state
+- `cerebras-batch`
+  - one-shot CLI over the Cerebras Files + Batch APIs: `files upload|list|get|content|delete`,
+    `batches create|submit|list|get|cancel|wait`, and `run` to submit → wait → dump outputs
 
 ## Examples
 
@@ -291,6 +302,7 @@ Optional flags:
 - `provider-openrouter`
 - `provider-openai`
 - `provider-anthropic`
+- `provider-cerebras`
 - `provider-ollama`
 - `provider-vllm`
 - `provider-groq`

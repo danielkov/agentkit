@@ -20,6 +20,8 @@ Most providers speak the [OpenAI chat completions format](https://platform.opena
 
 [`agentkit-provider-anthropic`](https://github.com/danielkov/agentkit/tree/main/crates/agentkit-provider-anthropic) takes Path 1. Anthropic's `/v1/messages` endpoint has a different shape (top-level `system`, no `tool` role, tool results as content blocks inside user messages, `x-api-key` auth, Anthropic-specific SSE event stream), so it implements `ModelAdapter` directly.
 
+[`agentkit-provider-cerebras`](https://github.com/danielkov/agentkit/tree/main/crates/agentkit-provider-cerebras) also takes Path 1, for different reasons. The wire shape is OpenAI-compatible, but the adapter carries surface area that `CompletionsProvider` does not model: msgpack + gzip request compression (behind a Cargo feature), an `X-Cerebras-Version-Patch` header that opts into new API majors, typed reasoning config with model-specific validation, strict JSON-Schema output with the documented constraint checks, a rate-limit snapshot surfaced on the adapter, and a Files + Batch API whose request builder is shared with the turn loop. Folding all of that into generic hooks would dilute them, so the crate talks to `/v1/chat/completions` directly and exposes the preview surfaces through its own types.
+
 ## The CompletionsProvider trait
 
 ```rust
@@ -133,19 +135,20 @@ let agent = Agent::builder()
 
 ## Available providers
 
-agentkit ships seven provider crates. Six go through `CompletionsProvider` (Path 2), and one — Anthropic — implements `ModelAdapter` directly (Path 1):
+agentkit ships eight provider crates. Six go through `CompletionsProvider` (Path 2), and two — Anthropic and Cerebras — implement `ModelAdapter` directly (Path 1):
 
-| Crate                                                                                                                 | Path       | Auth                  | Notes                                                                                                 |
-| --------------------------------------------------------------------------------------------------------------------- | ---------- | --------------------- | ----------------------------------------------------------------------------------------------------- |
-| [`agentkit-provider-openrouter`](https://github.com/danielkov/agentkit/tree/main/crates/agentkit-provider-openrouter) | 2 (hooks)  | Bearer + headers      | auth, cache mapping, 200-with-error handling, cost enrichment                                         |
-| `agentkit-provider-openai`                                                                                            | 2 (hooks)  | Bearer                | auth, cache mapping                                                                                   |
-| `agentkit-provider-anthropic`                                                                                         | 1 (direct) | `x-api-key` or Bearer | streaming, extended thinking, server tools, explicit cache-breakpoints, thinking-signature round-trip |
-| `agentkit-provider-ollama`                                                                                            | 2 (hooks)  | none                  | local runtime; no hooks                                                                               |
-| `agentkit-provider-vllm`                                                                                              | 2 (hooks)  | optional Bearer       | `preprocess_request` for optional auth                                                                |
-| `agentkit-provider-groq`                                                                                              | 2 (hooks)  | Bearer                | `preprocess_request` for auth                                                                         |
-| `agentkit-provider-mistral`                                                                                           | 2 (hooks)  | Bearer                | `preprocess_request` for auth                                                                         |
+| Crate                                                                                                                 | Path       | Auth                  | Notes                                                                                                                                          |
+| --------------------------------------------------------------------------------------------------------------------- | ---------- | --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`agentkit-provider-openrouter`](https://github.com/danielkov/agentkit/tree/main/crates/agentkit-provider-openrouter) | 2 (hooks)  | Bearer + headers      | auth, cache mapping, 200-with-error handling, cost enrichment                                                                                  |
+| `agentkit-provider-openai`                                                                                            | 2 (hooks)  | Bearer                | auth, cache mapping                                                                                                                            |
+| `agentkit-provider-anthropic`                                                                                         | 1 (direct) | `x-api-key` or Bearer | streaming, extended thinking, server tools, explicit cache-breakpoints, thinking-signature round-trip                                          |
+| `agentkit-provider-cerebras`                                                                                          | 1 (direct) | Bearer                | streaming, typed reasoning config, strict JSON-Schema output, rate-limit snapshot, version-patch header; feature-gated compression + Batch API |
+| `agentkit-provider-ollama`                                                                                            | 2 (hooks)  | none                  | local runtime; no hooks                                                                                                                        |
+| `agentkit-provider-vllm`                                                                                              | 2 (hooks)  | optional Bearer       | `preprocess_request` for optional auth                                                                                                         |
+| `agentkit-provider-groq`                                                                                              | 2 (hooks)  | Bearer                | `preprocess_request` for auth                                                                                                                  |
+| `agentkit-provider-mistral`                                                                                           | 2 (hooks)  | Bearer                | `preprocess_request` for auth                                                                                                                  |
 
-Ollama is the simplest Path-2 provider — no auth, no hooks. OpenRouter is the most complex Path-2 — auth headers, prompt-cache mapping, 200-with-error handling, response enrichment. Anthropic is the only Path-1 provider; read it if you're building an adapter for a non-OpenAI-compatible API.
+Ollama is the simplest Path-2 provider — no auth, no hooks. OpenRouter is the most complex Path-2 — auth headers, prompt-cache mapping, 200-with-error handling, response enrichment. Anthropic and Cerebras are the Path-1 providers: read Anthropic if your target API has a non-OpenAI shape, and read Cerebras if it is OpenAI-shaped on the wire but carries enough provider-specific surface — preview parameters, compression, versioning headers, out-of-band endpoints — that modelling it through hooks would be a squeeze.
 
 ## When to implement ModelAdapter directly
 

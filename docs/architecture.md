@@ -39,6 +39,12 @@
 - `agentkit-provider-anthropic`
   - Anthropic Messages API adapter; implements `ModelAdapter` directly (the
     Messages API is not OpenAI-compatible)
+- `agentkit-provider-cerebras`
+  - Cerebras Inference API adapter; implements `ModelAdapter` directly to
+    carry provider-specific surface (msgpack/gzip request compression,
+    `X-Cerebras-Version-Patch`, typed reasoning config, strict JSON-Schema
+    output, rate-limit snapshot, Files + Batch) that does not fit the
+    `CompletionsProvider` hook shape
 - `agentkit-provider-ollama`
   - Ollama model adapter
 - `agentkit-provider-vllm`

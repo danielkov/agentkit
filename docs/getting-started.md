@@ -18,6 +18,13 @@ API), then:
 
 - `cargo run -p anthropic-chat -- --web-search 3 --thinking 2048`
 
+To run the Cerebras examples, set `CEREBRAS_API_KEY` and `CEREBRAS_MODEL`
+(both required; `CEREBRAS_BASE_URL`, `CEREBRAS_VERSION_PATCH`, and
+`CEREBRAS_MAX_COMPLETION_TOKENS` are optional), then:
+
+- `cargo run -p cerebras-chat -- --reasoning-effort medium`
+- `cargo run -p cerebras-batch -- run ./prompts.json`
+
 ## Minimal composition
 
 The smallest useful assembly is:
@@ -76,3 +83,13 @@ The examples are meant to build up in complexity:
   - interactive REPL against Anthropic's Messages API, exercising streaming,
     server tools (web search, web fetch, code execution), extended thinking,
     and the buffered/streaming toggle
+- `cerebras-chat`
+  - interactive REPL against Cerebras' `/v1/chat/completions`, exposing every
+    `CerebrasConfig` knob (sampling, reasoning, response format, compression,
+    service tier, predicted outputs, local + MCP tools) as CLI flags, with
+    slash commands (`/show`, `/usage`, `/ratelimit`, `/headers`, `/models`,
+    `/reset`) for inspecting runtime state
+- `cerebras-batch`
+  - one-shot CLI over the Files + Batch APIs: `files upload|list|get|content|delete`,
+    `batches create|submit|list|get|cancel|wait`, and `run` for the
+    submit → wait → fetch happy path

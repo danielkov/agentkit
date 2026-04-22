@@ -13,8 +13,8 @@ rust-version.workspace = true
 tracing = ["dep:tracing"]
 
 [dependencies]
-agentkit-core = { version = "0.3.0", path = "../agentkit-core" }
-agentkit-loop = { version = "0.3.0", path = "../agentkit-loop" }
+agentkit-core = { version = "0.3.1", path = "../agentkit-core" }
+agentkit-loop = { version = "0.3.1", path = "../agentkit-loop" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

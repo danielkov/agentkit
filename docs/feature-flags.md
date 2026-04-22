@@ -34,6 +34,12 @@ The umbrella crate `agentkit` re-exports subcrates behind feature flags.
   - enables `agentkit-provider-anthropic`
   - implies `loop` (the Messages API is not OpenAI-compatible, so this adapter
     does not go through `adapter-completions`)
+- `provider-cerebras`
+  - enables `agentkit-provider-cerebras`
+  - implies `loop` (carries enough provider-specific surface — compression,
+    version-patch header, reasoning config, rate-limit snapshot, Files +
+    Batch — that it implements `ModelAdapter` directly instead of routing
+    through `adapter-completions`)
 - `provider-groq`
   - enables `agentkit-provider-groq`
   - implies `adapter-completions`
@@ -114,3 +120,14 @@ Anthropic Messages API (streaming, extended thinking, server tools):
 
 - everything needed for the host
 - `provider-anthropic`
+
+Cerebras Inference API (streaming, reasoning, rate-limit snapshot):
+
+- everything needed for the host
+- `provider-cerebras`
+- plus, on `agentkit-provider-cerebras` directly, any of:
+  - `compression` (msgpack + gzip request bodies)
+  - `predicted-outputs`
+  - `service-tiers`
+  - `batch` (Files + Batch API)
+  - `experimental` (umbrella for the three preview flags above)
