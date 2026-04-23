@@ -1,6 +1,6 @@
 # Interrupts and control flow
 
-The loop runs autonomously until it hits something that requires a human decision. These blocking points are _interrupts_. This chapter covers how interrupts work, why they exist, and how hosts resolve them.
+The loop runs autonomously until it hits a yield point that requires or invites host action. Some yields are _blocking_ (the loop genuinely cannot proceed without an answer), others are _cooperative_ (the host may interject but can also ignore the yield and call `next()` again to resume). Both are surfaced through the same `LoopStep::Interrupt` channel. This chapter covers each variant, the blocking/cooperative distinction, and how hosts resolve or pass through them.
 
 ## The interrupt model
 
@@ -14,10 +14,19 @@ pub enum LoopInterrupt {
     ApprovalRequest(PendingApproval),
     AuthRequest(PendingAuth),
     AwaitingInput(InputRequest),
+    AfterToolResult(ToolRoundInfo),
+}
+
+impl LoopInterrupt {
+    /// `true` for variants that must be resolved before the loop can
+    /// make progress: `ApprovalRequest`, `AuthRequest`.  `false` for
+    /// cooperative yields the host may ignore: `AwaitingInput`,
+    /// `AfterToolResult`.
+    pub fn is_blocking(&self) -> bool { /* ... */ }
 }
 ```
 
-Each interrupt type represents a different reason the loop cannot proceed without host intervention. The variants carry handle types (`PendingApproval`, `PendingAuth`, `InputRequest`) with ergonomic resolution methods, so hosts can resolve the interrupt directly on the handle rather than reaching back into the driver.
+Each variant represents a different reason control returned to the host. `ApprovalRequest` / `AuthRequest` / `AwaitingInput` carry handle types (`PendingApproval`, `PendingAuth`, `InputRequest`) with ergonomic resolution methods. `AfterToolResult` carries a `ToolRoundInfo` snapshot (`session_id`, `turn_id`, `transcript_len`) but needs no resolution — the host either calls `submit_input(..)` to interject or just calls `next()` again to continue the turn.
 
 ```text
 Loop autonomy boundary:
@@ -37,9 +46,10 @@ Loop autonomy boundary:
   ┌──────────────────────────▼───────────────────────────┐
   │                Host decision zone                    │
   │                                                      │
-  │   "Approve this shell command?"                      │
-  │   "Enter your GitHub OAuth token"                    │
-  │   "Type your next message"                           │
+  │   blocking:    "Approve this shell command?"         │
+  │   blocking:    "Enter your GitHub OAuth token"       │
+  │   cooperative: "Type your next message"              │
+  │   cooperative: "Tool round done — interject?"        │
   │                                                      │
   │   The host handles this, then calls next() again.    │
   └──────────────────────────────────────────────────────┘
@@ -231,6 +241,57 @@ LoopStep::Interrupt(LoopInterrupt::AwaitingInput(pending)) => {
 
 This is the most common interrupt in an interactive session. The pattern is: model finishes → host gets `AwaitingInput` → host reads user input → host calls `submit` → host calls `next()` → loop runs another turn.
 
+## After-tool-result yields
+
+A single user message can drive many tool rounds before the model produces a final reply. Between each round — after every tool call in the previous assistant message has a matching tool result in the transcript, and before the driver invokes the model again — the loop yields control to the host:
+
+```rust
+pub struct ToolRoundInfo {
+    pub session_id:     SessionId,
+    pub turn_id:        TurnId,
+    pub transcript_len: usize,
+}
+```
+
+Unlike approval or auth, this yield requires no resolution. The host has three choices:
+
+```rust
+LoopStep::Interrupt(LoopInterrupt::AfterToolResult(info)) => {
+    // 1. Ignore: just loop back to next().  The turn resumes with the
+    //    existing transcript into the next model call.
+    // 2. Interject: submit a user message that the next model call will
+    //    see as part of the transcript.
+    driver.submit_input(vec![Item::text(ItemKind::User, "also: be concise")])?;
+    // 3. Cancel: call cancellation.interrupt() and then drain the turn.
+}
+```
+
+The invariant maintained at this point is that the transcript ends in a valid `[…, assistant(tool_call…), tool_result(…)]` sequence — adding a user message here produces `[…, tool_call, tool_result, user]` which every major provider accepts as the prompt for the next assistant response.
+
+### Why yield if resolution is optional?
+
+Interactive agents frequently need to let the user type ahead during a slow turn ("wait, also be concise", "actually, skip the benchmarks"). Without a yield point, the only ways to interject are:
+
+- cancel the whole turn and restart with the combined message — loses progress and burns tokens;
+- inject into the next `TurnRequest.transcript` via a `ModelAdapter` wrapper — works, but requires a parallel buffer and post-turn reconciliation with the driver's own transcript;
+- hold the driver under a mutex and call `submit_input` from another task — violates the `&mut self` invariant and requires `unsafe` or a lock wrapper.
+
+`AfterToolResult` solves this natively: the driver is not mid-`next()` at the yield, so `submit_input` is callable in the normal way, and the transcript the model sees is always the single canonical one owned by the driver.
+
+### Hosts that don't care about interjection
+
+Non-interactive callers (batch jobs, tests, subagents) match the arm with `continue`:
+
+```rust
+loop {
+    match driver.next().await? {
+        LoopStep::Interrupt(LoopInterrupt::AfterToolResult(_)) => continue,
+        LoopStep::Finished(result) => break handle_result(result),
+        // …blocking interrupts handled as usual
+    }
+}
+```
+
 ## Interrupt ordering and state safety
 
 The driver enforces strict state transitions:
@@ -239,9 +300,11 @@ The driver enforces strict state transitions:
 Valid transitions:
 
   submit_input() ──▶ next() ──▶ Finished
-                               ──▶ Interrupt(Approval) ──▶ resolve_approval() ──▶ next()
-                               ──▶ Interrupt(Auth)     ──▶ resolve_auth()     ──▶ next()
-                               ──▶ Interrupt(Awaiting) ──▶ submit_input()     ──▶ next()
+                               ──▶ Interrupt(Approval)        ──▶ resolve_approval()    ──▶ next()
+                               ──▶ Interrupt(Auth)            ──▶ resolve_auth()        ──▶ next()
+                               ──▶ Interrupt(Awaiting)        ──▶ submit_input()        ──▶ next()
+                               ──▶ Interrupt(AfterToolResult) ──▶ [submit_input()]      ──▶ next()
+                                                                  (submit_input is optional)
 
 Invalid (state errors):
 
@@ -250,7 +313,7 @@ Invalid (state errors):
   resolve_approval() for a ToolCallId that doesn't exist → LoopError::InvalidState
 ```
 
-These constraints prevent subtle bugs where the host accidentally skips or duplicates an interrupt resolution. The cost is that the host must handle interrupts immediately, but this matches the reality that an unanswered approval request means the agent genuinely cannot proceed.
+Blocking interrupts (`ApprovalRequest`, `AuthRequest`) must be resolved before `next()` can run again; calling `next()` with an unresolved approval returns `LoopError::InvalidState`. Cooperative interrupts (`AwaitingInput`, `AfterToolResult`) impose no such constraint — the host calls `next()` when ready, with or without an intervening `submit_input()`. These constraints prevent subtle bugs where the host accidentally skips or duplicates a resolution that actually matters.
 
 ## The event/interrupt duality
 
@@ -304,4 +367,4 @@ The approval system still runs — it's just that the policy answers "yes" to ev
 
 > **Example:** [`openrouter-coding-agent`](https://github.com/danielkov/agentkit/tree/main/examples/openrouter-coding-agent) handles approval interrupts for filesystem writes in its main loop.
 >
-> **Crate:** [`agentkit-loop`](https://github.com/danielkov/agentkit/tree/main/crates/agentkit-loop) — `LoopStep`, `LoopInterrupt`, `PendingApproval`, `PendingAuth`, `InputRequest`. Approval types come from [`agentkit-tools-core`](https://github.com/danielkov/agentkit/tree/main/crates/agentkit-tools-core).
+> **Crate:** [`agentkit-loop`](https://github.com/danielkov/agentkit/tree/main/crates/agentkit-loop) — `LoopStep`, `LoopInterrupt`, `PendingApproval`, `PendingAuth`, `InputRequest`, `ToolRoundInfo`. Approval types come from [`agentkit-tools-core`](https://github.com/danielkov/agentkit/tree/main/crates/agentkit-tools-core).

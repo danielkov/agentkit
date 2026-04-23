@@ -95,10 +95,16 @@ where
         let _ = tokio::signal::ctrl_c().await;
         interrupt.interrupt();
     });
-    let step = driver.next().await;
+
+    let result = loop {
+        match driver.next().await {
+            Ok(LoopStep::Interrupt(LoopInterrupt::AfterToolResult(_))) => continue,
+            step => break step,
+        }
+    };
     ctrl_c.abort();
 
-    match step? {
+    match result? {
         LoopStep::Finished(result) => {
             if result.finish_reason == agentkit_core::FinishReason::Cancelled {
                 eprintln!("turn cancelled");
@@ -112,6 +118,7 @@ where
             }
             Ok(())
         }
+        LoopStep::Interrupt(LoopInterrupt::AfterToolResult(_)) => unreachable!(),
         LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_)) => Ok(()),
         LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(request)) => {
             eprintln!("approval required: {}", request.summary);

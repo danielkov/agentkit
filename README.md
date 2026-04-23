@@ -9,7 +9,7 @@ The project is intentionally split into small crates behind feature flags so hos
 `agentkit` is past the design-only stage. The repo currently includes working implementations for:
 
 - normalized transcript, content-part, and delta types with fluent builders
-- a runtime-agnostic loop driver with blocking interrupts for approval, auth, and input
+- a runtime-agnostic loop driver with blocking interrupts for approval and auth, plus cooperative yields for end-of-turn input and between-tool-round interjection
 - trait-based tools, permissions, approvals, and auth handoff
 - built-in filesystem, shell, and skills tools
 - context loading for `AGENTS.md` and skills directories
@@ -177,7 +177,10 @@ driver.submit_input(vec![Item::text(ItemKind::User, "Hello!")])?;
 
 match driver.next().await? {
     LoopStep::Finished(result) => { /* render result.items */ }
-    LoopStep::Interrupt(interrupt) => { /* resolve approval, auth, or input */ }
+    LoopStep::Interrupt(interrupt) if interrupt.is_blocking() => {
+        /* resolve approval or auth */
+    }
+    LoopStep::Interrupt(_) => { /* cooperative yield: submit input or call next() again */ }
 }
 ```
 

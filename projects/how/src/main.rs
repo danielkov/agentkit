@@ -530,6 +530,7 @@ async fn run_agent(
             LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(req)) => {
                 req.approve(&mut driver)?;
             }
+            LoopStep::Interrupt(LoopInterrupt::AfterToolResult(_)) => continue,
             LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_)) => break,
             LoopStep::Interrupt(LoopInterrupt::AuthRequest(_)) => break,
         }

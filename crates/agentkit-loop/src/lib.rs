@@ -773,6 +773,12 @@ pub struct TurnResult {
 ///         println!("Waiting for input: {}", pending.reason);
 ///         // ... call pending.submit(driver, items)
 ///     }
+///     LoopStep::Interrupt(LoopInterrupt::AfterToolResult(info)) => {
+///         // Cooperative yield between tool rounds.  Optionally call
+///         // driver.submit_input(...) to interject a user message, then
+///         // call driver.next() to resume the turn.
+///         let _ = info;
+///     }
 ///     LoopStep::Finished(result) => {
 ///         println!("Turn finished: {:?}", result.finish_reason);
 ///     }
@@ -788,6 +794,53 @@ pub enum LoopInterrupt {
     AuthRequest(PendingAuth),
     /// The driver has no pending input and needs the host to supply some.
     AwaitingInput(InputRequest),
+    /// A tool round finished: all tool calls from the previous assistant
+    /// message now have results in the transcript, and the driver is about to
+    /// invoke the model again.  The host may call
+    /// [`LoopDriver::submit_input`] to interject user messages before the
+    /// next model turn, then call [`LoopDriver::next`] to resume.
+    ///
+    /// This is a non-blocking interrupt: callers that do not care about
+    /// mid-turn interjection can treat it as a no-op (`_ => continue`) and
+    /// the next `next()` call resumes the turn.
+    AfterToolResult(ToolRoundInfo),
+}
+
+impl LoopInterrupt {
+    /// Returns `true` if the interrupt must be explicitly resolved before
+    /// the loop can make progress.  Approvals and auth requests are
+    /// blocking; [`AwaitingInput`](LoopInterrupt::AwaitingInput) and
+    /// [`AfterToolResult`](LoopInterrupt::AfterToolResult) are cooperative
+    /// and can be ignored by calling [`LoopDriver::next`] again.
+    pub fn is_blocking(&self) -> bool {
+        matches!(
+            self,
+            LoopInterrupt::ApprovalRequest(_) | LoopInterrupt::AuthRequest(_)
+        )
+    }
+}
+
+/// Metadata describing a completed tool round, surfaced via
+/// [`LoopInterrupt::AfterToolResult`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolRoundInfo {
+    /// The session that produced this tool round.
+    pub session_id: SessionId,
+    /// The turn that is about to continue into the next model call.
+    pub turn_id: agentkit_core::TurnId,
+    /// Transcript length at the yield point (for snapshots / UIs).
+    pub transcript_len: usize,
+}
+
+impl ToolRoundInfo {
+    /// Convenience: forwards to [`LoopDriver::submit_input`].
+    pub fn submit<S: ModelSession>(
+        &self,
+        driver: &mut LoopDriver<S>,
+        items: Vec<Item>,
+    ) -> Result<(), LoopError> {
+        driver.submit_input(items)
+    }
 }
 
 /// The result of advancing the agent loop by one step.
@@ -955,6 +1008,7 @@ where
             pending_approval_order: VecDeque::new(),
             pending_auth: None,
             active_tool_round: None,
+            pending_round_resume: None,
             next_turn_index: 1,
         };
         driver.emit(AgentEvent::RunStarted { session_id });
@@ -1136,6 +1190,7 @@ where
     pending_approval_order: VecDeque<ToolCallId>,
     pending_auth: Option<PendingAuthToolCall>,
     active_tool_round: Option<ActiveToolRound>,
+    pending_round_resume: Option<agentkit_core::TurnId>,
     next_turn_index: u64,
 }
 
@@ -1538,7 +1593,21 @@ where
                     if active.background_pending && !active.foreground_progressed {
                         return Ok(None);
                     }
-                    return Ok(Some(Box::pin(self.drive_turn(turn_id, false)).await?));
+                    // Yield control back to the host between tool rounds.
+                    // All tool calls in this round have results in the
+                    // transcript; the transcript is provider-valid.  The
+                    // host may submit_input before calling next() to
+                    // resume, which will re-enter drive_turn via
+                    // pending_round_resume.
+                    let info = ToolRoundInfo {
+                        session_id: self.session_id.clone(),
+                        turn_id: turn_id.clone(),
+                        transcript_len: self.transcript.len(),
+                    };
+                    self.pending_round_resume = Some(turn_id);
+                    return Ok(Some(LoopStep::Interrupt(LoopInterrupt::AfterToolResult(
+                        info,
+                    ))));
                 }
             }
         }
@@ -2009,6 +2078,15 @@ where
         let (had_loop_updates, loop_step) = self.drain_pending_loop_updates().await?;
         if let Some(step) = loop_step {
             return Ok(step);
+        }
+
+        // Resume after an AfterToolResult yield.  Any input submitted by the
+        // host during the yield is folded into the transcript as part of the
+        // continuation turn; background task results drained just above are
+        // already in the transcript.
+        if let Some(turn_id) = self.pending_round_resume.take() {
+            self.transcript.append(&mut self.pending_input);
+            return self.drive_turn(turn_id, false).await;
         }
 
         if self.pending_input.is_empty() && !had_loop_updates {
@@ -2975,7 +3053,7 @@ mod tests {
             }])
             .unwrap();
 
-        let result = driver.next().await.unwrap();
+        let result = run_until_finished(&mut driver).await;
 
         match result {
             LoopStep::Finished(turn) => {
@@ -2987,6 +3065,18 @@ mod tests {
                 }
             }
             other => panic!("unexpected loop step: {other:?}"),
+        }
+    }
+
+    /// Test helper: drives the loop, transparently resuming non-blocking
+    /// cooperative interrupts (AfterToolResult), until a terminal step or a
+    /// blocking interrupt is reached.
+    async fn run_until_finished<S: ModelSession + Send>(driver: &mut LoopDriver<S>) -> LoopStep {
+        loop {
+            match driver.next().await.unwrap() {
+                LoopStep::Interrupt(LoopInterrupt::AfterToolResult(_)) => continue,
+                step => return step,
+            }
         }
     }
 
@@ -3021,7 +3111,7 @@ mod tests {
             }])
             .unwrap();
 
-        let result = driver.next().await.unwrap();
+        let result = run_until_finished(&mut driver).await;
 
         match result {
             LoopStep::Finished(turn) => match &turn.items[0].parts[0] {
@@ -3604,6 +3694,75 @@ mod tests {
         assert_eq!(seen.len(), 2);
         assert_eq!(seen[0], Some(default_cache));
         assert_eq!(seen[1], Some(override_cache));
+    }
+
+    #[tokio::test]
+    async fn loop_yields_after_tool_result_between_rounds() {
+        let tools = ToolRegistry::new().with(EchoTool::default());
+        let agent = Agent::builder()
+            .model(FakeAdapter)
+            .tools(tools)
+            .permissions(AllowAllPermissions)
+            .build()
+            .unwrap();
+
+        let mut driver = agent
+            .start(SessionConfig {
+                session_id: SessionId::new("yield-session"),
+                metadata: MetadataMap::new(),
+                cache: None,
+            })
+            .await
+            .unwrap();
+
+        driver
+            .submit_input(vec![Item::text(ItemKind::User, "ping")])
+            .unwrap();
+
+        // First next() runs the model turn, resolves the tool call, and
+        // yields AfterToolResult before calling the model again.
+        let step = driver.next().await.unwrap();
+        let info = match step {
+            LoopStep::Interrupt(LoopInterrupt::AfterToolResult(info)) => info,
+            other => panic!("expected AfterToolResult, got {other:?}"),
+        };
+        assert_eq!(info.session_id, SessionId::new("yield-session"));
+        // Transcript at yield: [User, Assistant(tool_call), Tool(result)]
+        assert_eq!(info.transcript_len, 3);
+
+        // The yield is cooperative, not blocking.
+        let interrupt = LoopInterrupt::AfterToolResult(info.clone());
+        assert!(!interrupt.is_blocking());
+
+        // Host interjects a message mid-turn.
+        driver
+            .submit_input(vec![Item::text(ItemKind::User, "also: report back")])
+            .unwrap();
+
+        // Second next() resumes the turn into the next model call, which
+        // sees the tool result (and the injected user message) and finishes.
+        let step = driver.next().await.unwrap();
+        match step {
+            LoopStep::Finished(turn) => {
+                assert_eq!(turn.finish_reason, FinishReason::Completed);
+            }
+            other => panic!("expected Finished, got {other:?}"),
+        }
+
+        // Transcript must now include the injected user message.
+        let snapshot = driver.snapshot();
+        let has_injected_message = snapshot.transcript.iter().any(|item| {
+            item.kind == ItemKind::User
+                && item.parts.iter().any(|part| match part {
+                    Part::Text(text) => text.text == "also: report back",
+                    _ => false,
+                })
+        });
+        assert!(
+            has_injected_message,
+            "injected user message should be in transcript, got: {:?}",
+            snapshot.transcript
+        );
     }
 
     #[test]

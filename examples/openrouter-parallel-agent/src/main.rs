@@ -178,6 +178,7 @@ where
                 let _ = pending.cancel(driver);
                 continue;
             }
+            LoopStep::Interrupt(LoopInterrupt::AfterToolResult(_)) => continue,
             LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_)) => {
                 // No more input to process right now. Background tasks may
                 // still be running — the caller can wait for them and

@@ -159,9 +159,17 @@ loop {
             let decision = ask_user(req).await?;
             driver.resolve_approval(decision)?;
         }
+        LoopStep::Interrupt(LoopInterrupt::AuthRequest(_)) => {
+            // Obtain credentials and resolve; omitted here.
+            break;
+        }
         LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_)) => {
             let input = read_input().await?;
             driver.submit_input(input)?;
+        }
+        LoopStep::Interrupt(LoopInterrupt::AfterToolResult(_)) => {
+            // Optional mid-turn interjection point.  Non-interactive
+            // callers just loop; interactive callers may submit_input.
         }
         LoopStep::Finished(turn) => {
             println!("turn complete: {:?}", turn.finish_reason);
@@ -199,11 +207,11 @@ Semantics:
 
 - calling `next()` twice without answering an outstanding interrupt should return an error
 - calling `resolve_approval()` when no approval is pending should return an error
-- calling `submit_input()` while the loop is blocked on approval should either error or explicitly append to a future queue; v1 should prefer erroring to keep behavior obvious
+- calling `submit_input()` while the loop is blocked on approval or auth errors with `LoopError::InvalidState`; submitting during a cooperative yield (`AwaitingInput`, `AfterToolResult`) is allowed and is the intended path for mid-turn interjection
 
 ## LoopStep and interrupts
 
-Recommended shape:
+Shape:
 
 ```rust
 pub enum LoopStep {
@@ -212,18 +220,22 @@ pub enum LoopStep {
 }
 
 pub enum LoopInterrupt {
-    ApprovalRequest(ApprovalRequest),
-    AwaitingInput(InputRequest),
+    ApprovalRequest(PendingApproval),       // blocking
+    AuthRequest(PendingAuth),               // blocking
+    AwaitingInput(InputRequest),            // cooperative
+    AfterToolResult(ToolRoundInfo),         // cooperative
 }
 ```
 
 Why this is the right boundary:
 
-- `ApprovalRequest` means the loop cannot continue safely without a host decision
-- `AwaitingInput` means the current turn boundary has been reached and the loop needs more user/host input
-- `Finished` means the requested turn completed successfully enough to hand control back to the host
+- `ApprovalRequest` means the loop cannot continue safely without a host decision.
+- `AuthRequest` means a tool needs credentials before it can execute.
+- `AwaitingInput` means the current turn boundary has been reached and the loop needs more user/host input.
+- `AfterToolResult` means a tool round just finished; the host may interject a user message before the next model call by calling `submit_input`, or just call `next()` again to resume.
+- `Finished` means the requested turn completed and the host takes control back.
 
-This keeps control flow simple and explicit.
+Blocking variants must be resolved before `next()` can run again; cooperative variants impose no such constraint. `LoopInterrupt::is_blocking()` surfaces the distinction.
 
 ## Approval model
 

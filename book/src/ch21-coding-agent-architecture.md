@@ -110,6 +110,10 @@ loop {
                 let resolution = handle_auth(&req)?;
                 driver.resolve_auth(resolution)?;
             }
+            // Cooperative yield between tool rounds.  A headless coding
+            // agent just resumes; an interactive host can `submit_input`
+            // here to interject a user message before the next model call.
+            LoopStep::Interrupt(LoopInterrupt::AfterToolResult(_)) => continue,
             LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_)) => break,
             LoopStep::Finished(result) => {
                 print_usage(&result);

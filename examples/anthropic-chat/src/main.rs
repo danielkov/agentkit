@@ -147,34 +147,38 @@ async fn run_turn<S>(
 where
     S: agentkit_loop::ModelSession,
 {
-    match driver.next().await? {
-        LoopStep::Finished(result) => {
-            println!();
-            match result.finish_reason {
-                agentkit_core::FinishReason::Cancelled => eprintln!("[turn cancelled]"),
-                agentkit_core::FinishReason::Error => eprintln!("[turn ended with error]"),
-                _ => {}
-            }
+    loop {
+        match driver.next().await? {
+            LoopStep::Finished(result) => {
+                println!();
+                match result.finish_reason {
+                    agentkit_core::FinishReason::Cancelled => eprintln!("[turn cancelled]"),
+                    agentkit_core::FinishReason::Error => eprintln!("[turn ended with error]"),
+                    _ => {}
+                }
 
-            if let Some(usage) = usage_slot
-                .lock()
-                .expect("usage slot poisoned")
-                .take()
-                .or(result.usage)
-            {
-                print_usage_footer(&usage);
+                if let Some(usage) = usage_slot
+                    .lock()
+                    .expect("usage slot poisoned")
+                    .take()
+                    .or(result.usage)
+                {
+                    print_usage_footer(&usage);
+                }
+                return Ok(());
             }
-        }
-        LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_)) => {}
-        LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(request)) => {
-            eprintln!("\n[approval required] {}", request.summary);
-        }
-        LoopStep::Interrupt(LoopInterrupt::AuthRequest(request)) => {
-            eprintln!("\n[auth required] {}", request.provider);
+            LoopStep::Interrupt(LoopInterrupt::AfterToolResult(_)) => continue,
+            LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_)) => return Ok(()),
+            LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(request)) => {
+                eprintln!("\n[approval required] {}", request.summary);
+                return Ok(());
+            }
+            LoopStep::Interrupt(LoopInterrupt::AuthRequest(request)) => {
+                eprintln!("\n[auth required] {}", request.provider);
+                return Ok(());
+            }
         }
     }
-
-    Ok(())
 }
 
 fn print_usage_footer(usage: &Usage) {

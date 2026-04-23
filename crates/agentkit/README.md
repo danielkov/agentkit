@@ -87,6 +87,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Feed the next user message and continue the loop.
                     break;
                 }
+                // Cooperative yield between tool rounds.  A non-interactive
+                // host resumes immediately; an interactive host may call
+                // driver.submit_input(...) here before calling next() again.
+                agentkit::loop_::LoopInterrupt::AfterToolResult(_) => continue,
             },
         }
     }

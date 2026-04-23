@@ -6,7 +6,7 @@ This crate provides:
 
 - **Model adapter traits** -- `ModelAdapter`, `ModelSession`, and `ModelTurn` abstract away the model provider so you can swap between OpenRouter, Anthropic, or a local LLM without changing loop logic.
 - **`Agent` builder and `LoopDriver`** -- configure tools, permissions, observers, and compaction, then drive the loop step-by-step.
-- **Interrupt handling** -- the loop pauses and yields `LoopStep::Interrupt` when a tool call requires user approval, authentication, or when no input is queued.
+- **Interrupt handling** -- the loop pauses and yields `LoopStep::Interrupt` on blocking events (tool approval, authentication) and cooperative yields (`AwaitingInput` at end-of-turn, `AfterToolResult` between tool rounds). The host either resolves the interrupt or just calls `next()` again depending on whether `LoopInterrupt::is_blocking()` is `true`.
 - **Observer hooks** -- attach `LoopObserver` implementations to receive streaming `AgentEvent`s (deltas, tool calls, usage, warnings, lifecycle events).
 - **Transcript compaction** -- optionally compact the transcript when it grows too large, via the `agentkit-compaction` integration.
 
@@ -117,6 +117,10 @@ loop {
             println!("No more input, stopping.");
             break;
         }
+        // Cooperative yield between tool rounds.  Interactive hosts may
+        // call driver.submit_input(...) here to interject a user message
+        // before the next model call; non-interactive callers just loop.
+        LoopStep::Interrupt(LoopInterrupt::AfterToolResult(_)) => continue,
     }
 }
 # Ok(())

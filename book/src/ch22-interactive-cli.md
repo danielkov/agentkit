@@ -1,55 +1,186 @@
 # The interactive CLI
 
-This chapter covers the host-side implementation of an interactive coding agent CLI: input handling, output rendering, approval UX, session lifecycle, and error recovery.
+This chapter covers the host-side implementation of an interactive coding agent CLI: architecture, input handling, output rendering, approval UX, session lifecycle, and error recovery.
 
 Everything in this chapter is host code — agentkit doesn't include a CLI. The library provides the loop, and the host provides the user interface. This separation means the same agentkit crates power a terminal CLI, a web server, an IDE plugin, or a headless CI agent.
 
-## The host loop skeleton
+## Architecture: actor + command channel
 
-Before diving into details, here's the complete structure of an interactive CLI host:
+An interactive CLI has two responsibilities that pull in different directions:
+
+- **Driving the loop** — owning the single `&mut LoopDriver`, processing `LoopStep`s, holding in-flight transcript state.
+- **Owning the terminal** — reading stdin, rendering streaming output, switching between message-input and approval-input modes.
+
+A single-task design solves this with `tokio::select!` over `driver.next()` and a stdin reader, plus local buffering for messages typed mid-turn. That works, but it tangles "when is the driver at rest?" with "when should I render a prompt?". The production pattern for non-trivial CLIs is to split the two concerns into separate tasks communicating via typed channels:
+
+```text
+  ┌──────────────┐   AgentCommand    ┌───────────────────┐
+  │   UI task    │ ────────────────▶ │   Agent task      │
+  │ (stdin/TTY)  │                   │ (owns LoopDriver) │
+  │              │ ◀──────────────── │                   │
+  └──────────────┘     UiEvent       └───────────────────┘
+```
+
+- **Agent task** owns the `LoopDriver`. Runs a `Mode::Idle` / `Driving` / `AwaitingApproval` state machine driven by incoming `AgentCommand`s and outgoing `LoopStep`s. Knows nothing about terminal rendering.
+- **UI task** owns stdin and stdout. Holds a local `UiMode::{MessageInput, ApprovalInput}` that determines how each typed line is classified. Knows nothing about the driver.
+- **Observers** run inside the agent task. A `ChannelObserver` forwards every `AgentEvent` to the UI as a `UiEvent::Agent(event)`; the UI renders from that stream.
+
+Two typed channels:
 
 ```rust
-// Setup
-let agent = Agent::builder()
-    .model(adapter)
-    .tools(tools)
-    .permissions(permissions)
-    .observer(reporter)
-    .compaction(compaction)
-    .cancellation(cancellation_handle)
-    .build()?;
+// UI → agent.  The UI decides what a raw stdin line means based on its
+// local UiMode; the agent never inspects raw strings.
+enum AgentCommand {
+    UserMessage(String),
+    ApprovalAnswer(ApprovalDecision),
+    Cancel,
+    Quit,
+}
 
-let mut driver = agent.start(session_config).await?;
+// agent → UI.  Carries forwarded AgentEvents plus explicit transitions
+// that tell the UI when to change mode or render the prompt.
+enum UiEvent {
+    Agent(AgentEvent),
+    ApprovalRequested(ApprovalRequest),  // UI switches to ApprovalInput
+    Idle,                                // UI renders prompt, switches to MessageInput
+    Busy,                                // UI shows `⎿ queued` on mid-turn typing
+    Shutdown,
+}
+```
 
-// Submit system prompt and context
-driver.submit_input(system_items)?;
-driver.submit_input(context_items)?;
+Why this shape:
 
-// Main interaction loop
+- **The `&mut LoopDriver` invariant stays intact.** Every driver mutation happens inside the agent task. The UI task cannot accidentally call `submit_input` while `next()` is awaiting.
+- **The approval race disappears.** With one string channel both typed-ahead user messages and approval answers arrive as `AgentCommand`, and a heuristic must decide which is which. With two typed variants and a UI-owned `UiMode`, the UI classifies at the source — no race.
+- **The front-end is pluggable.** Swap the UI task for an HTTP handler, a test harness, or a GUI without touching the agent code.
+- **State transitions read top-to-bottom.** The agent task is a self-contained `loop { mode = match mode { … } }` state machine.
+
+The `openrouter-coding-agent` example implements this pattern end-to-end.
+
+## The agent-task state machine
+
+```rust
+enum Mode {
+    Idle,
+    Driving { buffered: Vec<Item> },
+    AwaitingApproval { pending: PendingApproval, buffered: Vec<Item> },
+}
+
 loop {
-    // Read user input
-    let input = read_user_input()?;
-    if input == "/exit" { break; }
-
-    driver.submit_input(vec![user_item(&input)])?;
-
-    // Drive the turn to completion
-    loop {
-        match driver.next().await? {
-            LoopStep::Finished(_) => break,
-            LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_)) => break,
-            LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(p)) => {
-                handle_approval(p, &mut driver)?;
-            }
-            LoopStep::Interrupt(LoopInterrupt::AuthRequest(p)) => {
-                handle_auth(p, &mut driver)?;
+    mode = match mode {
+        Mode::Idle => {
+            evt_tx.send(UiEvent::Idle).ok();
+            match cmd_rx.recv().await {
+                Some(AgentCommand::UserMessage(text)) => {
+                    driver.submit_input(vec![Item::text(ItemKind::User, text)])?;
+                    evt_tx.send(UiEvent::Busy).ok();
+                    Mode::Driving { buffered: Vec::new() }
+                }
+                Some(AgentCommand::Quit) | None => break,
+                _ => Mode::Idle,  // stray commands at rest: drop
             }
         }
+
+        Mode::Driving { mut buffered } => tokio::select! {
+            step = driver.next() => match step? {
+                LoopStep::Interrupt(LoopInterrupt::AfterToolResult(_)) => {
+                    // Flush typed-ahead messages so the next model call sees them.
+                    if !buffered.is_empty() {
+                        driver.submit_input(std::mem::take(&mut buffered))?;
+                    }
+                    Mode::Driving { buffered }
+                }
+                LoopStep::Finished(_) | LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_)) => {
+                    if !buffered.is_empty() {
+                        driver.submit_input(std::mem::take(&mut buffered))?;
+                        Mode::Driving { buffered }  // auto-advance
+                    } else {
+                        Mode::Idle
+                    }
+                }
+                LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(pending)) => {
+                    evt_tx.send(UiEvent::ApprovalRequested(pending.request.clone())).ok();
+                    Mode::AwaitingApproval { pending, buffered }
+                }
+                LoopStep::Interrupt(LoopInterrupt::AuthRequest(_)) => break,
+            },
+            Some(cmd) = cmd_rx.recv() => match cmd {
+                AgentCommand::UserMessage(text) => {
+                    buffered.push(Item::text(ItemKind::User, text));
+                    Mode::Driving { buffered }
+                }
+                AgentCommand::Cancel => {
+                    cancellation.interrupt();
+                    Mode::Driving { buffered }
+                }
+                AgentCommand::Quit | _ => { /* cancel + drain + break */ }
+            },
+        },
+
+        Mode::AwaitingApproval { pending, mut buffered } =>
+            match cmd_rx.recv().await {
+                Some(AgentCommand::ApprovalAnswer(decision)) => {
+                    apply_approval(pending, decision, &mut driver)?;
+                    Mode::Driving { buffered }
+                }
+                Some(AgentCommand::UserMessage(text)) => {
+                    // User typed a message during the approval — preserve it.
+                    buffered.push(Item::text(ItemKind::User, text));
+                    Mode::AwaitingApproval { pending, buffered }
+                }
+                Some(AgentCommand::Cancel) => {
+                    pending.deny_with_reason(&mut driver, "cancelled")?;
+                    cancellation.interrupt();
+                    Mode::Driving { buffered }
+                }
+                _ => break,
+            },
+    };
+}
+```
+
+The three modes correspond to the three reasons a host might be waiting: waiting for the user to speak, waiting for the driver to finish work, waiting for the user to answer an approval.
+
+## The UI-task classifier
+
+```rust
+enum UiMode { MessageInput, ApprovalInput }
+
+fn classify_line(line: &str, mode: UiMode) -> Option<AgentCommand> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() { return None; }
+    match trimmed {
+        "/exit" | "/quit" => return Some(AgentCommand::Quit),
+        "/cancel"         => return Some(AgentCommand::Cancel),
+        _ => {}
+    }
+    match mode {
+        UiMode::MessageInput  => Some(AgentCommand::UserMessage(line.to_string())),
+        UiMode::ApprovalInput => Some(AgentCommand::ApprovalAnswer(parse_answer(trimmed))),
     }
 }
 ```
 
-Every section below fills in a piece of this skeleton.
+The UI flips to `ApprovalInput` on `UiEvent::ApprovalRequested` and back to `MessageInput` when it sends an `ApprovalAnswer` (or on the next `UiEvent::Idle`). Slash commands are mode-independent. The `Busy` event tracks whether a `⎿ queued` echo should accompany a `UserMessage` — useful so typed-ahead messages visibly reach the classifier even when streaming output is interleaving with them on the terminal.
+
+## Minimal skeleton
+
+For simple CLIs or prototypes, a single-task skeleton with cooperative-yield passthrough is still fine:
+
+```rust
+driver.submit_input(vec![user_item(&input)])?;
+loop {
+    match driver.next().await? {
+        LoopStep::Finished(_) => break,
+        LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_)) => break,
+        LoopStep::Interrupt(LoopInterrupt::AfterToolResult(_)) => continue,
+        LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(p)) => handle_approval(p, &mut driver)?,
+        LoopStep::Interrupt(LoopInterrupt::AuthRequest(p))     => handle_auth(p, &mut driver)?,
+    }
+}
+```
+
+This is what the one-shot CLIs in the repo (`openrouter-chat`, `openrouter-agent-cli`) use. The actor split is worth adopting when a CLI grows mid-turn interjection, rich approval UX, or a pluggable front-end.
 
 ## Input handling
 

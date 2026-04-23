@@ -97,21 +97,23 @@ There is no polling, no callback registration, and no event queue the host must 
 
 ## Interrupts
 
-An interrupt pauses the loop and returns control to the host. agentkit defines three interrupt types:
+An interrupt pauses the loop and returns control to the host. agentkit defines four interrupt types, split into blocking (must be resolved before the loop continues) and cooperative (host may ignore the yield and call `next()` again):
 
 ```rust
 pub enum LoopInterrupt {
-    ApprovalRequest(PendingApproval),
-    AuthRequest(PendingAuth),
-    AwaitingInput(InputRequest),
+    ApprovalRequest(PendingApproval),     // blocking
+    AuthRequest(PendingAuth),             // blocking
+    AwaitingInput(InputRequest),          // cooperative
+    AfterToolResult(ToolRoundInfo),       // cooperative
 }
 ```
 
-| Interrupt         | Trigger                                              | Resolution                                                         |
-| ----------------- | ---------------------------------------------------- | ------------------------------------------------------------------ |
-| `ApprovalRequest` | A tool call requires explicit permission             | Host calls `approve()` or `deny()` on the `PendingApproval` handle |
-| `AuthRequest`     | A tool needs credentials the loop doesn't have       | Host provides credentials or cancels                               |
-| `AwaitingInput`   | The model finished and the loop has no pending input | Host calls `submit_input()` with new items                         |
+| Interrupt         | Trigger                                                   | Resolution                                                               |
+| ----------------- | --------------------------------------------------------- | ------------------------------------------------------------------------ |
+| `ApprovalRequest` | A tool call requires explicit permission                  | Host calls `approve()` or `deny()` on the `PendingApproval` handle       |
+| `AuthRequest`     | A tool needs credentials the loop doesn't have            | Host provides credentials or cancels                                     |
+| `AwaitingInput`   | The model finished and the loop has no pending input      | Host calls `submit_input()` with new items                               |
+| `AfterToolResult` | A tool round completed, model is about to be called again | Optional — host may `submit_input()` to interject, or just call `next()` |
 
 Interrupts are the mechanism for user cancellation and external preemption. A user who wants to abort a loop heading in the wrong direction triggers a cancellation (via `CancellationController::interrupt()`), which causes the current turn to end with `FinishReason::Cancelled`. The host sees this in the `TurnResult` and can decide how to proceed — submit corrected input, adjust the system prompt, or stop entirely.
 
@@ -127,14 +129,14 @@ pub trait LoopObserver: Send {
 
 Observers are informational — they cannot stall the loop or alter its control flow. This keeps the driver's state machine simple: `next()` either returns a `LoopStep` or doesn't return yet. There is no interleaving of observer handling with loop logic.
 
-| Blocking (`LoopStep`)  | Non-blocking (`AgentEvent`)      |
-| ---------------------- | -------------------------------- |
-| `ApprovalRequest`      | `ContentDelta`                   |
-| `AuthRequest`          | `ToolCallRequested`              |
-| `AwaitingInput`        | `UsageUpdated`                   |
-| `Finished(TurnResult)` | `CompactionStarted` / `Finished` |
-|                        | `TurnStarted` / `TurnFinished`   |
-|                        | `Warning`                        |
+| Control flow (`LoopStep`) | Observation (`AgentEvent`)       |
+| ------------------------- | -------------------------------- |
+| `ApprovalRequest`         | `ContentDelta`                   |
+| `AuthRequest`             | `ToolCallRequested`              |
+| `AwaitingInput`           | `UsageUpdated`                   |
+| `AfterToolResult`         | `CompactionStarted` / `Finished` |
+| `Finished(TurnResult)`    | `TurnStarted` / `TurnFinished`   |
+|                           | `Warning`                        |
 
 ## The three-layer model
 
@@ -217,6 +219,11 @@ match driver.next().await? {
     }
     LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_)) => {
         // Model finished, prompt user for more input
+    }
+    LoopStep::Interrupt(LoopInterrupt::AfterToolResult(_)) => {
+        // Tool round done.  Non-interactive callers just loop back; an
+        // interactive host may call driver.submit_input(...) here to
+        // interject a user message before the next model call.
     }
     LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(pending)) => {
         // A tool needs permission — approve or deny

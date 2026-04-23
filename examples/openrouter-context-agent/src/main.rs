@@ -117,23 +117,26 @@ async fn run_to_completion<S>(
 where
     S: agentkit_loop::ModelSession,
 {
-    match driver.next().await? {
-        LoopStep::Finished(result) => {
-            for item in result.items {
-                if item.kind == ItemKind::Assistant {
-                    print_assistant_item(item);
+    loop {
+        match driver.next().await? {
+            LoopStep::Finished(result) => {
+                for item in result.items {
+                    if item.kind == ItemKind::Assistant {
+                        print_assistant_item(item);
+                    }
                 }
+                return Ok(());
             }
-            Ok(())
-        }
-        LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(req)) => {
-            Err(format!("unexpected approval request: {}", req.summary).into())
-        }
-        LoopStep::Interrupt(LoopInterrupt::AuthRequest(req)) => {
-            Err(format!("unexpected auth request from {}", req.provider).into())
-        }
-        LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_)) => {
-            Err("loop requested more input before finishing".into())
+            LoopStep::Interrupt(LoopInterrupt::AfterToolResult(_)) => continue,
+            LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(req)) => {
+                return Err(format!("unexpected approval request: {}", req.summary).into());
+            }
+            LoopStep::Interrupt(LoopInterrupt::AuthRequest(req)) => {
+                return Err(format!("unexpected auth request from {}", req.provider).into());
+            }
+            LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_)) => {
+                return Err("loop requested more input before finishing".into());
+            }
         }
     }
 }

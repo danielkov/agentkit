@@ -106,10 +106,17 @@ Driver state machine:
        append tool results
                 │
                 ▼
+  ┌─────────────────────────────────┐
+  │   AfterToolResult              ─┼──▶ Interrupt (cooperative)
+  │                                 │    host may submit_input() to
+  │   host calls next() to resume  ◀┼─── interject, then next() to
+  └─────────────┬───────────────────┘    resume into the next model turn
+                │
+                ▼
        go to "Model turn" ◀─── automatic tool roundtrip
 ```
 
-The host cannot call `next()` twice without resolving an outstanding interrupt — that's a state error. This is intentional. The driver forces the host to deal with interrupts before proceeding. You can't accidentally ignore an approval request.
+The host cannot call `next()` twice without resolving an outstanding _blocking_ interrupt (`ApprovalRequest`, `AuthRequest`) — that's a state error. Cooperative interrupts (`AwaitingInput`, `AfterToolResult`) require no resolution; calling `next()` again resumes the loop as described in the diagram. The driver forces the host to deal with blocking interrupts before proceeding so an approval request can never be silently skipped.
 
 ## Anatomy of a turn
 
@@ -192,7 +199,7 @@ If the model requested tool calls (indicated by `FinishReason::ToolCall`):
 
 ### 7. Tool roundtrip
 
-If tools were executed, the driver starts another model turn automatically (back to step 3). The model sees the tool results and may request more tools or produce a final response.
+If tools were executed, the driver yields `LoopStep::Interrupt(AfterToolResult(_))` before invoking the model again. The host has a chance to call `submit_input(..)` to interject a user message at this boundary — the resulting transcript `[..., tool_call, tool_result, user]` is valid for the next model call. Calling `next()` again resumes the turn into the next model call (back to step 3). The model sees the tool results (and any injected message) and may request more tools or produce a final response.
 
 ### 8. Return result
 
@@ -210,24 +217,32 @@ LoopStep::Finished(TurnResult {
 
 ### Multiple tool roundtrips per user turn
 
-A single user message can trigger many tool roundtrips:
+A single user message can trigger many tool roundtrips. Between each one the driver yields `AfterToolResult` back to the host:
 
 ```text
 User: "Add error handling to src/parser.rs"
 
-  Turn 1: model → ToolCall(fs.read_file)
-          execute → result appended
-  Turn 2: model → ToolCall(fs.replace_in_file)
-          execute → result appended
-  Turn 3: model → ToolCall(shell.exec("cargo check"))
-          execute → result appended
-  Turn 4: model → Text("I've added error handling...")
-          no tool calls → Finished
+  Model call 1: ToolCall(fs.read_file)
+                execute → result appended
+  ──▶ next() returns Interrupt(AfterToolResult)
+      (host may submit_input or just call next())
 
-Host sees: one call to next(), one TurnResult with all items.
+  Model call 2: ToolCall(fs.replace_in_file)
+                execute → result appended
+  ──▶ next() returns Interrupt(AfterToolResult)
+
+  Model call 3: ToolCall(shell.exec("cargo check"))
+                execute → result appended
+  ──▶ next() returns Interrupt(AfterToolResult)
+
+  Model call 4: Text("I've added error handling...")
+                no tool calls
+  ──▶ next() returns Finished(TurnResult)
+
+Host sees: four calls to next(), three cooperative yields, one Finished.
 ```
 
-From the host's perspective, this is one call to `next()` that returns one `TurnResult` containing all items produced across all internal turns. This is a critical feature for coding agents — the model must be able to chain tool calls without returning control to the host after each one.
+From the host's perspective, each tool round ends with a cooperative yield. Non-interactive callers match `AfterToolResult` with `continue` and see essentially one "turn" delivered as a final `TurnResult`; interactive callers can interject user input at each boundary without cancelling the turn. Either way, the model chains tool calls without the host having to mediate each call — only the round boundaries are exposed.
 
 ## Event delivery during a turn
 
