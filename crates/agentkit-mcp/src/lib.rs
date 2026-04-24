@@ -18,8 +18,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex as StdMutex, RwLock};
 
 use agentkit_capabilities::{
-    CapabilityContext, CapabilityError, CapabilityName, CapabilityProvider, Invocable,
-    InvocableOutput, InvocableRequest, InvocableResult, InvocableSpec, PromptContents,
+    CapabilityContext, CapabilityError, CapabilityProvider, Invocable, PromptContents,
     PromptDescriptor, PromptId, PromptProvider, ResourceContents, ResourceDescriptor, ResourceId,
     ResourceProvider,
 };
@@ -28,7 +27,8 @@ use agentkit_core::{
     ToolResultPart,
 };
 use agentkit_tools_core::{
-    AuthOperation, AuthRequest, AuthResolution, Tool, ToolAnnotations, ToolCatalogEvent,
+    AuthOperation, AuthRequest, AuthResolution, PermissionChecker, PermissionDecision,
+    PermissionRequest, Tool, ToolAnnotations, ToolCapabilityProvider, ToolCatalogEvent,
     ToolContext, ToolError, ToolExecutionOutcome, ToolExecutor, ToolName, ToolRegistry,
     ToolRequest, ToolResult, ToolSpec,
 };
@@ -228,6 +228,57 @@ impl McpServerConfig {
     pub fn with_metadata(mut self, metadata: MetadataMap) -> Self {
         self.metadata = metadata;
         self
+    }
+}
+
+/// Strategy used to derive the agentkit-side tool name for an MCP tool.
+///
+/// The default (`Default`) preserves agentkit's historical
+/// `mcp_<server>_<tool>` shape so that names satisfy provider validators
+/// that only allow `[a-zA-Z0-9_-]` (e.g. Anthropic on Vertex). Use
+/// [`McpToolNamespace::None`] when the calling provider already namespaces
+/// remote tools, or [`McpToolNamespace::Custom`] for a bespoke scheme.
+#[derive(Clone)]
+pub enum McpToolNamespace {
+    /// Format names as `mcp_<server>_<tool>`.
+    Default,
+    /// Use the raw MCP tool name with no prefix at all.
+    None,
+    /// Apply a caller-supplied function for full control.
+    Custom(Arc<dyn Fn(&McpServerId, &str) -> String + Send + Sync>),
+}
+
+impl Default for McpToolNamespace {
+    fn default() -> Self {
+        Self::Default
+    }
+}
+
+impl fmt::Debug for McpToolNamespace {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Default => f.write_str("McpToolNamespace::Default"),
+            Self::None => f.write_str("McpToolNamespace::None"),
+            Self::Custom(_) => f.write_str("McpToolNamespace::Custom(<fn>)"),
+        }
+    }
+}
+
+impl McpToolNamespace {
+    /// Builds a custom namespace from a closure.
+    pub fn custom(
+        f: impl Fn(&McpServerId, &str) -> String + Send + Sync + 'static,
+    ) -> Self {
+        Self::Custom(Arc::new(f))
+    }
+
+    /// Applies the namespace strategy to produce the agentkit tool name.
+    pub fn apply(&self, server_id: &McpServerId, tool_name: &str) -> String {
+        match self {
+            Self::Default => format!("mcp_{server_id}_{tool_name}"),
+            Self::None => tool_name.to_string(),
+            Self::Custom(f) => f(server_id, tool_name),
+        }
     }
 }
 
@@ -878,55 +929,6 @@ async fn connect_rmcp_streamable_http(
     Ok((service, capabilities))
 }
 
-/// Adapter exposing an MCP tool as an [`Invocable`] for the capabilities system.
-pub struct McpInvocable {
-    connection: Arc<McpConnection>,
-    tool_name: String,
-    spec: InvocableSpec,
-}
-
-impl McpInvocable {
-    /// Creates a new invocable adapter for the given MCP tool.
-    pub fn new(connection: Arc<McpConnection>, tool: McpTool) -> Self {
-        let server_id = connection.server_id().clone();
-        let spec = invocable_spec_from_tool(&server_id, &tool);
-        Self {
-            connection,
-            tool_name: tool.name.into_owned(),
-            spec,
-        }
-    }
-}
-
-#[async_trait]
-impl Invocable for McpInvocable {
-    fn spec(&self) -> &InvocableSpec {
-        &self.spec
-    }
-
-    async fn invoke(
-        &self,
-        request: InvocableRequest,
-        _ctx: &mut CapabilityContext<'_>,
-    ) -> Result<InvocableResult, CapabilityError> {
-        let result = self
-            .connection
-            .call_tool(&self.tool_name, request.input)
-            .await
-            .map_err(|error| match error {
-                McpError::AuthRequired(request) => {
-                    CapabilityError::Unavailable(format!("auth required: {:?}", request))
-                }
-                other => CapabilityError::ExecutionFailed(other.to_string()),
-            })?;
-
-        Ok(InvocableResult {
-            output: call_tool_result_to_invocable_output(result),
-            metadata: MetadataMap::new(),
-        })
-    }
-}
-
 /// Adapter exposing a single MCP resource as a [`ResourceProvider`].
 pub struct McpResourceHandle {
     connection: Arc<McpConnection>,
@@ -992,6 +994,12 @@ impl PromptProvider for McpPromptHandle {
 }
 
 /// A [`CapabilityProvider`] that surfaces MCP tools, resources, and prompts.
+///
+/// The tool side is built by wrapping [`McpToolAdapter`]s in
+/// [`agentkit_tools_core::ToolInvocableAdapter`], so the same
+/// permission-check + adapter-spec plumbing the rest of agentkit uses also
+/// applies to MCP tools — this crate no longer ships its own
+/// `McpInvocable`.
 pub struct McpCapabilityProvider {
     invocables: Vec<Arc<dyn Invocable>>,
     resources: Vec<Arc<dyn ResourceProvider>>,
@@ -999,16 +1007,38 @@ pub struct McpCapabilityProvider {
 }
 
 impl McpCapabilityProvider {
-    /// Builds a capability provider from an existing connection and snapshot.
+    /// Builds a capability provider from an existing connection and snapshot,
+    /// using the [`McpToolNamespace::Default`] tool naming strategy.
     pub fn from_snapshot(connection: Arc<McpConnection>, snapshot: &McpDiscoverySnapshot) -> Self {
-        let invocables = snapshot
-            .tools
-            .iter()
-            .cloned()
-            .map(|tool| {
-                Arc::new(McpInvocable::new(connection.clone(), tool)) as Arc<dyn Invocable>
-            })
-            .collect();
+        Self::from_snapshot_with_namespace(connection, snapshot, &McpToolNamespace::Default)
+    }
+
+    /// Builds a capability provider with a custom tool naming strategy.
+    pub fn from_snapshot_with_namespace(
+        connection: Arc<McpConnection>,
+        snapshot: &McpDiscoverySnapshot,
+        namespace: &McpToolNamespace,
+    ) -> Self {
+        let server_id = connection.server_id().clone();
+        let registry = snapshot.tools.iter().cloned().fold(
+            ToolRegistry::new(),
+            |registry, tool| {
+                registry.with(McpToolAdapter::with_namespace(
+                    &server_id,
+                    connection.clone(),
+                    tool,
+                    namespace,
+                ))
+            },
+        );
+        let permissions: Arc<dyn PermissionChecker> = Arc::new(McpAllowAllPermissions);
+        let resources_arc: Arc<dyn agentkit_tools_core::ToolResources> = Arc::new(());
+        let invocables = ToolCapabilityProvider::from_registry(
+            &registry,
+            permissions,
+            resources_arc,
+        )
+        .invocables();
 
         let resources = snapshot
             .resources
@@ -1089,12 +1119,25 @@ impl CapabilityProvider for McpCapabilityProvider {
     }
 }
 
+/// Permission checker that approves every request. Used internally by
+/// [`McpCapabilityProvider`] when bridging MCP tools through the standard
+/// agentkit invocable adapter — MCP servers are gated upstream at connection
+/// time, not per-call.
+struct McpAllowAllPermissions;
+
+impl PermissionChecker for McpAllowAllPermissions {
+    fn evaluate(&self, _request: &dyn PermissionRequest) -> PermissionDecision {
+        PermissionDecision::Allow
+    }
+}
+
 /// A connected MCP server together with its configuration and snapshot.
 #[derive(Clone)]
 pub struct McpServerHandle {
     config: McpServerConfig,
     connection: Arc<McpConnection>,
     snapshot: McpDiscoverySnapshot,
+    namespace: McpToolNamespace,
 }
 
 impl McpServerHandle {
@@ -1118,24 +1161,34 @@ impl McpServerHandle {
         &self.snapshot
     }
 
+    /// Returns the tool naming strategy in effect for this server.
+    pub fn namespace(&self) -> &McpToolNamespace {
+        &self.namespace
+    }
+
     /// Builds a [`ToolRegistry`] containing an [`McpToolAdapter`] for each tool.
     pub fn tool_registry(&self) -> ToolRegistry {
         self.snapshot
             .tools
             .iter()
             .cloned()
-            .fold(ToolRegistry::new(), |registry, descriptor| {
-                registry.with(McpToolAdapter::new(
+            .fold(ToolRegistry::new(), |registry, tool| {
+                registry.with(McpToolAdapter::with_namespace(
                     self.server_id(),
                     self.connection.clone(),
-                    descriptor,
+                    tool,
+                    &self.namespace,
                 ))
             })
     }
 
     /// Builds an [`McpCapabilityProvider`] from this server's snapshot.
     pub fn capability_provider(&self) -> McpCapabilityProvider {
-        McpCapabilityProvider::from_snapshot(self.connection.clone(), &self.snapshot)
+        McpCapabilityProvider::from_snapshot_with_namespace(
+            self.connection.clone(),
+            &self.snapshot,
+            &self.namespace,
+        )
     }
 }
 
@@ -1145,6 +1198,7 @@ pub struct McpServerManager {
     connections: BTreeMap<McpServerId, McpServerHandle>,
     auth: BTreeMap<McpServerId, MetadataMap>,
     catalog_tx: broadcast::Sender<McpCatalogEvent>,
+    namespace: McpToolNamespace,
 }
 
 impl Default for McpServerManager {
@@ -1155,6 +1209,7 @@ impl Default for McpServerManager {
             connections: BTreeMap::new(),
             auth: BTreeMap::new(),
             catalog_tx,
+            namespace: McpToolNamespace::Default,
         }
     }
 }
@@ -1163,6 +1218,23 @@ impl McpServerManager {
     /// Creates an empty server manager with no registered servers.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Sets the tool naming strategy for every adapter built by this manager.
+    pub fn with_namespace(mut self, namespace: McpToolNamespace) -> Self {
+        self.namespace = namespace;
+        self
+    }
+
+    /// Replaces the tool naming strategy in place.
+    pub fn set_namespace(&mut self, namespace: McpToolNamespace) -> &mut Self {
+        self.namespace = namespace;
+        self
+    }
+
+    /// Returns the active tool naming strategy.
+    pub fn namespace(&self) -> &McpToolNamespace {
+        &self.namespace
     }
 
     /// Registers a server configuration. Returns `self` for chaining.
@@ -1213,6 +1285,7 @@ impl McpServerManager {
             config,
             connection,
             snapshot,
+            namespace: self.namespace.clone(),
         };
         self.connections.insert(server_id.clone(), handle.clone());
         self.emit_catalog_event(McpCatalogEvent::ServerConnected {
@@ -1685,9 +1758,20 @@ pub struct McpToolAdapter {
 }
 
 impl McpToolAdapter {
-    /// Creates a new tool adapter for the given MCP tool.
+    /// Creates a new tool adapter for the given MCP tool, using the
+    /// [`McpToolNamespace::Default`] naming strategy.
     pub fn new(server_id: &McpServerId, connection: Arc<McpConnection>, tool: McpTool) -> Self {
-        let spec = tool_spec_from_tool(server_id, &tool);
+        Self::with_namespace(server_id, connection, tool, &McpToolNamespace::Default)
+    }
+
+    /// Creates a new tool adapter with a custom name-namespacing strategy.
+    pub fn with_namespace(
+        server_id: &McpServerId,
+        connection: Arc<McpConnection>,
+        tool: McpTool,
+        namespace: &McpToolNamespace,
+    ) -> Self {
+        let spec = tool_spec_from_tool(server_id, &tool, namespace);
         Self {
             tool_name: tool.name.into_owned(),
             connection,
@@ -1754,22 +1838,13 @@ fn rmcp_server_capabilities_to_agentkit(
     }
 }
 
-fn invocable_spec_from_tool(server_id: &McpServerId, tool: &McpTool) -> InvocableSpec {
-    InvocableSpec {
-        name: CapabilityName::new(format!("mcp_{}_{}", server_id, tool.name)),
-        description: tool
-            .description
-            .as_ref()
-            .map(|d| d.to_string())
-            .unwrap_or_else(|| tool.name.to_string()),
-        input_schema: Value::Object((*tool.input_schema).clone()),
-        metadata: MetadataMap::new(),
-    }
-}
-
-fn tool_spec_from_tool(server_id: &McpServerId, tool: &McpTool) -> ToolSpec {
+fn tool_spec_from_tool(
+    server_id: &McpServerId,
+    tool: &McpTool,
+    namespace: &McpToolNamespace,
+) -> ToolSpec {
     ToolSpec {
-        name: ToolName::new(format!("mcp_{}_{}", server_id, tool.name)),
+        name: ToolName::new(namespace.apply(server_id, &tool.name)),
         description: tool
             .description
             .as_ref()
@@ -1933,31 +2008,6 @@ fn agentkit_part_from_resource(resource: ResourceContents) -> Part {
         .unwrap_or("text/plain")
         .to_string();
     Part::Media(MediaPart::new(Modality::Binary, mime, resource.data))
-}
-
-fn call_tool_result_to_invocable_output(result: CallToolResult) -> InvocableOutput {
-    if let Some(structured) = result.structured_content {
-        return InvocableOutput::Structured(structured);
-    }
-    let parts = call_tool_content_to_parts(result.content);
-    if parts.iter().all(|part| matches!(part, Part::Text(_))) {
-        let text = parts
-            .iter()
-            .filter_map(|part| match part {
-                Part::Text(text) => Some(text.text.clone()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        InvocableOutput::Text(text)
-    } else {
-        InvocableOutput::Items(vec![Item {
-            id: None,
-            kind: ItemKind::Tool,
-            parts,
-            metadata: MetadataMap::new(),
-        }])
-    }
 }
 
 fn call_tool_result_to_tool_output(result: CallToolResult) -> ToolOutput {
