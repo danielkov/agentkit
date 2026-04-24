@@ -135,18 +135,14 @@ version = "0.4.0"
 dependencies = [
  "agentkit-capabilities",
  "agentkit-core",
- "agentkit-http",
  "agentkit-tools-core",
  "async-trait",
- "futures-util",
- "reqwest",
+ "http",
  "rmcp",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
- "tokio-util",
- "url",
 ]
 
 [[package]]
@@ -1617,13 +1613,11 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 name = "mcp-dynamic-auth"
 version = "0.4.0"
 dependencies = [
- "agentkit-http",
+ "agentkit-core",
  "agentkit-mcp",
- "async-trait",
+ "agentkit-tools-core",
  "axum",
  "http",
- "reqwest",
- "reqwest-middleware",
  "serde_json",
  "tokio",
 ]

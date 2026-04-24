@@ -10,22 +10,20 @@ license.workspace = true
 rust-version.workspace = true
 
 [features]
-default = ["reqwest-client"]
-reqwest-client = ["agentkit-http/reqwest-client", "dep:reqwest"]
-legacy-sse = ["reqwest-client"]
+default = []
 
 [dependencies]
 agentkit-capabilities = { version = "0.4.0", path = "../agentkit-capabilities" }
 agentkit-core = { version = "0.4.0", path = "../agentkit-core" }
-agentkit-http = { version = "0.4.0", path = "../agentkit-http", default-features = false }
 agentkit-tools-core = { version = "0.4.0", path = "../agentkit-tools-core" }
 async-trait.workspace = true
-futures-util = "0.3.31"
+http = "1"
 rmcp = { version = "1.5.0", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest", "auth"] }
-url = "2"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["io-util", "net", "process", "sync", "time"] }
-tokio-util = { version = "0.7.16", features = ["io"] }
-reqwest = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["sync"] }
+
+[dev-dependencies]
+rmcp = { version = "1.5.0", default-features = false, features = ["client", "server", "transport-async-rw", "macros"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util"] }

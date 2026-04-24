@@ -7,12 +7,10 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-agentkit-http = { path = "../../crates/agentkit-http", features = ["reqwest-middleware-client"] }
+agentkit-core = { path = "../../crates/agentkit-core" }
 agentkit-mcp = { path = "../../crates/agentkit-mcp" }
-async-trait.workspace = true
+agentkit-tools-core = { path = "../../crates/agentkit-tools-core" }
 axum = "0.8.4"
 http = "1"
-reqwest.workspace = true
-reqwest-middleware = "0.5"
 serde_json.workspace = true
 tokio = { workspace = true, features = ["sync", "time", "net", "rt-multi-thread", "macros"] }

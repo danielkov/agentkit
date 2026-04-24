@@ -1,9 +1,21 @@
-use std::collections::{BTreeMap, VecDeque};
+//! Model Context Protocol integration for agentkit, built on top of [`rmcp`].
+//!
+//! This crate exposes:
+//!
+//! - [`McpServerConfig`] / [`McpTransportBinding`] / [`StdioTransportConfig`] /
+//!   [`StreamableHttpTransportConfig`] — declarative transport configuration.
+//! - [`McpConnection`] — a live, single-server connection wrapping
+//!   [`rmcp::service::RunningService`].
+//! - [`McpServerManager`] — multi-server lifecycle, discovery, catalog diffing,
+//!   and auth replay.
+//! - [`McpServerHandle`], [`McpToolExecutor`], [`McpToolAdapter`],
+//!   [`McpInvocable`], [`McpResourceHandle`], [`McpPromptHandle`],
+//!   [`McpCapabilityProvider`] — bridges into the agentkit `Tool` / capabilities
+//!   systems.
+
+use std::collections::BTreeMap;
 use std::fmt;
-use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock};
-use std::time::Duration;
 
 use agentkit_capabilities::{
     CapabilityContext, CapabilityError, CapabilityName, CapabilityProvider, Invocable,
@@ -14,16 +26,13 @@ use agentkit_capabilities::{
 use agentkit_core::{
     DataRef, Item, ItemKind, MetadataMap, Part, TextPart, ToolOutput, ToolResultPart,
 };
-use agentkit_http::{
-    HeaderMap, Http, HttpError, HttpRequestBuilder, HttpResponse, StatusCode, header as http_header,
-};
 use agentkit_tools_core::{
     AuthOperation, AuthRequest, AuthResolution, Tool, ToolAnnotations, ToolCatalogEvent,
     ToolContext, ToolError, ToolExecutionOutcome, ToolExecutor, ToolName, ToolRegistry,
     ToolRequest, ToolResult, ToolSpec,
 };
 use async_trait::async_trait;
-use futures_util::TryStreamExt;
+use http::{HeaderName, HeaderValue};
 use rmcp::ServiceExt;
 use rmcp::handler::client::ClientHandler;
 use rmcp::model as rmcp_model;
@@ -33,32 +42,11 @@ use rmcp::transport::{ConfigureCommandExt, StreamableHttpClientTransport, TokioC
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
-use tokio::task::JoinHandle;
-use tokio::time::sleep;
-use tokio_util::io::StreamReader;
-use url::Url;
-
-const MCP_LATEST_PROTOCOL_VERSION: &str = "2025-11-25";
-const MCP_SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
-    &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+use tokio::sync::{Mutex, broadcast, mpsc};
 
 /// Unique identifier for a registered MCP server.
 ///
 /// Each MCP server in a [`McpServerManager`] is addressed by its `McpServerId`.
-/// The inner string is typically a short, human-readable name such as `"filesystem"`
-/// or `"github"`.
-///
-/// # Example
-///
-/// ```rust
-/// use agentkit_mcp::McpServerId;
-///
-/// let id = McpServerId::new("filesystem");
-/// assert_eq!(id.to_string(), "filesystem");
-/// ```
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct McpServerId(pub String);
 
@@ -75,23 +63,10 @@ impl fmt::Display for McpServerId {
     }
 }
 
-/// Configuration for an MCP server that communicates over standard I/O (stdin/stdout).
+/// Configuration for an MCP server that communicates over standard I/O.
 ///
-/// This is the most common transport for local MCP servers. The specified command is
-/// spawned as a child process, and JSON-RPC messages are exchanged line-by-line over
-/// its stdin and stdout streams.
-///
-/// # Example
-///
-/// ```rust
-/// use agentkit_mcp::StdioTransportConfig;
-///
-/// let config = StdioTransportConfig::new("npx")
-///     .with_arg("-y")
-///     .with_arg("@modelcontextprotocol/server-filesystem")
-///     .with_env("HOME", "/home/user")
-///     .with_cwd("/tmp");
-/// ```
+/// The specified command is spawned as a child process; rmcp drives the
+/// JSON-RPC framing over its stdin/stdout.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StdioTransportConfig {
     /// The executable to launch (e.g. `"npx"`, `"python"`, `"node"`).
@@ -134,62 +109,15 @@ impl StdioTransportConfig {
     }
 }
 
-/// Configuration for an MCP server that communicates over Server-Sent Events (SSE).
-///
-/// Use this transport for remote MCP servers exposed over HTTP. The client opens an
-/// SSE stream to the given URL, receives an `endpoint` event pointing to the POST
-/// endpoint, and then exchanges JSON-RPC messages over that endpoint.
-///
-/// Auth headers and other per-request customisation live on the [`Http`] client
-/// — either via `reqwest::ClientBuilder::default_headers` or a custom
-/// [`agentkit_http::HttpClient`] implementation — passed in through
-/// [`with_client`](Self::with_client).
-#[derive(Clone, Debug)]
-pub struct SseTransportConfig {
-    /// The SSE endpoint URL to connect to.
-    pub url: String,
-    /// HTTP client used for all requests on this transport. When `None`, the
-    /// factory builds a default reqwest-backed client with agentkit's user agent.
-    pub client: Option<Http>,
-}
-
-impl SseTransportConfig {
-    /// Creates a new SSE transport configuration for the given URL.
-    pub fn new(url: impl Into<String>) -> Self {
-        Self {
-            url: url.into(),
-            client: None,
-        }
-    }
-
-    /// Supplies a pre-configured HTTP client. Use this to attach auth headers
-    /// (via `reqwest::ClientBuilder::default_headers`), install retry/tracing
-    /// middleware, or plug in a non-reqwest backend.
-    pub fn with_client(mut self, client: Http) -> Self {
-        self.client = Some(client);
-        self
-    }
-}
-
-/// Configuration for an MCP server that communicates over Streamable HTTP.
-///
-/// Use this transport for modern remote MCP servers that expose a single HTTP
-/// endpoint supporting JSON-RPC over POST, with optional SSE responses for
-/// streaming server messages.
-///
-/// Auth headers and other per-request customisation live on the [`Http`] client
-/// passed in via [`with_client`](Self::with_client).
-#[derive(Clone, Debug)]
+/// Configuration for an MCP server that communicates over the MCP Streamable HTTP transport.
+#[derive(Clone, Debug, Default)]
 pub struct StreamableHttpTransportConfig {
     /// The MCP endpoint URL to connect to.
     pub url: String,
-    /// HTTP client used for all requests on this transport. When `None`, the
-    /// factory builds a default reqwest-backed client with agentkit's user agent.
-    pub client: Option<Http>,
     /// Static bearer token sent as an HTTP `Authorization: Bearer ...` header.
     pub bearer_token: Option<String>,
     /// Static custom HTTP headers sent with every Streamable HTTP request.
-    pub headers: HeaderMap,
+    pub headers: Vec<(HeaderName, HeaderValue)>,
 }
 
 impl StreamableHttpTransportConfig {
@@ -197,17 +125,9 @@ impl StreamableHttpTransportConfig {
     pub fn new(url: impl Into<String>) -> Self {
         Self {
             url: url.into(),
-            client: None,
             bearer_token: None,
-            headers: HeaderMap::new(),
+            headers: Vec::new(),
         }
-    }
-
-    /// Supplies a pre-configured HTTP client. See
-    /// [`SseTransportConfig::with_client`] for the typical use cases.
-    pub fn with_client(mut self, client: Http) -> Self {
-        self.client = Some(client);
-        self
     }
 
     /// Sets a static bearer token for Streamable HTTP authorization.
@@ -221,10 +141,10 @@ impl StreamableHttpTransportConfig {
     /// Reserved MCP session and protocol headers are still managed by RMCP.
     pub fn with_header<N, V>(mut self, name: N, value: V) -> Result<Self, McpError>
     where
-        N: TryInto<agentkit_http::HeaderName>,
-        N::Error: std::fmt::Display,
-        V: TryInto<agentkit_http::HeaderValue>,
-        V::Error: std::fmt::Display,
+        N: TryInto<HeaderName>,
+        N::Error: fmt::Display,
+        V: TryInto<HeaderValue>,
+        V::Error: fmt::Display,
     {
         let name = name
             .try_into()
@@ -232,50 +152,22 @@ impl StreamableHttpTransportConfig {
         let value = value
             .try_into()
             .map_err(|error| McpError::Transport(format!("invalid HTTP header value: {error}")))?;
-        self.headers.insert(name, value);
+        self.headers.push((name, value));
         Ok(self)
     }
 }
 
 /// Selects which transport an MCP server should use.
-///
-/// This enum is passed into [`McpServerConfig`] and determines how the client will
-/// communicate with the MCP server. The built-in options are [`Stdio`](Self::Stdio),
-/// [`StreamableHttp`](Self::StreamableHttp), and the legacy [`Sse`](Self::Sse);
-/// use [`Custom`](Self::Custom) to provide your own [`McpTransportFactory`].
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum McpTransportBinding {
     /// Communicate over the child process's stdin/stdout.
     Stdio(StdioTransportConfig),
     /// Communicate over the MCP Streamable HTTP transport.
     StreamableHttp(StreamableHttpTransportConfig),
-    /// Communicate over HTTP Server-Sent Events.
-    Sse(SseTransportConfig),
-    /// A user-supplied transport factory.
-    Custom(Arc<dyn McpTransportFactory>),
 }
 
-/// Full configuration for a single MCP server, combining an identifier, a transport
-/// binding, and optional metadata.
-///
-/// Register one or more of these with [`McpServerManager`] to manage the lifecycle
-/// of MCP servers in an agentkit runtime.
-///
-/// # Example
-///
-/// ```rust
-/// use agentkit_mcp::{McpServerConfig, McpTransportBinding, StdioTransportConfig};
-///
-/// let config = McpServerConfig::new(
-///     "filesystem",
-///     McpTransportBinding::Stdio(
-///         StdioTransportConfig::new("npx")
-///             .with_arg("-y")
-///             .with_arg("@modelcontextprotocol/server-filesystem"),
-///     ),
-/// );
-/// ```
-#[derive(Clone)]
+/// Full configuration for a single MCP server.
+#[derive(Clone, Debug)]
 pub struct McpServerConfig {
     /// Unique identifier for this server.
     pub id: McpServerId,
@@ -287,11 +179,6 @@ pub struct McpServerConfig {
 
 impl McpServerConfig {
     /// Creates a new server configuration with the given identifier and transport.
-    ///
-    /// # Arguments
-    ///
-    /// * `id` - A unique name for this server (e.g. `"filesystem"`).
-    /// * `transport` - The [`McpTransportBinding`] that determines how to connect.
     pub fn new(id: impl Into<String>, transport: McpTransportBinding) -> Self {
         Self {
             id: McpServerId::new(id),
@@ -306,11 +193,6 @@ impl McpServerConfig {
             id,
             McpTransportBinding::Stdio(StdioTransportConfig::new(command)),
         )
-    }
-
-    /// Creates an SSE-backed server configuration.
-    pub fn sse(id: impl Into<String>, url: impl Into<String>) -> Self {
-        Self::new(id, McpTransportBinding::Sse(SseTransportConfig::new(url)))
     }
 
     /// Creates a Streamable HTTP-backed server configuration.
@@ -328,558 +210,7 @@ impl McpServerConfig {
     }
 }
 
-/// A single JSON-RPC frame exchanged with an MCP server.
-///
-/// This is the low-level wire unit. Most users will not interact with `McpFrame`
-/// directly; instead use [`McpConnection`] or the higher-level adapters.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct McpFrame {
-    /// The raw JSON-RPC value (request, response, or notification).
-    pub value: Value,
-}
-
-/// Factory trait for creating new [`McpTransport`] connections.
-///
-/// Implement this trait to provide a custom transport mechanism. The built-in
-/// [`StdioTransportFactory`] and [`SseTransportFactory`] cover the two standard
-/// MCP transports; use this trait for in-memory, WebSocket, or other custom
-/// transports.
-///
-/// # Errors
-///
-/// Returns [`McpError`] if the connection cannot be established.
-#[async_trait]
-pub trait McpTransportFactory: Send + Sync {
-    /// Establishes a new transport connection and returns it.
-    async fn connect(&self) -> Result<Box<dyn McpTransport>, McpError>;
-}
-
-/// Bidirectional transport for exchanging [`McpFrame`] messages with an MCP server.
-///
-/// Implement this trait to provide a custom transport. Each transport instance
-/// represents a single, live connection.
-///
-/// # Errors
-///
-/// All methods return [`McpError`] on I/O or protocol failures.
-#[async_trait]
-pub trait McpTransport: Send + Sync {
-    /// Sends a JSON-RPC frame to the server.
-    async fn send(&mut self, message: McpFrame) -> Result<(), McpError>;
-    /// Receives the next JSON-RPC frame from the server, or `None` if the stream has ended.
-    async fn recv(&mut self) -> Result<Option<McpFrame>, McpError>;
-    /// Closes the transport, releasing any underlying resources.
-    async fn close(&mut self) -> Result<(), McpError>;
-}
-
-/// Factory that spawns a child process and connects via stdin/stdout.
-///
-/// Created from a [`StdioTransportConfig`]. Each call to
-/// [`connect`](McpTransportFactory::connect) spawns a new child process.
-pub struct StdioTransportFactory {
-    config: StdioTransportConfig,
-}
-
-impl StdioTransportFactory {
-    /// Creates a new factory from the given stdio transport configuration.
-    pub fn new(config: StdioTransportConfig) -> Self {
-        Self { config }
-    }
-}
-
-#[async_trait]
-impl McpTransportFactory for StdioTransportFactory {
-    async fn connect(&self) -> Result<Box<dyn McpTransport>, McpError> {
-        let mut command = Command::new(&self.config.command);
-        command.args(&self.config.args);
-        command.stdin(Stdio::piped());
-        command.stdout(Stdio::piped());
-        command.stderr(Stdio::inherit());
-
-        if let Some(cwd) = &self.config.cwd {
-            command.current_dir(cwd);
-        }
-
-        for (key, value) in &self.config.env {
-            command.env(key, value);
-        }
-
-        let mut child = command.spawn().map_err(McpError::Io)?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| McpError::Transport("failed to capture MCP stdin".into()))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| McpError::Transport("failed to capture MCP stdout".into()))?;
-
-        Ok(Box::new(StdioTransport {
-            child,
-            stdin,
-            stdout: BufReader::new(stdout),
-        }))
-    }
-}
-
-/// Factory that opens an HTTP SSE stream and connects via Server-Sent Events.
-///
-/// Created from an [`SseTransportConfig`]. Each call to
-/// [`connect`](McpTransportFactory::connect) opens a new HTTP connection.
-pub struct SseTransportFactory {
-    config: SseTransportConfig,
-}
-
-impl SseTransportFactory {
-    /// Creates a new factory from the given SSE transport configuration.
-    pub fn new(config: SseTransportConfig) -> Self {
-        Self { config }
-    }
-}
-
-/// Factory that connects to a Streamable HTTP MCP endpoint.
-///
-/// Created from a [`StreamableHttpTransportConfig`]. Each call to
-/// [`connect`](McpTransportFactory::connect) creates a new HTTP-backed MCP session.
-pub struct StreamableHttpTransportFactory {
-    config: StreamableHttpTransportConfig,
-}
-
-impl StreamableHttpTransportFactory {
-    /// Creates a new factory from the given Streamable HTTP transport configuration.
-    pub fn new(config: StreamableHttpTransportConfig) -> Self {
-        Self { config }
-    }
-}
-
-#[async_trait]
-impl McpTransportFactory for SseTransportFactory {
-    async fn connect(&self) -> Result<Box<dyn McpTransport>, McpError> {
-        let client = resolve_http_client(self.config.client.as_ref())?;
-
-        let response = client
-            .get(self.config.url.as_str())
-            .header("Accept", "text/event-stream")
-            .header("Cache-Control", "no-cache")
-            .send()
-            .await?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<unreadable response body>".into());
-            return Err(McpError::Transport(format!(
-                "SSE connection failed with status {status}: {body}"
-            )));
-        }
-
-        let response_url = Url::parse(response.url())
-            .map_err(|error| McpError::Transport(format!("invalid SSE response URL: {error}")))?;
-        let stream = response.bytes_stream().map_err(std::io::Error::other);
-        let reader = BufReader::new(StreamReader::new(stream));
-        let (frame_tx, frame_rx) = mpsc::unbounded_channel();
-        let (endpoint_tx, endpoint_rx) = oneshot::channel();
-        let read_task = tokio::spawn(read_sse_stream(reader, response_url, frame_tx, endpoint_tx));
-
-        let endpoint_url = endpoint_rx
-            .await
-            .map_err(|_| McpError::Transport("SSE stream closed before endpoint event".into()))??;
-
-        Ok(Box::new(SseTransport {
-            client,
-            endpoint_url,
-            frame_rx,
-            read_task,
-        }))
-    }
-}
-
-#[async_trait]
-impl McpTransportFactory for StreamableHttpTransportFactory {
-    async fn connect(&self) -> Result<Box<dyn McpTransport>, McpError> {
-        let client = resolve_http_client(self.config.client.as_ref())?;
-
-        let endpoint_url = Url::parse(&self.config.url)
-            .map_err(|error| McpError::Transport(format!("invalid MCP endpoint URL: {error}")))?;
-
-        Ok(Box::new(StreamableHttpTransport {
-            client,
-            endpoint_url,
-            protocol_version: None,
-            session_id: None,
-            pending_frames: VecDeque::new(),
-        }))
-    }
-}
-
-fn resolve_http_client(configured: Option<&Http>) -> Result<Http, McpError> {
-    if let Some(client) = configured {
-        return Ok(client.clone());
-    }
-    #[cfg(feature = "reqwest-client")]
-    {
-        reqwest::Client::builder()
-            .user_agent(concat!("agentkit-mcp/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .map(Http::new)
-            .map_err(|error| McpError::Http(HttpError::request(error)))
-    }
-    #[cfg(not(feature = "reqwest-client"))]
-    {
-        Err(McpError::Transport(
-            "no HTTP client configured; enable the `reqwest-client` feature or supply one via `with_client`".into(),
-        ))
-    }
-}
-
-struct StdioTransport {
-    child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
-}
-
-struct SseTransport {
-    client: Http,
-    endpoint_url: Url,
-    frame_rx: mpsc::UnboundedReceiver<Result<McpFrame, McpError>>,
-    read_task: JoinHandle<()>,
-}
-
-struct StreamableHttpTransport {
-    client: Http,
-    endpoint_url: Url,
-    protocol_version: Option<String>,
-    session_id: Option<String>,
-    pending_frames: VecDeque<McpFrame>,
-}
-
-#[async_trait]
-impl McpTransport for StdioTransport {
-    async fn send(&mut self, message: McpFrame) -> Result<(), McpError> {
-        let mut encoded = serde_json::to_vec(&message.value).map_err(McpError::Serialize)?;
-        encoded.push(b'\n');
-        self.stdin.write_all(&encoded).await.map_err(McpError::Io)?;
-        self.stdin.flush().await.map_err(McpError::Io)?;
-        Ok(())
-    }
-
-    async fn recv(&mut self) -> Result<Option<McpFrame>, McpError> {
-        let mut line = String::new();
-        let read = self
-            .stdout
-            .read_line(&mut line)
-            .await
-            .map_err(McpError::Io)?;
-        if read == 0 {
-            return Ok(None);
-        }
-
-        let value = serde_json::from_str(line.trim()).map_err(McpError::Serialize)?;
-        Ok(Some(McpFrame { value }))
-    }
-
-    async fn close(&mut self) -> Result<(), McpError> {
-        let _ = self.stdin.shutdown().await;
-        let _ = self.child.kill().await;
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl McpTransport for SseTransport {
-    async fn send(&mut self, message: McpFrame) -> Result<(), McpError> {
-        let response = self
-            .client
-            .post(self.endpoint_url.as_str())
-            .header("Content-Type", "application/json")
-            .json(&message.value)
-            .send()
-            .await?;
-        let status = response.status();
-        if !status.is_success() {
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<unreadable response body>".into());
-            return Err(McpError::Transport(format!(
-                "SSE POST failed with status {status}: {body}"
-            )));
-        }
-
-        Ok(())
-    }
-
-    async fn recv(&mut self) -> Result<Option<McpFrame>, McpError> {
-        match self.frame_rx.recv().await {
-            Some(Ok(frame)) => Ok(Some(frame)),
-            Some(Err(error)) => Err(error),
-            None => Ok(None),
-        }
-    }
-
-    async fn close(&mut self) -> Result<(), McpError> {
-        self.read_task.abort();
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl McpTransport for StreamableHttpTransport {
-    async fn send(&mut self, message: McpFrame) -> Result<(), McpError> {
-        let is_request = is_jsonrpc_request(&message.value);
-        let request_id = message.value.get("id").cloned();
-        let is_initialize =
-            message.value.get("method").and_then(Value::as_str) == Some("initialize");
-
-        let mut request = self
-            .client
-            .post(self.endpoint_url.as_str())
-            .header("Content-Type", "application/json")
-            .header("Accept", "application/json, text/event-stream");
-
-        request = apply_streamable_http_headers(
-            request,
-            self.protocol_version.as_deref(),
-            self.session_id.as_deref(),
-        );
-
-        let response = request.json(&message.value).send().await?;
-
-        if is_initialize {
-            self.capture_session_id(response.headers());
-        }
-
-        let status = response.status();
-        if !status.is_success() {
-            return Err(
-                streamable_http_status_error("Streamable HTTP POST", status, response).await,
-            );
-        }
-
-        if !is_request {
-            return Ok(());
-        }
-
-        let content_type = response
-            .headers()
-            .get(http_header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default()
-            .to_string();
-
-        if content_type.starts_with("application/json") {
-            let value: Value = response.json().await?;
-            self.maybe_update_protocol_version(&message.value, &value)?;
-            self.pending_frames.push_back(McpFrame { value });
-            return Ok(());
-        }
-
-        if !content_type.starts_with("text/event-stream") {
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<unreadable response body>".into());
-            return Err(McpError::Transport(format!(
-                "unexpected Streamable HTTP response content type {content_type:?}: {body}"
-            )));
-        }
-
-        let request_id = request_id.ok_or_else(|| {
-            McpError::Protocol("JSON-RPC request over Streamable HTTP is missing an id".into())
-        })?;
-        self.collect_streamable_http_response(response, &message.value, &request_id)
-            .await
-    }
-
-    async fn recv(&mut self) -> Result<Option<McpFrame>, McpError> {
-        Ok(self.pending_frames.pop_front())
-    }
-
-    async fn close(&mut self) -> Result<(), McpError> {
-        let Some(session_id) = self.session_id.clone() else {
-            return Ok(());
-        };
-
-        let mut request = self.client.delete(self.endpoint_url.as_str());
-        request = apply_streamable_http_headers(
-            request,
-            self.protocol_version.as_deref(),
-            Some(session_id.as_str()),
-        );
-
-        let response = request.send().await?;
-        if response.status().is_success()
-            || response.status() == StatusCode::METHOD_NOT_ALLOWED
-            || response.status() == StatusCode::NOT_FOUND
-        {
-            self.session_id = None;
-            return Ok(());
-        }
-
-        Err(
-            streamable_http_status_error("Streamable HTTP DELETE", response.status(), response)
-                .await,
-        )
-    }
-}
-
-impl StreamableHttpTransport {
-    async fn collect_streamable_http_response(
-        &mut self,
-        response: HttpResponse,
-        request_message: &Value,
-        request_id: &Value,
-    ) -> Result<(), McpError> {
-        let mut retry_delay = Duration::from_millis(0);
-        let mut last_event_id = None;
-        let mut saw_response = false;
-
-        saw_response |= self
-            .read_streamable_http_events(
-                response,
-                request_message,
-                request_id,
-                &mut last_event_id,
-                &mut retry_delay,
-            )
-            .await?;
-
-        while !saw_response && last_event_id.is_some() {
-            if !retry_delay.is_zero() {
-                sleep(retry_delay).await;
-            }
-
-            let response = self
-                .resume_streamable_http_stream(last_event_id.as_deref().unwrap())
-                .await?;
-            saw_response |= self
-                .read_streamable_http_events(
-                    response,
-                    request_message,
-                    request_id,
-                    &mut last_event_id,
-                    &mut retry_delay,
-                )
-                .await?;
-        }
-
-        Ok(())
-    }
-
-    async fn read_streamable_http_events(
-        &mut self,
-        response: HttpResponse,
-        request_message: &Value,
-        request_id: &Value,
-        last_event_id: &mut Option<String>,
-        retry_delay: &mut Duration,
-    ) -> Result<bool, McpError> {
-        let stream = response.bytes_stream().map_err(std::io::Error::other);
-        let mut reader = BufReader::new(StreamReader::new(stream));
-        let mut saw_response = false;
-
-        while let Some(event) = read_next_sse_event(&mut reader).await? {
-            if let Some(id) = event.id.clone() {
-                *last_event_id = Some(id);
-            }
-            if let Some(retry_ms) = event.retry_ms {
-                *retry_delay = Duration::from_millis(retry_ms);
-            }
-
-            let Some(frame) = streamable_http_event_to_frame(event)? else {
-                continue;
-            };
-
-            self.maybe_update_protocol_version(request_message, &frame.value)?;
-            if frame.value.get("id") == Some(request_id) {
-                saw_response = true;
-            }
-            self.pending_frames.push_back(frame);
-        }
-
-        Ok(saw_response)
-    }
-
-    async fn resume_streamable_http_stream(
-        &self,
-        last_event_id: &str,
-    ) -> Result<HttpResponse, McpError> {
-        let mut request = self
-            .client
-            .get(self.endpoint_url.as_str())
-            .header("Accept", "text/event-stream")
-            .header("Cache-Control", "no-cache")
-            .header("Last-Event-ID", last_event_id);
-
-        request = apply_streamable_http_headers(
-            request,
-            self.protocol_version.as_deref(),
-            self.session_id.as_deref(),
-        );
-
-        let response = request.send().await?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(
-                streamable_http_status_error("Streamable HTTP GET", status, response).await,
-            );
-        }
-
-        let content_type = response
-            .headers()
-            .get(http_header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default();
-        if !content_type.starts_with("text/event-stream") {
-            let content_type = content_type.to_string();
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<unreadable response body>".into());
-            return Err(McpError::Transport(format!(
-                "Streamable HTTP GET expected text/event-stream, got {content_type:?}: {body}"
-            )));
-        }
-
-        Ok(response)
-    }
-
-    fn maybe_update_protocol_version(
-        &mut self,
-        request_message: &Value,
-        response_value: &Value,
-    ) -> Result<(), McpError> {
-        if request_message.get("method").and_then(Value::as_str) != Some("initialize") {
-            return Ok(());
-        }
-
-        let protocol_version = response_value
-            .get("result")
-            .and_then(|result| result.get("protocolVersion"))
-            .and_then(Value::as_str);
-
-        if let Some(protocol_version) = protocol_version {
-            self.protocol_version = Some(protocol_version.to_string());
-        }
-
-        Ok(())
-    }
-
-    fn capture_session_id(&mut self, headers: &HeaderMap) {
-        self.session_id = headers
-            .get("MCP-Session-Id")
-            .and_then(|value| value.to_str().ok())
-            .map(|value| value.to_string());
-    }
-}
-
 /// Descriptor for a tool advertised by an MCP server.
-///
-/// Returned as part of a [`McpDiscoverySnapshot`] after server discovery. The
-/// [`input_schema`](Self::input_schema) field is the JSON Schema that describes
-/// the tool's expected input.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct McpToolDescriptor {
     /// The tool name as reported by the MCP server.
@@ -893,9 +224,6 @@ pub struct McpToolDescriptor {
 }
 
 /// Descriptor for a resource advertised by an MCP server.
-///
-/// Resources represent data that the server can provide (e.g. files, database
-/// records). Each resource is identified by a URI.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpResourceDescriptor {
     /// The resource URI (e.g. `"file:///tmp/example.txt"`).
@@ -911,9 +239,6 @@ pub struct McpResourceDescriptor {
 }
 
 /// Descriptor for a prompt template advertised by an MCP server.
-///
-/// Prompts are reusable message templates that can be parameterized with arguments.
-/// The [`input_schema`](Self::input_schema) describes the expected arguments.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct McpPromptDescriptor {
     /// Unique identifier for the prompt (typically the same as `name`).
@@ -929,10 +254,6 @@ pub struct McpPromptDescriptor {
 }
 
 /// A snapshot of all capabilities discovered from a single MCP server.
-///
-/// Obtained by calling [`McpConnection::discover`] or as part of a
-/// [`McpServerHandle`]. Contains the full list of tools, resources, and prompts
-/// that the server advertised at discovery time.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct McpDiscoverySnapshot {
     /// The server this snapshot was taken from.
@@ -948,9 +269,6 @@ pub struct McpDiscoverySnapshot {
 }
 
 /// Catalog and lifecycle events emitted by [`McpServerManager`].
-///
-/// Hosts can subscribe to these events and forward tool-catalog changes to
-/// `agentkit-loop` as next-turn model capability updates.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum McpCatalogEvent {
     /// A server connected and completed initial discovery.
@@ -1015,21 +333,106 @@ impl McpCatalogEvent {
     }
 }
 
-#[derive(Clone)]
-struct AgentkitRmcpClientHandler {
-    info: rmcp_model::ClientInfo,
-    notifications: mpsc::UnboundedSender<RmcpServerNotification>,
+/// Capabilities advertised by an MCP server during the `initialize` handshake.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpServerCapabilities {
+    /// Advertised `tools` capability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<ToolsCapability>,
+    /// Advertised `resources` capability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<ResourcesCapability>,
+    /// Advertised `prompts` capability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompts: Option<PromptsCapability>,
+    /// Advertised `logging` capability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logging: Option<LoggingCapability>,
 }
 
+impl McpServerCapabilities {
+    /// Returns a capabilities struct with every top-level capability
+    /// advertised. Useful for tests.
+    pub fn all() -> Self {
+        Self {
+            tools: Some(ToolsCapability::default()),
+            resources: Some(ResourcesCapability::default()),
+            prompts: Some(PromptsCapability::default()),
+            logging: Some(LoggingCapability::default()),
+        }
+    }
+}
+
+/// Tools sub-capability flags from the MCP `initialize` response.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolsCapability {
+    /// Server emits `notifications/tools/list_changed` when the catalog changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub list_changed: Option<bool>,
+}
+
+/// Resources sub-capability flags from the MCP `initialize` response.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResourcesCapability {
+    /// Server supports `resources/subscribe`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscribe: Option<bool>,
+    /// Server emits `notifications/resources/list_changed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub list_changed: Option<bool>,
+}
+
+/// Prompts sub-capability flags from the MCP `initialize` response.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptsCapability {
+    /// Server emits `notifications/prompts/list_changed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub list_changed: Option<bool>,
+}
+
+/// Logging sub-capability. Spec reserves the key with no defined sub-fields yet.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoggingCapability {}
+
+/// Server-originated catalog notifications observed by [`McpClientHandler`].
+///
+/// Drained by [`McpConnection`] inside
+/// [`McpServerManager::refresh_changed_catalogs`] to trigger re-discovery of
+/// the affected capability lists.
+#[allow(clippy::enum_variant_names)]
 #[derive(Clone, Debug)]
-enum RmcpServerNotification {
+pub enum McpServerNotification {
+    /// Server announced `notifications/tools/list_changed`.
     ToolsChanged,
+    /// Server announced `notifications/resources/list_changed`.
     ResourcesChanged,
+    /// Server announced `notifications/prompts/list_changed`.
     PromptsChanged,
 }
 
-impl AgentkitRmcpClientHandler {
-    fn new(notifications: mpsc::UnboundedSender<RmcpServerNotification>) -> Self {
+/// rmcp [`ClientHandler`] used by [`McpConnection`].
+///
+/// You only need to construct this directly if you're wiring rmcp transports
+/// that [`McpTransportBinding`] does not cover (in-memory pipes, websockets,
+/// custom IO). Pair it with [`McpConnection::from_running_service`].
+#[derive(Clone)]
+pub struct McpClientHandler {
+    info: rmcp_model::ClientInfo,
+    notifications: mpsc::UnboundedSender<McpServerNotification>,
+}
+
+impl McpClientHandler {
+    /// Builds a handler together with the notification receiver that
+    /// [`McpConnection::from_running_service`] expects.
+    pub fn with_channel() -> (Self, mpsc::UnboundedReceiver<McpServerNotification>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (Self::new(tx), rx)
+    }
+
+    fn new(notifications: mpsc::UnboundedSender<McpServerNotification>) -> Self {
         Self {
             info: rmcp_model::ClientInfo::new(
                 rmcp_model::ClientCapabilities::default(),
@@ -1042,14 +445,14 @@ impl AgentkitRmcpClientHandler {
     }
 }
 
-impl ClientHandler for AgentkitRmcpClientHandler {
+impl ClientHandler for McpClientHandler {
     fn on_tool_list_changed(
         &self,
         _context: rmcp::service::NotificationContext<RoleClient>,
     ) -> impl Future<Output = ()> + rmcp::service::MaybeSendFuture + '_ {
         let _ = self
             .notifications
-            .send(RmcpServerNotification::ToolsChanged);
+            .send(McpServerNotification::ToolsChanged);
         std::future::ready(())
     }
 
@@ -1059,7 +462,7 @@ impl ClientHandler for AgentkitRmcpClientHandler {
     ) -> impl Future<Output = ()> + rmcp::service::MaybeSendFuture + '_ {
         let _ = self
             .notifications
-            .send(RmcpServerNotification::ResourcesChanged);
+            .send(McpServerNotification::ResourcesChanged);
         std::future::ready(())
     }
 
@@ -1069,7 +472,7 @@ impl ClientHandler for AgentkitRmcpClientHandler {
     ) -> impl Future<Output = ()> + rmcp::service::MaybeSendFuture + '_ {
         let _ = self
             .notifications
-            .send(RmcpServerNotification::PromptsChanged);
+            .send(McpServerNotification::PromptsChanged);
         std::future::ready(())
     }
 
@@ -1078,215 +481,20 @@ impl ClientHandler for AgentkitRmcpClientHandler {
     }
 }
 
-type RmcpClientService = RunningService<RoleClient, AgentkitRmcpClientHandler>;
+type RmcpClientService = RunningService<RoleClient, McpClientHandler>;
 
-enum McpConnectionInner {
-    Rmcp(RmcpClientService),
-    Legacy(Box<dyn McpTransport>),
-}
-
-/// A live connection to a single MCP server.
-///
-/// Wraps an RMCP client service for built-in transports and exposes
-/// high-level methods for tool calls, resource reads, prompt retrieval, and
-/// capability discovery. Custom transports use the compatibility JSON-RPC
-/// path.
-///
-/// Create a connection with [`McpConnection::connect`] or indirectly through
-/// [`McpServerManager::connect_server`].
-///
-/// # Example
-///
-/// ```rust,no_run
-/// use agentkit_mcp::{McpConnection, McpServerConfig, McpTransportBinding, StdioTransportConfig};
-///
-/// # #[tokio::main]
-/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-/// let config = McpServerConfig::new(
-///     "filesystem",
-///     McpTransportBinding::Stdio(StdioTransportConfig::new("npx")
-///         .with_arg("-y")
-///         .with_arg("@modelcontextprotocol/server-filesystem")),
-/// );
-///
-/// let connection = McpConnection::connect(&config).await?;
-/// let snapshot = connection.discover().await?;
-/// println!("found {} tools", snapshot.tools.len());
-/// # Ok(())
-/// # }
-/// ```
+/// A live connection to a single MCP server, wrapping an
+/// [`rmcp::service::RunningService`].
 pub struct McpConnection {
     server_id: McpServerId,
-    config: McpServerConfig,
-    inner: Mutex<McpConnectionInner>,
+    config: Option<McpServerConfig>,
+    inner: Mutex<RmcpClientService>,
     auth: Mutex<Option<MetadataMap>>,
-    notifications: Mutex<mpsc::UnboundedReceiver<RmcpServerNotification>>,
-    next_id: AtomicU64,
+    notifications: Mutex<mpsc::UnboundedReceiver<McpServerNotification>>,
     capabilities: McpServerCapabilities,
-}
-
-/// Capabilities advertised by an MCP server during the `initialize` handshake.
-///
-/// Per the MCP specification, a client must only call `<capability>/list`
-/// (and related) methods for capabilities the server has advertised. Calling
-/// an unadvertised method generally results in a `-32601 Method not found`
-/// JSON-RPC error.
-///
-/// Each capability is `Some(_)` when the server advertised the top-level key
-/// (regardless of sub-field contents) and `None` otherwise. Sub-structs carry
-/// the optional feature flags from the spec (`listChanged`, `subscribe`).
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct McpServerCapabilities {
-    /// Advertised `tools` capability → `tools/list` and `tools/call` supported.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tools: Option<ToolsCapability>,
-    /// Advertised `resources` capability → `resources/list` and `resources/read`
-    /// supported.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resources: Option<ResourcesCapability>,
-    /// Advertised `prompts` capability → `prompts/list` and `prompts/get`
-    /// supported.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prompts: Option<PromptsCapability>,
-    /// Advertised `logging` capability — currently informational; no discovery
-    /// call is made for it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub logging: Option<LoggingCapability>,
-}
-
-/// Tools sub-capability flags from the MCP `initialize` response.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ToolsCapability {
-    /// Server will emit `notifications/tools/list_changed` when the tool
-    /// catalog changes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub list_changed: Option<bool>,
-}
-
-/// Resources sub-capability flags from the MCP `initialize` response.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ResourcesCapability {
-    /// Server supports `resources/subscribe` for change notifications on
-    /// individual resources.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subscribe: Option<bool>,
-    /// Server will emit `notifications/resources/list_changed` when the
-    /// resource catalog changes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub list_changed: Option<bool>,
-}
-
-/// Prompts sub-capability flags from the MCP `initialize` response.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PromptsCapability {
-    /// Server will emit `notifications/prompts/list_changed` when the prompt
-    /// catalog changes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub list_changed: Option<bool>,
-}
-
-/// Logging sub-capability. Spec reserves the key with no defined sub-fields
-/// yet; kept as a unit struct for forward-compat.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LoggingCapability {}
-
-impl McpServerCapabilities {
-    /// Build capabilities from an MCP `initialize` response's `capabilities`
-    /// object. Absence of a key means the capability is not supported.
-    /// Malformed sub-structures degrade to `Some(Default::default())` rather
-    /// than erroring — the presence of the key is the load-bearing signal.
-    pub fn from_initialize_value(value: Option<&Value>) -> Self {
-        let Some(obj) = value.and_then(Value::as_object) else {
-            return Self::default();
-        };
-        fn lift<T: Default + for<'de> Deserialize<'de>>(v: Option<&Value>) -> Option<T> {
-            v.map(|value| serde_json::from_value(value.clone()).unwrap_or_default())
-        }
-        Self {
-            tools: lift(obj.get("tools")),
-            resources: lift(obj.get("resources")),
-            prompts: lift(obj.get("prompts")),
-            logging: lift(obj.get("logging")),
-        }
-    }
-
-    /// Return a capabilities struct with every top-level capability advertised
-    /// (sub-flags left at their defaults). Useful for tests and for callers
-    /// that want to attempt discovery regardless of what the server
-    /// advertised.
-    pub fn all() -> Self {
-        Self {
-            tools: Some(ToolsCapability::default()),
-            resources: Some(ResourcesCapability::default()),
-            prompts: Some(PromptsCapability::default()),
-            logging: Some(LoggingCapability::default()),
-        }
-    }
-}
-
-/// Wire shape of an MCP `initialize` response's `result` object. Used
-/// internally by [`McpConnection::connect`] to validate the protocol version
-/// and extract advertised capabilities in one typed step.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct InitializeResult {
-    protocol_version: String,
-    #[serde(default)]
-    capabilities: McpServerCapabilities,
-}
-
-/// Minimal envelope used to decode list-style responses (`tools/list`,
-/// `resources/list`, `prompts/list`). Each MCP list method wraps its payload
-/// in a single-field object.
-#[derive(Debug, Deserialize)]
-struct ToolsListPayload {
-    #[serde(default)]
-    tools: Vec<Value>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ResourcesListPayload {
-    #[serde(default)]
-    resources: Vec<Value>,
-}
-
-#[derive(Debug, Deserialize)]
-struct PromptsListPayload {
-    #[serde(default)]
-    prompts: Vec<Value>,
-}
-
-/// Wire shape of a `resources/read` response. Servers return one or more
-/// content blocks; agentkit currently consumes the first one and discriminates
-/// on `text` vs. `uri`.
-#[derive(Debug, Deserialize)]
-struct ResourcesReadPayload {
-    #[serde(default)]
-    contents: Vec<ResourceContentBlock>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ResourceContentBlock {
-    #[serde(default)]
-    text: Option<String>,
-    #[serde(default)]
-    uri: Option<String>,
-}
-
-/// Wire shape of a `prompts/get` response.
-#[derive(Debug, Deserialize)]
-struct PromptsGetPayload {
-    #[serde(default)]
-    messages: Vec<Value>,
 }
 
 /// The result of replaying an MCP operation after auth resolution.
-///
-/// Returned by [`McpConnection::replay_auth_operation`] and
-/// [`McpServerManager::resolve_auth_and_resume`].
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum McpOperationResult {
     /// The server was successfully (re)connected; contains the discovery snapshot.
@@ -1300,13 +508,8 @@ pub enum McpOperationResult {
 }
 
 impl McpConnection {
-    /// Connects to an MCP server, performs the JSON-RPC `initialize` handshake, and
-    /// returns a ready-to-use connection.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`McpError`] if the transport fails to connect, the handshake is
-    /// rejected, or the server requires authentication ([`McpError::AuthRequired`]).
+    /// Connects to an MCP server, performs the rmcp `initialize` handshake,
+    /// and returns a ready-to-use connection.
     pub async fn connect(config: &McpServerConfig) -> Result<Self, McpError> {
         Self::connect_with_auth(config, None).await
     }
@@ -1316,290 +519,121 @@ impl McpConnection {
         auth: Option<&MetadataMap>,
     ) -> Result<Self, McpError> {
         let (notification_tx, notification_rx) = mpsc::unbounded_channel();
-        let (inner, capabilities) = match &config.transport {
+        let (service, capabilities) = match &config.transport {
             McpTransportBinding::Stdio(binding) => {
                 connect_rmcp_stdio(config, binding, notification_tx).await?
             }
             McpTransportBinding::StreamableHttp(binding) => {
                 connect_rmcp_streamable_http(config, binding, auth, notification_tx).await?
             }
-            McpTransportBinding::Sse(binding) => {
-                #[cfg(feature = "legacy-sse")]
-                {
-                    connect_legacy_transport(
-                        config,
-                        Arc::new(SseTransportFactory::new(binding.clone())),
-                        auth,
-                    )
-                    .await?
-                }
-                #[cfg(not(feature = "legacy-sse"))]
-                {
-                    let _ = binding;
-                    return Err(McpError::Transport(
-                        "legacy HTTP+SSE MCP transport is disabled; enable the `legacy-sse` feature or use Streamable HTTP".into(),
-                    ));
-                }
-            }
-            McpTransportBinding::Custom(factory) => {
-                connect_legacy_transport(config, factory.clone(), auth).await?
-            }
         };
 
         Ok(Self {
             server_id: config.id.clone(),
-            config: config.clone(),
-            inner: Mutex::new(inner),
+            config: Some(config.clone()),
+            inner: Mutex::new(service),
             auth: Mutex::new(auth.cloned()),
             notifications: Mutex::new(notification_rx),
-            next_id: AtomicU64::new(1),
             capabilities,
         })
     }
 
-    async fn reconnect_rmcp_inner(
-        &self,
-        auth: Option<&MetadataMap>,
-    ) -> Result<McpConnectionInner, McpError> {
+    /// Adopts an externally constructed [`rmcp::service::RunningService`] as
+    /// an [`McpConnection`].
+    ///
+    /// Use this when you need a transport rmcp supports but
+    /// [`McpTransportBinding`] does not (in-memory pipes for tests, websockets,
+    /// custom IO). Pair the service with the notification receiver returned by
+    /// [`McpClientHandler::with_channel`] so list-change notifications stay
+    /// observable.
+    ///
+    /// The connection has no [`McpServerConfig`] attached, so reconnect-on-auth
+    /// is unavailable; [`resolve_auth`](Self::resolve_auth) only updates stored
+    /// credentials in this mode.
+    pub fn from_running_service(
+        server_id: impl Into<McpServerId>,
+        service: RmcpClientService,
+        notifications: mpsc::UnboundedReceiver<McpServerNotification>,
+    ) -> Self {
+        let capabilities = service
+            .peer_info()
+            .map(|info| rmcp_server_capabilities_to_agentkit(&info.capabilities))
+            .unwrap_or_default();
+        Self {
+            server_id: server_id.into(),
+            config: None,
+            inner: Mutex::new(service),
+            auth: Mutex::new(None),
+            notifications: Mutex::new(notifications),
+            capabilities,
+        }
+    }
+
+    async fn reconnect_inner(&self, auth: Option<&MetadataMap>) -> Result<(), McpError> {
+        let Some(config) = self.config.clone() else {
+            return Ok(());
+        };
         let (notification_tx, notification_rx) = mpsc::unbounded_channel();
-        let (inner, _capabilities) = match &self.config.transport {
+        let (service, _capabilities) = match &config.transport {
             McpTransportBinding::Stdio(binding) => {
-                connect_rmcp_stdio(&self.config, binding, notification_tx).await?
+                connect_rmcp_stdio(&config, binding, notification_tx).await?
             }
             McpTransportBinding::StreamableHttp(binding) => {
-                connect_rmcp_streamable_http(&self.config, binding, auth, notification_tx).await?
-            }
-            McpTransportBinding::Sse(binding) => {
-                #[cfg(feature = "legacy-sse")]
-                {
-                    connect_legacy_transport(
-                        &self.config,
-                        Arc::new(SseTransportFactory::new(binding.clone())),
-                        auth,
-                    )
-                    .await?
-                }
-                #[cfg(not(feature = "legacy-sse"))]
-                {
-                    let _ = binding;
-                    return Err(McpError::Transport(
-                        "legacy HTTP+SSE MCP transport is disabled; enable the `legacy-sse` feature or use Streamable HTTP".into(),
-                    ));
-                }
-            }
-            McpTransportBinding::Custom(factory) => {
-                connect_legacy_transport(&self.config, factory.clone(), auth).await?
+                connect_rmcp_streamable_http(&config, binding, auth, notification_tx).await?
             }
         };
         *self.notifications.lock().await = notification_rx;
-        Ok(inner)
-    }
-}
-
-async fn connect_legacy_transport(
-    config: &McpServerConfig,
-    factory: Arc<dyn McpTransportFactory>,
-    auth: Option<&MetadataMap>,
-) -> Result<(McpConnectionInner, McpServerCapabilities), McpError> {
-    let mut transport = factory.connect().await?;
-    let mut params = serde_json::Map::new();
-    params.insert(
-        "protocolVersion".into(),
-        Value::String(MCP_LATEST_PROTOCOL_VERSION.into()),
-    );
-    params.insert("capabilities".into(), json!({}));
-    params.insert(
-        "clientInfo".into(),
-        json!({
-            "name": "agentkit-mcp",
-            "version": env!("CARGO_PKG_VERSION")
-        }),
-    );
-    if let Some(auth) = auth {
-        params.insert("auth".into(), metadata_to_value(auth));
-    }
-    let init_params = Value::Object(params.clone());
-    transport
-        .send(McpFrame {
-            value: json!({
-                "jsonrpc": "2.0",
-                "id": 0,
-                "method": "initialize",
-                "params": init_params.clone()
-            }),
-        })
-        .await?;
-    let init_response = transport
-        .recv()
-        .await?
-        .ok_or_else(|| McpError::Transport("transport closed during MCP initialization".into()))?;
-    if let Some(error) = init_response.value.get("error") {
-        if let Some(auth_request) =
-            parse_auth_request(&config.id, "initialize", &init_params, error)
-        {
-            return Err(McpError::AuthRequired(Box::new(auth_request)));
-        }
-        return Err(McpError::Invocation(error.to_string()));
-    }
-    let result_value = init_response
-        .value
-        .get("result")
-        .cloned()
-        .ok_or_else(|| McpError::Protocol("initialize response missing result".into()))?;
-    let initialize: InitializeResult = serde_json::from_value(result_value)
-        .map_err(|error| McpError::Protocol(format!("malformed initialize result: {error}")))?;
-    if !MCP_SUPPORTED_PROTOCOL_VERSIONS.contains(&initialize.protocol_version.as_str()) {
-        return Err(McpError::Protocol(format!(
-            "unsupported MCP protocol version negotiated during initialize: {}",
-            initialize.protocol_version
-        )));
-    }
-    let capabilities = initialize.capabilities;
-    transport
-        .send(McpFrame {
-            value: json!({
-                "jsonrpc": "2.0",
-                "method": "notifications/initialized",
-                "params": {}
-            }),
-        })
-        .await?;
-
-    Ok((McpConnectionInner::Legacy(transport), capabilities))
-}
-
-async fn connect_rmcp_stdio(
-    config: &McpServerConfig,
-    binding: &StdioTransportConfig,
-    notification_tx: mpsc::UnboundedSender<RmcpServerNotification>,
-) -> Result<(McpConnectionInner, McpServerCapabilities), McpError> {
-    let transport = TokioChildProcess::new(
-        tokio::process::Command::new(&binding.command).configure(|command| {
-            command.args(&binding.args);
-            if let Some(cwd) = &binding.cwd {
-                command.current_dir(cwd);
-            }
-            for (key, value) in &binding.env {
-                command.env(key, value);
-            }
-        }),
-    )
-    .map_err(McpError::Io)?;
-
-    let service = AgentkitRmcpClientHandler::new(notification_tx)
-        .serve(transport)
-        .await
-        .map_err(|error| rmcp_initialize_error(config, error))?;
-    let capabilities = service
-        .peer_info()
-        .map(|info| rmcp_server_capabilities_to_agentkit(&info.capabilities))
-        .unwrap_or_default();
-
-    Ok((McpConnectionInner::Rmcp(service), capabilities))
-}
-
-async fn connect_rmcp_streamable_http(
-    config: &McpServerConfig,
-    binding: &StreamableHttpTransportConfig,
-    auth: Option<&MetadataMap>,
-    notification_tx: mpsc::UnboundedSender<RmcpServerNotification>,
-) -> Result<(McpConnectionInner, McpServerCapabilities), McpError> {
-    if binding.client.is_some() {
-        return Err(McpError::Transport(
-            "custom agentkit HTTP clients are not supported by the RMCP Streamable HTTP transport; use static headers or the default reqwest client".into(),
-        ));
+        *self.inner.lock().await = service;
+        Ok(())
     }
 
-    let auth_header = auth
-        .and_then(bearer_token_from_metadata)
-        .or_else(|| binding.bearer_token.clone());
-    let mut rmcp_config = RmcpStreamableHttpClientTransportConfig::with_uri(binding.url.clone());
-    if let Some(auth_header) = auth_header {
-        rmcp_config = rmcp_config.auth_header(auth_header);
-    }
-    rmcp_config = rmcp_config.custom_headers(
-        binding
-            .headers
-            .iter()
-            .map(|(name, value)| (name.clone(), value.clone()))
-            .collect(),
-    );
-    let transport = StreamableHttpClientTransport::from_config(rmcp_config);
-
-    let service = AgentkitRmcpClientHandler::new(notification_tx)
-        .serve(transport)
-        .await
-        .map_err(|error| rmcp_initialize_error(config, error))?;
-    let capabilities = service
-        .peer_info()
-        .map(|info| rmcp_server_capabilities_to_agentkit(&info.capabilities))
-        .unwrap_or_default();
-
-    Ok((McpConnectionInner::Rmcp(service), capabilities))
-}
-
-impl McpConnection {
     /// Returns the [`McpServerId`] for this connection.
     pub fn server_id(&self) -> &McpServerId {
         &self.server_id
     }
 
-    /// Closes the underlying transport, shutting down the connection to the server.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`McpError`] if the transport cannot be closed cleanly.
-    pub async fn close(&self) -> Result<(), McpError> {
-        let mut inner = self.inner.lock().await;
-        match &mut *inner {
-            McpConnectionInner::Rmcp(service) => {
-                service.close().await.map(|_| ()).map_err(|error| {
-                    McpError::Transport(format!("RMCP service close failed: {error}"))
-                })
-            }
-            McpConnectionInner::Legacy(transport) => transport.close().await,
-        }
+    /// Returns the capabilities advertised by the server during `initialize`.
+    pub fn capabilities(&self) -> &McpServerCapabilities {
+        &self.capabilities
     }
 
-    /// Stores or clears authentication credentials for future requests on this
-    /// connection.
+    /// Gracefully closes the underlying rmcp service.
     ///
-    /// After calling this method with [`AuthResolution::Provided`], every subsequent
-    /// JSON-RPC request will include the credentials in an `auth` field.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`McpError`] if the resolution cannot be applied.
+    /// For Streamable HTTP this drives the rmcp transport to issue a `DELETE`
+    /// against the negotiated session, releasing server-side state.
+    pub async fn close(&self) -> Result<(), McpError> {
+        let mut inner = self.inner.lock().await;
+        inner
+            .close()
+            .await
+            .map(|_| ())
+            .map_err(|error| McpError::Transport(format!("rmcp service close failed: {error}")))
+    }
+
+    /// Stores or clears authentication credentials and, when configured to do
+    /// so via [`McpServerConfig`], reconnects to apply them.
     pub async fn resolve_auth(&self, resolution: AuthResolution) -> Result<(), McpError> {
-        let mut auth = self.auth.lock().await;
+        let mut auth_slot = self.auth.lock().await;
         match resolution {
             AuthResolution::Provided { credentials, .. } => {
-                *auth = Some(credentials);
+                *auth_slot = Some(credentials);
             }
             AuthResolution::Cancelled { .. } => {
-                *auth = None;
+                *auth_slot = None;
             }
         }
-        if matches!(&*self.inner.lock().await, McpConnectionInner::Legacy(_)) {
-            return Ok(());
+        let snapshot = auth_slot.clone();
+        drop(auth_slot);
+        // Only reconnect if we have a config to reconnect with. Without one
+        // (e.g. constructed via [`from_running_service`]) the auth is stored
+        // but not pushed to the live transport.
+        if self.config.is_some() {
+            self.reconnect_inner(snapshot.as_ref()).await?;
         }
-        let replacement = self.reconnect_rmcp_inner(auth.as_ref()).await?;
-        *self.inner.lock().await = replacement;
         Ok(())
     }
 
-    /// Performs capability discovery by listing tools, resources, and
-    /// prompts — but only for the capabilities the server advertised during
-    /// `initialize`. Unadvertised capabilities produce empty collections
-    /// without making any requests, avoiding `-32601 Method not found`
-    /// errors from spec-compliant servers.
-    ///
-    /// Returns an [`McpDiscoverySnapshot`] containing everything the server
-    /// advertised.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`McpError`] if any advertised list request fails.
+    /// Discovers tools, resources, and prompts that the server advertised.
     pub async fn discover(&self) -> Result<McpDiscoverySnapshot, McpError> {
         let tools = if self.capabilities.tools.is_some() {
             self.list_tools().await?
@@ -1625,12 +659,7 @@ impl McpConnection {
         })
     }
 
-    /// Returns the capabilities advertised by the server during `initialize`.
-    pub fn capabilities(&self) -> &McpServerCapabilities {
-        &self.capabilities
-    }
-
-    async fn drain_notifications(&self) -> Vec<RmcpServerNotification> {
+    async fn drain_notifications(&self) -> Vec<McpServerNotification> {
         let mut notifications = self.notifications.lock().await;
         let mut drained = Vec::new();
         while let Ok(notification) = notifications.try_recv() {
@@ -1640,308 +669,108 @@ impl McpConnection {
     }
 
     /// Lists all tools advertised by the connected MCP server.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`McpError`] if the `tools/list` request fails.
     pub async fn list_tools(&self) -> Result<Vec<McpToolDescriptor>, McpError> {
-        let mut inner = self.inner.lock().await;
-        match &mut *inner {
-            McpConnectionInner::Rmcp(service) => service
-                .list_all_tools()
-                .await
-                .map_err(rmcp_service_error)
-                .and_then(|tools| {
-                    tools
-                        .into_iter()
-                        .map(rmcp_tool_descriptor)
-                        .collect::<Result<Vec<_>, _>>()
-                }),
-            McpConnectionInner::Legacy(_) => {
-                drop(inner);
-                let result = self.request("tools/list", json!({})).await?;
-                let payload: ToolsListPayload =
-                    serde_json::from_value(result).map_err(McpError::Serialize)?;
-                payload
-                    .tools
+        let inner = self.inner.lock().await;
+        inner
+            .list_all_tools()
+            .await
+            .map_err(rmcp_service_error)
+            .and_then(|tools| {
+                tools
                     .into_iter()
-                    .map(parse_tool_descriptor)
-                    .collect()
-            }
-        }
+                    .map(rmcp_tool_descriptor)
+                    .collect::<Result<Vec<_>, _>>()
+            })
     }
 
     /// Lists all resources advertised by the connected MCP server.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`McpError`] if the `resources/list` request fails.
     pub async fn list_resources(&self) -> Result<Vec<McpResourceDescriptor>, McpError> {
-        let mut inner = self.inner.lock().await;
-        match &mut *inner {
-            McpConnectionInner::Rmcp(service) => service
-                .list_all_resources()
-                .await
-                .map_err(rmcp_service_error)
-                .map(|resources| {
-                    resources
-                        .into_iter()
-                        .map(rmcp_resource_descriptor)
-                        .collect()
-                }),
-            McpConnectionInner::Legacy(_) => {
-                drop(inner);
-                let result = self.request("resources/list", json!({})).await?;
-                let payload: ResourcesListPayload =
-                    serde_json::from_value(result).map_err(McpError::Serialize)?;
-                payload
-                    .resources
+        let inner = self.inner.lock().await;
+        inner
+            .list_all_resources()
+            .await
+            .map_err(rmcp_service_error)
+            .map(|resources| {
+                resources
                     .into_iter()
-                    .map(parse_resource_descriptor)
+                    .map(rmcp_resource_descriptor)
                     .collect()
-            }
-        }
+            })
     }
 
     /// Lists all prompts advertised by the connected MCP server.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`McpError`] if the `prompts/list` request fails.
     pub async fn list_prompts(&self) -> Result<Vec<McpPromptDescriptor>, McpError> {
-        let mut inner = self.inner.lock().await;
-        match &mut *inner {
-            McpConnectionInner::Rmcp(service) => service
-                .list_all_prompts()
-                .await
-                .map_err(rmcp_service_error)
-                .map(|prompts| prompts.into_iter().map(rmcp_prompt_descriptor).collect()),
-            McpConnectionInner::Legacy(_) => {
-                drop(inner);
-                let result = self.request("prompts/list", json!({})).await?;
-                let payload: PromptsListPayload =
-                    serde_json::from_value(result).map_err(McpError::Serialize)?;
-                payload
-                    .prompts
-                    .into_iter()
-                    .map(parse_prompt_descriptor)
-                    .collect()
-            }
-        }
+        let inner = self.inner.lock().await;
+        inner
+            .list_all_prompts()
+            .await
+            .map_err(rmcp_service_error)
+            .map(|prompts| prompts.into_iter().map(rmcp_prompt_descriptor).collect())
     }
 
     /// Invokes a tool on the MCP server and returns the raw JSON result.
-    ///
-    /// # Arguments
-    ///
-    /// * `name` - The tool name as it appears in the server's tool list.
-    /// * `arguments` - A JSON value matching the tool's input schema.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`McpError::AuthRequired`] if the server demands authentication,
-    /// or another [`McpError`] variant on transport or protocol failures.
     pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, McpError> {
-        let mut inner = self.inner.lock().await;
-        match &mut *inner {
-            McpConnectionInner::Rmcp(service) => {
-                let mut params = rmcp_model::CallToolRequestParams::new(name.to_string());
-                if !arguments.is_null() {
-                    params = params
-                        .with_arguments(value_to_json_object(arguments, "tools/call arguments")?);
-                }
-                service
-                    .call_tool(params)
-                    .await
-                    .map_err(|error| {
-                        rmcp_operation_error(
-                            &self.server_id,
-                            "tools/call",
-                            json!({ "name": name }),
-                            error,
-                        )
-                    })
-                    .and_then(|result| serde_json::to_value(result).map_err(McpError::Serialize))
-            }
-            McpConnectionInner::Legacy(_) => {
-                drop(inner);
-                self.request(
-                    "tools/call",
-                    json!({
-                        "name": name,
-                        "arguments": arguments,
-                    }),
-                )
-                .await
-            }
+        let inner = self.inner.lock().await;
+        let mut params = rmcp_model::CallToolRequestParams::new(name.to_string());
+        if !arguments.is_null() {
+            params =
+                params.with_arguments(value_to_json_object(arguments, "tools/call arguments")?);
         }
+        let result = inner.call_tool(params).await.map_err(|error| {
+            rmcp_operation_error(
+                &self.server_id,
+                "tools/call",
+                json!({ "name": name }),
+                error,
+            )
+        })?;
+        serde_json::to_value(result).map_err(McpError::Serialize)
     }
 
     /// Reads a resource from the MCP server by URI.
-    ///
-    /// # Arguments
-    ///
-    /// * `uri` - The resource URI (e.g. `"file:///tmp/example.txt"`).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`McpError`] if the resource cannot be read or the response is malformed.
     pub async fn read_resource(&self, uri: &str) -> Result<ResourceContents, McpError> {
-        let mut inner = self.inner.lock().await;
-        match &mut *inner {
-            McpConnectionInner::Rmcp(service) => service
-                .read_resource(rmcp_model::ReadResourceRequestParams::new(uri))
-                .await
-                .map_err(|error| {
-                    rmcp_operation_error(
-                        &self.server_id,
-                        "resources/read",
-                        json!({ "uri": uri }),
-                        error,
-                    )
-                })
-                .and_then(rmcp_resource_contents),
-            McpConnectionInner::Legacy(_) => {
-                drop(inner);
-                let result = self
-                    .request(
-                        "resources/read",
-                        json!({
-                            "uri": uri,
-                        }),
-                    )
-                    .await?;
-                legacy_resource_contents(result)
-            }
-        }
+        let inner = self.inner.lock().await;
+        inner
+            .read_resource(rmcp_model::ReadResourceRequestParams::new(uri))
+            .await
+            .map_err(|error| {
+                rmcp_operation_error(
+                    &self.server_id,
+                    "resources/read",
+                    json!({ "uri": uri }),
+                    error,
+                )
+            })
+            .and_then(rmcp_resource_contents)
     }
 
     /// Retrieves a prompt from the MCP server, rendering it with the given arguments.
-    ///
-    /// # Arguments
-    ///
-    /// * `name` - The prompt name as it appears in the server's prompt list.
-    /// * `arguments` - A JSON value containing the prompt's input arguments.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`McpError`] if the prompt cannot be retrieved or the response is malformed.
     pub async fn get_prompt(
         &self,
         name: &str,
         arguments: Value,
     ) -> Result<PromptContents, McpError> {
-        let mut inner = self.inner.lock().await;
-        match &mut *inner {
-            McpConnectionInner::Rmcp(service) => {
-                let mut params = rmcp_model::GetPromptRequestParams::new(name);
-                if !arguments.is_null() {
-                    params = params
-                        .with_arguments(value_to_json_object(arguments, "prompts/get arguments")?);
-                }
-                service
-                    .get_prompt(params)
-                    .await
-                    .map_err(|error| {
-                        rmcp_operation_error(
-                            &self.server_id,
-                            "prompts/get",
-                            json!({ "name": name }),
-                            error,
-                        )
-                    })
-                    .and_then(rmcp_prompt_contents)
-            }
-            McpConnectionInner::Legacy(_) => {
-                drop(inner);
-                let result = self
-                    .request(
-                        "prompts/get",
-                        json!({
-                            "name": name,
-                            "arguments": arguments,
-                        }),
-                    )
-                    .await?;
-                legacy_prompt_contents(result)
-            }
+        let inner = self.inner.lock().await;
+        let mut params = rmcp_model::GetPromptRequestParams::new(name);
+        if !arguments.is_null() {
+            params =
+                params.with_arguments(value_to_json_object(arguments, "prompts/get arguments")?);
         }
-    }
-
-    async fn request(&self, method: &str, params: Value) -> Result<Value, McpError> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let params = self.enrich_params(params.clone()).await;
-        let mut inner = self.inner.lock().await;
-        let McpConnectionInner::Legacy(transport) = &mut *inner else {
-            return Err(McpError::Protocol(format!(
-                "raw JSON-RPC request path is not available for RMCP-backed connection method {method}"
-            )));
-        };
-        transport
-            .send(McpFrame {
-                value: json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "method": method,
-                    "params": params,
-                }),
+        inner
+            .get_prompt(params)
+            .await
+            .map_err(|error| {
+                rmcp_operation_error(
+                    &self.server_id,
+                    "prompts/get",
+                    json!({ "name": name }),
+                    error,
+                )
             })
-            .await?;
-
-        loop {
-            let Some(frame) = transport.recv().await? else {
-                return Err(McpError::Transport(
-                    "transport closed while waiting for MCP response".into(),
-                ));
-            };
-
-            if frame.value.get("id").and_then(Value::as_u64) != Some(id) {
-                continue;
-            }
-
-            if let Some(error) = frame.value.get("error") {
-                if let Some(auth_request) =
-                    parse_auth_request(&self.server_id, method, &params, error)
-                {
-                    return Err(McpError::AuthRequired(Box::new(auth_request)));
-                }
-                return Err(McpError::Invocation(error.to_string()));
-            }
-
-            return frame
-                .value
-                .get("result")
-                .cloned()
-                .ok_or_else(|| McpError::Protocol("MCP response missing result".into()));
-        }
-    }
-
-    async fn enrich_params(&self, params: Value) -> Value {
-        let auth = self.auth.lock().await;
-        let Some(auth) = auth.as_ref() else {
-            return params;
-        };
-
-        match params {
-            Value::Object(mut object) => {
-                object
-                    .entry("auth")
-                    .or_insert_with(|| metadata_to_value(auth));
-                Value::Object(object)
-            }
-            other => other,
-        }
+            .and_then(rmcp_prompt_contents)
     }
 
     /// Replays an MCP operation that previously failed with an auth challenge.
-    ///
-    /// This is called after credentials have been resolved via [`resolve_auth`](Self::resolve_auth).
-    /// The operation is re-issued with the stored credentials attached.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`McpError::AuthResolution`] if the operation targets a different server,
-    /// or other [`McpError`] variants if the replayed operation itself fails.
     pub async fn replay_auth_operation(
         &self,
         operation: &AuthOperation,
@@ -2014,12 +843,65 @@ impl McpConnection {
     }
 }
 
-/// Adapter that exposes an MCP tool as an [`Invocable`] for the capabilities system.
-///
-/// This is the capabilities-layer adapter. For the tool-layer adapter, see
-/// [`McpToolAdapter`]. Names are prefixed with `mcp_<server_id>_<tool_name>`
-/// so they satisfy provider validators that only allow `[a-zA-Z0-9_-]`
-/// (e.g. Anthropic on Vertex).
+async fn connect_rmcp_stdio(
+    config: &McpServerConfig,
+    binding: &StdioTransportConfig,
+    notification_tx: mpsc::UnboundedSender<McpServerNotification>,
+) -> Result<(RmcpClientService, McpServerCapabilities), McpError> {
+    let transport = TokioChildProcess::new(
+        tokio::process::Command::new(&binding.command).configure(|command| {
+            command.args(&binding.args);
+            if let Some(cwd) = &binding.cwd {
+                command.current_dir(cwd);
+            }
+            for (key, value) in &binding.env {
+                command.env(key, value);
+            }
+        }),
+    )
+    .map_err(McpError::Io)?;
+
+    let service = McpClientHandler::new(notification_tx)
+        .serve(transport)
+        .await
+        .map_err(|error| rmcp_initialize_error(config, error))?;
+    let capabilities = service
+        .peer_info()
+        .map(|info| rmcp_server_capabilities_to_agentkit(&info.capabilities))
+        .unwrap_or_default();
+
+    Ok((service, capabilities))
+}
+
+async fn connect_rmcp_streamable_http(
+    config: &McpServerConfig,
+    binding: &StreamableHttpTransportConfig,
+    auth: Option<&MetadataMap>,
+    notification_tx: mpsc::UnboundedSender<McpServerNotification>,
+) -> Result<(RmcpClientService, McpServerCapabilities), McpError> {
+    let auth_header = auth
+        .and_then(bearer_token_from_metadata)
+        .or_else(|| binding.bearer_token.clone());
+    let mut rmcp_config = RmcpStreamableHttpClientTransportConfig::with_uri(binding.url.clone());
+    if let Some(auth_header) = auth_header {
+        rmcp_config = rmcp_config.auth_header(auth_header);
+    }
+    rmcp_config = rmcp_config.custom_headers(binding.headers.iter().cloned().collect());
+    let transport = StreamableHttpClientTransport::from_config(rmcp_config);
+
+    let service = McpClientHandler::new(notification_tx)
+        .serve(transport)
+        .await
+        .map_err(|error| rmcp_initialize_error(config, error))?;
+    let capabilities = service
+        .peer_info()
+        .map(|info| rmcp_server_capabilities_to_agentkit(&info.capabilities))
+        .unwrap_or_default();
+
+    Ok((service, capabilities))
+}
+
+/// Adapter exposing an MCP tool as an [`Invocable`] for the capabilities system.
 pub struct McpInvocable {
     connection: Arc<McpConnection>,
     descriptor: McpToolDescriptor,
@@ -2028,11 +910,6 @@ pub struct McpInvocable {
 
 impl McpInvocable {
     /// Creates a new invocable adapter for the given MCP tool.
-    ///
-    /// # Arguments
-    ///
-    /// * `connection` - A shared connection to the MCP server that owns the tool.
-    /// * `descriptor` - The tool descriptor obtained from discovery.
     pub fn new(connection: Arc<McpConnection>, descriptor: McpToolDescriptor) -> Self {
         let spec = InvocableSpec {
             name: CapabilityName::new(format!(
@@ -2085,10 +962,7 @@ impl Invocable for McpInvocable {
     }
 }
 
-/// Adapter that exposes a single MCP resource as a [`ResourceProvider`].
-///
-/// Created automatically by [`McpCapabilityProvider::from_snapshot`] for each
-/// resource discovered on the server.
+/// Adapter exposing a single MCP resource as a [`ResourceProvider`].
 pub struct McpResourceHandle {
     connection: Arc<McpConnection>,
     descriptor: ResourceDescriptor,
@@ -2117,10 +991,7 @@ impl ResourceProvider for McpResourceHandle {
     }
 }
 
-/// Adapter that exposes a single MCP prompt as a [`PromptProvider`].
-///
-/// Created automatically by [`McpCapabilityProvider::from_snapshot`] for each
-/// prompt discovered on the server.
+/// Adapter exposing a single MCP prompt as a [`PromptProvider`].
 pub struct McpPromptHandle {
     connection: Arc<McpConnection>,
     descriptor: PromptDescriptor,
@@ -2150,32 +1021,7 @@ impl PromptProvider for McpPromptHandle {
     }
 }
 
-/// A [`CapabilityProvider`] that surfaces MCP tools, resources, and prompts into the
-/// agentkit capabilities system.
-///
-/// Built from a discovery snapshot, this provider wraps each MCP tool as an
-/// [`McpInvocable`], each resource as an [`McpResourceHandle`], and each prompt as
-/// an [`McpPromptHandle`].
-///
-/// # Example
-///
-/// ```rust,no_run
-/// use std::sync::Arc;
-/// use agentkit_mcp::{McpCapabilityProvider, McpServerConfig, McpTransportBinding, StdioTransportConfig};
-///
-/// # #[tokio::main]
-/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-/// let config = McpServerConfig::new(
-///     "filesystem",
-///     McpTransportBinding::Stdio(StdioTransportConfig::new("npx")
-///         .with_arg("-y")
-///         .with_arg("@modelcontextprotocol/server-filesystem")),
-/// );
-/// let (connection, provider, snapshot) = McpCapabilityProvider::connect(&config).await?;
-/// // `provider` implements CapabilityProvider and can be registered with an agent.
-/// # Ok(())
-/// # }
-/// ```
+/// A [`CapabilityProvider`] that surfaces MCP tools, resources, and prompts.
 pub struct McpCapabilityProvider {
     invocables: Vec<Arc<dyn Invocable>>,
     resources: Vec<Arc<dyn ResourceProvider>>,
@@ -2183,11 +1029,7 @@ pub struct McpCapabilityProvider {
 }
 
 impl McpCapabilityProvider {
-    /// Creates a capability provider from an existing connection and its discovery
-    /// snapshot.
-    ///
-    /// Each tool, resource, and prompt in the snapshot is wrapped in the appropriate
-    /// adapter type.
+    /// Builds a capability provider from an existing connection and snapshot.
     pub fn from_snapshot(connection: Arc<McpConnection>, snapshot: &McpDiscoverySnapshot) -> Self {
         let invocables = snapshot
             .tools
@@ -2241,10 +1083,7 @@ impl McpCapabilityProvider {
         }
     }
 
-    /// Merges multiple capability providers into a single provider.
-    ///
-    /// This is useful when managing several MCP servers through a
-    /// [`McpServerManager`] and you want one combined provider for the agent.
+    /// Merges multiple capability providers into one.
     pub fn merge<I>(providers: I) -> Self
     where
         I: IntoIterator<Item = Self>,
@@ -2266,14 +1105,7 @@ impl McpCapabilityProvider {
         }
     }
 
-    /// Connects to an MCP server, performs discovery, and builds a capability
-    /// provider in one step.
-    ///
-    /// Returns the shared connection, the provider, and the discovery snapshot.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`McpError`] if connection or discovery fails.
+    /// Connects to an MCP server, performs discovery, and builds a provider.
     pub async fn connect(
         config: &McpServerConfig,
     ) -> Result<(Arc<McpConnection>, Self, McpDiscoverySnapshot), McpError> {
@@ -2299,11 +1131,7 @@ impl CapabilityProvider for McpCapabilityProvider {
     }
 }
 
-/// A connected MCP server together with its configuration and discovery snapshot.
-///
-/// Obtained from [`McpServerManager::connect_server`] or
-/// [`McpServerManager::connect_all`]. Provides convenience methods to create
-/// tool registries and capability providers from the server's discovered capabilities.
+/// A connected MCP server together with its configuration and snapshot.
 #[derive(Clone)]
 pub struct McpServerHandle {
     config: McpServerConfig,
@@ -2332,8 +1160,7 @@ impl McpServerHandle {
         &self.snapshot
     }
 
-    /// Builds a [`ToolRegistry`] containing an [`McpToolAdapter`] for each tool
-    /// discovered on this server.
+    /// Builds a [`ToolRegistry`] containing an [`McpToolAdapter`] for each tool.
     pub fn tool_registry(&self) -> ToolRegistry {
         self.snapshot
             .tools
@@ -2348,52 +1175,13 @@ impl McpServerHandle {
             })
     }
 
-    /// Builds an [`McpCapabilityProvider`] from this server's discovery snapshot.
+    /// Builds an [`McpCapabilityProvider`] from this server's snapshot.
     pub fn capability_provider(&self) -> McpCapabilityProvider {
         McpCapabilityProvider::from_snapshot(self.connection.clone(), &self.snapshot)
     }
 }
 
-/// Manages the lifecycle of one or more MCP servers: registration, connection,
-/// discovery, refresh, disconnection, and auth resolution.
-///
-/// This is the primary entry point for integrating MCP servers into an agentkit
-/// application. Register server configurations, connect them, and then obtain a
-/// combined [`ToolRegistry`] or [`McpCapabilityProvider`] for use in an agent loop.
-///
-/// # Example
-///
-/// ```rust,no_run
-/// use agentkit_mcp::{
-///     McpServerConfig, McpServerManager, McpTransportBinding, StdioTransportConfig,
-/// };
-///
-/// # #[tokio::main]
-/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-/// let mut manager = McpServerManager::new()
-///     .with_server(McpServerConfig::new(
-///         "filesystem",
-///         McpTransportBinding::Stdio(
-///             StdioTransportConfig::new("npx")
-///                 .with_arg("-y")
-///                 .with_arg("@modelcontextprotocol/server-filesystem"),
-///         ),
-///     ))
-///     .with_server(McpServerConfig::new(
-///         "github",
-///         McpTransportBinding::Stdio(
-///             StdioTransportConfig::new("npx")
-///                 .with_arg("-y")
-///                 .with_arg("@modelcontextprotocol/server-github"),
-///         ),
-///     ));
-///
-/// let handles = manager.connect_all().await?;
-/// let registry = manager.tool_registry();
-/// println!("tools: {:?}", registry.specs().iter().map(|s| &s.name).collect::<Vec<_>>());
-/// # Ok(())
-/// # }
-/// ```
+/// Manages the lifecycle of one or more MCP servers.
 pub struct McpServerManager {
     configs: BTreeMap<McpServerId, McpServerConfig>,
     connections: BTreeMap<McpServerId, McpServerHandle>,
@@ -2419,25 +1207,19 @@ impl McpServerManager {
         Self::default()
     }
 
-    /// Registers a server configuration and returns `self` for chaining.
-    ///
-    /// The server is not connected until [`connect_server`](Self::connect_server) or
-    /// [`connect_all`](Self::connect_all) is called.
+    /// Registers a server configuration. Returns `self` for chaining.
     pub fn with_server(mut self, config: McpServerConfig) -> Self {
         self.register_server(config);
         self
     }
 
     /// Registers a server configuration by mutable reference.
-    ///
-    /// The server is not connected until [`connect_server`](Self::connect_server) or
-    /// [`connect_all`](Self::connect_all) is called.
     pub fn register_server(&mut self, config: McpServerConfig) -> &mut Self {
         self.configs.insert(config.id.clone(), config);
         self
     }
 
-    /// Returns the handle for a connected server, or `None` if it is not connected.
+    /// Returns the handle for a connected server, or `None` if not connected.
     pub fn connected_server(&self, server_id: &McpServerId) -> Option<&McpServerHandle> {
         self.connections.get(server_id)
     }
@@ -2457,13 +1239,6 @@ impl McpServerManager {
     }
 
     /// Connects a single registered server by its identifier.
-    ///
-    /// Performs the MCP handshake and full capability discovery.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`McpError::UnknownServer`] if the server ID has not been registered,
-    /// or other [`McpError`] variants if connection or discovery fails.
     pub async fn connect_server(
         &mut self,
         server_id: &McpServerId,
@@ -2489,34 +1264,16 @@ impl McpServerManager {
     }
 
     /// Connects all registered servers sequentially.
-    ///
-    /// Returns a handle for each server in registration order. If any server fails
-    /// to connect, the error is returned immediately and remaining servers are
-    /// not attempted.
-    ///
-    /// # Errors
-    ///
-    /// Returns the first [`McpError`] encountered during connection.
     pub async fn connect_all(&mut self) -> Result<Vec<McpServerHandle>, McpError> {
         let server_ids = self.configs.keys().cloned().collect::<Vec<_>>();
         let mut handles = Vec::with_capacity(server_ids.len());
-
         for server_id in server_ids {
             handles.push(self.connect_server(&server_id).await?);
         }
-
         Ok(handles)
     }
 
-    /// Re-discovers capabilities for a connected server, updating the stored snapshot.
-    ///
-    /// Call this after the server's capabilities may have changed (e.g. after
-    /// installing a plugin).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`McpError::UnknownServer`] if the server is not connected, or other
-    /// [`McpError`] variants if discovery fails.
+    /// Re-discovers capabilities for a connected server.
     pub async fn refresh_server(
         &mut self,
         server_id: &McpServerId,
@@ -2543,16 +1300,7 @@ impl McpServerManager {
         Ok(snapshot)
     }
 
-    /// Processes pending server list-change notifications and refreshes affected snapshots.
-    ///
-    /// RMCP receives `notifications/tools/list_changed`,
-    /// `notifications/resources/list_changed`, and
-    /// `notifications/prompts/list_changed` on the transport task. This method
-    /// drains those notifications, re-runs discovery for each affected server,
-    /// updates the manager snapshot, and emits diffed [`McpCatalogEvent`]s.
-    ///
-    /// Hosts can call this between model turns to make capability changes visible
-    /// on the next request without injecting synthetic transcript text.
+    /// Processes pending server list-change notifications.
     pub async fn refresh_changed_catalogs(&mut self) -> Result<Vec<McpCatalogEvent>, McpError> {
         let server_ids = self.connections.keys().cloned().collect::<Vec<_>>();
         let mut emitted = Vec::new();
@@ -2597,14 +1345,7 @@ impl McpServerManager {
         Ok(emitted)
     }
 
-    /// Disconnects a server and removes it from the active connections.
-    ///
-    /// The server configuration remains registered and can be reconnected later
-    /// with [`connect_server`](Self::connect_server).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`McpError::UnknownServer`] if the server is not connected.
+    /// Disconnects a server and removes it from active connections.
     pub async fn disconnect_server(&mut self, server_id: &McpServerId) -> Result<(), McpError> {
         let Some(handle) = self.connections.remove(server_id) else {
             return Err(McpError::UnknownServer(server_id.to_string()));
@@ -2616,13 +1357,7 @@ impl McpServerManager {
         Ok(())
     }
 
-    /// Stores or clears authentication credentials for a server and, if already
-    /// connected, updates the live connection as well.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`McpError::UnknownServer`] if the server ID from the resolution
-    /// does not match any registered server.
+    /// Stores or clears authentication credentials for a server.
     pub async fn resolve_auth(&mut self, resolution: AuthResolution) -> Result<(), McpError> {
         let server_id = resolution
             .request()
@@ -2652,15 +1387,7 @@ impl McpServerManager {
         }
     }
 
-    /// Resolves authentication and immediately replays the operation that originally
-    /// triggered the auth challenge.
-    ///
-    /// This is a convenience method combining [`resolve_auth`](Self::resolve_auth)
-    /// and [`replay_auth_request`](Self::replay_auth_request).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`McpError`] if auth resolution or the replayed operation fails.
+    /// Resolves auth and immediately replays the operation that triggered the challenge.
     pub async fn resolve_auth_and_resume(
         &mut self,
         resolution: AuthResolution,
@@ -2671,14 +1398,6 @@ impl McpServerManager {
     }
 
     /// Replays an auth request's original MCP operation using stored credentials.
-    ///
-    /// For connect operations the server is (re)connected. For tool calls, resource
-    /// reads, and prompt retrievals the request is re-issued on the existing or
-    /// newly established connection.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`McpError`] if the operation cannot be replayed.
     pub async fn replay_auth_request(
         &mut self,
         request: &AuthRequest,
@@ -2727,10 +1446,9 @@ impl McpServerManager {
             .ok_or_else(|| McpError::UnknownServer(server_id.to_string()))
     }
 
-    /// Builds a combined [`ToolRegistry`] containing [`McpToolAdapter`]s for every
-    /// tool discovered across all connected servers.
+    /// Builds a combined [`ToolRegistry`] for every tool across all connected servers.
     ///
-    /// Tool names are prefixed as `mcp_<server_id>_<tool_name>`.
+    /// Tool names are prefixed `mcp_<server_id>_<tool_name>`.
     pub fn tool_registry(&self) -> ToolRegistry {
         self.connections
             .values()
@@ -2746,8 +1464,7 @@ impl McpServerManager {
             })
     }
 
-    /// Builds a combined [`McpCapabilityProvider`] from all connected servers,
-    /// merging their tools, resources, and prompts.
+    /// Builds a combined [`McpCapabilityProvider`] from all connected servers.
     pub fn capability_provider(&self) -> McpCapabilityProvider {
         McpCapabilityProvider::merge(
             self.connections
@@ -2756,7 +1473,7 @@ impl McpServerManager {
         )
     }
 
-    /// Builds an MCP-backed executor from the current discovered tool snapshot.
+    /// Builds an MCP-backed executor from the current snapshot.
     pub fn tool_executor(&self) -> McpToolExecutor {
         McpToolExecutor::from_manager(self)
     }
@@ -2842,22 +1559,18 @@ where
         .collect();
     let changed = current
         .iter()
-        .filter_map(|(name, item)| {
+        .filter(|(name, item)| {
             previous
-                .get(name)
-                .is_some_and(|previous_item| previous_item != item)
-                .then(|| name.clone())
+                .get(*name)
+                .is_some_and(|previous_item| previous_item != *item)
         })
+        .map(|(name, _)| name.clone())
         .collect();
 
     (added, removed, changed)
 }
 
 /// A tool executor backed by MCP tool adapters.
-///
-/// The executor stores a replaceable registry snapshot so hosts can refresh it
-/// after [`McpServerManager`] catalog events without rebuilding the entire
-/// agent loop.
 #[derive(Clone)]
 pub struct McpToolExecutor {
     registry: Arc<RwLock<ToolRegistry>>,
@@ -2866,7 +1579,7 @@ pub struct McpToolExecutor {
 }
 
 impl McpToolExecutor {
-    /// Creates an executor from a manager's current connected server snapshot.
+    /// Creates an executor from a manager's current connected snapshot.
     pub fn from_manager(manager: &McpServerManager) -> Self {
         Self {
             registry: Arc::new(RwLock::new(manager.tool_registry())),
@@ -2991,21 +1704,7 @@ impl ToolExecutor for McpToolExecutor {
     }
 }
 
-/// Adapter that exposes an MCP tool as an agentkit [`Tool`].
-///
-/// This is the tool-layer adapter for the tool registry. For the capabilities-layer
-/// adapter, see [`McpInvocable`]. Tool names are prefixed as
-/// `mcp_<server_id>_<tool_name>`.
-///
-/// # Example
-///
-/// ```rust
-/// use std::sync::Arc;
-/// use agentkit_core::MetadataMap;
-/// use agentkit_mcp::{McpToolAdapter, McpToolDescriptor, McpServerId};
-/// # // McpToolAdapter::new requires a connection which we cannot construct in a doc test,
-/// # // so this example only shows the construction pattern.
-/// ```
+/// Adapter exposing an MCP tool as an agentkit [`Tool`].
 pub struct McpToolAdapter {
     descriptor: McpToolDescriptor,
     connection: Arc<McpConnection>,
@@ -3014,12 +1713,6 @@ pub struct McpToolAdapter {
 
 impl McpToolAdapter {
     /// Creates a new tool adapter for the given MCP tool.
-    ///
-    /// # Arguments
-    ///
-    /// * `server_id` - The server's identifier, used to namespace the tool name.
-    /// * `connection` - A shared connection to the owning MCP server.
-    /// * `descriptor` - The tool descriptor obtained from discovery.
     pub fn new(
         server_id: &McpServerId,
         connection: Arc<McpConnection>,
@@ -3153,15 +1846,15 @@ fn rmcp_resource_descriptor(resource: rmcp_model::Resource) -> McpResourceDescri
     if let Some(size) = resource.size {
         metadata.insert("size".into(), Value::Number(size.into()));
     }
-    if let Some(icons) = resource.icons.as_ref() {
-        if let Ok(value) = serde_json::to_value(icons) {
-            metadata.insert("icons".into(), value);
-        }
+    if let Some(icons) = resource.icons.as_ref()
+        && let Ok(value) = serde_json::to_value(icons)
+    {
+        metadata.insert("icons".into(), value);
     }
-    if let Some(meta) = resource.meta.as_ref() {
-        if let Ok(value) = serde_json::to_value(meta) {
-            metadata.insert("_meta".into(), value);
-        }
+    if let Some(meta) = resource.meta.as_ref()
+        && let Ok(value) = serde_json::to_value(meta)
+    {
+        metadata.insert("_meta".into(), value);
     }
 
     McpResourceDescriptor {
@@ -3178,15 +1871,15 @@ fn rmcp_prompt_descriptor(prompt: rmcp_model::Prompt) -> McpPromptDescriptor {
     if let Some(title) = prompt.title.clone() {
         metadata.insert("title".into(), Value::String(title));
     }
-    if let Some(icons) = prompt.icons.as_ref() {
-        if let Ok(value) = serde_json::to_value(icons) {
-            metadata.insert("icons".into(), value);
-        }
+    if let Some(icons) = prompt.icons.as_ref()
+        && let Ok(value) = serde_json::to_value(icons)
+    {
+        metadata.insert("icons".into(), value);
     }
-    if let Some(meta) = prompt.meta.as_ref() {
-        if let Ok(value) = serde_json::to_value(meta) {
-            metadata.insert("_meta".into(), value);
-        }
+    if let Some(meta) = prompt.meta.as_ref()
+        && let Ok(value) = serde_json::to_value(meta)
+    {
+        metadata.insert("_meta".into(), value);
     }
 
     let properties = prompt
@@ -3208,101 +1901,6 @@ fn rmcp_prompt_descriptor(prompt: rmcp_model::Prompt) -> McpPromptDescriptor {
     }
 }
 
-fn parse_tool_descriptor(value: Value) -> Result<McpToolDescriptor, McpError> {
-    Ok(McpToolDescriptor {
-        name: required_string(&value, "name")?,
-        description: value
-            .get("description")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-        input_schema: value
-            .get("inputSchema")
-            .cloned()
-            .unwrap_or_else(|| json!({ "type": "object" })),
-        metadata: MetadataMap::new(),
-    })
-}
-
-fn parse_resource_descriptor(value: Value) -> Result<McpResourceDescriptor, McpError> {
-    Ok(McpResourceDescriptor {
-        id: required_string(&value, "uri")?,
-        name: value
-            .get("name")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .unwrap_or_else(|| {
-                value
-                    .get("uri")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string()
-            }),
-        description: value
-            .get("description")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-        mime_type: value
-            .get("mimeType")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-        metadata: MetadataMap::new(),
-    })
-}
-
-fn parse_prompt_descriptor(value: Value) -> Result<McpPromptDescriptor, McpError> {
-    let name = required_string(&value, "name")?;
-    let properties = value
-        .get("arguments")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|arg| {
-            let name = arg.get("name")?.as_str()?.to_string();
-            Some((name, json!({ "type": "string" })))
-        })
-        .collect::<serde_json::Map<String, Value>>();
-
-    Ok(McpPromptDescriptor {
-        id: name.clone(),
-        name,
-        description: value
-            .get("description")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-        input_schema: json!({
-            "type": "object",
-            "properties": properties,
-        }),
-        metadata: MetadataMap::new(),
-    })
-}
-
-fn legacy_resource_contents(result: Value) -> Result<ResourceContents, McpError> {
-    let payload: ResourcesReadPayload =
-        serde_json::from_value(result).map_err(McpError::Serialize)?;
-    let content = payload
-        .contents
-        .into_iter()
-        .next()
-        .ok_or_else(|| McpError::Protocol("resources/read returned no contents".into()))?;
-
-    let data = if let Some(text) = content.text {
-        DataRef::InlineText(text)
-    } else if let Some(found_uri) = content.uri {
-        DataRef::Uri(found_uri)
-    } else {
-        return Err(McpError::Protocol(
-            "unsupported resource content shape".into(),
-        ));
-    };
-
-    Ok(ResourceContents {
-        data,
-        metadata: MetadataMap::new(),
-    })
-}
-
 fn rmcp_resource_contents(
     result: rmcp_model::ReadResourceResult,
 ) -> Result<ResourceContents, McpError> {
@@ -3321,20 +1919,6 @@ fn rmcp_resource_contents(
 
     Ok(ResourceContents {
         data,
-        metadata: MetadataMap::new(),
-    })
-}
-
-fn legacy_prompt_contents(result: Value) -> Result<PromptContents, McpError> {
-    let payload: PromptsGetPayload = serde_json::from_value(result).map_err(McpError::Serialize)?;
-    let items = payload
-        .messages
-        .into_iter()
-        .map(parse_prompt_message)
-        .collect::<Result<Vec<_>, _>>()?;
-
-    Ok(PromptContents {
-        items,
         metadata: MetadataMap::new(),
     })
 }
@@ -3381,14 +1965,6 @@ fn parse_prompt_message(value: Value) -> Result<Item, McpError> {
     })
 }
 
-fn required_string(value: &Value, field: &str) -> Result<String, McpError> {
-    value
-        .get(field)
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .ok_or_else(|| McpError::Protocol(format!("missing string field {field}")))
-}
-
 fn value_to_invocable_output(value: Value) -> InvocableOutput {
     if let Some(content) = value.get("content").and_then(Value::as_array) {
         let text = content
@@ -3417,15 +1993,6 @@ fn invocable_output_to_tool_output(output: InvocableOutput) -> ToolOutput {
         }
         InvocableOutput::Data(data) => ToolOutput::Structured(json!({ "data": data })),
     }
-}
-
-fn metadata_to_value(metadata: &MetadataMap) -> Value {
-    Value::Object(
-        metadata
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect(),
-    )
 }
 
 fn value_to_json_object(value: Value, context: &str) -> Result<rmcp_model::JsonObject, McpError> {
@@ -3507,50 +2074,6 @@ fn parse_transport_auth_request(
     })
 }
 
-fn parse_auth_request(
-    server_id: &McpServerId,
-    method: &str,
-    params: &Value,
-    error: &Value,
-) -> Option<AuthRequest> {
-    let code = error.get("code").and_then(Value::as_i64);
-    let message = error.get("message").and_then(Value::as_str);
-    let data = error.get("data");
-
-    let auth_marker = matches!(code, Some(401 | -32001))
-        || data
-            .and_then(|data| data.get("auth_required"))
-            .and_then(Value::as_bool)
-            == Some(true)
-        || data.and_then(|data| data.get("auth")).is_some();
-
-    if !auth_marker {
-        return None;
-    }
-
-    let mut challenge = MetadataMap::new();
-    challenge.insert("server_id".into(), Value::String(server_id.to_string()));
-    challenge.insert("method".into(), Value::String(method.into()));
-
-    if let Some(code) = code {
-        challenge.insert("code".into(), Value::Number(code.into()));
-    }
-    if let Some(message) = message {
-        challenge.insert("message".into(), Value::String(message.into()));
-    }
-    if let Some(data) = data {
-        challenge.insert("data".into(), data.clone());
-    }
-
-    Some(AuthRequest {
-        task_id: None,
-        id: format!("mcp:{}:{}", server_id, method),
-        provider: format!("mcp.{}", server_id),
-        operation: auth_operation_for_method(server_id, method, params),
-        challenge,
-    })
-}
-
 fn auth_operation_for_method(
     server_id: &McpServerId,
     method: &str,
@@ -3616,210 +2139,22 @@ fn normalize_mcp_tool_name(server_id: &McpServerId, tool_name: &str) -> String {
         .to_string()
 }
 
-async fn read_sse_stream<R>(
-    mut reader: R,
-    response_url: Url,
-    frame_tx: mpsc::UnboundedSender<Result<McpFrame, McpError>>,
-    endpoint_tx: oneshot::Sender<Result<Url, McpError>>,
-) where
-    R: AsyncBufRead + Unpin,
-{
-    let mut endpoint_tx = Some(endpoint_tx);
-    loop {
-        match read_next_sse_event(&mut reader).await {
-            Ok(Some(event)) => {
-                if let Some(endpoint) = legacy_sse_event_to_endpoint(&response_url, &event) {
-                    if let Some(tx) = endpoint_tx.take() {
-                        let _ = tx.send(endpoint);
-                    }
-                    continue;
-                }
-
-                if let Some(frame) = legacy_sse_event_to_frame(event) {
-                    let _ = frame_tx.send(frame);
-                }
-            }
-            Ok(None) => break,
-            Err(error) => {
-                if let Some(tx) = endpoint_tx.take() {
-                    let _ = tx.send(Err(error));
-                } else {
-                    let _ = frame_tx.send(Err(error));
-                }
-                return;
-            }
-        }
-    }
-
-    if let Some(tx) = endpoint_tx.take() {
-        let _ = tx.send(Err(McpError::Transport(
-            "SSE stream ended before endpoint event".into(),
-        )));
-    }
-}
-
-fn resolve_sse_endpoint(response_url: &Url, endpoint: &str) -> Result<Url, McpError> {
-    response_url
-        .join(endpoint.trim())
-        .map_err(|error| McpError::Transport(format!("invalid SSE endpoint URL: {error}")))
-}
-
-#[derive(Debug)]
-struct SseEvent {
-    event_name: Option<String>,
-    data: String,
-    id: Option<String>,
-    retry_ms: Option<u64>,
-}
-
-async fn read_next_sse_event<R>(reader: &mut R) -> Result<Option<SseEvent>, McpError>
-where
-    R: AsyncBufRead + Unpin,
-{
-    let mut event_name = None;
-    let mut data_lines = Vec::new();
-    let mut id = None;
-    let mut retry_ms = None;
-
-    loop {
-        let mut line = String::new();
-        let read = reader.read_line(&mut line).await.map_err(McpError::Io)?;
-        if read == 0 {
-            if event_name.is_none() && data_lines.is_empty() && id.is_none() && retry_ms.is_none() {
-                return Ok(None);
-            }
-            return Ok(Some(SseEvent {
-                event_name,
-                data: data_lines.join("\n"),
-                id,
-                retry_ms,
-            }));
-        }
-
-        let line = line.trim_end_matches(['\r', '\n']);
-        if line.is_empty() {
-            if event_name.is_none() && data_lines.is_empty() && id.is_none() && retry_ms.is_none() {
-                continue;
-            }
-            return Ok(Some(SseEvent {
-                event_name,
-                data: data_lines.join("\n"),
-                id,
-                retry_ms,
-            }));
-        }
-
-        if line.starts_with(':') {
-            continue;
-        }
-
-        if let Some(rest) = line.strip_prefix("event:") {
-            event_name = Some(rest.trim_start().to_string());
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("data:") {
-            data_lines.push(rest.trim_start().to_string());
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("id:") {
-            id = Some(rest.trim_start().to_string());
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("retry:") {
-            retry_ms = rest.trim_start().parse().ok();
-        }
-    }
-}
-
-fn legacy_sse_event_to_endpoint(
-    response_url: &Url,
-    event: &SseEvent,
-) -> Option<Result<Url, McpError>> {
-    if event.event_name.as_deref() != Some("endpoint") {
-        return None;
-    }
-    if event.data.is_empty() {
-        return Some(Err(McpError::Transport(
-            "legacy SSE endpoint event is missing data".into(),
-        )));
-    }
-    Some(resolve_sse_endpoint(response_url, &event.data))
-}
-
-fn legacy_sse_event_to_frame(event: SseEvent) -> Option<Result<McpFrame, McpError>> {
-    let event_name = event.event_name.unwrap_or_else(|| "message".into());
-    if event_name != "message" || event.data.is_empty() {
-        return None;
-    }
-
-    Some(
-        serde_json::from_str(&event.data)
-            .map_err(McpError::Serialize)
-            .map(|value| McpFrame { value }),
-    )
-}
-
-fn streamable_http_event_to_frame(event: SseEvent) -> Result<Option<McpFrame>, McpError> {
-    let event_name = event.event_name.unwrap_or_else(|| "message".into());
-    if event_name != "message" || event.data.is_empty() {
-        return Ok(None);
-    }
-
-    let value = serde_json::from_str(&event.data).map_err(McpError::Serialize)?;
-    Ok(Some(McpFrame { value }))
-}
-
-fn is_jsonrpc_request(value: &Value) -> bool {
-    value.get("method").is_some() && value.get("id").is_some()
-}
-
-fn apply_streamable_http_headers(
-    mut request: HttpRequestBuilder,
-    protocol_version: Option<&str>,
-    session_id: Option<&str>,
-) -> HttpRequestBuilder {
-    if let Some(protocol_version) = protocol_version {
-        request = request.header("MCP-Protocol-Version", protocol_version);
-    }
-    if let Some(session_id) = session_id {
-        request = request.header("MCP-Session-Id", session_id);
-    }
-
-    request
-}
-
-async fn streamable_http_status_error(
-    operation: &str,
-    status: StatusCode,
-    response: HttpResponse,
-) -> McpError {
-    let body = response
-        .text()
-        .await
-        .unwrap_or_else(|_| "<unreadable response body>".into());
-    McpError::Transport(format!("{operation} failed with status {status}: {body}"))
-}
-
 /// Errors produced by MCP transport, protocol, and lifecycle operations.
 #[derive(Debug, Error)]
 pub enum McpError {
-    /// An underlying I/O error (e.g. spawning a child process or reading from a pipe).
+    /// An underlying I/O error.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
-    /// An HTTP-level error surfaced by the configured [`agentkit_http::HttpClient`].
-    #[error("http error: {0}")]
-    Http(#[from] HttpError),
     /// A JSON serialization or deserialization error.
     #[error("serialization error: {0}")]
     Serialize(#[from] serde_json::Error),
-    /// A transport-level error (e.g. unexpected disconnection or bad SSE response).
+    /// A transport-level error.
     #[error("transport error: {0}")]
     Transport(String),
-    /// An MCP protocol violation (e.g. missing required fields in a response).
+    /// An MCP protocol violation.
     #[error("protocol error: {0}")]
     Protocol(String),
     /// The server requires authentication before the operation can proceed.
-    /// Contains the [`AuthRequest`] that describes the challenge.
     #[error("MCP auth required: {0:?}")]
     AuthRequired(Box<AuthRequest>),
     /// An error occurred while resolving or replaying authentication.
@@ -3833,860 +2168,14 @@ pub enum McpError {
     UnknownServer(String),
 }
 
-#[cfg(test)]
-mod tests {
-    use std::collections::VecDeque;
-    use std::sync::{Arc as StdArc, Mutex as StdMutex};
-
-    use super::*;
-    use agentkit_tools_core::{PermissionChecker, PermissionDecision, PermissionRequest};
-    #[cfg(feature = "reqwest-client")]
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    #[cfg(feature = "reqwest-client")]
-    use tokio::net::TcpListener;
-
-    struct AllowAll;
-
-    impl PermissionChecker for AllowAll {
-        fn evaluate(&self, _request: &dyn PermissionRequest) -> PermissionDecision {
-            PermissionDecision::Allow
-        }
+impl From<&str> for McpServerId {
+    fn from(value: &str) -> Self {
+        Self::new(value)
     }
-
-    struct FakeTransport {
-        recv: VecDeque<Value>,
-    }
-
-    #[async_trait]
-    impl McpTransport for FakeTransport {
-        async fn send(&mut self, _message: McpFrame) -> Result<(), McpError> {
-            Ok(())
-        }
-
-        async fn recv(&mut self) -> Result<Option<McpFrame>, McpError> {
-            Ok(self.recv.pop_front().map(|value| McpFrame { value }))
-        }
-
-        async fn close(&mut self) -> Result<(), McpError> {
-            Ok(())
-        }
-    }
-
-    fn fake_connection(responses: Vec<Value>) -> McpConnection {
-        let (_notification_tx, notification_rx) = mpsc::unbounded_channel();
-        McpConnection {
-            server_id: McpServerId::new("fake"),
-            config: McpServerConfig::new(
-                "fake",
-                McpTransportBinding::Custom(Arc::new(FakeTransportFactory::new(Vec::new()))),
-            ),
-            inner: Mutex::new(McpConnectionInner::Legacy(Box::new(FakeTransport {
-                recv: responses.into(),
-            }))),
-            auth: Mutex::new(None),
-            notifications: Mutex::new(notification_rx),
-            next_id: AtomicU64::new(1),
-            capabilities: McpServerCapabilities::all(),
-        }
-    }
-
-    #[derive(Clone)]
-    struct FakeTransportFactory {
-        responses: StdArc<StdMutex<VecDeque<Vec<Value>>>>,
-    }
-
-    impl FakeTransportFactory {
-        fn new(sequences: Vec<Vec<Value>>) -> Self {
-            Self {
-                responses: StdArc::new(StdMutex::new(sequences.into())),
-            }
-        }
-    }
-
-    #[async_trait]
-    impl McpTransportFactory for FakeTransportFactory {
-        async fn connect(&self) -> Result<Box<dyn McpTransport>, McpError> {
-            let responses =
-                self.responses.lock().unwrap().pop_front().ok_or_else(|| {
-                    McpError::Transport("no fake transport responses left".into())
-                })?;
-            Ok(Box::new(FakeTransport {
-                recv: responses.into(),
-            }))
-        }
-    }
-
-    #[tokio::test]
-    async fn discovery_parses_snapshot() {
-        let connection = fake_connection(vec![
-            json!({ "jsonrpc": "2.0", "id": 1, "result": { "tools": [{ "name": "echo", "description": "Echo", "inputSchema": {"type": "object"} }] } }),
-            json!({ "jsonrpc": "2.0", "id": 2, "result": { "resources": [{ "uri": "file:///tmp/example.txt", "name": "example.txt", "mimeType": "text/plain" }] } }),
-            json!({ "jsonrpc": "2.0", "id": 3, "result": { "prompts": [{ "name": "summarize", "description": "Summarize", "arguments": [{ "name": "path" }] }] } }),
-        ]);
-
-        let snapshot = connection.discover().await.unwrap();
-        assert_eq!(snapshot.tools[0].name, "echo");
-        assert_eq!(snapshot.resources[0].id, "file:///tmp/example.txt");
-        assert_eq!(snapshot.prompts[0].id, "summarize");
-    }
-
-    #[tokio::test]
-    async fn discover_skips_unadvertised_capabilities() {
-        // Server advertises ONLY tools — discover must not send
-        // resources/list or prompts/list (real servers like Linear return
-        // -32601 for those). The fixture deliberately provides a single
-        // tools/list response and nothing else; if discover erroneously
-        // tried to call resources/list, FakeTransport's empty queue would
-        // yield `None` and the test would fail with a transport error.
-        let factory = FakeTransportFactory::new(vec![vec![
-            json!({
-                "jsonrpc": "2.0",
-                "id": 0,
-                "result": {
-                    "protocolVersion": "2025-11-25",
-                    "capabilities": { "tools": { "listChanged": true } },
-                    "serverInfo": { "name": "tools-only", "version": "1.0.0" }
-                }
-            }),
-            json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "result": {
-                    "tools": [
-                        { "name": "ping", "description": "ping", "inputSchema": {"type":"object"} }
-                    ]
-                }
-            }),
-        ]]);
-        let config =
-            McpServerConfig::new("tools-only", McpTransportBinding::Custom(Arc::new(factory)));
-        let connection = McpConnection::connect(&config).await.unwrap();
-        assert!(connection.capabilities().tools.is_some());
-        assert_eq!(
-            connection.capabilities().tools,
-            Some(ToolsCapability {
-                list_changed: Some(true),
-            })
-        );
-        assert!(connection.capabilities().resources.is_none());
-        assert!(connection.capabilities().prompts.is_none());
-
-        let snapshot = connection.discover().await.unwrap();
-        assert_eq!(snapshot.tools.len(), 1);
-        assert_eq!(snapshot.tools[0].name, "ping");
-        assert!(snapshot.resources.is_empty());
-        assert!(snapshot.prompts.is_empty());
-    }
-
-    #[tokio::test]
-    async fn tool_adapter_returns_text_output() {
-        let connection = Arc::new(fake_connection(vec![json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "result": { "content": [{ "type": "text", "text": "pong" }] }
-        })]));
-        let server_id = connection.server_id().clone();
-        let adapter = McpToolAdapter::new(
-            &server_id,
-            connection,
-            McpToolDescriptor {
-                name: "echo".into(),
-                description: Some("Echo".into()),
-                input_schema: json!({ "type": "object" }),
-                metadata: MetadataMap::new(),
-            },
-        );
-        let metadata = MetadataMap::new();
-        let mut ctx = ToolContext {
-            capability: CapabilityContext {
-                session_id: None,
-                turn_id: None,
-                metadata: &metadata,
-            },
-            permissions: &AllowAll,
-            resources: &(),
-            cancellation: None,
-        };
-
-        let result = adapter
-            .invoke(
-                ToolRequest {
-                    call_id: "call-1".into(),
-                    tool_name: ToolName::new("mcp_fake_echo"),
-                    input: json!({}),
-                    session_id: "session-1".into(),
-                    turn_id: "turn-1".into(),
-                    metadata: MetadataMap::new(),
-                },
-                &mut ctx,
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(result.result.output, ToolOutput::Text("pong".into()));
-    }
-
-    #[tokio::test]
-    async fn request_surfaces_auth_required_errors() {
-        let connection = fake_connection(vec![json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "error": {
-                "code": -32001,
-                "message": "authentication required",
-                "data": {
-                    "auth_required": true,
-                    "scope": "secrets.read"
-                }
-            }
-        })]);
-
-        let error = connection.call_tool("echo", json!({})).await.unwrap_err();
-        match error {
-            McpError::AuthRequired(request) => {
-                assert_eq!(request.provider, "mcp.fake");
-                assert_eq!(
-                    request.challenge.get("method"),
-                    Some(&Value::String("tools/call".into()))
-                );
-                assert!(matches!(
-                    request.operation,
-                    AuthOperation::McpToolCall { ref tool_name, .. } if tool_name == "echo"
-                ));
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn tool_adapter_maps_auth_required_into_tool_error() {
-        let connection = Arc::new(fake_connection(vec![json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "error": {
-                "code": -32001,
-                "message": "authentication required",
-                "data": { "auth_required": true }
-            }
-        })]));
-        let server_id = connection.server_id().clone();
-        let adapter = McpToolAdapter::new(
-            &server_id,
-            connection,
-            McpToolDescriptor {
-                name: "echo".into(),
-                description: Some("Echo".into()),
-                input_schema: json!({ "type": "object" }),
-                metadata: MetadataMap::new(),
-            },
-        );
-        let metadata = MetadataMap::new();
-        let mut ctx = ToolContext {
-            capability: CapabilityContext {
-                session_id: None,
-                turn_id: None,
-                metadata: &metadata,
-            },
-            permissions: &AllowAll,
-            resources: &(),
-            cancellation: None,
-        };
-
-        let error = adapter
-            .invoke(
-                ToolRequest {
-                    call_id: "call-1".into(),
-                    tool_name: ToolName::new("mcp_fake_echo"),
-                    input: json!({}),
-                    session_id: "session-1".into(),
-                    turn_id: "turn-1".into(),
-                    metadata: MetadataMap::new(),
-                },
-                &mut ctx,
-            )
-            .await
-            .unwrap_err();
-
-        match error {
-            ToolError::AuthRequired(request) => {
-                assert_eq!(request.provider, "mcp.fake");
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
-    }
-
-    struct RecordingTransport {
-        recv: VecDeque<Value>,
-        sent: StdArc<StdMutex<Vec<Value>>>,
-    }
-
-    #[async_trait]
-    impl McpTransport for RecordingTransport {
-        async fn send(&mut self, message: McpFrame) -> Result<(), McpError> {
-            self.sent.lock().unwrap().push(message.value);
-            Ok(())
-        }
-
-        async fn recv(&mut self) -> Result<Option<McpFrame>, McpError> {
-            Ok(self.recv.pop_front().map(|value| McpFrame { value }))
-        }
-
-        async fn close(&mut self) -> Result<(), McpError> {
-            Ok(())
-        }
-    }
-
-    #[derive(Clone)]
-    struct RecordingTransportFactory {
-        responses: StdArc<StdMutex<VecDeque<Vec<Value>>>>,
-        sent: StdArc<StdMutex<Vec<Value>>>,
-    }
-
-    impl RecordingTransportFactory {
-        fn new(sequences: Vec<Vec<Value>>) -> Self {
-            Self {
-                responses: StdArc::new(StdMutex::new(sequences.into())),
-                sent: StdArc::new(StdMutex::new(Vec::new())),
-            }
-        }
-
-        fn sent(&self) -> Vec<Value> {
-            self.sent.lock().unwrap().clone()
-        }
-    }
-
-    #[async_trait]
-    impl McpTransportFactory for RecordingTransportFactory {
-        async fn connect(&self) -> Result<Box<dyn McpTransport>, McpError> {
-            let responses = self.responses.lock().unwrap().pop_front().ok_or_else(|| {
-                McpError::Transport("no recording transport responses left".into())
-            })?;
-            Ok(Box::new(RecordingTransport {
-                recv: responses.into(),
-                sent: self.sent.clone(),
-            }))
-        }
-    }
-
-    #[tokio::test]
-    async fn connection_includes_resolved_auth_in_future_requests() {
-        let factory = RecordingTransportFactory::new(vec![vec![
-            json!({ "jsonrpc": "2.0", "id": 0, "result": { "protocolVersion": "2025-11-25", "capabilities": { "tools": {}, "resources": {}, "prompts": {} }, "serverInfo": { "name": "recording", "version": "1.0.0" } } }),
-            json!({ "jsonrpc": "2.0", "id": 1, "result": { "content": [{ "type": "text", "text": "ok" }] } }),
-        ]]);
-        let config = McpServerConfig::new(
-            "recording",
-            McpTransportBinding::Custom(Arc::new(factory.clone())),
-        );
-        let connection = McpConnection::connect(&config).await.unwrap();
-        let mut auth = MetadataMap::new();
-        auth.insert("token".into(), json!("secret-token"));
-        let request = AuthRequest {
-            task_id: None,
-            id: "auth-recording-tool".into(),
-            provider: "mcp.recording".into(),
-            operation: AuthOperation::McpToolCall {
-                server_id: "recording".into(),
-                tool_name: "echo".into(),
-                input: json!({}),
-                metadata: MetadataMap::new(),
-            },
-            challenge: MetadataMap::new(),
-        };
-        connection
-            .resolve_auth(agentkit_tools_core::AuthResolution::Provided {
-                request,
-                credentials: auth,
-            })
-            .await
-            .unwrap();
-
-        let _ = connection.call_tool("echo", json!({})).await.unwrap();
-        let sent = factory.sent();
-        assert!(
-            sent.iter().any(|value| {
-                value
-                    .get("params")
-                    .and_then(|params| params.get("auth"))
-                    .and_then(|auth| auth.get("token"))
-                    == Some(&json!("secret-token"))
-            }),
-            "expected an MCP request to include the resolved auth payload, saw {:?}",
-            sent
-        );
-    }
-
-    #[tokio::test]
-    async fn manager_reuses_stored_auth_on_connect() {
-        let factory = RecordingTransportFactory::new(vec![vec![
-            json!({ "jsonrpc": "2.0", "id": 0, "result": { "protocolVersion": "2025-11-25", "capabilities": { "tools": {}, "resources": {}, "prompts": {} }, "serverInfo": { "name": "recording", "version": "1.0.0" } } }),
-            json!({ "jsonrpc": "2.0", "id": 1, "result": { "tools": [] } }),
-            json!({ "jsonrpc": "2.0", "id": 2, "result": { "resources": [] } }),
-            json!({ "jsonrpc": "2.0", "id": 3, "result": { "prompts": [] } }),
-        ]]);
-        let server_id = McpServerId::new("recording");
-        let mut manager = McpServerManager::new().with_server(McpServerConfig::new(
-            server_id.to_string(),
-            McpTransportBinding::Custom(Arc::new(factory.clone())),
-        ));
-        let mut auth = MetadataMap::new();
-        auth.insert("token".into(), json!("seed-token"));
-        let request = AuthRequest {
-            task_id: None,
-            id: "auth-recording-connect".into(),
-            provider: "mcp.recording".into(),
-            operation: AuthOperation::McpConnect {
-                server_id: server_id.to_string(),
-                metadata: MetadataMap::new(),
-            },
-            challenge: MetadataMap::new(),
-        };
-        manager
-            .resolve_auth(agentkit_tools_core::AuthResolution::Provided {
-                request,
-                credentials: auth,
-            })
-            .await
-            .unwrap();
-
-        manager.connect_server(&server_id).await.unwrap();
-        let sent = factory.sent();
-        assert!(
-            sent.iter().any(|value| {
-                value.get("method").and_then(Value::as_str) == Some("initialize")
-                    && value
-                        .get("params")
-                        .and_then(|params| params.get("auth"))
-                        .and_then(|auth| auth.get("token"))
-                        == Some(&json!("seed-token"))
-            }),
-            "expected initialize to include stored auth, saw {:?}",
-            sent
-        );
-    }
-
-    #[tokio::test]
-    async fn manager_resolves_auth_and_replays_resource_read() {
-        let factory = RecordingTransportFactory::new(vec![vec![
-            json!({ "jsonrpc": "2.0", "id": 0, "result": { "protocolVersion": "2025-11-25", "capabilities": { "tools": {}, "resources": {}, "prompts": {} }, "serverInfo": { "name": "recording", "version": "1.0.0" } } }),
-            json!({ "jsonrpc": "2.0", "id": 1, "result": { "tools": [] } }),
-            json!({ "jsonrpc": "2.0", "id": 2, "result": { "resources": [] } }),
-            json!({ "jsonrpc": "2.0", "id": 3, "result": { "prompts": [] } }),
-            json!({
-                "jsonrpc": "2.0",
-                "id": 4,
-                "result": {
-                    "contents": [
-                        {
-                            "uri": "file:///tmp/secret.txt",
-                            "text": "secret from resource"
-                        }
-                    ]
-                }
-            }),
-        ]]);
-        let server_id = McpServerId::new("recording");
-        let mut manager = McpServerManager::new().with_server(McpServerConfig::new(
-            server_id.to_string(),
-            McpTransportBinding::Custom(Arc::new(factory.clone())),
-        ));
-        let mut auth = MetadataMap::new();
-        auth.insert("token".into(), json!("resource-token"));
-        let request = AuthRequest {
-            task_id: None,
-            id: "auth-recording-resource".into(),
-            provider: "mcp.recording".into(),
-            operation: AuthOperation::McpResourceRead {
-                server_id: server_id.to_string(),
-                resource_id: "file:///tmp/secret.txt".into(),
-                metadata: MetadataMap::new(),
-            },
-            challenge: MetadataMap::new(),
-        };
-
-        let result = manager
-            .resolve_auth_and_resume(agentkit_tools_core::AuthResolution::Provided {
-                request,
-                credentials: auth,
-            })
-            .await
-            .unwrap();
-
-        match result {
-            McpOperationResult::Resource(contents) => {
-                assert_eq!(
-                    contents.data,
-                    DataRef::InlineText("secret from resource".into())
-                );
-            }
-            other => panic!("unexpected replay result: {other:?}"),
-        }
-
-        let sent = factory.sent();
-        assert!(
-            sent.iter().any(|value| {
-                value.get("method").and_then(Value::as_str) == Some("resources/read")
-                    && value
-                        .get("params")
-                        .and_then(|params| params.get("auth"))
-                        .and_then(|auth| auth.get("token"))
-                        == Some(&json!("resource-token"))
-            }),
-            "expected resources/read to include resolved auth, saw {:?}",
-            sent
-        );
-    }
-
-    #[tokio::test]
-    async fn manager_resolves_auth_and_replays_connect() {
-        let factory = RecordingTransportFactory::new(vec![vec![
-            json!({ "jsonrpc": "2.0", "id": 0, "result": { "protocolVersion": "2025-11-25", "capabilities": { "tools": {}, "resources": {}, "prompts": {} }, "serverInfo": { "name": "recording", "version": "1.0.0" } } }),
-            json!({ "jsonrpc": "2.0", "id": 1, "result": { "tools": [] } }),
-            json!({ "jsonrpc": "2.0", "id": 2, "result": { "resources": [] } }),
-            json!({ "jsonrpc": "2.0", "id": 3, "result": { "prompts": [] } }),
-        ]]);
-        let server_id = McpServerId::new("recording");
-        let mut manager = McpServerManager::new().with_server(McpServerConfig::new(
-            server_id.to_string(),
-            McpTransportBinding::Custom(Arc::new(factory.clone())),
-        ));
-        let mut auth = MetadataMap::new();
-        auth.insert("token".into(), json!("connect-token"));
-        let request = AuthRequest {
-            task_id: None,
-            id: "auth-recording-connect-replay".into(),
-            provider: "mcp.recording".into(),
-            operation: AuthOperation::McpConnect {
-                server_id: server_id.to_string(),
-                metadata: MetadataMap::new(),
-            },
-            challenge: MetadataMap::new(),
-        };
-
-        let result = manager
-            .resolve_auth_and_resume(agentkit_tools_core::AuthResolution::Provided {
-                request,
-                credentials: auth,
-            })
-            .await
-            .unwrap();
-
-        match result {
-            McpOperationResult::Connected(snapshot) => {
-                assert_eq!(snapshot.server_id, server_id);
-            }
-            other => panic!("unexpected replay result: {other:?}"),
-        }
-    }
-
-    #[cfg(feature = "reqwest-client")]
-    #[tokio::test]
-    async fn sse_transport_posts_messages_and_receives_frames() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let requests = StdArc::new(StdMutex::new(Vec::new()));
-        let captured = requests.clone();
-
-        let server = tokio::spawn(async move {
-            for _ in 0..2 {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                let mut buffer = vec![0_u8; 4096];
-                let read = socket.read(&mut buffer).await.unwrap();
-                let request = String::from_utf8_lossy(&buffer[..read]).to_string();
-
-                if request.starts_with("GET /sse ") {
-                    let body = concat!(
-                        "event: endpoint\n",
-                        "data: /messages\n\n",
-                        "event: message\n",
-                        "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}\n\n"
-                    );
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    socket.write_all(response.as_bytes()).await.unwrap();
-                } else {
-                    captured.lock().unwrap().push(request);
-                    socket
-                        .write_all(
-                            b"HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
-                        )
-                        .await
-                        .unwrap();
-                }
-            }
-        });
-
-        let factory =
-            SseTransportFactory::new(SseTransportConfig::new(format!("http://{address}/sse")));
-        let mut transport = factory.connect().await.unwrap();
-        transport
-            .send(McpFrame {
-                value: json!({
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "tools/list",
-                    "params": {}
-                }),
-            })
-            .await
-            .unwrap();
-        let frame = transport.recv().await.unwrap().unwrap();
-        transport.close().await.unwrap();
-        server.await.unwrap();
-
-        assert_eq!(frame.value["result"]["tools"], json!([]));
-        let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 1);
-        assert!(requests[0].starts_with("POST /messages "));
-        assert!(requests[0].contains("\"method\":\"tools/list\""));
-    }
-
-    #[cfg(feature = "reqwest-client")]
-    #[tokio::test]
-    async fn streamable_http_connection_tracks_session_and_protocol_headers() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let requests = StdArc::new(StdMutex::new(Vec::new()));
-        let captured = requests.clone();
-
-        let server = tokio::spawn(async move {
-            for _ in 0..5 {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                let mut buffer = vec![0_u8; 8192];
-                let read = socket.read(&mut buffer).await.unwrap();
-                let request = String::from_utf8_lossy(&buffer[..read]).to_string();
-                captured.lock().unwrap().push(request.clone());
-
-                let response = if request.contains("\"method\":\"initialize\"") {
-                    let body = "{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"serverInfo\":{\"name\":\"remote\",\"version\":\"1.0.0\"}}}";
-                    format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nMCP-Session-Id: session-123\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    )
-                } else if request.contains("\"method\":\"notifications/initialized\"") {
-                    "HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
-                        .to_string()
-                } else if request.starts_with("DELETE /mcp ") {
-                    "HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
-                        .to_string()
-                } else {
-                    let body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}";
-                    format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    )
-                };
-
-                socket.write_all(response.as_bytes()).await.unwrap();
-            }
-        });
-
-        let config = McpServerConfig::new(
-            "remote",
-            McpTransportBinding::StreamableHttp(StreamableHttpTransportConfig::new(format!(
-                "http://{address}/mcp"
-            ))),
-        );
-        let connection = McpConnection::connect(&config).await.unwrap();
-        let _ = connection.list_tools().await.unwrap();
-        connection.close().await.unwrap();
-        server.await.unwrap();
-
-        let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 5);
-        let normalized = requests
-            .iter()
-            .map(|request| request.to_ascii_lowercase())
-            .collect::<Vec<_>>();
-        assert!(requests[0].starts_with("POST /mcp "));
-        assert!(!requests[0].contains("MCP-Session-Id:"));
-        assert!(normalized[1].contains("mcp-session-id: session-123"));
-        assert!(normalized[1].contains("mcp-protocol-version: 2025-11-25"));
-        assert!(normalized[2].contains("mcp-session-id: session-123"));
-        assert!(normalized[2].contains("mcp-protocol-version: 2025-11-25"));
-        let delete = requests
-            .iter()
-            .zip(normalized.iter())
-            .find(|(request, _)| request.starts_with("DELETE /mcp "))
-            .expect("expected RMCP transport to delete the Streamable HTTP session on close");
-        assert!(delete.1.contains("mcp-session-id: session-123"));
-    }
-
-    #[cfg(feature = "reqwest-client")]
-    #[tokio::test]
-    async fn streamable_http_transport_resumes_sse_streams_until_response_arrives() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let requests = StdArc::new(StdMutex::new(Vec::new()));
-        let captured = requests.clone();
-
-        let server = tokio::spawn(async move {
-            for _ in 0..2 {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                let mut buffer = vec![0_u8; 8192];
-                let read = socket.read(&mut buffer).await.unwrap();
-                let request = String::from_utf8_lossy(&buffer[..read]).to_string();
-                captured.lock().unwrap().push(request.clone());
-
-                let response = if request.starts_with("POST /mcp ") {
-                    let body = concat!(
-                        "id: evt-1\n",
-                        "event: message\n",
-                        "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{\"phase\":\"stream-start\"}}\n\n"
-                    );
-                    format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    )
-                } else {
-                    let body = concat!(
-                        "id: evt-2\n",
-                        "event: message\n",
-                        "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}\n\n"
-                    );
-                    format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    )
-                };
-
-                socket.write_all(response.as_bytes()).await.unwrap();
-            }
-        });
-
-        let factory = StreamableHttpTransportFactory::new(StreamableHttpTransportConfig::new(
-            format!("http://{address}/mcp"),
-        ));
-        let mut transport = factory.connect().await.unwrap();
-        transport
-            .send(McpFrame {
-                value: json!({
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "tools/list",
-                    "params": {}
-                }),
-            })
-            .await
-            .unwrap();
-
-        let first = transport.recv().await.unwrap().unwrap();
-        let second = transport.recv().await.unwrap().unwrap();
-        transport.close().await.unwrap();
-        server.await.unwrap();
-
-        assert_eq!(
-            first.value["method"],
-            Value::String("notifications/message".into())
-        );
-        assert_eq!(second.value["result"]["tools"], json!([]));
-
-        let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 2);
-        assert!(requests[0].starts_with("POST /mcp "));
-        assert!(requests[1].starts_with("GET /mcp "));
-        assert!(
-            requests[1].contains("last-event-id: evt-1")
-                || requests[1].contains("Last-Event-ID: evt-1")
-        );
-    }
-
-    #[tokio::test]
-    async fn server_manager_connects_refreshes_and_aggregates_tools() {
-        let alpha = McpServerConfig::new(
-            "alpha",
-            McpTransportBinding::Custom(Arc::new(FakeTransportFactory::new(vec![vec![
-                json!({ "jsonrpc": "2.0", "id": 0, "result": { "protocolVersion": "2025-11-25", "capabilities": { "tools": {}, "resources": {}, "prompts": {} }, "serverInfo": { "name": "alpha", "version": "1.0.0" } } }),
-                json!({ "jsonrpc": "2.0", "id": 1, "result": { "tools": [{ "name": "echo", "description": "Echo", "inputSchema": {"type": "object"} }] } }),
-                json!({ "jsonrpc": "2.0", "id": 2, "result": { "resources": [] } }),
-                json!({ "jsonrpc": "2.0", "id": 3, "result": { "prompts": [] } }),
-                json!({ "jsonrpc": "2.0", "id": 4, "result": { "tools": [{ "name": "echo_v2", "description": "Echo 2", "inputSchema": {"type": "object"} }] } }),
-                json!({ "jsonrpc": "2.0", "id": 5, "result": { "resources": [] } }),
-                json!({ "jsonrpc": "2.0", "id": 6, "result": { "prompts": [] } }),
-            ]]))),
-        );
-        let beta = McpServerConfig::new(
-            "beta",
-            McpTransportBinding::Custom(Arc::new(FakeTransportFactory::new(vec![vec![
-                json!({ "jsonrpc": "2.0", "id": 0, "result": { "protocolVersion": "2025-11-25", "capabilities": { "tools": {}, "resources": {}, "prompts": {} }, "serverInfo": { "name": "beta", "version": "1.0.0" } } }),
-                json!({ "jsonrpc": "2.0", "id": 1, "result": { "tools": [{ "name": "search", "description": "Search", "inputSchema": {"type": "object"} }] } }),
-                json!({ "jsonrpc": "2.0", "id": 2, "result": { "resources": [] } }),
-                json!({ "jsonrpc": "2.0", "id": 3, "result": { "prompts": [] } }),
-            ]]))),
-        );
-
-        let mut manager = McpServerManager::new().with_server(alpha).with_server(beta);
-        let mut catalog_events = manager.subscribe_catalog_events();
-
-        let handles = manager.connect_all().await.unwrap();
-        assert_eq!(handles.len(), 2);
-        assert!(matches!(
-            catalog_events.recv().await.unwrap(),
-            McpCatalogEvent::ServerConnected { ref server_id } if server_id == &McpServerId::new("alpha")
-        ));
-        assert!(matches!(
-            catalog_events.recv().await.unwrap(),
-            McpCatalogEvent::ServerConnected { ref server_id } if server_id == &McpServerId::new("beta")
-        ));
-        assert_eq!(
-            manager
-                .tool_registry()
-                .specs()
-                .into_iter()
-                .map(|spec| spec.name.0)
-                .collect::<Vec<_>>(),
-            vec!["mcp_alpha_echo".to_string(), "mcp_beta_search".to_string()]
-        );
-
-        let refreshed = manager
-            .refresh_server(&McpServerId::new("alpha"))
-            .await
-            .unwrap();
-        assert_eq!(refreshed.tools[0].name, "echo_v2");
-        assert!(matches!(
-            catalog_events.recv().await.unwrap(),
-            McpCatalogEvent::ToolsChanged {
-                ref server_id,
-                ref added,
-                ref removed,
-                ref changed,
-            } if server_id == &McpServerId::new("alpha")
-                && added == &vec!["echo_v2".to_string()]
-                && removed == &vec!["echo".to_string()]
-                && changed.is_empty()
-        ));
-        assert_eq!(
-            manager
-                .connected_server(&McpServerId::new("alpha"))
-                .unwrap()
-                .snapshot()
-                .tools[0]
-                .name,
-            "echo_v2"
-        );
-
-        let capabilities = manager.capability_provider();
-        assert_eq!(capabilities.invocables().len(), 2);
-
-        manager
-            .disconnect_server(&McpServerId::new("alpha"))
-            .await
-            .unwrap();
-        assert!(matches!(
-            catalog_events.recv().await.unwrap(),
-            McpCatalogEvent::ServerDisconnected { ref server_id } if server_id == &McpServerId::new("alpha")
-        ));
-        assert!(
-            manager
-                .connected_server(&McpServerId::new("alpha"))
-                .is_none()
-        );
+}
+
+impl From<String> for McpServerId {
+    fn from(value: String) -> Self {
+        Self::new(value)
     }
 }
