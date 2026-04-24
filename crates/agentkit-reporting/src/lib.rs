@@ -555,6 +555,13 @@ where
         AgentEvent::ToolCallRequested(call) => {
             writeln!(writer, "[tool] call {} {}", call.name, call.input)?;
         }
+        AgentEvent::ToolResultReceived(result) => {
+            writeln!(
+                writer,
+                "[tool] result call_id={} is_error={}",
+                result.call_id, result.is_error
+            )?;
+        }
         AgentEvent::ApprovalRequired(request) => {
             writeln!(
                 writer,
