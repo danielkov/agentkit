@@ -62,7 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         first
             .tools
             .iter()
-            .map(|t| t.name.as_str())
+            .map(|t| t.name.as_ref())
             .collect::<Vec<_>>(),
         registry.current().await,
     );
@@ -98,7 +98,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         second
             .tools
             .iter()
-            .map(|t| t.name.as_str())
+            .map(|t| t.name.as_ref())
             .collect::<Vec<_>>(),
         registry.current().await,
     );
