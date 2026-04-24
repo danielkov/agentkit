@@ -44,7 +44,7 @@ cargo run -p openrouter-coding-agent
 
 You get a `›` prompt. Type a message and press enter.
 
-- Type while the agent is mid-turn (e.g. during a slow `shell.exec`): the line is echoed as `⎿ queued` and reaches the model at the next tool-round boundary. The turn itself is not cancelled.
+- Type while the agent is mid-turn (e.g. during a slow `shell_exec`): the line is echoed as `⎿ queued` and reaches the model at the next tool-round boundary. The turn itself is not cancelled.
 - `Ctrl-C` cancels the in-flight turn. The next prompt appears.
 - `/cancel` cancels the turn without quitting (same as `Ctrl-C` but via the command channel).
 - `/exit` or `/quit` quits — at the idle prompt, immediately; during a turn, after the current turn's cancellation settles.

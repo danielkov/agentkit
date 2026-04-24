@@ -164,8 +164,8 @@ For older MCP servers that still use the deprecated HTTP+SSE transport, `agentki
 │  ┌──────────────────────┐   ┌──────────────────────┐     │
 │  │  Native tools        │   │  MCP tools           │     │
 │  │  (ToolRegistry)      │   │  (McpToolAdapter)    │     │
-│  │  fs.read_file        │   │  mcp.github.search   │     │
-│  │  shell.exec          │   │  mcp.db.query        │     │
+│  │  fs_read_file        │   │  mcp.github.search   │     │
+│  │  shell_exec          │   │  mcp.db.query        │     │
 │  └──────────┬───────────┘   └──────────┬───────────┘     │
 │             │                          │                 │
 │             └──── unified tool list ───┘                 │

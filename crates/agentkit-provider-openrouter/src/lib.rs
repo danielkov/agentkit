@@ -318,7 +318,7 @@ impl CompletionsProvider for OpenRouterProvider {
 
     fn preprocess_response(
         &self,
-        _status: agentkit_http::StatusCode,
+        status: agentkit_http::StatusCode,
         body: &str,
     ) -> Result<(), LoopError> {
         #[derive(serde::Deserialize)]
@@ -329,13 +329,48 @@ impl CompletionsProvider for OpenRouterProvider {
         struct ErrBody {
             message: String,
             code: Value,
+            #[serde(default)]
+            metadata: Option<Value>,
         }
 
         if let Ok(e) = serde_json::from_str::<ErrResp>(body) {
+            // OpenRouter nests the upstream provider's error body inside
+            // `error.metadata` (e.g. Anthropic's `{"error":{"type":...,"message":...}}`).
+            // Log the whole envelope so the real cause is visible without
+            // having to reproduce with curl.
+            tracing::error!(
+                status = %status,
+                message = %e.error.message,
+                code = %e.error.code,
+                metadata = %e.error.metadata.as_ref()
+                    .map(|m| m.to_string())
+                    .unwrap_or_default(),
+                "OpenRouter returned error"
+            );
+            let detail = e
+                .error
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("raw").and_then(Value::as_str).map(str::to_owned))
+                .or_else(|| {
+                    e.error
+                        .metadata
+                        .as_ref()
+                        .map(|m| m.to_string())
+                })
+                .unwrap_or_default();
+            let suffix = if detail.is_empty() {
+                String::new()
+            } else {
+                format!(" — upstream: {detail}")
+            };
             return Err(LoopError::Provider(format!(
-                "OpenRouter returned error (code {}): {}",
-                e.error.code, e.error.message
+                "OpenRouter returned error (code {}): {}{}",
+                e.error.code, e.error.message, suffix
             )));
+        }
+        if !status.is_success() {
+            tracing::error!(status = %status, body = %body, "OpenRouter non-2xx without error envelope");
         }
         Ok(())
     }

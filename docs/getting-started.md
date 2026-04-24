@@ -9,7 +9,7 @@
 Examples:
 
 - `cargo run -p openrouter-chat -- "hello"`
-- `cargo run -p openrouter-coding-agent -- "Use fs.read_file on ./Cargo.toml and return only the workspace member count as an integer."`
+- `cargo run -p openrouter-coding-agent -- "Use fs_read_file on ./Cargo.toml and return only the workspace member count as an integer."`
 - `cargo run -p openrouter-agent-cli -- --mcp-mock "Return only the secret from the MCP tool."`
 
 To run the Anthropic example instead, set `ANTHROPIC_API_KEY`,

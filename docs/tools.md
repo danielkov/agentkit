@@ -186,7 +186,7 @@ Suggested convention:
 
 - lowercase ASCII
 - `-`, `_`, and `.` allowed
-- namespaced patterns such as `fs.read_file` or `mcp.github.search`
+- namespaced patterns such as `fs_read_file` or `mcp.github.search`
 
 ## 3. Tool trait
 

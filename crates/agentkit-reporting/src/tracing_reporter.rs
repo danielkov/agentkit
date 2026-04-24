@@ -75,6 +75,21 @@ impl LoopObserver for TracingReporter {
             AgentEvent::AuthResolved { provided } => {
                 tracing::info!(target: "agentkit", provided, "auth resolved");
             }
+            AgentEvent::ToolCatalogChanged {
+                source,
+                added,
+                removed,
+                changed,
+            } => {
+                tracing::info!(
+                    target: "agentkit",
+                    source = %source,
+                    added = added.len(),
+                    removed = removed.len(),
+                    changed = changed.len(),
+                    "tool catalog changed"
+                );
+            }
             AgentEvent::CompactionStarted {
                 session_id,
                 turn_id,

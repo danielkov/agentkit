@@ -8,13 +8,13 @@ A coding agent needs to read, write, and navigate files. This chapter covers `ag
 
 | Tool                  | Description                                  | Annotations   |
 | --------------------- | -------------------------------------------- | ------------- |
-| `fs.read_file`        | Read file contents with optional line ranges | `read_only`   |
-| `fs.write_file`       | Write or overwrite a file                    | `destructive` |
-| `fs.replace_in_file`  | Find-and-replace within a file               | `destructive` |
-| `fs.move`             | Rename or move a file                        | `destructive` |
-| `fs.delete`           | Delete a file                                | `destructive` |
-| `fs.list_directory`   | List directory contents                      | `read_only`   |
-| `fs.create_directory` | Create a directory                           | —             |
+| `fs_read_file`        | Read file contents with optional line ranges | `read_only`   |
+| `fs_write_file`       | Write or overwrite a file                    | `destructive` |
+| `fs_replace_in_file`  | Find-and-replace within a file               | `destructive` |
+| `fs_move`             | Rename or move a file                        | `destructive` |
+| `fs_delete`           | Delete a file                                | `destructive` |
+| `fs_list_directory`   | List directory contents                      | `read_only`   |
+| `fs_create_directory` | Create a directory                           | —             |
 
 All tools implement the `Tool` trait and can be registered with a single call:
 
@@ -68,7 +68,7 @@ Without this policy, the model can — and routinely does — overwrite files it
 Without read-before-write:
 
   User: "Add error handling to parser.rs"
-  Model: ToolCall(fs.write_file, { path: "src/parser.rs", content: "... entirely new file ..." })
+  Model: ToolCall(fs_write_file, { path: "src/parser.rs", content: "... entirely new file ..." })
 
   The model hallucinated the file contents. The original code is gone.
   Any code that wasn't in the model's context window is lost.
@@ -77,13 +77,13 @@ Without read-before-write:
 With read-before-write:
 
   User: "Add error handling to parser.rs"
-  Model: ToolCall(fs.write_file, { path: "src/parser.rs", content: "..." })
+  Model: ToolCall(fs_write_file, { path: "src/parser.rs", content: "..." })
   → Denied: "src/parser.rs has not been read in this session"
 
-  Model: ToolCall(fs.read_file, { path: "src/parser.rs" })
+  Model: ToolCall(fs_read_file, { path: "src/parser.rs" })
   → Success: file contents returned
 
-  Model: ToolCall(fs.replace_in_file, { path: "src/parser.rs", find: "...", replace: "..." })
+  Model: ToolCall(fs_replace_in_file, { path: "src/parser.rs", find: "...", replace: "..." })
   → Success: targeted edit
 ```
 
@@ -91,28 +91,28 @@ The policy is session-scoped — the tracker resets when a new session starts. R
 
 ## Implementation patterns
 
-### `fs.read_file`
+### `fs_read_file`
 
 Accepts a `path` and optional `from`/`to` line numbers. Returns the file contents as text. Records the path as "read" in `FileSystemToolResources` for read-before-write tracking.
 
 Line range support lets the model read specific sections of large files without consuming the entire context window:
 
 ```text
-fs.read_file({ path: "src/main.rs", from: 50, to: 75 })
+fs_read_file({ path: "src/main.rs", from: 50, to: 75 })
 → Returns lines 50-75 only
 ```
 
-### `fs.replace_in_file`
+### `fs_replace_in_file`
 
 Accepts a `path`, `find`, `replace`, and an optional `replace_all` boolean. Reads the file, performs the replacement, writes the result. This is the primary editing tool — it's more precise than full-file writes because the model only needs to specify the changed region.
 
 The replacement is exact string matching, not regex. If the search text doesn't appear in the file, the tool returns an error. When `replace_all` is false (the default), only the first occurrence is replaced — this avoids accidental mass edits.
 
-### `fs.write_file`
+### `fs_write_file`
 
 Writes or overwrites an entire file. Subject to read-before-write policy for existing files. New files (that don't exist yet) can be written without a prior read.
 
-### `fs.list_directory`
+### `fs_list_directory`
 
 Returns the contents of a directory. Useful for the model to explore project structure before reading specific files. Returns filenames and basic metadata (file vs directory, size).
 
@@ -123,10 +123,10 @@ Filesystem errors (file not found, permission denied, etc.) are returned as a `T
 ```text
 Error flow:
 
-  fs.read_file({ path: "nonexistent.rs" })
+  fs_read_file({ path: "nonexistent.rs" })
   → ToolResult { result: ToolResultPart { is_error: true, output: "File not found: nonexistent.rs", .. }, .. }
   → Model: "The file doesn't exist. Let me check the directory structure..."
-  → fs.list_directory({ path: "src/" })
+  → fs_list_directory({ path: "src/" })
   → Model finds the correct file name and retries
 ```
 

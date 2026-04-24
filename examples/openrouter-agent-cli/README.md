@@ -17,7 +17,7 @@ Repository inspection:
 
 ```bash
 cargo run -p openrouter-agent-cli -- \
-  "Use fs.read_file on ./Cargo.toml and return only the workspace member count as an integer."
+  "Use fs_read_file on ./Cargo.toml and return only the workspace member count as an integer."
 ```
 
 Context-aware run:

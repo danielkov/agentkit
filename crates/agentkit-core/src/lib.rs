@@ -448,7 +448,7 @@ pub enum ItemKind {
 ///     Part::text("Reading the config file..."),
 ///     Part::ToolCall(ToolCallPart::new(
 ///         "call-42",
-///         "fs.read_file",
+///         "fs_read_file",
 ///         json!({ "path": "config.toml" }),
 ///     )),
 /// ];
@@ -800,15 +800,15 @@ impl ReasoningPart {
 /// use agentkit_core::ToolCallPart;
 /// use serde_json::json;
 ///
-/// let call = ToolCallPart::new("call-7", "fs.read_file", json!({ "path": "src/main.rs" }));
+/// let call = ToolCallPart::new("call-7", "fs_read_file", json!({ "path": "src/main.rs" }));
 ///
-/// assert_eq!(call.name, "fs.read_file");
+/// assert_eq!(call.name, "fs_read_file");
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCallPart {
     /// Unique identifier for this tool call, used to correlate with [`ToolResultPart::call_id`].
     pub id: ToolCallId,
-    /// The name of the tool to invoke (e.g. `"fs.read_file"`, `"shell.exec"`).
+    /// The name of the tool to invoke (e.g. `"fs_read_file"`, `"shell_exec"`).
     pub name: String,
     /// The JSON arguments to pass to the tool.
     pub input: Value,

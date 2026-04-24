@@ -9,13 +9,13 @@ One-shot OpenRouter example that wires together:
 - `agentkit-tool-shell`
 - `agentkit-reporting`
 
-This example demonstrates how the `AsyncTaskManager` schedules tool calls as async tasks with different routing strategies. A closure-based `TaskRoutingPolicy` routes `fs.*` calls as foreground (blocking the turn until resolved) and `shell.exec` calls as foreground-then-detach-after-2-seconds (auto-promoted to background if they haven't finished in time).
+This example demonstrates how the `AsyncTaskManager` schedules tool calls as async tasks with different routing strategies. A closure-based `TaskRoutingPolicy` routes `fs.*` calls as foreground (blocking the turn until resolved) and `shell_exec` calls as foreground-then-detach-after-2-seconds (auto-promoted to background if they haven't finished in time).
 
 A side task listens to the `TaskManagerHandle` event stream and prints task lifecycle events (`started`, `detached`, `completed`, `cancelled`, `failed`) to stderr so you can observe the scheduling in real time.
 
 ## Run
 
-Multi-file read — the model issues several foreground `fs.read_file` calls:
+Multi-file read — the model issues several foreground `fs_read_file` calls:
 
 ```bash
 cargo run -p openrouter-parallel-agent -- \

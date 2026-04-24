@@ -54,7 +54,7 @@ let compaction = CompactionConfig::new(
 
 // 4. Configure task management
 let task_manager = AsyncTaskManager::new().routing(|req: &ToolRequest| {
-    if req.tool_name.0 == "shell.exec" {
+    if req.tool_name.0 == "shell_exec" {
         RoutingDecision::ForegroundThenDetachAfter(Duration::from_secs(10))
     } else {
         RoutingDecision::Foreground

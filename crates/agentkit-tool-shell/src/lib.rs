@@ -6,7 +6,7 @@
 //! and cooperative turn cancellation through [`agentkit_tools_core::ToolContext`].
 //!
 //! The easiest way to get started is with the [`registry()`] helper, which
-//! returns a [`ToolRegistry`] pre-loaded with the `shell.exec` tool.
+//! returns a [`ToolRegistry`] pre-loaded with the `shell_exec` tool.
 //!
 //! Pair the tool with [`CommandPolicy`](agentkit_tools_core::CommandPolicy) from
 //! `agentkit-tools-core` when you need fine-grained control over which
@@ -18,14 +18,14 @@
 //! use agentkit_tool_shell::{registry, ShellExecTool};
 //! use agentkit_tools_core::Tool;
 //!
-//! // Build a registry that contains the shell.exec tool.
+//! // Build a registry that contains the shell_exec tool.
 //! let reg = registry();
 //! let specs = reg.specs();
-//! assert!(specs.iter().any(|s| s.name.0 == "shell.exec"));
+//! assert!(specs.iter().any(|s| s.name.0 == "shell_exec"));
 //!
 //! // Or construct the tool manually and register it yourself.
 //! let tool = ShellExecTool::default();
-//! assert_eq!(tool.spec().name.0, "shell.exec");
+//! assert_eq!(tool.spec().name.0, "shell_exec");
 //! ```
 
 use std::collections::BTreeMap;
@@ -46,7 +46,7 @@ use tokio::time::timeout;
 /// Creates a [`ToolRegistry`] pre-populated with [`ShellExecTool`].
 ///
 /// This is the simplest way to add shell execution to an agent.  The returned
-/// registry contains a single tool registered under the name `shell.exec`.
+/// registry contains a single tool registered under the name `shell_exec`.
 ///
 /// # Example
 ///
@@ -55,7 +55,7 @@ use tokio::time::timeout;
 ///
 /// let reg = registry();
 /// assert_eq!(reg.specs().len(), 1);
-/// assert_eq!(reg.specs()[0].name.0, "shell.exec");
+/// assert_eq!(reg.specs()[0].name.0, "shell_exec");
 /// ```
 pub fn registry() -> ToolRegistry {
     ToolRegistry::new().with(ShellExecTool::default())
@@ -64,7 +64,7 @@ pub fn registry() -> ToolRegistry {
 /// A tool that executes shell commands as subprocesses.
 ///
 /// `ShellExecTool` implements the [`Tool`] trait and is registered under the
-/// name `shell.exec`.  When invoked it spawns the requested executable, waits
+/// name `shell_exec`.  When invoked it spawns the requested executable, waits
 /// for it to finish (respecting an optional timeout and turn cancellation), and
 /// returns a structured JSON object with `stdout`, `stderr`, `success`, and
 /// `exit_code` fields.
@@ -93,7 +93,7 @@ pub fn registry() -> ToolRegistry {
 /// reg.register(ShellExecTool::default());
 ///
 /// let spec = &reg.specs()[0];
-/// assert_eq!(spec.name.0, "shell.exec");
+/// assert_eq!(spec.name.0, "shell_exec");
 /// assert!(spec.annotations.destructive_hint);
 /// ```
 #[derive(Clone, Debug)]
@@ -105,7 +105,7 @@ impl Default for ShellExecTool {
     fn default() -> Self {
         Self {
             spec: ToolSpec {
-                name: ToolName::new("shell.exec"),
+                name: ToolName::new("shell_exec"),
                 description: "Execute a shell command and capture stdout, stderr, and exit status."
                     .into(),
                 input_schema: json!({
@@ -151,7 +151,7 @@ struct ShellExecInput {
 
 #[async_trait]
 impl Tool for ShellExecTool {
-    /// Returns the [`ToolSpec`] describing the `shell.exec` tool.
+    /// Returns the [`ToolSpec`] describing the `shell_exec` tool.
     fn spec(&self) -> &ToolSpec {
         &self.spec
     }
@@ -346,7 +346,7 @@ mod tests {
             .execute(
                 ToolRequest {
                     call_id: "call-1".into(),
-                    tool_name: ToolName::new("shell.exec"),
+                    tool_name: ToolName::new("shell_exec"),
                     input: json!({
                         "executable": "sh",
                         "argv": ["-c", "printf hello"]
@@ -391,7 +391,7 @@ mod tests {
             .execute(
                 ToolRequest {
                     call_id: "call-2".into(),
-                    tool_name: ToolName::new("shell.exec"),
+                    tool_name: ToolName::new("shell_exec"),
                     input: json!({
                         "executable": "sh",
                         "argv": ["-c", "printf nope"]

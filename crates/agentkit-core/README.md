@@ -47,7 +47,7 @@ use serde_json::json;
 // The model asks to read a file.
 let tool_call = ToolCallPart::new(
     ToolCallId::new("call-1"),
-    "fs.read_file",
+    "fs_read_file",
     json!({ "path": "CHANGELOG.md" }),
 );
 

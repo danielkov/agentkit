@@ -57,7 +57,7 @@ Implement `TaskRoutingPolicy` or use a closure:
 
 ```rust
 let task_manager = AsyncTaskManager::new().routing(|req: &ToolRequest| {
-    if req.tool_name.0 == "shell.exec" {
+    if req.tool_name.0 == "shell_exec" {
         RoutingDecision::ForegroundThenDetachAfter(Duration::from_secs(5))
     } else {
         RoutingDecision::Foreground
@@ -138,10 +138,10 @@ When the driver starts a new turn, it calls `task_manager.take_pending_loop_upda
 
 ```text
 Turn N:
-  Model: ToolCall(shell.exec, "cargo test")
+  Model: ToolCall(shell_exec, "cargo test")
   Task manager: starts foreground, detaches after 5s
   Model receives: "task detached"
-  Model: ToolCall(fs.read_file, "src/test_results.rs")  ← continues working
+  Model: ToolCall(fs_read_file, "src/test_results.rs")  ← continues working
   Turn ends
 
 Turn N+1:

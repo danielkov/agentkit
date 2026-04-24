@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::process::Stdio;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::time::Duration;
 
 use agentkit_capabilities::{
@@ -18,17 +18,24 @@ use agentkit_http::{
     HeaderMap, Http, HttpError, HttpRequestBuilder, HttpResponse, StatusCode, header as http_header,
 };
 use agentkit_tools_core::{
-    AuthOperation, AuthRequest, AuthResolution, Tool, ToolAnnotations, ToolContext, ToolError,
-    ToolName, ToolRegistry, ToolRequest, ToolResult, ToolSpec,
+    AuthOperation, AuthRequest, AuthResolution, Tool, ToolAnnotations, ToolCatalogEvent,
+    ToolContext, ToolError, ToolExecutionOutcome, ToolExecutor, ToolName, ToolRegistry,
+    ToolRequest, ToolResult, ToolSpec,
 };
 use async_trait::async_trait;
 use futures_util::TryStreamExt;
+use rmcp::ServiceExt;
+use rmcp::handler::client::ClientHandler;
+use rmcp::model as rmcp_model;
+use rmcp::service::{RoleClient, RunningService};
+use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig as RmcpStreamableHttpClientTransportConfig;
+use rmcp::transport::{ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tokio_util::io::StreamReader;
@@ -179,6 +186,10 @@ pub struct StreamableHttpTransportConfig {
     /// HTTP client used for all requests on this transport. When `None`, the
     /// factory builds a default reqwest-backed client with agentkit's user agent.
     pub client: Option<Http>,
+    /// Static bearer token sent as an HTTP `Authorization: Bearer ...` header.
+    pub bearer_token: Option<String>,
+    /// Static custom HTTP headers sent with every Streamable HTTP request.
+    pub headers: HeaderMap,
 }
 
 impl StreamableHttpTransportConfig {
@@ -187,6 +198,8 @@ impl StreamableHttpTransportConfig {
         Self {
             url: url.into(),
             client: None,
+            bearer_token: None,
+            headers: HeaderMap::new(),
         }
     }
 
@@ -195,6 +208,32 @@ impl StreamableHttpTransportConfig {
     pub fn with_client(mut self, client: Http) -> Self {
         self.client = Some(client);
         self
+    }
+
+    /// Sets a static bearer token for Streamable HTTP authorization.
+    pub fn with_bearer_token(mut self, token: impl Into<String>) -> Self {
+        self.bearer_token = Some(token.into());
+        self
+    }
+
+    /// Adds a static HTTP header for every Streamable HTTP request.
+    ///
+    /// Reserved MCP session and protocol headers are still managed by RMCP.
+    pub fn with_header<N, V>(mut self, name: N, value: V) -> Result<Self, McpError>
+    where
+        N: TryInto<agentkit_http::HeaderName>,
+        N::Error: std::fmt::Display,
+        V: TryInto<agentkit_http::HeaderValue>,
+        V::Error: std::fmt::Display,
+    {
+        let name = name
+            .try_into()
+            .map_err(|error| McpError::Transport(format!("invalid HTTP header name: {error}")))?;
+        let value = value
+            .try_into()
+            .map_err(|error| McpError::Transport(format!("invalid HTTP header value: {error}")))?;
+        self.headers.insert(name, value);
+        Ok(self)
     }
 }
 
@@ -908,11 +947,150 @@ pub struct McpDiscoverySnapshot {
     pub metadata: MetadataMap,
 }
 
+/// Catalog and lifecycle events emitted by [`McpServerManager`].
+///
+/// Hosts can subscribe to these events and forward tool-catalog changes to
+/// `agentkit-loop` as next-turn model capability updates.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum McpCatalogEvent {
+    /// A server connected and completed initial discovery.
+    ServerConnected { server_id: McpServerId },
+    /// A server disconnected.
+    ServerDisconnected { server_id: McpServerId },
+    /// The server's tool list changed.
+    ToolsChanged {
+        server_id: McpServerId,
+        added: Vec<String>,
+        removed: Vec<String>,
+        changed: Vec<String>,
+    },
+    /// The server's resource list changed.
+    ResourcesChanged {
+        server_id: McpServerId,
+        added: Vec<String>,
+        removed: Vec<String>,
+        changed: Vec<String>,
+    },
+    /// The server's prompt list changed.
+    PromptsChanged {
+        server_id: McpServerId,
+        added: Vec<String>,
+        removed: Vec<String>,
+        changed: Vec<String>,
+    },
+    /// Authentication state changed for a server.
+    AuthChanged { server_id: McpServerId },
+    /// A catalog refresh failed.
+    RefreshFailed {
+        server_id: McpServerId,
+        message: String,
+    },
+}
+
+impl McpCatalogEvent {
+    fn as_tool_catalog_event(&self) -> Option<ToolCatalogEvent> {
+        match self {
+            Self::ToolsChanged {
+                server_id,
+                added,
+                removed,
+                changed,
+            } => Some(ToolCatalogEvent {
+                source: format!("mcp:{server_id}"),
+                added: added
+                    .iter()
+                    .map(|name| format!("mcp_{server_id}_{name}"))
+                    .collect(),
+                removed: removed
+                    .iter()
+                    .map(|name| format!("mcp_{server_id}_{name}"))
+                    .collect(),
+                changed: changed
+                    .iter()
+                    .map(|name| format!("mcp_{server_id}_{name}"))
+                    .collect(),
+            }),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct AgentkitRmcpClientHandler {
+    info: rmcp_model::ClientInfo,
+    notifications: mpsc::UnboundedSender<RmcpServerNotification>,
+}
+
+#[derive(Clone, Debug)]
+enum RmcpServerNotification {
+    ToolsChanged,
+    ResourcesChanged,
+    PromptsChanged,
+}
+
+impl AgentkitRmcpClientHandler {
+    fn new(notifications: mpsc::UnboundedSender<RmcpServerNotification>) -> Self {
+        Self {
+            info: rmcp_model::ClientInfo::new(
+                rmcp_model::ClientCapabilities::default(),
+                rmcp_model::Implementation::new("agentkit-mcp", env!("CARGO_PKG_VERSION"))
+                    .with_title("agentkit MCP client"),
+            )
+            .with_protocol_version(rmcp_model::ProtocolVersion::LATEST),
+            notifications,
+        }
+    }
+}
+
+impl ClientHandler for AgentkitRmcpClientHandler {
+    fn on_tool_list_changed(
+        &self,
+        _context: rmcp::service::NotificationContext<RoleClient>,
+    ) -> impl Future<Output = ()> + rmcp::service::MaybeSendFuture + '_ {
+        let _ = self
+            .notifications
+            .send(RmcpServerNotification::ToolsChanged);
+        std::future::ready(())
+    }
+
+    fn on_resource_list_changed(
+        &self,
+        _context: rmcp::service::NotificationContext<RoleClient>,
+    ) -> impl Future<Output = ()> + rmcp::service::MaybeSendFuture + '_ {
+        let _ = self
+            .notifications
+            .send(RmcpServerNotification::ResourcesChanged);
+        std::future::ready(())
+    }
+
+    fn on_prompt_list_changed(
+        &self,
+        _context: rmcp::service::NotificationContext<RoleClient>,
+    ) -> impl Future<Output = ()> + rmcp::service::MaybeSendFuture + '_ {
+        let _ = self
+            .notifications
+            .send(RmcpServerNotification::PromptsChanged);
+        std::future::ready(())
+    }
+
+    fn get_info(&self) -> rmcp_model::ClientInfo {
+        self.info.clone()
+    }
+}
+
+type RmcpClientService = RunningService<RoleClient, AgentkitRmcpClientHandler>;
+
+enum McpConnectionInner {
+    Rmcp(RmcpClientService),
+    Legacy(Box<dyn McpTransport>),
+}
+
 /// A live connection to a single MCP server.
 ///
-/// Handles JSON-RPC request/response framing, automatic auth enrichment, and
+/// Wraps an RMCP client service for built-in transports and exposes
 /// high-level methods for tool calls, resource reads, prompt retrieval, and
-/// capability discovery.
+/// capability discovery. Custom transports use the compatibility JSON-RPC
+/// path.
 ///
 /// Create a connection with [`McpConnection::connect`] or indirectly through
 /// [`McpServerManager::connect_server`].
@@ -939,9 +1117,170 @@ pub struct McpDiscoverySnapshot {
 /// ```
 pub struct McpConnection {
     server_id: McpServerId,
-    transport: Mutex<Box<dyn McpTransport>>,
+    config: McpServerConfig,
+    inner: Mutex<McpConnectionInner>,
     auth: Mutex<Option<MetadataMap>>,
+    notifications: Mutex<mpsc::UnboundedReceiver<RmcpServerNotification>>,
     next_id: AtomicU64,
+    capabilities: McpServerCapabilities,
+}
+
+/// Capabilities advertised by an MCP server during the `initialize` handshake.
+///
+/// Per the MCP specification, a client must only call `<capability>/list`
+/// (and related) methods for capabilities the server has advertised. Calling
+/// an unadvertised method generally results in a `-32601 Method not found`
+/// JSON-RPC error.
+///
+/// Each capability is `Some(_)` when the server advertised the top-level key
+/// (regardless of sub-field contents) and `None` otherwise. Sub-structs carry
+/// the optional feature flags from the spec (`listChanged`, `subscribe`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpServerCapabilities {
+    /// Advertised `tools` capability → `tools/list` and `tools/call` supported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<ToolsCapability>,
+    /// Advertised `resources` capability → `resources/list` and `resources/read`
+    /// supported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<ResourcesCapability>,
+    /// Advertised `prompts` capability → `prompts/list` and `prompts/get`
+    /// supported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompts: Option<PromptsCapability>,
+    /// Advertised `logging` capability — currently informational; no discovery
+    /// call is made for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logging: Option<LoggingCapability>,
+}
+
+/// Tools sub-capability flags from the MCP `initialize` response.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolsCapability {
+    /// Server will emit `notifications/tools/list_changed` when the tool
+    /// catalog changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub list_changed: Option<bool>,
+}
+
+/// Resources sub-capability flags from the MCP `initialize` response.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResourcesCapability {
+    /// Server supports `resources/subscribe` for change notifications on
+    /// individual resources.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscribe: Option<bool>,
+    /// Server will emit `notifications/resources/list_changed` when the
+    /// resource catalog changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub list_changed: Option<bool>,
+}
+
+/// Prompts sub-capability flags from the MCP `initialize` response.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptsCapability {
+    /// Server will emit `notifications/prompts/list_changed` when the prompt
+    /// catalog changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub list_changed: Option<bool>,
+}
+
+/// Logging sub-capability. Spec reserves the key with no defined sub-fields
+/// yet; kept as a unit struct for forward-compat.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoggingCapability {}
+
+impl McpServerCapabilities {
+    /// Build capabilities from an MCP `initialize` response's `capabilities`
+    /// object. Absence of a key means the capability is not supported.
+    /// Malformed sub-structures degrade to `Some(Default::default())` rather
+    /// than erroring — the presence of the key is the load-bearing signal.
+    pub fn from_initialize_value(value: Option<&Value>) -> Self {
+        let Some(obj) = value.and_then(Value::as_object) else {
+            return Self::default();
+        };
+        fn lift<T: Default + for<'de> Deserialize<'de>>(v: Option<&Value>) -> Option<T> {
+            v.map(|value| serde_json::from_value(value.clone()).unwrap_or_default())
+        }
+        Self {
+            tools: lift(obj.get("tools")),
+            resources: lift(obj.get("resources")),
+            prompts: lift(obj.get("prompts")),
+            logging: lift(obj.get("logging")),
+        }
+    }
+
+    /// Return a capabilities struct with every top-level capability advertised
+    /// (sub-flags left at their defaults). Useful for tests and for callers
+    /// that want to attempt discovery regardless of what the server
+    /// advertised.
+    pub fn all() -> Self {
+        Self {
+            tools: Some(ToolsCapability::default()),
+            resources: Some(ResourcesCapability::default()),
+            prompts: Some(PromptsCapability::default()),
+            logging: Some(LoggingCapability::default()),
+        }
+    }
+}
+
+/// Wire shape of an MCP `initialize` response's `result` object. Used
+/// internally by [`McpConnection::connect`] to validate the protocol version
+/// and extract advertised capabilities in one typed step.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InitializeResult {
+    protocol_version: String,
+    #[serde(default)]
+    capabilities: McpServerCapabilities,
+}
+
+/// Minimal envelope used to decode list-style responses (`tools/list`,
+/// `resources/list`, `prompts/list`). Each MCP list method wraps its payload
+/// in a single-field object.
+#[derive(Debug, Deserialize)]
+struct ToolsListPayload {
+    #[serde(default)]
+    tools: Vec<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResourcesListPayload {
+    #[serde(default)]
+    resources: Vec<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PromptsListPayload {
+    #[serde(default)]
+    prompts: Vec<Value>,
+}
+
+/// Wire shape of a `resources/read` response. Servers return one or more
+/// content blocks; agentkit currently consumes the first one and discriminates
+/// on `text` vs. `uri`.
+#[derive(Debug, Deserialize)]
+struct ResourcesReadPayload {
+    #[serde(default)]
+    contents: Vec<ResourceContentBlock>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResourceContentBlock {
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    uri: Option<String>,
+}
+
+/// Wire shape of a `prompts/get` response.
+#[derive(Debug, Deserialize)]
+struct PromptsGetPayload {
+    #[serde(default)]
+    messages: Vec<Value>,
 }
 
 /// The result of replaying an MCP operation after auth resolution.
@@ -976,89 +1315,230 @@ impl McpConnection {
         config: &McpServerConfig,
         auth: Option<&MetadataMap>,
     ) -> Result<Self, McpError> {
-        let factory: Arc<dyn McpTransportFactory> = match &config.transport {
+        let (notification_tx, notification_rx) = mpsc::unbounded_channel();
+        let (inner, capabilities) = match &config.transport {
             McpTransportBinding::Stdio(binding) => {
-                Arc::new(StdioTransportFactory::new(binding.clone()))
+                connect_rmcp_stdio(config, binding, notification_tx).await?
             }
             McpTransportBinding::StreamableHttp(binding) => {
-                Arc::new(StreamableHttpTransportFactory::new(binding.clone()))
+                connect_rmcp_streamable_http(config, binding, auth, notification_tx).await?
             }
             McpTransportBinding::Sse(binding) => {
-                Arc::new(SseTransportFactory::new(binding.clone()))
+                #[cfg(feature = "legacy-sse")]
+                {
+                    connect_legacy_transport(
+                        config,
+                        Arc::new(SseTransportFactory::new(binding.clone())),
+                        auth,
+                    )
+                    .await?
+                }
+                #[cfg(not(feature = "legacy-sse"))]
+                {
+                    let _ = binding;
+                    return Err(McpError::Transport(
+                        "legacy HTTP+SSE MCP transport is disabled; enable the `legacy-sse` feature or use Streamable HTTP".into(),
+                    ));
+                }
             }
-            McpTransportBinding::Custom(factory) => factory.clone(),
+            McpTransportBinding::Custom(factory) => {
+                connect_legacy_transport(config, factory.clone(), auth).await?
+            }
         };
-
-        let mut transport = factory.connect().await?;
-        let mut params = serde_json::Map::new();
-        params.insert(
-            "protocolVersion".into(),
-            Value::String(MCP_LATEST_PROTOCOL_VERSION.into()),
-        );
-        params.insert("capabilities".into(), json!({}));
-        params.insert(
-            "clientInfo".into(),
-            json!({
-                "name": "agentkit-mcp",
-                "version": env!("CARGO_PKG_VERSION")
-            }),
-        );
-        if let Some(auth) = auth {
-            params.insert("auth".into(), metadata_to_value(auth));
-        }
-        let init_params = Value::Object(params.clone());
-        transport
-            .send(McpFrame {
-                value: json!({
-                    "jsonrpc": "2.0",
-                    "id": 0,
-                    "method": "initialize",
-                    "params": init_params.clone()
-                }),
-            })
-            .await?;
-        let init_response = transport.recv().await?.ok_or_else(|| {
-            McpError::Transport("transport closed during MCP initialization".into())
-        })?;
-        if let Some(error) = init_response.value.get("error") {
-            if let Some(auth_request) =
-                parse_auth_request(&config.id, "initialize", &init_params, error)
-            {
-                return Err(McpError::AuthRequired(Box::new(auth_request)));
-            }
-            return Err(McpError::Invocation(error.to_string()));
-        }
-        let negotiated_protocol_version = init_response
-            .value
-            .get("result")
-            .and_then(|result| result.get("protocolVersion"))
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                McpError::Protocol("initialize response missing result.protocolVersion".into())
-            })?;
-        if !MCP_SUPPORTED_PROTOCOL_VERSIONS.contains(&negotiated_protocol_version) {
-            return Err(McpError::Protocol(format!(
-                "unsupported MCP protocol version negotiated during initialize: {negotiated_protocol_version}"
-            )));
-        }
-        transport
-            .send(McpFrame {
-                value: json!({
-                    "jsonrpc": "2.0",
-                    "method": "notifications/initialized",
-                    "params": {}
-                }),
-            })
-            .await?;
 
         Ok(Self {
             server_id: config.id.clone(),
-            transport: Mutex::new(transport),
+            config: config.clone(),
+            inner: Mutex::new(inner),
             auth: Mutex::new(auth.cloned()),
+            notifications: Mutex::new(notification_rx),
             next_id: AtomicU64::new(1),
+            capabilities,
         })
     }
 
+    async fn reconnect_rmcp_inner(
+        &self,
+        auth: Option<&MetadataMap>,
+    ) -> Result<McpConnectionInner, McpError> {
+        let (notification_tx, notification_rx) = mpsc::unbounded_channel();
+        let (inner, _capabilities) = match &self.config.transport {
+            McpTransportBinding::Stdio(binding) => {
+                connect_rmcp_stdio(&self.config, binding, notification_tx).await?
+            }
+            McpTransportBinding::StreamableHttp(binding) => {
+                connect_rmcp_streamable_http(&self.config, binding, auth, notification_tx).await?
+            }
+            McpTransportBinding::Sse(binding) => {
+                #[cfg(feature = "legacy-sse")]
+                {
+                    connect_legacy_transport(
+                        &self.config,
+                        Arc::new(SseTransportFactory::new(binding.clone())),
+                        auth,
+                    )
+                    .await?
+                }
+                #[cfg(not(feature = "legacy-sse"))]
+                {
+                    let _ = binding;
+                    return Err(McpError::Transport(
+                        "legacy HTTP+SSE MCP transport is disabled; enable the `legacy-sse` feature or use Streamable HTTP".into(),
+                    ));
+                }
+            }
+            McpTransportBinding::Custom(factory) => {
+                connect_legacy_transport(&self.config, factory.clone(), auth).await?
+            }
+        };
+        *self.notifications.lock().await = notification_rx;
+        Ok(inner)
+    }
+}
+
+async fn connect_legacy_transport(
+    config: &McpServerConfig,
+    factory: Arc<dyn McpTransportFactory>,
+    auth: Option<&MetadataMap>,
+) -> Result<(McpConnectionInner, McpServerCapabilities), McpError> {
+    let mut transport = factory.connect().await?;
+    let mut params = serde_json::Map::new();
+    params.insert(
+        "protocolVersion".into(),
+        Value::String(MCP_LATEST_PROTOCOL_VERSION.into()),
+    );
+    params.insert("capabilities".into(), json!({}));
+    params.insert(
+        "clientInfo".into(),
+        json!({
+            "name": "agentkit-mcp",
+            "version": env!("CARGO_PKG_VERSION")
+        }),
+    );
+    if let Some(auth) = auth {
+        params.insert("auth".into(), metadata_to_value(auth));
+    }
+    let init_params = Value::Object(params.clone());
+    transport
+        .send(McpFrame {
+            value: json!({
+                "jsonrpc": "2.0",
+                "id": 0,
+                "method": "initialize",
+                "params": init_params.clone()
+            }),
+        })
+        .await?;
+    let init_response = transport
+        .recv()
+        .await?
+        .ok_or_else(|| McpError::Transport("transport closed during MCP initialization".into()))?;
+    if let Some(error) = init_response.value.get("error") {
+        if let Some(auth_request) =
+            parse_auth_request(&config.id, "initialize", &init_params, error)
+        {
+            return Err(McpError::AuthRequired(Box::new(auth_request)));
+        }
+        return Err(McpError::Invocation(error.to_string()));
+    }
+    let result_value = init_response
+        .value
+        .get("result")
+        .cloned()
+        .ok_or_else(|| McpError::Protocol("initialize response missing result".into()))?;
+    let initialize: InitializeResult = serde_json::from_value(result_value)
+        .map_err(|error| McpError::Protocol(format!("malformed initialize result: {error}")))?;
+    if !MCP_SUPPORTED_PROTOCOL_VERSIONS.contains(&initialize.protocol_version.as_str()) {
+        return Err(McpError::Protocol(format!(
+            "unsupported MCP protocol version negotiated during initialize: {}",
+            initialize.protocol_version
+        )));
+    }
+    let capabilities = initialize.capabilities;
+    transport
+        .send(McpFrame {
+            value: json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized",
+                "params": {}
+            }),
+        })
+        .await?;
+
+    Ok((McpConnectionInner::Legacy(transport), capabilities))
+}
+
+async fn connect_rmcp_stdio(
+    config: &McpServerConfig,
+    binding: &StdioTransportConfig,
+    notification_tx: mpsc::UnboundedSender<RmcpServerNotification>,
+) -> Result<(McpConnectionInner, McpServerCapabilities), McpError> {
+    let transport = TokioChildProcess::new(
+        tokio::process::Command::new(&binding.command).configure(|command| {
+            command.args(&binding.args);
+            if let Some(cwd) = &binding.cwd {
+                command.current_dir(cwd);
+            }
+            for (key, value) in &binding.env {
+                command.env(key, value);
+            }
+        }),
+    )
+    .map_err(McpError::Io)?;
+
+    let service = AgentkitRmcpClientHandler::new(notification_tx)
+        .serve(transport)
+        .await
+        .map_err(|error| rmcp_initialize_error(config, error))?;
+    let capabilities = service
+        .peer_info()
+        .map(|info| rmcp_server_capabilities_to_agentkit(&info.capabilities))
+        .unwrap_or_default();
+
+    Ok((McpConnectionInner::Rmcp(service), capabilities))
+}
+
+async fn connect_rmcp_streamable_http(
+    config: &McpServerConfig,
+    binding: &StreamableHttpTransportConfig,
+    auth: Option<&MetadataMap>,
+    notification_tx: mpsc::UnboundedSender<RmcpServerNotification>,
+) -> Result<(McpConnectionInner, McpServerCapabilities), McpError> {
+    if binding.client.is_some() {
+        return Err(McpError::Transport(
+            "custom agentkit HTTP clients are not supported by the RMCP Streamable HTTP transport; use static headers or the default reqwest client".into(),
+        ));
+    }
+
+    let auth_header = auth
+        .and_then(bearer_token_from_metadata)
+        .or_else(|| binding.bearer_token.clone());
+    let mut rmcp_config = RmcpStreamableHttpClientTransportConfig::with_uri(binding.url.clone());
+    if let Some(auth_header) = auth_header {
+        rmcp_config = rmcp_config.auth_header(auth_header);
+    }
+    rmcp_config = rmcp_config.custom_headers(
+        binding
+            .headers
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect(),
+    );
+    let transport = StreamableHttpClientTransport::from_config(rmcp_config);
+
+    let service = AgentkitRmcpClientHandler::new(notification_tx)
+        .serve(transport)
+        .await
+        .map_err(|error| rmcp_initialize_error(config, error))?;
+    let capabilities = service
+        .peer_info()
+        .map(|info| rmcp_server_capabilities_to_agentkit(&info.capabilities))
+        .unwrap_or_default();
+
+    Ok((McpConnectionInner::Rmcp(service), capabilities))
+}
+
+impl McpConnection {
     /// Returns the [`McpServerId`] for this connection.
     pub fn server_id(&self) -> &McpServerId {
         &self.server_id
@@ -1070,8 +1550,15 @@ impl McpConnection {
     ///
     /// Returns [`McpError`] if the transport cannot be closed cleanly.
     pub async fn close(&self) -> Result<(), McpError> {
-        let mut transport = self.transport.lock().await;
-        transport.close().await
+        let mut inner = self.inner.lock().await;
+        match &mut *inner {
+            McpConnectionInner::Rmcp(service) => {
+                service.close().await.map(|_| ()).map_err(|error| {
+                    McpError::Transport(format!("RMCP service close failed: {error}"))
+                })
+            }
+            McpConnectionInner::Legacy(transport) => transport.close().await,
+        }
     }
 
     /// Stores or clears authentication credentials for future requests on this
@@ -1093,24 +1580,63 @@ impl McpConnection {
                 *auth = None;
             }
         }
+        if matches!(&*self.inner.lock().await, McpConnectionInner::Legacy(_)) {
+            return Ok(());
+        }
+        let replacement = self.reconnect_rmcp_inner(auth.as_ref()).await?;
+        *self.inner.lock().await = replacement;
         Ok(())
     }
 
-    /// Performs full capability discovery by listing tools, resources, and prompts.
+    /// Performs capability discovery by listing tools, resources, and
+    /// prompts — but only for the capabilities the server advertised during
+    /// `initialize`. Unadvertised capabilities produce empty collections
+    /// without making any requests, avoiding `-32601 Method not found`
+    /// errors from spec-compliant servers.
     ///
-    /// Returns an [`McpDiscoverySnapshot`] containing everything the server advertises.
+    /// Returns an [`McpDiscoverySnapshot`] containing everything the server
+    /// advertised.
     ///
     /// # Errors
     ///
-    /// Returns [`McpError`] if any of the list requests fail.
+    /// Returns [`McpError`] if any advertised list request fails.
     pub async fn discover(&self) -> Result<McpDiscoverySnapshot, McpError> {
+        let tools = if self.capabilities.tools.is_some() {
+            self.list_tools().await?
+        } else {
+            Vec::new()
+        };
+        let resources = if self.capabilities.resources.is_some() {
+            self.list_resources().await?
+        } else {
+            Vec::new()
+        };
+        let prompts = if self.capabilities.prompts.is_some() {
+            self.list_prompts().await?
+        } else {
+            Vec::new()
+        };
         Ok(McpDiscoverySnapshot {
             server_id: self.server_id.clone(),
-            tools: self.list_tools().await?,
-            resources: self.list_resources().await?,
-            prompts: self.list_prompts().await?,
+            tools,
+            resources,
+            prompts,
             metadata: MetadataMap::new(),
         })
+    }
+
+    /// Returns the capabilities advertised by the server during `initialize`.
+    pub fn capabilities(&self) -> &McpServerCapabilities {
+        &self.capabilities
+    }
+
+    async fn drain_notifications(&self) -> Vec<RmcpServerNotification> {
+        let mut notifications = self.notifications.lock().await;
+        let mut drained = Vec::new();
+        while let Ok(notification) = notifications.try_recv() {
+            drained.push(notification);
+        }
+        drained
     }
 
     /// Lists all tools advertised by the connected MCP server.
@@ -1119,15 +1645,30 @@ impl McpConnection {
     ///
     /// Returns [`McpError`] if the `tools/list` request fails.
     pub async fn list_tools(&self) -> Result<Vec<McpToolDescriptor>, McpError> {
-        let result = self.request("tools/list", json!({})).await?;
-        result
-            .get("tools")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .map(parse_tool_descriptor)
-            .collect()
+        let mut inner = self.inner.lock().await;
+        match &mut *inner {
+            McpConnectionInner::Rmcp(service) => service
+                .list_all_tools()
+                .await
+                .map_err(rmcp_service_error)
+                .and_then(|tools| {
+                    tools
+                        .into_iter()
+                        .map(rmcp_tool_descriptor)
+                        .collect::<Result<Vec<_>, _>>()
+                }),
+            McpConnectionInner::Legacy(_) => {
+                drop(inner);
+                let result = self.request("tools/list", json!({})).await?;
+                let payload: ToolsListPayload =
+                    serde_json::from_value(result).map_err(McpError::Serialize)?;
+                payload
+                    .tools
+                    .into_iter()
+                    .map(parse_tool_descriptor)
+                    .collect()
+            }
+        }
     }
 
     /// Lists all resources advertised by the connected MCP server.
@@ -1136,15 +1677,30 @@ impl McpConnection {
     ///
     /// Returns [`McpError`] if the `resources/list` request fails.
     pub async fn list_resources(&self) -> Result<Vec<McpResourceDescriptor>, McpError> {
-        let result = self.request("resources/list", json!({})).await?;
-        result
-            .get("resources")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .map(parse_resource_descriptor)
-            .collect()
+        let mut inner = self.inner.lock().await;
+        match &mut *inner {
+            McpConnectionInner::Rmcp(service) => service
+                .list_all_resources()
+                .await
+                .map_err(rmcp_service_error)
+                .map(|resources| {
+                    resources
+                        .into_iter()
+                        .map(rmcp_resource_descriptor)
+                        .collect()
+                }),
+            McpConnectionInner::Legacy(_) => {
+                drop(inner);
+                let result = self.request("resources/list", json!({})).await?;
+                let payload: ResourcesListPayload =
+                    serde_json::from_value(result).map_err(McpError::Serialize)?;
+                payload
+                    .resources
+                    .into_iter()
+                    .map(parse_resource_descriptor)
+                    .collect()
+            }
+        }
     }
 
     /// Lists all prompts advertised by the connected MCP server.
@@ -1153,15 +1709,25 @@ impl McpConnection {
     ///
     /// Returns [`McpError`] if the `prompts/list` request fails.
     pub async fn list_prompts(&self) -> Result<Vec<McpPromptDescriptor>, McpError> {
-        let result = self.request("prompts/list", json!({})).await?;
-        result
-            .get("prompts")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .map(parse_prompt_descriptor)
-            .collect()
+        let mut inner = self.inner.lock().await;
+        match &mut *inner {
+            McpConnectionInner::Rmcp(service) => service
+                .list_all_prompts()
+                .await
+                .map_err(rmcp_service_error)
+                .map(|prompts| prompts.into_iter().map(rmcp_prompt_descriptor).collect()),
+            McpConnectionInner::Legacy(_) => {
+                drop(inner);
+                let result = self.request("prompts/list", json!({})).await?;
+                let payload: PromptsListPayload =
+                    serde_json::from_value(result).map_err(McpError::Serialize)?;
+                payload
+                    .prompts
+                    .into_iter()
+                    .map(parse_prompt_descriptor)
+                    .collect()
+            }
+        }
     }
 
     /// Invokes a tool on the MCP server and returns the raw JSON result.
@@ -1176,14 +1742,39 @@ impl McpConnection {
     /// Returns [`McpError::AuthRequired`] if the server demands authentication,
     /// or another [`McpError`] variant on transport or protocol failures.
     pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, McpError> {
-        self.request(
-            "tools/call",
-            json!({
-                "name": name,
-                "arguments": arguments,
-            }),
-        )
-        .await
+        let mut inner = self.inner.lock().await;
+        match &mut *inner {
+            McpConnectionInner::Rmcp(service) => {
+                let mut params = rmcp_model::CallToolRequestParams::new(name.to_string());
+                if !arguments.is_null() {
+                    params = params
+                        .with_arguments(value_to_json_object(arguments, "tools/call arguments")?);
+                }
+                service
+                    .call_tool(params)
+                    .await
+                    .map_err(|error| {
+                        rmcp_operation_error(
+                            &self.server_id,
+                            "tools/call",
+                            json!({ "name": name }),
+                            error,
+                        )
+                    })
+                    .and_then(|result| serde_json::to_value(result).map_err(McpError::Serialize))
+            }
+            McpConnectionInner::Legacy(_) => {
+                drop(inner);
+                self.request(
+                    "tools/call",
+                    json!({
+                        "name": name,
+                        "arguments": arguments,
+                    }),
+                )
+                .await
+            }
+        }
     }
 
     /// Reads a resource from the MCP server by URI.
@@ -1196,35 +1787,33 @@ impl McpConnection {
     ///
     /// Returns [`McpError`] if the resource cannot be read or the response is malformed.
     pub async fn read_resource(&self, uri: &str) -> Result<ResourceContents, McpError> {
-        let result = self
-            .request(
-                "resources/read",
-                json!({
-                    "uri": uri,
-                }),
-            )
-            .await?;
-        let content = result
-            .get("contents")
-            .and_then(Value::as_array)
-            .and_then(|values| values.first())
-            .cloned()
-            .ok_or_else(|| McpError::Protocol("resources/read returned no contents".into()))?;
-
-        let data = if let Some(text) = content.get("text").and_then(Value::as_str) {
-            DataRef::InlineText(text.into())
-        } else if let Some(found_uri) = content.get("uri").and_then(Value::as_str) {
-            DataRef::Uri(found_uri.into())
-        } else {
-            return Err(McpError::Protocol(
-                "unsupported resource content shape".into(),
-            ));
-        };
-
-        Ok(ResourceContents {
-            data,
-            metadata: MetadataMap::new(),
-        })
+        let mut inner = self.inner.lock().await;
+        match &mut *inner {
+            McpConnectionInner::Rmcp(service) => service
+                .read_resource(rmcp_model::ReadResourceRequestParams::new(uri))
+                .await
+                .map_err(|error| {
+                    rmcp_operation_error(
+                        &self.server_id,
+                        "resources/read",
+                        json!({ "uri": uri }),
+                        error,
+                    )
+                })
+                .and_then(rmcp_resource_contents),
+            McpConnectionInner::Legacy(_) => {
+                drop(inner);
+                let result = self
+                    .request(
+                        "resources/read",
+                        json!({
+                            "uri": uri,
+                        }),
+                    )
+                    .await?;
+                legacy_resource_contents(result)
+            }
+        }
     }
 
     /// Retrieves a prompt from the MCP server, rendering it with the given arguments.
@@ -1242,34 +1831,52 @@ impl McpConnection {
         name: &str,
         arguments: Value,
     ) -> Result<PromptContents, McpError> {
-        let result = self
-            .request(
-                "prompts/get",
-                json!({
-                    "name": name,
-                    "arguments": arguments,
-                }),
-            )
-            .await?;
-        let items = result
-            .get("messages")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .map(parse_prompt_message)
-            .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(PromptContents {
-            items,
-            metadata: MetadataMap::new(),
-        })
+        let mut inner = self.inner.lock().await;
+        match &mut *inner {
+            McpConnectionInner::Rmcp(service) => {
+                let mut params = rmcp_model::GetPromptRequestParams::new(name);
+                if !arguments.is_null() {
+                    params = params
+                        .with_arguments(value_to_json_object(arguments, "prompts/get arguments")?);
+                }
+                service
+                    .get_prompt(params)
+                    .await
+                    .map_err(|error| {
+                        rmcp_operation_error(
+                            &self.server_id,
+                            "prompts/get",
+                            json!({ "name": name }),
+                            error,
+                        )
+                    })
+                    .and_then(rmcp_prompt_contents)
+            }
+            McpConnectionInner::Legacy(_) => {
+                drop(inner);
+                let result = self
+                    .request(
+                        "prompts/get",
+                        json!({
+                            "name": name,
+                            "arguments": arguments,
+                        }),
+                    )
+                    .await?;
+                legacy_prompt_contents(result)
+            }
+        }
     }
 
     async fn request(&self, method: &str, params: Value) -> Result<Value, McpError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let params = self.enrich_params(params.clone()).await;
-        let mut transport = self.transport.lock().await;
+        let mut inner = self.inner.lock().await;
+        let McpConnectionInner::Legacy(transport) = &mut *inner else {
+            return Err(McpError::Protocol(format!(
+                "raw JSON-RPC request path is not available for RMCP-backed connection method {method}"
+            )));
+        };
         transport
             .send(McpFrame {
                 value: json!({
@@ -1787,11 +2394,23 @@ impl McpServerHandle {
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Default)]
 pub struct McpServerManager {
     configs: BTreeMap<McpServerId, McpServerConfig>,
     connections: BTreeMap<McpServerId, McpServerHandle>,
     auth: BTreeMap<McpServerId, MetadataMap>,
+    catalog_tx: broadcast::Sender<McpCatalogEvent>,
+}
+
+impl Default for McpServerManager {
+    fn default() -> Self {
+        let (catalog_tx, _) = broadcast::channel(128);
+        Self {
+            configs: BTreeMap::new(),
+            connections: BTreeMap::new(),
+            auth: BTreeMap::new(),
+            catalog_tx,
+        }
+    }
 }
 
 impl McpServerManager {
@@ -1828,6 +2447,15 @@ impl McpServerManager {
         self.connections.values().collect()
     }
 
+    /// Subscribes to MCP catalog and lifecycle events.
+    pub fn subscribe_catalog_events(&self) -> broadcast::Receiver<McpCatalogEvent> {
+        self.catalog_tx.subscribe()
+    }
+
+    fn emit_catalog_event(&self, event: McpCatalogEvent) {
+        let _ = self.catalog_tx.send(event);
+    }
+
     /// Connects a single registered server by its identifier.
     ///
     /// Performs the MCP handshake and full capability discovery.
@@ -1854,6 +2482,9 @@ impl McpServerManager {
             snapshot,
         };
         self.connections.insert(server_id.clone(), handle.clone());
+        self.emit_catalog_event(McpCatalogEvent::ServerConnected {
+            server_id: server_id.clone(),
+        });
         Ok(handle)
     }
 
@@ -1894,9 +2525,76 @@ impl McpServerManager {
             .connections
             .get_mut(server_id)
             .ok_or_else(|| McpError::UnknownServer(server_id.to_string()))?;
-        let snapshot = handle.connection.discover().await?;
+        let previous = handle.snapshot.clone();
+        let snapshot = match handle.connection.discover().await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.emit_catalog_event(McpCatalogEvent::RefreshFailed {
+                    server_id: server_id.clone(),
+                    message: error.to_string(),
+                });
+                return Err(error);
+            }
+        };
         handle.snapshot = snapshot.clone();
+        for event in diff_discovery_snapshots(server_id, &previous, &snapshot) {
+            self.emit_catalog_event(event);
+        }
         Ok(snapshot)
+    }
+
+    /// Processes pending server list-change notifications and refreshes affected snapshots.
+    ///
+    /// RMCP receives `notifications/tools/list_changed`,
+    /// `notifications/resources/list_changed`, and
+    /// `notifications/prompts/list_changed` on the transport task. This method
+    /// drains those notifications, re-runs discovery for each affected server,
+    /// updates the manager snapshot, and emits diffed [`McpCatalogEvent`]s.
+    ///
+    /// Hosts can call this between model turns to make capability changes visible
+    /// on the next request without injecting synthetic transcript text.
+    pub async fn refresh_changed_catalogs(&mut self) -> Result<Vec<McpCatalogEvent>, McpError> {
+        let server_ids = self.connections.keys().cloned().collect::<Vec<_>>();
+        let mut emitted = Vec::new();
+
+        for server_id in server_ids {
+            let Some(connection) = self
+                .connections
+                .get(&server_id)
+                .map(McpServerHandle::connection)
+            else {
+                continue;
+            };
+            let notifications = connection.drain_notifications().await;
+            if notifications.is_empty() {
+                continue;
+            }
+
+            let handle = self
+                .connections
+                .get_mut(&server_id)
+                .ok_or_else(|| McpError::UnknownServer(server_id.to_string()))?;
+            let previous = handle.snapshot.clone();
+            let snapshot = match handle.connection.discover().await {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    let event = McpCatalogEvent::RefreshFailed {
+                        server_id: server_id.clone(),
+                        message: error.to_string(),
+                    };
+                    self.emit_catalog_event(event.clone());
+                    emitted.push(event);
+                    return Err(error);
+                }
+            };
+            handle.snapshot = snapshot.clone();
+            for event in diff_discovery_snapshots(&server_id, &previous, &snapshot) {
+                self.emit_catalog_event(event.clone());
+                emitted.push(event);
+            }
+        }
+
+        Ok(emitted)
     }
 
     /// Disconnects a server and removes it from the active connections.
@@ -1911,7 +2609,11 @@ impl McpServerManager {
         let Some(handle) = self.connections.remove(server_id) else {
             return Err(McpError::UnknownServer(server_id.to_string()));
         };
-        handle.connection.close().await
+        handle.connection.close().await?;
+        self.emit_catalog_event(McpCatalogEvent::ServerDisconnected {
+            server_id: server_id.clone(),
+        });
+        Ok(())
     }
 
     /// Stores or clears authentication credentials for a server and, if already
@@ -1938,10 +2640,12 @@ impl McpServerManager {
 
         if let Some(handle) = self.connections.get(&server_id) {
             handle.connection.resolve_auth(resolution).await?;
+            self.emit_catalog_event(McpCatalogEvent::AuthChanged { server_id });
             return Ok(());
         }
 
         if self.configs.contains_key(&server_id) {
+            self.emit_catalog_event(McpCatalogEvent::AuthChanged { server_id });
             Ok(())
         } else {
             Err(McpError::UnknownServer(server_id.to_string()))
@@ -2051,6 +2755,240 @@ impl McpServerManager {
                 .map(McpServerHandle::capability_provider),
         )
     }
+
+    /// Builds an MCP-backed executor from the current discovered tool snapshot.
+    pub fn tool_executor(&self) -> McpToolExecutor {
+        McpToolExecutor::from_manager(self)
+    }
+
+    fn connection_map(&self) -> BTreeMap<McpServerId, Arc<McpConnection>> {
+        self.connections
+            .iter()
+            .map(|(server_id, handle)| (server_id.clone(), handle.connection()))
+            .collect()
+    }
+}
+
+fn diff_discovery_snapshots(
+    server_id: &McpServerId,
+    previous: &McpDiscoverySnapshot,
+    current: &McpDiscoverySnapshot,
+) -> Vec<McpCatalogEvent> {
+    let mut events = Vec::new();
+    let (added, removed, changed) = diff_named_items(
+        previous.tools.iter().map(|item| (item.name.clone(), item)),
+        current.tools.iter().map(|item| (item.name.clone(), item)),
+    );
+    if !added.is_empty() || !removed.is_empty() || !changed.is_empty() {
+        events.push(McpCatalogEvent::ToolsChanged {
+            server_id: server_id.clone(),
+            added,
+            removed,
+            changed,
+        });
+    }
+
+    let (added, removed, changed) = diff_named_items(
+        previous
+            .resources
+            .iter()
+            .map(|item| (item.id.clone(), item)),
+        current.resources.iter().map(|item| (item.id.clone(), item)),
+    );
+    if !added.is_empty() || !removed.is_empty() || !changed.is_empty() {
+        events.push(McpCatalogEvent::ResourcesChanged {
+            server_id: server_id.clone(),
+            added,
+            removed,
+            changed,
+        });
+    }
+
+    let (added, removed, changed) = diff_named_items(
+        previous.prompts.iter().map(|item| (item.id.clone(), item)),
+        current.prompts.iter().map(|item| (item.id.clone(), item)),
+    );
+    if !added.is_empty() || !removed.is_empty() || !changed.is_empty() {
+        events.push(McpCatalogEvent::PromptsChanged {
+            server_id: server_id.clone(),
+            added,
+            removed,
+            changed,
+        });
+    }
+
+    events
+}
+
+fn diff_named_items<'a, T>(
+    previous: impl IntoIterator<Item = (String, &'a T)>,
+    current: impl IntoIterator<Item = (String, &'a T)>,
+) -> (Vec<String>, Vec<String>, Vec<String>)
+where
+    T: PartialEq + 'a,
+{
+    let previous = previous.into_iter().collect::<BTreeMap<_, _>>();
+    let current = current.into_iter().collect::<BTreeMap<_, _>>();
+
+    let added = current
+        .keys()
+        .filter(|name| !previous.contains_key(*name))
+        .cloned()
+        .collect();
+    let removed = previous
+        .keys()
+        .filter(|name| !current.contains_key(*name))
+        .cloned()
+        .collect();
+    let changed = current
+        .iter()
+        .filter_map(|(name, item)| {
+            previous
+                .get(name)
+                .is_some_and(|previous_item| previous_item != item)
+                .then(|| name.clone())
+        })
+        .collect();
+
+    (added, removed, changed)
+}
+
+/// A tool executor backed by MCP tool adapters.
+///
+/// The executor stores a replaceable registry snapshot so hosts can refresh it
+/// after [`McpServerManager`] catalog events without rebuilding the entire
+/// agent loop.
+#[derive(Clone)]
+pub struct McpToolExecutor {
+    registry: Arc<RwLock<ToolRegistry>>,
+    connections: Arc<RwLock<BTreeMap<McpServerId, Arc<McpConnection>>>>,
+    events: Arc<StdMutex<Vec<ToolCatalogEvent>>>,
+}
+
+impl McpToolExecutor {
+    /// Creates an executor from a manager's current connected server snapshot.
+    pub fn from_manager(manager: &McpServerManager) -> Self {
+        Self {
+            registry: Arc::new(RwLock::new(manager.tool_registry())),
+            connections: Arc::new(RwLock::new(manager.connection_map())),
+            events: Arc::new(StdMutex::new(Vec::new())),
+        }
+    }
+
+    /// Refreshes the executor registry from the manager's current snapshot.
+    pub fn refresh_from_manager(&self, manager: &McpServerManager) {
+        *self
+            .registry
+            .write()
+            .expect("MCP tool registry lock poisoned") = manager.tool_registry();
+        *self
+            .connections
+            .write()
+            .expect("MCP connection map lock poisoned") = manager.connection_map();
+    }
+
+    /// Queues a catalog event for the loop-facing [`ToolExecutor`] API.
+    pub fn push_catalog_event(&self, event: McpCatalogEvent) {
+        if let Some(event) = event.as_tool_catalog_event() {
+            self.events
+                .lock()
+                .expect("MCP catalog event lock poisoned")
+                .push(event);
+        }
+    }
+
+    fn executor(&self) -> Result<agentkit_tools_core::BasicToolExecutor, ToolError> {
+        let registry = self
+            .registry
+            .read()
+            .map_err(|_| ToolError::Internal("MCP tool registry lock poisoned".into()))?
+            .clone();
+        Ok(agentkit_tools_core::BasicToolExecutor::new(registry))
+    }
+}
+
+#[async_trait]
+impl ToolExecutor for McpToolExecutor {
+    fn specs(&self) -> Vec<ToolSpec> {
+        self.registry
+            .read()
+            .expect("MCP tool registry lock poisoned")
+            .specs()
+    }
+
+    fn drain_catalog_events(&self) -> Vec<ToolCatalogEvent> {
+        std::mem::take(&mut *self.events.lock().expect("MCP catalog event lock poisoned"))
+    }
+
+    async fn execute(
+        &self,
+        request: ToolRequest,
+        ctx: &mut ToolContext<'_>,
+    ) -> ToolExecutionOutcome {
+        let Ok(executor) = self.executor() else {
+            return ToolExecutionOutcome::Failed(ToolError::Internal(
+                "MCP tool registry lock poisoned".into(),
+            ));
+        };
+        executor.execute(request, ctx).await
+    }
+
+    async fn execute_approved(
+        &self,
+        request: ToolRequest,
+        approved_request: &agentkit_tools_core::ApprovalRequest,
+        ctx: &mut ToolContext<'_>,
+    ) -> ToolExecutionOutcome {
+        let Ok(executor) = self.executor() else {
+            return ToolExecutionOutcome::Failed(ToolError::Internal(
+                "MCP tool registry lock poisoned".into(),
+            ));
+        };
+        executor
+            .execute_approved(request, approved_request, ctx)
+            .await
+    }
+
+    async fn execute_after_auth(
+        &self,
+        request: ToolRequest,
+        auth_resolution: &AuthResolution,
+        ctx: &mut ToolContext<'_>,
+    ) -> ToolExecutionOutcome {
+        if let Some(server_id) = auth_resolution.request().server_id() {
+            let connection = self
+                .connections
+                .read()
+                .map_err(|_| ToolError::Internal("MCP connection map lock poisoned".into()))
+                .and_then(|connections| {
+                    connections
+                        .get(&McpServerId::new(server_id))
+                        .cloned()
+                        .ok_or_else(|| {
+                            ToolError::Unavailable(format!("MCP server not connected: {server_id}"))
+                        })
+                });
+            match connection {
+                Ok(connection) => {
+                    if let Err(error) = connection.resolve_auth(auth_resolution.clone()).await {
+                        return ToolExecutionOutcome::Failed(ToolError::ExecutionFailed(
+                            error.to_string(),
+                        ));
+                    }
+                }
+                Err(error) => return ToolExecutionOutcome::Failed(error),
+            }
+        }
+
+        let Ok(executor) = self.executor() else {
+            return ToolExecutionOutcome::Failed(ToolError::Internal(
+                "MCP tool registry lock poisoned".into(),
+            ));
+        };
+        executor
+            .execute_after_auth(request, auth_resolution, ctx)
+            .await
+    }
 }
 
 /// Adapter that exposes an MCP tool as an agentkit [`Tool`].
@@ -2139,6 +3077,137 @@ impl Tool for McpToolAdapter {
     }
 }
 
+fn rmcp_server_capabilities_to_agentkit(
+    capabilities: &rmcp_model::ServerCapabilities,
+) -> McpServerCapabilities {
+    McpServerCapabilities {
+        tools: capabilities.tools.as_ref().map(|tools| ToolsCapability {
+            list_changed: tools.list_changed,
+        }),
+        resources: capabilities
+            .resources
+            .as_ref()
+            .map(|resources| ResourcesCapability {
+                subscribe: resources.subscribe,
+                list_changed: resources.list_changed,
+            }),
+        prompts: capabilities
+            .prompts
+            .as_ref()
+            .map(|prompts| PromptsCapability {
+                list_changed: prompts.list_changed,
+            }),
+        logging: capabilities.logging.as_ref().map(|_| LoggingCapability {}),
+    }
+}
+
+fn rmcp_tool_descriptor(tool: rmcp_model::Tool) -> Result<McpToolDescriptor, McpError> {
+    let mut metadata = MetadataMap::new();
+    if let Some(title) = tool.title.clone() {
+        metadata.insert("title".into(), Value::String(title));
+    }
+    if let Some(output_schema) = tool.output_schema.as_ref() {
+        metadata.insert(
+            "output_schema".into(),
+            Value::Object((**output_schema).clone()),
+        );
+    }
+    if let Some(annotations) = tool.annotations.as_ref() {
+        metadata.insert(
+            "annotations".into(),
+            serde_json::to_value(annotations).map_err(McpError::Serialize)?,
+        );
+    }
+    if let Some(execution) = tool.execution.as_ref() {
+        metadata.insert(
+            "execution".into(),
+            serde_json::to_value(execution).map_err(McpError::Serialize)?,
+        );
+    }
+    if let Some(icons) = tool.icons.as_ref() {
+        metadata.insert(
+            "icons".into(),
+            serde_json::to_value(icons).map_err(McpError::Serialize)?,
+        );
+    }
+    if let Some(meta) = tool.meta.as_ref() {
+        metadata.insert(
+            "_meta".into(),
+            serde_json::to_value(meta).map_err(McpError::Serialize)?,
+        );
+    }
+
+    Ok(McpToolDescriptor {
+        name: tool.name.into_owned(),
+        description: tool.description.map(|description| description.into_owned()),
+        input_schema: Value::Object((*tool.input_schema).clone()),
+        metadata,
+    })
+}
+
+fn rmcp_resource_descriptor(resource: rmcp_model::Resource) -> McpResourceDescriptor {
+    let mut metadata = MetadataMap::new();
+    if let Some(title) = resource.title.clone() {
+        metadata.insert("title".into(), Value::String(title));
+    }
+    if let Some(size) = resource.size {
+        metadata.insert("size".into(), Value::Number(size.into()));
+    }
+    if let Some(icons) = resource.icons.as_ref() {
+        if let Ok(value) = serde_json::to_value(icons) {
+            metadata.insert("icons".into(), value);
+        }
+    }
+    if let Some(meta) = resource.meta.as_ref() {
+        if let Ok(value) = serde_json::to_value(meta) {
+            metadata.insert("_meta".into(), value);
+        }
+    }
+
+    McpResourceDescriptor {
+        id: resource.uri.clone(),
+        name: resource.name.clone(),
+        description: resource.description.clone(),
+        mime_type: resource.mime_type.clone(),
+        metadata,
+    }
+}
+
+fn rmcp_prompt_descriptor(prompt: rmcp_model::Prompt) -> McpPromptDescriptor {
+    let mut metadata = MetadataMap::new();
+    if let Some(title) = prompt.title.clone() {
+        metadata.insert("title".into(), Value::String(title));
+    }
+    if let Some(icons) = prompt.icons.as_ref() {
+        if let Ok(value) = serde_json::to_value(icons) {
+            metadata.insert("icons".into(), value);
+        }
+    }
+    if let Some(meta) = prompt.meta.as_ref() {
+        if let Ok(value) = serde_json::to_value(meta) {
+            metadata.insert("_meta".into(), value);
+        }
+    }
+
+    let properties = prompt
+        .arguments
+        .unwrap_or_default()
+        .into_iter()
+        .map(|argument| (argument.name, json!({ "type": "string" })))
+        .collect::<serde_json::Map<String, Value>>();
+
+    McpPromptDescriptor {
+        id: prompt.name.clone(),
+        name: prompt.name,
+        description: prompt.description,
+        input_schema: json!({
+            "type": "object",
+            "properties": properties,
+        }),
+        metadata,
+    }
+}
+
 fn parse_tool_descriptor(value: Value) -> Result<McpToolDescriptor, McpError> {
     Ok(McpToolDescriptor {
         name: required_string(&value, "name")?,
@@ -2205,6 +3274,81 @@ fn parse_prompt_descriptor(value: Value) -> Result<McpPromptDescriptor, McpError
             "type": "object",
             "properties": properties,
         }),
+        metadata: MetadataMap::new(),
+    })
+}
+
+fn legacy_resource_contents(result: Value) -> Result<ResourceContents, McpError> {
+    let payload: ResourcesReadPayload =
+        serde_json::from_value(result).map_err(McpError::Serialize)?;
+    let content = payload
+        .contents
+        .into_iter()
+        .next()
+        .ok_or_else(|| McpError::Protocol("resources/read returned no contents".into()))?;
+
+    let data = if let Some(text) = content.text {
+        DataRef::InlineText(text)
+    } else if let Some(found_uri) = content.uri {
+        DataRef::Uri(found_uri)
+    } else {
+        return Err(McpError::Protocol(
+            "unsupported resource content shape".into(),
+        ));
+    };
+
+    Ok(ResourceContents {
+        data,
+        metadata: MetadataMap::new(),
+    })
+}
+
+fn rmcp_resource_contents(
+    result: rmcp_model::ReadResourceResult,
+) -> Result<ResourceContents, McpError> {
+    let content = result
+        .contents
+        .into_iter()
+        .next()
+        .ok_or_else(|| McpError::Protocol("resources/read returned no contents".into()))?;
+
+    let data = match content {
+        rmcp_model::ResourceContents::TextResourceContents { text, .. } => {
+            DataRef::InlineText(text)
+        }
+        rmcp_model::ResourceContents::BlobResourceContents { uri, .. } => DataRef::Uri(uri),
+    };
+
+    Ok(ResourceContents {
+        data,
+        metadata: MetadataMap::new(),
+    })
+}
+
+fn legacy_prompt_contents(result: Value) -> Result<PromptContents, McpError> {
+    let payload: PromptsGetPayload = serde_json::from_value(result).map_err(McpError::Serialize)?;
+    let items = payload
+        .messages
+        .into_iter()
+        .map(parse_prompt_message)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(PromptContents {
+        items,
+        metadata: MetadataMap::new(),
+    })
+}
+
+fn rmcp_prompt_contents(result: rmcp_model::GetPromptResult) -> Result<PromptContents, McpError> {
+    let items = result
+        .messages
+        .into_iter()
+        .map(|message| serde_json::to_value(message).map_err(McpError::Serialize))
+        .map(|value| value.and_then(parse_prompt_message))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(PromptContents {
+        items,
         metadata: MetadataMap::new(),
     })
 }
@@ -2282,6 +3426,85 @@ fn metadata_to_value(metadata: &MetadataMap) -> Value {
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect(),
     )
+}
+
+fn value_to_json_object(value: Value, context: &str) -> Result<rmcp_model::JsonObject, McpError> {
+    match value {
+        Value::Object(object) => Ok(object),
+        Value::Null => Ok(serde_json::Map::new()),
+        other => Err(McpError::Protocol(format!(
+            "{context} must be a JSON object, got {other}"
+        ))),
+    }
+}
+
+fn bearer_token_from_metadata(metadata: &MetadataMap) -> Option<String> {
+    ["bearer_token", "access_token", "token", "api_key"]
+        .into_iter()
+        .find_map(|key| metadata.get(key).and_then(Value::as_str).map(str::to_owned))
+}
+
+fn rmcp_initialize_error(
+    config: &McpServerConfig,
+    error: rmcp::service::ClientInitializeError,
+) -> McpError {
+    let message = error.to_string();
+    if let Some(auth_request) =
+        parse_transport_auth_request(&config.id, "initialize", &json!({}), &message)
+    {
+        return McpError::AuthRequired(Box::new(auth_request));
+    }
+    McpError::Transport(message)
+}
+
+fn rmcp_service_error(error: rmcp::ServiceError) -> McpError {
+    McpError::Invocation(error.to_string())
+}
+
+fn rmcp_operation_error(
+    server_id: &McpServerId,
+    method: &str,
+    params: Value,
+    error: rmcp::ServiceError,
+) -> McpError {
+    let message = error.to_string();
+    if let Some(auth_request) = parse_transport_auth_request(server_id, method, &params, &message) {
+        return McpError::AuthRequired(Box::new(auth_request));
+    }
+    McpError::Invocation(message)
+}
+
+fn parse_transport_auth_request(
+    server_id: &McpServerId,
+    method: &str,
+    params: &Value,
+    message: &str,
+) -> Option<AuthRequest> {
+    let lower = message.to_ascii_lowercase();
+    if !(lower.contains("auth required")
+        || lower.contains("unauthorized")
+        || lower.contains("insufficient scope")
+        || lower.contains("insufficient_scope"))
+    {
+        return None;
+    }
+
+    let mut challenge = MetadataMap::new();
+    challenge.insert("server_id".into(), Value::String(server_id.to_string()));
+    challenge.insert("method".into(), Value::String(method.into()));
+    challenge.insert("message".into(), Value::String(message.into()));
+    challenge.insert("flow_kind".into(), Value::String("http_bearer".into()));
+    if lower.contains("insufficient scope") || lower.contains("insufficient_scope") {
+        challenge.insert("insufficient_scope".into(), Value::Bool(true));
+    }
+
+    Some(AuthRequest {
+        task_id: None,
+        id: format!("mcp:{}:{}", server_id, method),
+        provider: format!("mcp.{}", server_id),
+        operation: auth_operation_for_method(server_id, method, params),
+        challenge,
+    })
 }
 
 fn parse_auth_request(
@@ -2617,7 +3840,9 @@ mod tests {
 
     use super::*;
     use agentkit_tools_core::{PermissionChecker, PermissionDecision, PermissionRequest};
+    #[cfg(feature = "reqwest-client")]
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    #[cfg(feature = "reqwest-client")]
     use tokio::net::TcpListener;
 
     struct AllowAll;
@@ -2648,13 +3873,20 @@ mod tests {
     }
 
     fn fake_connection(responses: Vec<Value>) -> McpConnection {
+        let (_notification_tx, notification_rx) = mpsc::unbounded_channel();
         McpConnection {
             server_id: McpServerId::new("fake"),
-            transport: Mutex::new(Box::new(FakeTransport {
+            config: McpServerConfig::new(
+                "fake",
+                McpTransportBinding::Custom(Arc::new(FakeTransportFactory::new(Vec::new()))),
+            ),
+            inner: Mutex::new(McpConnectionInner::Legacy(Box::new(FakeTransport {
                 recv: responses.into(),
-            })),
+            }))),
             auth: Mutex::new(None),
+            notifications: Mutex::new(notification_rx),
             next_id: AtomicU64::new(1),
+            capabilities: McpServerCapabilities::all(),
         }
     }
 
@@ -2696,6 +3928,54 @@ mod tests {
         assert_eq!(snapshot.tools[0].name, "echo");
         assert_eq!(snapshot.resources[0].id, "file:///tmp/example.txt");
         assert_eq!(snapshot.prompts[0].id, "summarize");
+    }
+
+    #[tokio::test]
+    async fn discover_skips_unadvertised_capabilities() {
+        // Server advertises ONLY tools — discover must not send
+        // resources/list or prompts/list (real servers like Linear return
+        // -32601 for those). The fixture deliberately provides a single
+        // tools/list response and nothing else; if discover erroneously
+        // tried to call resources/list, FakeTransport's empty queue would
+        // yield `None` and the test would fail with a transport error.
+        let factory = FakeTransportFactory::new(vec![vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 0,
+                "result": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": { "tools": { "listChanged": true } },
+                    "serverInfo": { "name": "tools-only", "version": "1.0.0" }
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "tools": [
+                        { "name": "ping", "description": "ping", "inputSchema": {"type":"object"} }
+                    ]
+                }
+            }),
+        ]]);
+        let config =
+            McpServerConfig::new("tools-only", McpTransportBinding::Custom(Arc::new(factory)));
+        let connection = McpConnection::connect(&config).await.unwrap();
+        assert!(connection.capabilities().tools.is_some());
+        assert_eq!(
+            connection.capabilities().tools,
+            Some(ToolsCapability {
+                list_changed: Some(true),
+            })
+        );
+        assert!(connection.capabilities().resources.is_none());
+        assert!(connection.capabilities().prompts.is_none());
+
+        let snapshot = connection.discover().await.unwrap();
+        assert_eq!(snapshot.tools.len(), 1);
+        assert_eq!(snapshot.tools[0].name, "ping");
+        assert!(snapshot.resources.is_empty());
+        assert!(snapshot.prompts.is_empty());
     }
 
     #[tokio::test]
@@ -2891,7 +4171,7 @@ mod tests {
     #[tokio::test]
     async fn connection_includes_resolved_auth_in_future_requests() {
         let factory = RecordingTransportFactory::new(vec![vec![
-            json!({ "jsonrpc": "2.0", "id": 0, "result": { "protocolVersion": "2025-11-25", "capabilities": {}, "serverInfo": { "name": "recording", "version": "1.0.0" } } }),
+            json!({ "jsonrpc": "2.0", "id": 0, "result": { "protocolVersion": "2025-11-25", "capabilities": { "tools": {}, "resources": {}, "prompts": {} }, "serverInfo": { "name": "recording", "version": "1.0.0" } } }),
             json!({ "jsonrpc": "2.0", "id": 1, "result": { "content": [{ "type": "text", "text": "ok" }] } }),
         ]]);
         let config = McpServerConfig::new(
@@ -2939,7 +4219,7 @@ mod tests {
     #[tokio::test]
     async fn manager_reuses_stored_auth_on_connect() {
         let factory = RecordingTransportFactory::new(vec![vec![
-            json!({ "jsonrpc": "2.0", "id": 0, "result": { "protocolVersion": "2025-11-25", "capabilities": {}, "serverInfo": { "name": "recording", "version": "1.0.0" } } }),
+            json!({ "jsonrpc": "2.0", "id": 0, "result": { "protocolVersion": "2025-11-25", "capabilities": { "tools": {}, "resources": {}, "prompts": {} }, "serverInfo": { "name": "recording", "version": "1.0.0" } } }),
             json!({ "jsonrpc": "2.0", "id": 1, "result": { "tools": [] } }),
             json!({ "jsonrpc": "2.0", "id": 2, "result": { "resources": [] } }),
             json!({ "jsonrpc": "2.0", "id": 3, "result": { "prompts": [] } }),
@@ -2988,7 +4268,7 @@ mod tests {
     #[tokio::test]
     async fn manager_resolves_auth_and_replays_resource_read() {
         let factory = RecordingTransportFactory::new(vec![vec![
-            json!({ "jsonrpc": "2.0", "id": 0, "result": { "protocolVersion": "2025-11-25", "capabilities": {}, "serverInfo": { "name": "recording", "version": "1.0.0" } } }),
+            json!({ "jsonrpc": "2.0", "id": 0, "result": { "protocolVersion": "2025-11-25", "capabilities": { "tools": {}, "resources": {}, "prompts": {} }, "serverInfo": { "name": "recording", "version": "1.0.0" } } }),
             json!({ "jsonrpc": "2.0", "id": 1, "result": { "tools": [] } }),
             json!({ "jsonrpc": "2.0", "id": 2, "result": { "resources": [] } }),
             json!({ "jsonrpc": "2.0", "id": 3, "result": { "prompts": [] } }),
@@ -3060,7 +4340,7 @@ mod tests {
     #[tokio::test]
     async fn manager_resolves_auth_and_replays_connect() {
         let factory = RecordingTransportFactory::new(vec![vec![
-            json!({ "jsonrpc": "2.0", "id": 0, "result": { "protocolVersion": "2025-11-25", "capabilities": {}, "serverInfo": { "name": "recording", "version": "1.0.0" } } }),
+            json!({ "jsonrpc": "2.0", "id": 0, "result": { "protocolVersion": "2025-11-25", "capabilities": { "tools": {}, "resources": {}, "prompts": {} }, "serverInfo": { "name": "recording", "version": "1.0.0" } } }),
             json!({ "jsonrpc": "2.0", "id": 1, "result": { "tools": [] } }),
             json!({ "jsonrpc": "2.0", "id": 2, "result": { "resources": [] } }),
             json!({ "jsonrpc": "2.0", "id": 3, "result": { "prompts": [] } }),
@@ -3099,6 +4379,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "reqwest-client")]
     #[tokio::test]
     async fn sse_transport_posts_messages_and_receives_frames() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3163,6 +4444,7 @@ mod tests {
         assert!(requests[0].contains("\"method\":\"tools/list\""));
     }
 
+    #[cfg(feature = "reqwest-client")]
     #[tokio::test]
     async fn streamable_http_connection_tracks_session_and_protocol_headers() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3171,7 +4453,7 @@ mod tests {
         let captured = requests.clone();
 
         let server = tokio::spawn(async move {
-            for _ in 0..4 {
+            for _ in 0..5 {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut buffer = vec![0_u8; 8192];
                 let read = socket.read(&mut buffer).await.unwrap();
@@ -3216,7 +4498,7 @@ mod tests {
         server.await.unwrap();
 
         let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 4);
+        assert_eq!(requests.len(), 5);
         let normalized = requests
             .iter()
             .map(|request| request.to_ascii_lowercase())
@@ -3227,10 +4509,15 @@ mod tests {
         assert!(normalized[1].contains("mcp-protocol-version: 2025-11-25"));
         assert!(normalized[2].contains("mcp-session-id: session-123"));
         assert!(normalized[2].contains("mcp-protocol-version: 2025-11-25"));
-        assert!(requests[3].starts_with("DELETE /mcp "));
-        assert!(normalized[3].contains("mcp-session-id: session-123"));
+        let delete = requests
+            .iter()
+            .zip(normalized.iter())
+            .find(|(request, _)| request.starts_with("DELETE /mcp "))
+            .expect("expected RMCP transport to delete the Streamable HTTP session on close");
+        assert!(delete.1.contains("mcp-session-id: session-123"));
     }
 
+    #[cfg(feature = "reqwest-client")]
     #[tokio::test]
     async fn streamable_http_transport_resumes_sse_streams_until_response_arrives() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3316,7 +4603,7 @@ mod tests {
         let alpha = McpServerConfig::new(
             "alpha",
             McpTransportBinding::Custom(Arc::new(FakeTransportFactory::new(vec![vec![
-                json!({ "jsonrpc": "2.0", "id": 0, "result": { "protocolVersion": "2025-11-25", "capabilities": {}, "serverInfo": { "name": "alpha", "version": "1.0.0" } } }),
+                json!({ "jsonrpc": "2.0", "id": 0, "result": { "protocolVersion": "2025-11-25", "capabilities": { "tools": {}, "resources": {}, "prompts": {} }, "serverInfo": { "name": "alpha", "version": "1.0.0" } } }),
                 json!({ "jsonrpc": "2.0", "id": 1, "result": { "tools": [{ "name": "echo", "description": "Echo", "inputSchema": {"type": "object"} }] } }),
                 json!({ "jsonrpc": "2.0", "id": 2, "result": { "resources": [] } }),
                 json!({ "jsonrpc": "2.0", "id": 3, "result": { "prompts": [] } }),
@@ -3328,7 +4615,7 @@ mod tests {
         let beta = McpServerConfig::new(
             "beta",
             McpTransportBinding::Custom(Arc::new(FakeTransportFactory::new(vec![vec![
-                json!({ "jsonrpc": "2.0", "id": 0, "result": { "protocolVersion": "2025-11-25", "capabilities": {}, "serverInfo": { "name": "beta", "version": "1.0.0" } } }),
+                json!({ "jsonrpc": "2.0", "id": 0, "result": { "protocolVersion": "2025-11-25", "capabilities": { "tools": {}, "resources": {}, "prompts": {} }, "serverInfo": { "name": "beta", "version": "1.0.0" } } }),
                 json!({ "jsonrpc": "2.0", "id": 1, "result": { "tools": [{ "name": "search", "description": "Search", "inputSchema": {"type": "object"} }] } }),
                 json!({ "jsonrpc": "2.0", "id": 2, "result": { "resources": [] } }),
                 json!({ "jsonrpc": "2.0", "id": 3, "result": { "prompts": [] } }),
@@ -3336,9 +4623,18 @@ mod tests {
         );
 
         let mut manager = McpServerManager::new().with_server(alpha).with_server(beta);
+        let mut catalog_events = manager.subscribe_catalog_events();
 
         let handles = manager.connect_all().await.unwrap();
         assert_eq!(handles.len(), 2);
+        assert!(matches!(
+            catalog_events.recv().await.unwrap(),
+            McpCatalogEvent::ServerConnected { ref server_id } if server_id == &McpServerId::new("alpha")
+        ));
+        assert!(matches!(
+            catalog_events.recv().await.unwrap(),
+            McpCatalogEvent::ServerConnected { ref server_id } if server_id == &McpServerId::new("beta")
+        ));
         assert_eq!(
             manager
                 .tool_registry()
@@ -3354,6 +4650,18 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(refreshed.tools[0].name, "echo_v2");
+        assert!(matches!(
+            catalog_events.recv().await.unwrap(),
+            McpCatalogEvent::ToolsChanged {
+                ref server_id,
+                ref added,
+                ref removed,
+                ref changed,
+            } if server_id == &McpServerId::new("alpha")
+                && added == &vec!["echo_v2".to_string()]
+                && removed == &vec!["echo".to_string()]
+                && changed.is_empty()
+        ));
         assert_eq!(
             manager
                 .connected_server(&McpServerId::new("alpha"))
@@ -3371,6 +4679,10 @@ mod tests {
             .disconnect_server(&McpServerId::new("alpha"))
             .await
             .unwrap();
+        assert!(matches!(
+            catalog_events.recv().await.unwrap(),
+            McpCatalogEvent::ServerDisconnected { ref server_id } if server_id == &McpServerId::new("alpha")
+        ));
         assert!(
             manager
                 .connected_server(&McpServerId::new("alpha"))

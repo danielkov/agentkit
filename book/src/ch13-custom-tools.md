@@ -170,8 +170,8 @@ Outer agent (orchestrator):
          │
          ▼
   Inner agent (researcher):
-    Model: ToolCall(fs.read_file, { path: "src/lib.rs" })
-    Model: ToolCall(shell.exec, { executable: "grep", argv: ["-r", "unsafe", "src/"] })
+    Model: ToolCall(fs_read_file, { path: "src/lib.rs" })
+    Model: ToolCall(shell_exec, { executable: "grep", argv: ["-r", "unsafe", "src/"] })
     Model: "Found 3 uses of unsafe in parser.rs, codec.rs, and ffi.rs..."
          │
          ▼

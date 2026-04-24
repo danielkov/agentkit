@@ -222,16 +222,16 @@ A single user message can trigger many tool roundtrips. Between each one the dri
 ```text
 User: "Add error handling to src/parser.rs"
 
-  Model call 1: ToolCall(fs.read_file)
+  Model call 1: ToolCall(fs_read_file)
                 execute → result appended
   ──▶ next() returns Interrupt(AfterToolResult)
       (host may submit_input or just call next())
 
-  Model call 2: ToolCall(fs.replace_in_file)
+  Model call 2: ToolCall(fs_replace_in_file)
                 execute → result appended
   ──▶ next() returns Interrupt(AfterToolResult)
 
-  Model call 3: ToolCall(shell.exec("cargo check"))
+  Model call 3: ToolCall(shell_exec("cargo check"))
                 execute → result appended
   ──▶ next() returns Interrupt(AfterToolResult)
 

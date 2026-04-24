@@ -153,12 +153,12 @@ RunStarted { session_id }
 │   ├── ContentDelta(AppendText { chunk: "I'll " })
 │   ├── ContentDelta(AppendText { chunk: "read the file." })
 │   ├── ContentDelta(CommitPart { part: Text("I'll read the file.") })
-│   ├── ToolCallRequested(ToolCallPart { name: "fs.read_file", ... })
+│   ├── ToolCallRequested(ToolCallPart { name: "fs_read_file", ... })
 │   └── UsageUpdated(Usage { input: 1500, output: 200 })
 │
 ├── TurnStarted { session_id, turn_id: "turn-2" }  ← automatic tool roundtrip
 │   ├── ContentDelta(...)                            ← model response after reading file
-│   ├── ToolCallRequested(ToolCallPart { name: "fs.replace_in_file", ... })
+│   ├── ToolCallRequested(ToolCallPart { name: "fs_replace_in_file", ... })
 │   └── UsageUpdated(Usage { ... })
 │
 └── TurnFinished(TurnResult { finish_reason: Completed, ... })

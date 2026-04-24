@@ -17,8 +17,8 @@ use agentkit_tools_core::{
 const SYSTEM_PROMPT: &str = "\
 You are a repository assistant with filesystem and shell tools.
 Use fs.* tools for reading, writing, and listing files.
-Use shell.exec for commands like `find`, `wc`, `grep`, `sleep`, or anything that benefits from the shell.
-When calling shell.exec, set `executable` to the command name or script path directly (e.g. \"sleep\", \"find\", \"./examples/openrouter-parallel-agent/scripts/delayed-secret.sh\") — never use `/bin/sh` or other shell wrappers.
+Use shell_exec for commands like `find`, `wc`, `grep`, `sleep`, or anything that benefits from the shell.
+When calling shell_exec, set `executable` to the command name or script path directly (e.g. \"sleep\", \"find\", \"./examples/openrouter-parallel-agent/scripts/delayed-secret.sh\") — never use `/bin/sh` or other shell wrappers.
 A script at ./examples/openrouter-parallel-agent/scripts/delayed-secret.sh prints a secret value after a delay. You can run it directly as the executable.
 When the user asks about multiple files, read them all — don't stop at one.
 Prefer concise answers.
@@ -69,7 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- async task manager ---
     let task_manager = AsyncTaskManager::new().routing(|req: &agentkit_tools_core::ToolRequest| {
-        if req.tool_name.0 == "shell.exec" {
+        if req.tool_name.0 == "shell_exec" {
             // Shell commands start foreground; detach after 2s if still running.
             RoutingDecision::ForegroundThenDetachAfter(Duration::from_secs(2))
         } else {

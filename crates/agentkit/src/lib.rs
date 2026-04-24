@@ -30,7 +30,7 @@
 //! | `provider-openrouter` | [`provider_openrouter`] | OpenRouter [`loop_::ModelAdapter`] implementation |
 //! | `task-manager` | [`task_manager`] | Tool task scheduling: [`task_manager::SimpleTaskManager`], [`task_manager::AsyncTaskManager`] |
 //! | `tool-fs` | [`tool_fs`] | Filesystem tools (read, write, edit, move, delete, list, mkdir) |
-//! | `tool-shell` | [`tool_shell`] | Shell execution tool (`shell.exec`) |
+//! | `tool-shell` | [`tool_shell`] | Shell execution tool (`shell_exec`) |
 //! | `tool-skills` | [`tool_skills`] | Progressive Agent Skills discovery and activation |
 //!
 //! ## Example: building and running an agent
@@ -292,7 +292,7 @@ pub use agentkit_provider_mistral as provider_mistral;
 #[cfg(feature = "tool-fs")]
 pub use agentkit_tool_fs as tool_fs;
 
-/// Shell execution tool (`shell.exec`).
+/// Shell execution tool (`shell_exec`).
 ///
 /// Call [`tool_shell::registry()`] to get a [`tools::ToolRegistry`] containing
 /// the shell execution tool. Supports custom working directories, environment

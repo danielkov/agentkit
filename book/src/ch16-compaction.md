@@ -101,20 +101,20 @@ Before (20 items, trigger threshold: 12):
   [2]  User: "What files are in src/?"
   [3]  Asst: (reasoning) "Let me list the directory"
              (text) "I'll check..."
-             (tool_call) fs.list_directory
+             (tool_call) fs_list_directory
   [4]  Tool: ["main.rs", "lib.rs", "parser.rs"]
   [5]  Asst: "There are three files..."
   [6]  User: "Read parser.rs"
-  [7]  Asst: (tool_call) fs.read_file
+  [7]  Asst: (tool_call) fs_read_file
   [8]  Tool: "fn parse() { ... }"
   [9]  Asst: "The parser contains..."
   [10] User: "Add error handling"
-  [11] Asst: (tool_call) fs.replace_in_file
+  [11] Asst: (tool_call) fs_replace_in_file
   [12] Tool: { is_error: true, "search text not found" }  ← failed
   [13] Asst: "Let me try again..."
-             (tool_call) fs.replace_in_file
+             (tool_call) fs_replace_in_file
   [14] Tool: "Replacement successful"
-  [15] Asst: (tool_call) shell.exec("cargo check")
+  [15] Asst: (tool_call) shell_exec("cargo check")
   [16] Tool: "Compiling... 0 errors"
   [17] Asst: "Done! I added error handling..."
   [18] User: "Now add tests"
@@ -131,9 +131,9 @@ After (10 items):
   [0]  System: "You are a coding assistant"            ← preserved
   [1]  Context: "Project uses Rust 2024..."             ← preserved
   [2]  Asst: "Let me try again..."                      ← recent 8 start here
-             (tool_call) fs.replace_in_file
+             (tool_call) fs_replace_in_file
   [3]  Tool: "Replacement successful"
-  [4]  Asst: (tool_call) shell.exec("cargo check")
+  [4]  Asst: (tool_call) shell_exec("cargo check")
   [5]  Tool: "Compiling... 0 errors"
   [6]  Asst: "Done! I added error handling..."
   [7]  User: "Now add tests"
