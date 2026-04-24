@@ -4,22 +4,24 @@
 
 `agentkit-mcp` is the MCP integration crate.
 
-It should make MCP servers usable from `agentkit` without forcing the rest of the stack to understand MCP transport details.
+It makes MCP servers usable from `agentkit` without forcing the rest of the stack to understand MCP transport details. The crate is built on top of the official [`rmcp`](https://crates.io/crates/rmcp) Rust SDK — wire-protocol types are re-exported as-is and there is no parallel agentkit-side type vocabulary.
 
-It should own:
+It owns:
 
 - MCP server configuration and lifecycle
-- transport/session management
+- transport/session management (delegated to rmcp)
 - auth handshakes and auth-required interruptions
 - discovery of MCP tools, resources, and prompts
 - adaptation of MCP tools into the shared tool system
-- access APIs for MCP resources and prompts
+- access APIs for MCP resources and prompts via the `agentkit-capabilities` `ResourceProvider`/`PromptProvider` traits
+- pluggable client-side responders for `sampling/createMessage`, `elicitation/create`, and `roots/list`
+- a broadcast subscription for server-pushed events: progress, logging, resource updates, list-changed, cancellation
 
-It should not pretend that all of MCP is a tool.
+It does not pretend that all of MCP is a tool.
 
 ## Non-goals
 
-`agentkit-mcp` should not own:
+`agentkit-mcp` does not own:
 
 - the main loop driver
 - the generic tool registry contract
@@ -32,11 +34,11 @@ This crate integrates MCP into `agentkit`; it does not replace the rest of the a
 
 ## Design principles
 
-### 1. MCP tools should plug into the normal tool system
+### 1. MCP tools plug into the normal tool system
 
-If an MCP server exposes tools, those should appear as ordinary `ToolSpec`s and execute through the same `ToolExecutor` path as native tools.
+If an MCP server exposes tools, those appear as ordinary `ToolSpec`s and execute through the same `ToolExecutor` path as native tools.
 
-That gives the loop one unified tool flow:
+The loop sees one unified tool flow:
 
 - tool discovered
 - tool spec exposed to model
@@ -47,495 +49,165 @@ That gives the loop one unified tool flow:
 
 ### 2. MCP resources and prompts stay first-class MCP concepts
 
-Resources and prompts are not tools.
-
-They should be exposed through dedicated MCP-facing APIs rather than awkward fake tools such as:
-
-- `mcp.read_resource`
-- `mcp.get_prompt`
-
-That preserves MCP’s structure and avoids flattening unlike concepts into one trait.
+Resources and prompts are not tools. They expose through the lower-level `ResourceProvider` / `PromptProvider` capability traits rather than awkward fake tools such as `mcp.read_resource` or `mcp.get_prompt`. That preserves MCP's structure and avoids flattening unlike concepts into one trait.
 
 ### 3. Auth is an interruption, not hidden retry logic
 
-MCP often involves auth or capability negotiation.
+MCP often involves auth or capability negotiation. `agentkit-mcp` surfaces auth requirements explicitly so the host can resolve them.
 
-`agentkit-mcp` should surface auth requirements explicitly so the host can resolve them.
+This aligns with the loop/tool interruption model:
 
-That should align with the loop/tool interruption model:
-
-- tool invocation may interrupt with `AuthRequired`
-- server/session startup may interrupt with `AuthRequired`
-- the host resolves the auth flow
+- tool invocation may interrupt with `ToolError::AuthRequired(AuthRequest)`
+- server/session startup may interrupt with `McpError::AuthRequired(AuthRequest)`
+- the host resolves the auth flow via `McpServerManager::resolve_auth(...)`
 - the same operation can then resume
 
-### 4. Transport details stay inside this crate
+### 4. Transport details stay inside this crate (and rmcp)
 
-The rest of `agentkit` should not care whether an MCP server is reached via:
+The rest of `agentkit` does not care whether an MCP server is reached via stdio, HTTP, or in-memory pipes. Built-in transports:
 
-- stdio
-- local child process
-- TCP
-- websocket
-- HTTP streaming
+- **stdio** (rmcp `TokioChildProcess`)
+- **Streamable HTTP** (rmcp `StreamableHttpClientTransport`)
 
-Those should all normalize into one server/session abstraction.
+For transports rmcp supports but the built-in `McpTransportBinding` enum does not (in-memory pipes for tests, websockets, custom IO), hosts construct the rmcp `RunningService` themselves and adopt it through `McpConnection::from_running_service_with_events`. Pair the service with the channels returned by `McpClientHandler::builder().build()` so list-change notifications and `McpServerEvent` subscribers stay observable.
 
-The transport layer should be pluggable.
+### 5. Discovery is explicit and cacheable
 
-Built-in transports for v1 should be:
+MCP server capabilities may change over time, but hosts should not be forced to re-discover on every loop step. The crate supports:
 
-- stdio
-- Streamable HTTP
-- legacy SSE compatibility
+- explicit discovery via `McpConnection::discover()` / `McpServerManager::refresh_server(...)`
+- stable `McpDiscoverySnapshot`s of tools/resources/prompts (rmcp wire types)
+- coalesced re-discovery of changed catalogs via `McpServerManager::refresh_changed_catalogs()`, driven by server-pushed `notifications/*/list_changed`
 
-Hosts should also be able to provide their own transport implementation.
+### 6. MCP implements the lower-level capability layer
 
-### 5. Discovery should be explicit and cacheable
+`agentkit-mcp` builds on `agentkit-capabilities`, not a parallel universe:
 
-MCP server capabilities may change over time, but hosts should not be forced to re-discover on every loop step.
+- MCP tools wrap into `ToolInvocableAdapter` invocables
+- MCP resources implement `ResourceProvider`
+- MCP prompts implement `PromptProvider`
 
-The crate should support:
+### 7. Bidirectional MCP is fully supported
 
-- explicit discovery/refresh
-- stable snapshots of tools/resources/prompts
-- invalidation when server configuration changes
+MCP is bidirectional — servers can issue `sampling/createMessage`, `elicitation/create`, and `roots/list` requests back into the client. The host installs `McpSamplingResponder` / `McpElicitationResponder` / `McpRootsProvider` implementations and the client only advertises the matching `ClientCapabilities` entry when a responder is wired in.
 
-### 6. MCP should implement the lower-level capability layer
-
-`agentkit-mcp` should build on `agentkit-capabilities`, not define a parallel universe.
-
-That means:
-
-- MCP tools map to invocables
-- MCP resources map to resource providers
-- MCP prompts map to prompt providers
+Server-pushed notifications (progress, logging, resource updates, list-changed, cancellation) are delivered as `McpServerEvent` over a `tokio::sync::broadcast` channel obtained via `McpConnection::subscribe_events`. List-changed events are *also* delivered through the legacy `McpServerNotification` mpsc receiver consumed by `refresh_changed_catalogs` — the two channels coexist: events for live UI/observability, mpsc for catalog re-sync.
 
 ## Main boundary
 
-The clean separation is:
+The clean separation:
 
 - `agentkit-capabilities` owns the lower-level invocable/resource/prompt contracts
 - `agentkit-tools-core` owns generic tool execution contracts
 - `agentkit-mcp` adapts MCP tools into those contracts
-- `agentkit-mcp` separately exposes MCP resources/prompts/server lifecycle/auth
+- `agentkit-mcp` separately exposes MCP resources/prompts/server lifecycle/auth/responders/events
+- `rmcp` owns the wire protocol, transports, and the JSON-RPC framing
 
 So:
 
 - MCP tools participate in the shared tool registry
 - MCP resources/prompts do not get forced into the tool system
+- Wire-protocol types are not re-wrapped — `CallToolResult`, `ReadResourceResult`, `Content`, `ToolAnnotations`, etc. flow through unchanged
 
 ## Core concepts
 
-## 1. Server configuration
+### 1. Server configuration
 
-Hosts need a way to define MCP servers declaratively.
-
-Recommended shape:
-
-```rust
+```rust,ignore
 pub struct McpServerConfig {
     pub id: McpServerId,
     pub transport: McpTransportBinding,
-    pub auth: McpAuthConfig,
     pub metadata: MetadataMap,
 }
-```
 
-`McpTransportBinding` should support:
-
-- built-in stdio transport configuration
-- built-in Streamable HTTP transport configuration
-- built-in legacy SSE transport configuration
-- host-provided custom transport factories
-
-This gives you a transport-agnostic surface without closing the door on user-defined transports.
-
-Recommended transport boundary:
-
-```rust
-pub trait McpTransportFactory: Send + Sync {
-    async fn connect(&self) -> Result<Box<dyn McpTransport>, McpError>;
-}
-
-pub trait McpTransport: Send {
-    async fn send(&mut self, message: McpFrame) -> Result<(), McpError>;
-    async fn recv(&mut self) -> Result<Option<McpFrame>, McpError>;
-    async fn close(&mut self) -> Result<(), McpError>;
+pub enum McpTransportBinding {
+    Stdio(StdioTransportConfig),
+    StreamableHttp(StreamableHttpTransportConfig),
 }
 ```
 
-The built-in stdio, Streamable HTTP, and legacy SSE implementations should just be default `McpTransportFactory` implementations.
+Both bindings are thin agentkit-owned config structs that drive the corresponding rmcp transport at connect time. Auth on Streamable HTTP is set declaratively via `with_bearer_token` / `with_header`; rotate with `McpServerManager::resolve_auth` (which currently triggers a reconnect with the new credentials).
 
-## 2. Server manager
+### 2. Server manager
 
-There should be one subsystem that owns MCP server lifecycle.
+`McpServerManager` is the subsystem that owns MCP server lifecycle. One per host.
 
-Recommended shape:
+```rust,ignore
+let manager = McpServerManager::new()
+    .with_server(config_a)
+    .with_server(config_b)
+    .with_namespace(McpToolNamespace::Default)
+    .with_sampling_responder(Arc::new(host_sampling))
+    .with_elicitation_responder(Arc::new(prompt_user))
+    .with_roots_provider(Arc::new(workspace_roots));
 
-```rust
-pub trait McpServerManager {
-    async fn connect(
-        &self,
-        config: &McpServerConfig,
-    ) -> Result<McpConnection, McpError>;
-}
+manager.connect_all().await?;
+let registry = manager.tool_registry();
+let provider = manager.capability_provider();
 ```
 
-`McpConnection` is the live handle to one configured MCP server.
+`McpConnection` is the live handle to one configured MCP server. It owns:
 
-It should own:
-
-- transport session
-- negotiated capabilities
+- the rmcp `RunningService` (negotiated transport + session)
+- negotiated server capabilities
 - auth state
-- discovery snapshot
+- the events broadcast sender + catalog notification receiver
 
-This gives you one operational boundary for server management.
+### 3. Discovery snapshot
 
-## 3. Connection snapshot and discovery
-
-Hosts and the loop should not have to ask the live server for static capability details repeatedly.
-
-Recommended discovery artifact:
-
-```rust
+```rust,ignore
 pub struct McpDiscoverySnapshot {
     pub server_id: McpServerId,
-    pub tools: Vec<McpToolDescriptor>,
-    pub resources: Vec<McpResourceDescriptor>,
-    pub prompts: Vec<McpPromptDescriptor>,
+    pub tools: Vec<McpTool>,        // = rmcp::model::Tool
+    pub resources: Vec<McpResource>, // = rmcp::model::Resource
+    pub prompts: Vec<McpPrompt>,     // = rmcp::model::Prompt
     pub metadata: MetadataMap,
 }
 ```
 
-This snapshot should be:
+Pattern-matching directly against the rmcp types gives access to `output_schema`, `annotations`, `mime_type`, prompt arguments, etc. without a wrapping layer.
 
-- serializable
-- refreshable
-- usable to populate tool registries and host UX
+### 4. Tool adaptation and namespacing
 
-## 4. MCP tool adaptation
+`McpToolAdapter` wraps an MCP tool as a `Tool` implementation. Tool names are namespaced as `mcp_<server_id>_<tool_name>` by default. Hosts override the strategy with `McpToolNamespace::None` (strip the prefix) or `McpToolNamespace::Custom(...)` (e.g. `remote.<server>.<tool>`).
 
-MCP tools should be adapted into `Tool` implementations, but the crate should also expose them through the lower-level invocable layer.
+### 5. Capability provider
 
-Recommended shape:
+`McpCapabilityProvider` builds invocables for tools (via `ToolInvocableAdapter`), `McpResourceHandle`s for resources, and `McpPromptHandle`s for prompts — surfacing all three through the `CapabilityProvider` trait that the agent loop and context system already consume.
 
-```rust
-pub struct McpToolAdapter {
-    server_id: McpServerId,
-    descriptor: McpToolDescriptor,
-    client: Arc<McpConnection>,
+### 6. Auth replay
+
+`McpServerManager::resolve_auth_and_resume(resolution)` resolves credentials and replays the operation that triggered the original challenge. The connection-level `McpConnection::replay_auth_operation(operation)` is also exposed for hosts that drive auth without going through the manager.
+
+### 7. Server events
+
+```rust,ignore
+pub enum McpServerEvent {
+    Progress(McpProgressNotificationParam),
+    Logging(McpLoggingMessageNotificationParam),
+    ResourceUpdated(McpResourceUpdatedNotificationParam),
+    ToolListChanged,
+    ResourceListChanged,
+    PromptListChanged,
+    Cancelled(McpCancelledNotificationParam),
 }
 ```
 
-This adapter should:
+Subscribers fan out from `McpConnection::subscribe_events()`. `McpConnection::set_logging_level(...)` negotiates the minimum severity the server emits; `subscribe_resource(uri)` / `unsubscribe_resource(uri)` toggle per-URI watch on resources that support it.
 
-- expose a `ToolSpec`
-- translate `ToolRequest` into MCP tool invocation
-- translate MCP responses into normalized `ToolResult`
-- surface auth or capability issues as `ToolInterruption`
+### 8. Errors
 
-This is the key place where MCP joins the shared tool path.
+`McpError` covers transport failure, protocol errors, auth challenges (`AuthRequired(Box<AuthRequest>)`), invocation errors, and unknown-server lookup misses. It implements `From<McpError> for rmcp::model::ErrorData` so responders can return agentkit errors and have them surface to the server as JSON-RPC errors.
 
-## 5. MCP resources API
+## What we validated
 
-Resources should have their own access layer.
-
-Recommended shape:
-
-```rust
-pub trait McpResourceStore {
-    async fn list_resources(
-        &self,
-        server: &McpServerId,
-    ) -> Result<Vec<McpResourceDescriptor>, McpError>;
-
-    async fn read_resource(
-        &self,
-        server: &McpServerId,
-        resource: &McpResourceId,
-    ) -> Result<McpResourceContents, McpError>;
-}
-```
-
-This is separate from the tool system on purpose.
-
-It allows:
-
-- host-side browsing
-- context loading integrations
-- prompt assembly using MCP resources
-
-without pretending resource access is a tool call.
-
-## 6. MCP prompts API
-
-Prompts should also stay distinct.
-
-Recommended shape:
-
-```rust
-pub trait McpPromptStore {
-    async fn list_prompts(
-        &self,
-        server: &McpServerId,
-    ) -> Result<Vec<McpPromptDescriptor>, McpError>;
-
-    async fn get_prompt(
-        &self,
-        server: &McpServerId,
-        prompt: &McpPromptId,
-        args: serde_json::Value,
-    ) -> Result<McpPromptContents, McpError>;
-}
-```
-
-This matters because prompts are closer to context-generation helpers than executable tools.
-
-That makes them more relevant to:
-
-- host UX
-- context sources
-- prompt assembly
-
-than to the tool executor path.
-
-## 7. Auth model
-
-Auth needs to be explicit and resumable.
-
-Recommended types:
-
-```rust
-pub struct AuthRequest {
-    pub server_id: McpServerId,
-    pub kind: AuthKind,
-    pub details: MetadataMap,
-}
-
-pub enum AuthResolution {
-    Provided(MetadataMap),
-    Cancelled,
-}
-```
-
-Where auth may arise during:
-
-- server connection
-- capability negotiation
-- tool invocation
-- resource read
-- prompt retrieval
-
-Recommended rule:
-
-- the MCP crate should not run host UX for auth
-- it should surface an `AuthRequest`
-- the host resolves it and the operation resumes
-
-## 8. Integration with loop interrupts
-
-The loop already has a blocking interrupt model.
-
-MCP should fit into it by translation, not by inventing a parallel control system.
-
-Recommended mapping:
-
-- MCP tool auth interruption -> `ToolInterruption::AuthRequired`
-- tool interruption -> loop interrupt
-- non-tool MCP auth needs, if initiated outside the loop, remain MCP-level API results for the host to resolve directly
-
-This is important because not all MCP interactions happen in a running agent turn.
-
-## 9. Permission boundary
-
-MCP needs its own structured action representation for policy decisions.
-
-Recommended `McpAction` variants:
-
-- connect server
-- invoke tool
-- read resource
-- fetch prompt
-- use auth scope
-
-These actions should plug into the shared `ProposedToolAction::Mcp(...)` path where relevant.
-
-For non-tool MCP operations, the same structured action model should still be reusable even if the execution path is not through `ToolExecutor`.
-
-This is one reason MCP should be designed before the detailed permissions doc: it expands the policy surface beyond local shell/fs operations.
-
-## 10. Discovery and registration
-
-Hosts need a practical way to take discovered MCP tools and register them.
-
-Recommended flow:
-
-1. host configures server(s)
-2. `agentkit-mcp` connects and discovers capabilities
-3. it produces an `McpDiscoverySnapshot`
-4. the host selects which MCP tools to expose
-5. `McpToolAdapter`s are created and registered in `ToolRegistry`
-
-Important design choice:
-
-- discovery should not automatically expose every tool by default
-
-Hosts should be able to:
-
-- expose all
-- expose a filtered subset
-- rename or namespace tools
-- attach policy overrides per server or per tool
-
-## 11. Namespacing
-
-MCP tools need predictable names to coexist with native tools.
-
-Recommended default convention:
-
-- `mcp.<server_id>.<tool_name>`
-
-Examples:
-
-- `mcp.github.search_code`
-- `mcp.linear.get_issue`
-
-Hosts may override the public name if they want a cleaner surface, but the default should be collision-safe.
-
-## 12. Error model
-
-`McpError` should be specific enough to support retries, reporting, and host intervention.
-
-Recommended categories:
-
-- transport failure
-- protocol error
-- capability missing
-- auth required
-- auth failed
-- invocation failed
-- discovery failed
-- unavailable
-
-When MCP tools are adapted into generic tool execution, these should map cleanly into:
-
-- `ToolInterruption`
-- `ToolError`
-- observer events
-
-without losing useful metadata.
-
-## 13. Context integration
-
-Because MCP resources and prompts are not tools, they should integrate with `agentkit-context`, not only with the loop.
-
-Examples:
-
-- load an MCP resource into the effective context for a session
-- materialize an MCP prompt as one or more `Item`s
-
-This bridge should be owned by `agentkit-mcp`.
-
-Reason:
-
-- MCP already owns the resource and prompt semantics
-- MCP now implements the shared capability layer directly
-- the context layer should be able to consume MCP-backed resources/prompts through adapters exposed by `agentkit-mcp`
-
-The interface should still follow the lower-level capability abstractions rather than a bespoke MCP-only path.
-
-The important point is that MCP prompts/resources should be usable in prompt assembly without going through fake tool calls.
-
-## 14. Runtime considerations
-
-Unlike `core` and ideally `loop`, `agentkit-mcp` may need stronger runtime assumptions depending on transports.
-
-Practical recommendation:
-
-- keep public MCP abstractions runtime-neutral where possible
-- allow transport implementations to depend on `tokio` behind feature flags
-
-Possible feature split:
-
-- `stdio`
-- `sse`
-- `auth`
-
-This keeps the integration flexible without pretending process/network handling is runtime-free.
-
-## Suggested public API shape
-
-Recommended first-pass types:
-
-```rust
-pub struct McpServerConfig { /* ... */ }
-pub struct McpDiscoverySnapshot { /* ... */ }
-pub struct McpToolAdapter { /* ... */ }
-
-pub trait McpServerManager { /* ... */ }
-pub trait McpResourceStore { /* ... */ }
-pub trait McpPromptStore { /* ... */ }
-```
-
-And operational result/interrupt types:
-
-```rust
-pub struct AuthRequest { /* ... */ }
-pub enum AuthResolution { /* ... */ }
-pub enum McpError { /* ... */ }
-```
-
-This is enough to support:
-
-- MCP server connection
-- discovery
-- tool adaptation
-- resource access
-- prompt access
-- explicit auth handshakes
-
-## Suggested module layout
-
-```text
-agentkit-mcp/
-  src/
-    lib.rs
-    config.rs
-    manager.rs
-    connection.rs
-    discovery.rs
-    tool_adapter.rs
-    resources.rs
-    prompts.rs
-    auth.rs
-    action.rs
-    error.rs
-```
-
-Module intent:
-
-- `config.rs`: server and transport configuration
-- `manager.rs`: connection/lifecycle interfaces
-- `connection.rs`: live connection abstraction
-- `discovery.rs`: descriptors and discovery snapshots
-- `tool_adapter.rs`: MCP tool integration with `agentkit-tools-core`
-- `resources.rs`: resource listing and read APIs
-- `prompts.rs`: prompt listing and fetch APIs
-- `auth.rs`: auth requests and resolution
-- `action.rs`: MCP policy action types
-- `error.rs`: MCP-specific errors
-
-## What we should validate early
-
-Before locking the MCP API, prove:
+The Phase 1-4 rebuild proved out:
 
 1. one MCP server can be connected and discovered from config alone
-2. discovered MCP tools can be registered into `ToolRegistry` with collision-safe names
-3. MCP tool invocation can interrupt for auth and resume cleanly
-4. MCP resources can be read without going through the tool path
-5. MCP prompts can be fetched and turned into context inputs
+2. discovered MCP tools register into `ToolRegistry` with collision-safe names
+3. MCP tool invocation interrupts for auth and resumes cleanly
+4. MCP resources are read without going through the tool path
+5. MCP prompts are fetched and turned into capability `PromptContents`
 6. server-specific metadata survives adaptation without polluting the generic tool model
-
-If any of those are awkward, the boundary between MCP, tools, and context is still wrong.
+7. server-initiated `sampling/createMessage`, `elicitation/create`, and `roots/list` are dispatched to host-supplied responders
+8. server-pushed progress/logging/resource-updated/list-changed/cancellation events reach broadcast subscribers
