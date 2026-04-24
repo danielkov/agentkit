@@ -7,16 +7,17 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use agentkit_core::MetadataMap;
 use agentkit_mcp::{
     McpConnection, McpServerConfig, McpTransportBinding, StreamableHttpTransportConfig,
 };
+use agentkit_tools_core::{AuthOperation, AuthRequest, AuthResolution};
 use axum::Router;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
-use mcp_dynamic_auth::{TokenRegistry, build_http};
-use reqwest::Client;
+use mcp_dynamic_auth::TokenRegistry;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
@@ -45,19 +46,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let registry = TokenRegistry::new("token-v1");
-    let client = Client::builder()
-        .user_agent(concat!(
-            env!("CARGO_PKG_NAME"),
-            "/",
-            env!("CARGO_PKG_VERSION")
-        ))
-        .build()?;
-    let http = build_http(client, registry.clone());
 
     let connection = McpConnection::connect(&McpServerConfig::new(
         "dynamic-auth",
         McpTransportBinding::StreamableHttp(
-            StreamableHttpTransportConfig::new(format!("http://{addr}/mcp")).with_client(http),
+            StreamableHttpTransportConfig::new(format!("http://{addr}/mcp"))
+                .with_bearer_token(registry.current().await),
         ),
     ))
     .await?;
@@ -75,6 +69,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     registry.rotate("token-v2").await;
     *mock.expected_token.lock().await = "token-v2".into();
+
+    // Trigger a reconnect that picks up the rotated token via stored auth
+    // credentials. (Phase-4 work will replace this reconnect with a live
+    // header rotation on the rmcp transport.)
+    let mut credentials = MetadataMap::new();
+    credentials.insert(
+        "bearer_token".into(),
+        Value::String(registry.current().await),
+    );
+    connection
+        .resolve_auth(AuthResolution::Provided {
+            request: AuthRequest::new(
+                "rotate-token",
+                "mcp.dynamic-auth",
+                AuthOperation::McpConnect {
+                    server_id: "dynamic-auth".into(),
+                    metadata: MetadataMap::new(),
+                },
+            ),
+            credentials,
+        })
+        .await?;
 
     let second = connection.discover().await?;
     println!(
