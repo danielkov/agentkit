@@ -47,15 +47,31 @@ use tokio::sync::{Mutex, broadcast, mpsc};
 
 /// Re-exports of the rmcp wire-protocol types this crate now surfaces directly
 /// instead of wrapping. Pull these in to pattern-match on tool annotations,
-/// content blocks, structured tool output, embedded resources, etc.
+/// content blocks, structured tool output, embedded resources, sampling /
+/// elicitation requests, progress and log notifications, etc.
 pub use rmcp::model::{
-    Annotations as McpAnnotations, AudioContent, CallToolResult, Content, EmbeddedResource,
-    GetPromptResult, ImageContent, Implementation as McpImplementation, Prompt as McpPrompt,
-    PromptArgument, PromptMessage, PromptMessageContent, PromptMessageRole, RawAudioContent,
-    RawContent, RawEmbeddedResource, RawImageContent, RawResource as McpRawResource,
-    RawTextContent, ReadResourceResult, Resource as McpResource,
-    ResourceContents as McpResourceContents, TextContent, Tool as McpTool,
-    ToolAnnotations as McpToolAnnotations,
+    Annotations as McpAnnotations, AudioContent, CallToolResult,
+    CancelledNotificationParam as McpCancelledNotificationParam,
+    ClientCapabilities as McpClientCapabilities, Content,
+    CreateElicitationRequestParams as McpCreateElicitationRequestParams,
+    CreateElicitationResult as McpCreateElicitationResult,
+    CreateMessageRequestParams as McpCreateMessageRequestParams,
+    CreateMessageResult as McpCreateMessageResult, ElicitationAction as McpElicitationAction,
+    ElicitationCapability as McpElicitationCapability, EmbeddedResource,
+    FormElicitationCapability as McpFormElicitationCapability, GetPromptResult, ImageContent,
+    Implementation as McpImplementation, ListRootsResult as McpListRootsResult,
+    LoggingLevel as McpLoggingLevel,
+    LoggingMessageNotificationParam as McpLoggingMessageNotificationParam,
+    ProgressNotificationParam as McpProgressNotificationParam, Prompt as McpPrompt, PromptArgument,
+    PromptMessage, PromptMessageContent, PromptMessageRole, RawAudioContent, RawContent,
+    RawEmbeddedResource, RawImageContent, RawResource as McpRawResource, RawTextContent,
+    ReadResourceResult, Resource as McpResource,
+    ResourceContents as McpResourceContents,
+    ResourceUpdatedNotificationParam as McpResourceUpdatedNotificationParam, Root as McpRoot,
+    RootsCapabilities as McpRootsCapabilities, SamplingCapability as McpSamplingCapability,
+    SamplingMessage as McpSamplingMessage, SetLevelRequestParams as McpSetLevelRequestParams,
+    TextContent, Tool as McpTool, ToolAnnotations as McpToolAnnotations,
+    UrlElicitationCapability as McpUrlElicitationCapability,
 };
 
 /// Backwards-compatible alias — descriptors are now the rmcp wire types.
@@ -437,7 +453,10 @@ pub struct LoggingCapability {}
 ///
 /// Drained by [`McpConnection`] inside
 /// [`McpServerManager::refresh_changed_catalogs`] to trigger re-discovery of
-/// the affected capability lists.
+/// the affected capability lists. For richer push-style consumption (progress,
+/// logging, resource updates, cancellation), subscribe via
+/// [`McpConnection::subscribe_events`] and pattern-match on
+/// [`McpServerEvent`].
 #[allow(clippy::enum_variant_names)]
 #[derive(Clone, Debug)]
 pub enum McpServerNotification {
@@ -449,46 +468,326 @@ pub enum McpServerNotification {
     PromptsChanged,
 }
 
-/// rmcp [`ClientHandler`] used by [`McpConnection`].
+/// Server-pushed events broadcast to every [`McpConnection::subscribe_events`]
+/// receiver.
 ///
-/// You only need to construct this directly if you're wiring rmcp transports
-/// that [`McpTransportBinding`] does not cover (in-memory pipes, websockets,
-/// custom IO). Pair it with [`McpConnection::from_running_service`].
-#[derive(Clone)]
-pub struct McpClientHandler {
-    info: rmcp_model::ClientInfo,
-    notifications: mpsc::UnboundedSender<McpServerNotification>,
+/// Covers the rmcp client-handler notification surface that does not feed the
+/// catalog refresh path: progress, logging, resource updates, cancellation,
+/// plus list-changed announcements (also delivered over the legacy
+/// [`McpServerNotification`] channel).
+#[derive(Clone, Debug)]
+pub enum McpServerEvent {
+    /// `notifications/progress` from the server, scoped to a
+    /// `progress_token` issued in a previous request.
+    Progress(McpProgressNotificationParam),
+    /// `notifications/message` (server log emission). Drives the optional
+    /// log-level negotiation initiated by [`McpConnection::set_logging_level`].
+    Logging(McpLoggingMessageNotificationParam),
+    /// `notifications/resources/updated` for a resource the client previously
+    /// subscribed to via [`McpConnection::subscribe_resource`].
+    ResourceUpdated(McpResourceUpdatedNotificationParam),
+    /// `notifications/tools/list_changed`.
+    ToolListChanged,
+    /// `notifications/resources/list_changed`.
+    ResourceListChanged,
+    /// `notifications/prompts/list_changed`.
+    PromptListChanged,
+    /// `notifications/cancelled` from the server, requesting cancellation of
+    /// an in-flight client request.
+    Cancelled(McpCancelledNotificationParam),
 }
 
-impl McpClientHandler {
-    /// Builds a handler together with the notification receiver that
-    /// [`McpConnection::from_running_service`] expects.
-    pub fn with_channel() -> (Self, mpsc::UnboundedReceiver<McpServerNotification>) {
-        let (tx, rx) = mpsc::unbounded_channel();
-        (Self::new(tx), rx)
+/// Pluggable handler invoked when an MCP server issues `sampling/createMessage`.
+///
+/// Wire one in via
+/// [`McpClientHandlerBuilder::with_sampling_responder`] (or
+/// [`McpServerManager::with_sampling_responder`]) to expose the host
+/// application's LLM as a sampling target for connected MCP servers.
+#[async_trait]
+pub trait McpSamplingResponder: Send + Sync + 'static {
+    /// Produces a sampled completion in response to a server-initiated
+    /// `sampling/createMessage` request.
+    async fn create_message(
+        &self,
+        params: McpCreateMessageRequestParams,
+    ) -> Result<McpCreateMessageResult, McpError>;
+}
+
+/// Pluggable handler invoked when an MCP server issues `elicitation/create`.
+///
+/// Wire one in via
+/// [`McpClientHandlerBuilder::with_elicitation_responder`] (or
+/// [`McpServerManager::with_elicitation_responder`]) to drive the
+/// host application's user-input UI.
+#[async_trait]
+pub trait McpElicitationResponder: Send + Sync + 'static {
+    /// Returns the user's response to a server-initiated elicitation request.
+    async fn create_elicitation(
+        &self,
+        params: McpCreateElicitationRequestParams,
+    ) -> Result<McpCreateElicitationResult, McpError>;
+}
+
+/// Pluggable handler invoked when an MCP server issues `roots/list`.
+///
+/// Wire one in via
+/// [`McpClientHandlerBuilder::with_roots_provider`] (or
+/// [`McpServerManager::with_roots_provider`]) to surface workspace roots
+/// that scope the server's filesystem access.
+#[async_trait]
+pub trait McpRootsProvider: Send + Sync + 'static {
+    /// Returns the roots the server should consider in scope.
+    async fn list_roots(&self) -> Result<Vec<McpRoot>, McpError>;
+}
+
+/// Default broadcast capacity for [`McpServerEvent`] subscribers.
+const DEFAULT_EVENTS_CAPACITY: usize = 128;
+
+/// Channels paired with an [`McpClientHandler`] returned by
+/// [`McpClientHandlerBuilder::build`].
+///
+/// `notifications` is the legacy mpsc receiver consumed by the catalog refresh
+/// path inside [`McpServerManager::refresh_changed_catalogs`]. `events` is the
+/// broadcast sender that surfaces every [`McpServerEvent`] — clone it once and
+/// pass it into [`McpConnection::from_running_service_with_events`] when
+/// adopting an externally constructed [`rmcp::service::RunningService`].
+pub struct McpClientChannels {
+    /// Legacy mpsc receiver for catalog list-changed announcements.
+    pub notifications: mpsc::UnboundedReceiver<McpServerNotification>,
+    /// Broadcast sender that forwards every [`McpServerEvent`] to subscribers.
+    pub events: broadcast::Sender<McpServerEvent>,
+}
+
+/// Builder for [`McpClientHandler`].
+///
+/// Configure responders for server-initiated `sampling/createMessage`,
+/// `elicitation/create`, and `roots/list` requests, then call [`Self::build`]
+/// to obtain the handler and its paired [`McpClientChannels`].
+#[derive(Clone, Default)]
+pub struct McpClientHandlerBuilder {
+    sampling: Option<Arc<dyn McpSamplingResponder>>,
+    elicitation: Option<Arc<dyn McpElicitationResponder>>,
+    roots: Option<Arc<dyn McpRootsProvider>>,
+    events_capacity: Option<usize>,
+}
+
+impl McpClientHandlerBuilder {
+    /// Creates an empty builder. By default no responders are wired.
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    fn new(notifications: mpsc::UnboundedSender<McpServerNotification>) -> Self {
-        Self {
+    /// Registers a responder for server-initiated `sampling/createMessage`
+    /// requests. The handler advertises `sampling` in `ClientCapabilities`.
+    pub fn with_sampling_responder(mut self, responder: Arc<dyn McpSamplingResponder>) -> Self {
+        self.sampling = Some(responder);
+        self
+    }
+
+    /// Registers a responder for server-initiated `elicitation/create`
+    /// requests. The handler advertises `elicitation` (form mode) in
+    /// `ClientCapabilities`.
+    pub fn with_elicitation_responder(
+        mut self,
+        responder: Arc<dyn McpElicitationResponder>,
+    ) -> Self {
+        self.elicitation = Some(responder);
+        self
+    }
+
+    /// Registers a provider for `roots/list`. The handler advertises `roots`
+    /// in `ClientCapabilities`.
+    pub fn with_roots_provider(mut self, provider: Arc<dyn McpRootsProvider>) -> Self {
+        self.roots = Some(provider);
+        self
+    }
+
+    /// Overrides the default broadcast capacity for the [`McpServerEvent`]
+    /// channel.
+    pub fn with_events_capacity(mut self, capacity: usize) -> Self {
+        self.events_capacity = Some(capacity);
+        self
+    }
+
+    /// Consumes the builder, returning the configured handler plus the channel
+    /// receiver and broadcast sender it writes into.
+    pub fn build(self) -> (McpClientHandler, McpClientChannels) {
+        let (notifications_tx, notifications_rx) = mpsc::unbounded_channel();
+        let events_capacity = self.events_capacity.unwrap_or(DEFAULT_EVENTS_CAPACITY);
+        let (events_tx, _) = broadcast::channel(events_capacity);
+
+        let mut capabilities = rmcp_model::ClientCapabilities::default();
+        if self.sampling.is_some() {
+            capabilities.sampling = Some(McpSamplingCapability::default());
+        }
+        if self.elicitation.is_some() {
+            capabilities.elicitation = Some(McpElicitationCapability {
+                form: Some(McpFormElicitationCapability::default()),
+                url: None,
+            });
+        }
+        if self.roots.is_some() {
+            capabilities.roots = Some(McpRootsCapabilities::default());
+        }
+
+        let handler = McpClientHandler {
             info: rmcp_model::ClientInfo::new(
-                rmcp_model::ClientCapabilities::default(),
+                capabilities,
                 rmcp_model::Implementation::new("agentkit-mcp", env!("CARGO_PKG_VERSION"))
                     .with_title("agentkit MCP client"),
             )
             .with_protocol_version(rmcp_model::ProtocolVersion::LATEST),
-            notifications,
-        }
+            notifications: notifications_tx,
+            events: events_tx.clone(),
+            sampling: self.sampling,
+            elicitation: self.elicitation,
+            roots: self.roots,
+        };
+
+        (
+            handler,
+            McpClientChannels {
+                notifications: notifications_rx,
+                events: events_tx,
+            },
+        )
+    }
+}
+
+/// rmcp [`ClientHandler`] used by [`McpConnection`].
+///
+/// You only need to construct this directly if you're wiring rmcp transports
+/// that [`McpTransportBinding`] does not cover (in-memory pipes, websockets,
+/// custom IO). Build one via [`McpClientHandlerBuilder`] (for full event +
+/// responder access) or the back-compat [`Self::with_channel`] shortcut, then
+/// pair the resulting service with [`McpConnection::from_running_service`] /
+/// [`McpConnection::from_running_service_with_events`].
+#[derive(Clone)]
+pub struct McpClientHandler {
+    info: rmcp_model::ClientInfo,
+    notifications: mpsc::UnboundedSender<McpServerNotification>,
+    events: broadcast::Sender<McpServerEvent>,
+    sampling: Option<Arc<dyn McpSamplingResponder>>,
+    elicitation: Option<Arc<dyn McpElicitationResponder>>,
+    roots: Option<Arc<dyn McpRootsProvider>>,
+}
+
+impl McpClientHandler {
+    /// Returns a default [`McpClientHandlerBuilder`].
+    pub fn builder() -> McpClientHandlerBuilder {
+        McpClientHandlerBuilder::new()
+    }
+
+    /// Builds a handler together with the notification receiver that
+    /// [`McpConnection::from_running_service`] expects. No responders are
+    /// wired, and the broadcast events sender is dropped — use
+    /// [`McpClientHandlerBuilder`] + [`McpConnection::from_running_service_with_events`]
+    /// when you need server-initiated request handling or event subscription.
+    pub fn with_channel() -> (Self, mpsc::UnboundedReceiver<McpServerNotification>) {
+        let (handler, channels) = McpClientHandlerBuilder::new().build();
+        (handler, channels.notifications)
     }
 }
 
 impl ClientHandler for McpClientHandler {
+    fn create_message(
+        &self,
+        params: rmcp_model::CreateMessageRequestParams,
+        _context: rmcp::service::RequestContext<RoleClient>,
+    ) -> impl Future<Output = Result<rmcp_model::CreateMessageResult, rmcp_model::ErrorData>>
+    + rmcp::service::MaybeSendFuture
+    + '_ {
+        let responder = self.sampling.clone();
+        async move {
+            match responder {
+                Some(responder) => responder.create_message(params).await.map_err(Into::into),
+                None => Err(rmcp_model::ErrorData::method_not_found::<
+                    rmcp_model::CreateMessageRequestMethod,
+                >()),
+            }
+        }
+    }
+
+    fn list_roots(
+        &self,
+        _context: rmcp::service::RequestContext<RoleClient>,
+    ) -> impl Future<Output = Result<rmcp_model::ListRootsResult, rmcp_model::ErrorData>>
+    + rmcp::service::MaybeSendFuture
+    + '_ {
+        let provider = self.roots.clone();
+        async move {
+            match provider {
+                Some(provider) => provider
+                    .list_roots()
+                    .await
+                    .map(McpListRootsResult::new)
+                    .map_err(Into::into),
+                None => Ok(McpListRootsResult::default()),
+            }
+        }
+    }
+
+    fn create_elicitation(
+        &self,
+        params: rmcp_model::CreateElicitationRequestParams,
+        _context: rmcp::service::RequestContext<RoleClient>,
+    ) -> impl Future<Output = Result<rmcp_model::CreateElicitationResult, rmcp_model::ErrorData>>
+    + rmcp::service::MaybeSendFuture
+    + '_ {
+        let responder = self.elicitation.clone();
+        async move {
+            match responder {
+                Some(responder) => responder
+                    .create_elicitation(params)
+                    .await
+                    .map_err(Into::into),
+                None => Ok(McpCreateElicitationResult::new(McpElicitationAction::Decline)),
+            }
+        }
+    }
+
+    fn on_progress(
+        &self,
+        params: rmcp_model::ProgressNotificationParam,
+        _context: rmcp::service::NotificationContext<RoleClient>,
+    ) -> impl Future<Output = ()> + rmcp::service::MaybeSendFuture + '_ {
+        let _ = self.events.send(McpServerEvent::Progress(params));
+        std::future::ready(())
+    }
+
+    fn on_logging_message(
+        &self,
+        params: rmcp_model::LoggingMessageNotificationParam,
+        _context: rmcp::service::NotificationContext<RoleClient>,
+    ) -> impl Future<Output = ()> + rmcp::service::MaybeSendFuture + '_ {
+        let _ = self.events.send(McpServerEvent::Logging(params));
+        std::future::ready(())
+    }
+
+    fn on_resource_updated(
+        &self,
+        params: rmcp_model::ResourceUpdatedNotificationParam,
+        _context: rmcp::service::NotificationContext<RoleClient>,
+    ) -> impl Future<Output = ()> + rmcp::service::MaybeSendFuture + '_ {
+        let _ = self.events.send(McpServerEvent::ResourceUpdated(params));
+        std::future::ready(())
+    }
+
+    fn on_cancelled(
+        &self,
+        params: rmcp_model::CancelledNotificationParam,
+        _context: rmcp::service::NotificationContext<RoleClient>,
+    ) -> impl Future<Output = ()> + rmcp::service::MaybeSendFuture + '_ {
+        let _ = self.events.send(McpServerEvent::Cancelled(params));
+        std::future::ready(())
+    }
+
     fn on_tool_list_changed(
         &self,
         _context: rmcp::service::NotificationContext<RoleClient>,
     ) -> impl Future<Output = ()> + rmcp::service::MaybeSendFuture + '_ {
-        let _ = self
-            .notifications
-            .send(McpServerNotification::ToolsChanged);
+        let _ = self.notifications.send(McpServerNotification::ToolsChanged);
+        let _ = self.events.send(McpServerEvent::ToolListChanged);
         std::future::ready(())
     }
 
@@ -499,6 +798,7 @@ impl ClientHandler for McpClientHandler {
         let _ = self
             .notifications
             .send(McpServerNotification::ResourcesChanged);
+        let _ = self.events.send(McpServerEvent::ResourceListChanged);
         std::future::ready(())
     }
 
@@ -509,6 +809,7 @@ impl ClientHandler for McpClientHandler {
         let _ = self
             .notifications
             .send(McpServerNotification::PromptsChanged);
+        let _ = self.events.send(McpServerEvent::PromptListChanged);
         std::future::ready(())
     }
 
@@ -517,7 +818,116 @@ impl ClientHandler for McpClientHandler {
     }
 }
 
+impl From<McpError> for rmcp_model::ErrorData {
+    fn from(error: McpError) -> Self {
+        rmcp_model::ErrorData::internal_error(error.to_string(), None)
+    }
+}
+
 type RmcpClientService = RunningService<RoleClient, McpClientHandler>;
+
+/// Configuration applied to every [`McpClientHandler`] this crate builds on
+/// behalf of a connection or [`McpServerManager`].
+///
+/// Holds the optional sampling / elicitation / roots responders plus the
+/// broadcast capacity for [`McpServerEvent`] subscribers. Pass an instance to
+/// [`McpConnection::connect_with_handler`] to drive a single connection, or
+/// install one on the manager via
+/// [`McpServerManager::with_handler_config`] / per-trait builders.
+#[derive(Clone, Default)]
+pub struct McpHandlerConfig {
+    /// Responder for server-initiated `sampling/createMessage` requests.
+    pub sampling: Option<Arc<dyn McpSamplingResponder>>,
+    /// Responder for server-initiated `elicitation/create` requests.
+    pub elicitation: Option<Arc<dyn McpElicitationResponder>>,
+    /// Provider for `roots/list`.
+    pub roots: Option<Arc<dyn McpRootsProvider>>,
+    /// Broadcast capacity for the [`McpServerEvent`] channel. Defaults to
+    /// `DEFAULT_EVENTS_CAPACITY` when `None`.
+    pub events_capacity: Option<usize>,
+}
+
+impl McpHandlerConfig {
+    /// Returns an empty handler config.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the sampling responder.
+    pub fn with_sampling_responder(mut self, responder: Arc<dyn McpSamplingResponder>) -> Self {
+        self.sampling = Some(responder);
+        self
+    }
+
+    /// Sets the elicitation responder.
+    pub fn with_elicitation_responder(
+        mut self,
+        responder: Arc<dyn McpElicitationResponder>,
+    ) -> Self {
+        self.elicitation = Some(responder);
+        self
+    }
+
+    /// Sets the roots provider.
+    pub fn with_roots_provider(mut self, provider: Arc<dyn McpRootsProvider>) -> Self {
+        self.roots = Some(provider);
+        self
+    }
+
+    /// Sets the broadcast capacity for [`McpServerEvent`] subscribers.
+    pub fn with_events_capacity(mut self, capacity: usize) -> Self {
+        self.events_capacity = Some(capacity);
+        self
+    }
+
+    fn build_handler(
+        &self,
+        events: Option<broadcast::Sender<McpServerEvent>>,
+    ) -> (McpClientHandler, McpClientChannels) {
+        let (notifications_tx, notifications_rx) = mpsc::unbounded_channel();
+        let events_tx = events.unwrap_or_else(|| {
+            let capacity = self.events_capacity.unwrap_or(DEFAULT_EVENTS_CAPACITY);
+            let (tx, _) = broadcast::channel(capacity);
+            tx
+        });
+
+        let mut capabilities = rmcp_model::ClientCapabilities::default();
+        if self.sampling.is_some() {
+            capabilities.sampling = Some(McpSamplingCapability::default());
+        }
+        if self.elicitation.is_some() {
+            capabilities.elicitation = Some(McpElicitationCapability {
+                form: Some(McpFormElicitationCapability::default()),
+                url: None,
+            });
+        }
+        if self.roots.is_some() {
+            capabilities.roots = Some(McpRootsCapabilities::default());
+        }
+
+        let handler = McpClientHandler {
+            info: rmcp_model::ClientInfo::new(
+                capabilities,
+                rmcp_model::Implementation::new("agentkit-mcp", env!("CARGO_PKG_VERSION"))
+                    .with_title("agentkit MCP client"),
+            )
+            .with_protocol_version(rmcp_model::ProtocolVersion::LATEST),
+            notifications: notifications_tx,
+            events: events_tx.clone(),
+            sampling: self.sampling.clone(),
+            elicitation: self.elicitation.clone(),
+            roots: self.roots.clone(),
+        };
+
+        (
+            handler,
+            McpClientChannels {
+                notifications: notifications_rx,
+                events: events_tx,
+            },
+        )
+    }
+}
 
 /// A live connection to a single MCP server, wrapping an
 /// [`rmcp::service::RunningService`].
@@ -527,6 +937,8 @@ pub struct McpConnection {
     inner: Mutex<RmcpClientService>,
     auth: Mutex<Option<MetadataMap>>,
     notifications: Mutex<mpsc::UnboundedReceiver<McpServerNotification>>,
+    events: broadcast::Sender<McpServerEvent>,
+    handler_config: McpHandlerConfig,
     capabilities: McpServerCapabilities,
 }
 
@@ -545,22 +957,37 @@ pub enum McpOperationResult {
 
 impl McpConnection {
     /// Connects to an MCP server, performs the rmcp `initialize` handshake,
-    /// and returns a ready-to-use connection.
+    /// and returns a ready-to-use connection. No sampling / elicitation /
+    /// roots responders are wired; use [`Self::connect_with_handler`] when
+    /// the server may issue those requests.
     pub async fn connect(config: &McpServerConfig) -> Result<Self, McpError> {
-        Self::connect_with_auth(config, None).await
+        Self::connect_with_auth(config, None, McpHandlerConfig::default()).await
+    }
+
+    /// Connects to an MCP server with a fully configured [`McpHandlerConfig`].
+    pub async fn connect_with_handler(
+        config: &McpServerConfig,
+        handler_config: McpHandlerConfig,
+    ) -> Result<Self, McpError> {
+        Self::connect_with_auth(config, None, handler_config).await
     }
 
     async fn connect_with_auth(
         config: &McpServerConfig,
         auth: Option<&MetadataMap>,
+        handler_config: McpHandlerConfig,
     ) -> Result<Self, McpError> {
-        let (notification_tx, notification_rx) = mpsc::unbounded_channel();
+        let (handler, channels) = handler_config.build_handler(None);
+        let McpClientChannels {
+            notifications: notification_rx,
+            events: events_tx,
+        } = channels;
         let (service, capabilities) = match &config.transport {
             McpTransportBinding::Stdio(binding) => {
-                connect_rmcp_stdio(config, binding, notification_tx).await?
+                connect_rmcp_stdio(config, binding, handler).await?
             }
             McpTransportBinding::StreamableHttp(binding) => {
-                connect_rmcp_streamable_http(config, binding, auth, notification_tx).await?
+                connect_rmcp_streamable_http(config, binding, auth, handler).await?
             }
         };
 
@@ -570,6 +997,8 @@ impl McpConnection {
             inner: Mutex::new(service),
             auth: Mutex::new(auth.cloned()),
             notifications: Mutex::new(notification_rx),
+            events: events_tx,
+            handler_config,
             capabilities,
         })
     }
@@ -585,11 +1014,28 @@ impl McpConnection {
     ///
     /// The connection has no [`McpServerConfig`] attached, so reconnect-on-auth
     /// is unavailable; [`resolve_auth`](Self::resolve_auth) only updates stored
-    /// credentials in this mode.
+    /// credentials in this mode. Server-pushed events from the underlying
+    /// handler are *not* forwarded to subscribers — use
+    /// [`Self::from_running_service_with_events`] paired with the broadcast
+    /// sender from [`McpClientChannels`] when you need event delivery.
     pub fn from_running_service(
         server_id: impl Into<McpServerId>,
         service: RmcpClientService,
         notifications: mpsc::UnboundedReceiver<McpServerNotification>,
+    ) -> Self {
+        let (events_tx, _) = broadcast::channel(DEFAULT_EVENTS_CAPACITY);
+        Self::from_running_service_with_events(server_id, service, notifications, events_tx)
+    }
+
+    /// Variant of [`Self::from_running_service`] that wires the broadcast
+    /// sender returned by [`McpClientHandlerBuilder::build`] / [`McpClientHandler::builder`]
+    /// so [`Self::subscribe_events`] receivers observe the same stream the
+    /// handler is publishing into.
+    pub fn from_running_service_with_events(
+        server_id: impl Into<McpServerId>,
+        service: RmcpClientService,
+        notifications: mpsc::UnboundedReceiver<McpServerNotification>,
+        events: broadcast::Sender<McpServerEvent>,
     ) -> Self {
         let capabilities = service
             .peer_info()
@@ -601,6 +1047,8 @@ impl McpConnection {
             inner: Mutex::new(service),
             auth: Mutex::new(None),
             notifications: Mutex::new(notifications),
+            events,
+            handler_config: McpHandlerConfig::default(),
             capabilities,
         }
     }
@@ -609,13 +1057,19 @@ impl McpConnection {
         let Some(config) = self.config.clone() else {
             return Ok(());
         };
-        let (notification_tx, notification_rx) = mpsc::unbounded_channel();
+        let (handler, channels) = self
+            .handler_config
+            .build_handler(Some(self.events.clone()));
+        let McpClientChannels {
+            notifications: notification_rx,
+            ..
+        } = channels;
         let (service, _capabilities) = match &config.transport {
             McpTransportBinding::Stdio(binding) => {
-                connect_rmcp_stdio(&config, binding, notification_tx).await?
+                connect_rmcp_stdio(&config, binding, handler).await?
             }
             McpTransportBinding::StreamableHttp(binding) => {
-                connect_rmcp_streamable_http(&config, binding, auth, notification_tx).await?
+                connect_rmcp_streamable_http(&config, binding, auth, handler).await?
             }
         };
         *self.notifications.lock().await = notification_rx;
@@ -631,6 +1085,95 @@ impl McpConnection {
     /// Returns the capabilities advertised by the server during `initialize`.
     pub fn capabilities(&self) -> &McpServerCapabilities {
         &self.capabilities
+    }
+
+    /// Subscribes to the per-connection [`McpServerEvent`] broadcast.
+    ///
+    /// Receivers buffer up to `events_capacity` (configured via
+    /// [`McpHandlerConfig::with_events_capacity`], defaults to
+    /// `DEFAULT_EVENTS_CAPACITY`) before slow consumers are signalled with
+    /// [`broadcast::error::RecvError::Lagged`]. Catalog `*ListChanged` events
+    /// are also delivered through the legacy [`McpServerNotification`]
+    /// receiver consumed by [`McpServerManager::refresh_changed_catalogs`].
+    pub fn subscribe_events(&self) -> broadcast::Receiver<McpServerEvent> {
+        self.events.subscribe()
+    }
+
+    /// Subscribes to `notifications/resources/updated` for the given URI.
+    ///
+    /// Updates surface as [`McpServerEvent::ResourceUpdated`] on every
+    /// receiver returned by [`Self::subscribe_events`].
+    pub async fn subscribe_resource(&self, uri: impl Into<String>) -> Result<(), McpError> {
+        let uri = uri.into();
+        let inner = self.inner.lock().await;
+        inner
+            .subscribe(rmcp_model::SubscribeRequestParams::new(uri.clone()))
+            .await
+            .map_err(|error| {
+                rmcp_operation_error(
+                    &self.server_id,
+                    "resources/subscribe",
+                    json!({ "uri": uri }),
+                    error,
+                )
+            })
+    }
+
+    /// Cancels a previous [`Self::subscribe_resource`] subscription.
+    pub async fn unsubscribe_resource(&self, uri: impl Into<String>) -> Result<(), McpError> {
+        let uri = uri.into();
+        let inner = self.inner.lock().await;
+        inner
+            .unsubscribe(rmcp_model::UnsubscribeRequestParams::new(uri.clone()))
+            .await
+            .map_err(|error| {
+                rmcp_operation_error(
+                    &self.server_id,
+                    "resources/unsubscribe",
+                    json!({ "uri": uri }),
+                    error,
+                )
+            })
+    }
+
+    /// Negotiates the minimum severity the server should emit through
+    /// `notifications/message`. Surfaced as [`McpServerEvent::Logging`].
+    pub async fn set_logging_level(&self, level: McpLoggingLevel) -> Result<(), McpError> {
+        let inner = self.inner.lock().await;
+        inner
+            .set_level(rmcp_model::SetLevelRequestParams::new(level))
+            .await
+            .map_err(|error| {
+                rmcp_operation_error(
+                    &self.server_id,
+                    "logging/setLevel",
+                    json!({ "level": format!("{level:?}") }),
+                    error,
+                )
+            })
+    }
+
+    /// Sends a `notifications/cancelled` to the server, asking it to stop
+    /// processing a previously issued request.
+    pub async fn notify_cancelled(
+        &self,
+        params: McpCancelledNotificationParam,
+    ) -> Result<(), McpError> {
+        let inner = self.inner.lock().await;
+        inner
+            .notify_cancelled(params)
+            .await
+            .map_err(rmcp_service_error)
+    }
+
+    /// Notifies the server that the client's roots list has changed; servers
+    /// may respond by re-issuing `roots/list`.
+    pub async fn notify_roots_list_changed(&self) -> Result<(), McpError> {
+        let inner = self.inner.lock().await;
+        inner
+            .notify_roots_list_changed()
+            .await
+            .map_err(rmcp_service_error)
     }
 
     /// Gracefully closes the underlying rmcp service.
@@ -874,7 +1417,7 @@ impl McpConnection {
 async fn connect_rmcp_stdio(
     config: &McpServerConfig,
     binding: &StdioTransportConfig,
-    notification_tx: mpsc::UnboundedSender<McpServerNotification>,
+    handler: McpClientHandler,
 ) -> Result<(RmcpClientService, McpServerCapabilities), McpError> {
     let transport = TokioChildProcess::new(
         tokio::process::Command::new(&binding.command).configure(|command| {
@@ -889,7 +1432,7 @@ async fn connect_rmcp_stdio(
     )
     .map_err(McpError::Io)?;
 
-    let service = McpClientHandler::new(notification_tx)
+    let service = handler
         .serve(transport)
         .await
         .map_err(|error| rmcp_initialize_error(config, error))?;
@@ -905,7 +1448,7 @@ async fn connect_rmcp_streamable_http(
     config: &McpServerConfig,
     binding: &StreamableHttpTransportConfig,
     auth: Option<&MetadataMap>,
-    notification_tx: mpsc::UnboundedSender<McpServerNotification>,
+    handler: McpClientHandler,
 ) -> Result<(RmcpClientService, McpServerCapabilities), McpError> {
     let auth_header = auth
         .and_then(bearer_token_from_metadata)
@@ -917,7 +1460,7 @@ async fn connect_rmcp_streamable_http(
     rmcp_config = rmcp_config.custom_headers(binding.headers.iter().cloned().collect());
     let transport = StreamableHttpClientTransport::from_config(rmcp_config);
 
-    let service = McpClientHandler::new(notification_tx)
+    let service = handler
         .serve(transport)
         .await
         .map_err(|error| rmcp_initialize_error(config, error))?;
@@ -1199,6 +1742,7 @@ pub struct McpServerManager {
     auth: BTreeMap<McpServerId, MetadataMap>,
     catalog_tx: broadcast::Sender<McpCatalogEvent>,
     namespace: McpToolNamespace,
+    handler_config: McpHandlerConfig,
 }
 
 impl Default for McpServerManager {
@@ -1210,6 +1754,7 @@ impl Default for McpServerManager {
             auth: BTreeMap::new(),
             catalog_tx,
             namespace: McpToolNamespace::Default,
+            handler_config: McpHandlerConfig::default(),
         }
     }
 }
@@ -1235,6 +1780,47 @@ impl McpServerManager {
     /// Returns the active tool naming strategy.
     pub fn namespace(&self) -> &McpToolNamespace {
         &self.namespace
+    }
+
+    /// Replaces the [`McpHandlerConfig`] applied to every connection this
+    /// manager opens.
+    pub fn with_handler_config(mut self, handler_config: McpHandlerConfig) -> Self {
+        self.handler_config = handler_config;
+        self
+    }
+
+    /// Sets the [`McpHandlerConfig`] in place.
+    pub fn set_handler_config(&mut self, handler_config: McpHandlerConfig) -> &mut Self {
+        self.handler_config = handler_config;
+        self
+    }
+
+    /// Returns the active [`McpHandlerConfig`].
+    pub fn handler_config(&self) -> &McpHandlerConfig {
+        &self.handler_config
+    }
+
+    /// Convenience builder that installs a sampling responder on the manager's
+    /// [`McpHandlerConfig`]. Subsequent connections will advertise the
+    /// `sampling` client capability.
+    pub fn with_sampling_responder(mut self, responder: Arc<dyn McpSamplingResponder>) -> Self {
+        self.handler_config.sampling = Some(responder);
+        self
+    }
+
+    /// Convenience builder that installs an elicitation responder.
+    pub fn with_elicitation_responder(
+        mut self,
+        responder: Arc<dyn McpElicitationResponder>,
+    ) -> Self {
+        self.handler_config.elicitation = Some(responder);
+        self
+    }
+
+    /// Convenience builder that installs a roots provider.
+    pub fn with_roots_provider(mut self, provider: Arc<dyn McpRootsProvider>) -> Self {
+        self.handler_config.roots = Some(provider);
+        self
     }
 
     /// Registers a server configuration. Returns `self` for chaining.
@@ -1278,8 +1864,14 @@ impl McpServerManager {
             .get(server_id)
             .cloned()
             .ok_or_else(|| McpError::UnknownServer(server_id.to_string()))?;
-        let connection =
-            Arc::new(McpConnection::connect_with_auth(&config, self.auth.get(server_id)).await?);
+        let connection = Arc::new(
+            McpConnection::connect_with_auth(
+                &config,
+                self.auth.get(server_id),
+                self.handler_config.clone(),
+            )
+            .await?,
+        );
         let snapshot = connection.discover().await?;
         let handle = McpServerHandle {
             config,

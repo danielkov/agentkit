@@ -3,30 +3,38 @@
 //! agentkit-side adapters end-to-end through a real rmcp client+server pair.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use agentkit_capabilities::{
-    CapabilityContext, CapabilityProvider, Invocable, InvocableOutput, InvocableRequest,
+    CapabilityContext, CapabilityProvider, InvocableOutput, InvocableRequest,
 };
 use agentkit_core::{MetadataMap, ToolOutput};
 use agentkit_mcp::{
-    McpCapabilityProvider, McpClientHandler, McpConnection, McpResourceContents,
-    McpServerCapabilities, McpServerId, McpToolAdapter, McpToolNamespace, PromptMessageContent,
+    McpCapabilityProvider, McpClientHandler, McpConnection, McpCreateElicitationRequestParams,
+    McpCreateElicitationResult, McpCreateMessageRequestParams, McpCreateMessageResult,
+    McpElicitationAction, McpElicitationResponder, McpError, McpLoggingLevel,
+    McpLoggingMessageNotificationParam, McpProgressNotificationParam,
+    McpResourceContents, McpResourceUpdatedNotificationParam, McpRoot, McpRootsProvider,
+    McpSamplingMessage, McpSamplingResponder, McpServerCapabilities, McpServerEvent, McpServerId,
+    McpToolAdapter, McpToolNamespace, PromptMessageContent,
 };
 use agentkit_tools_core::{
     PermissionChecker, PermissionDecision, PermissionRequest, Tool, ToolContext, ToolName,
     ToolRequest,
 };
+use async_trait::async_trait;
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    Annotated, CallToolResult, Content, ErrorData as McpError, GetPromptRequestParams,
+    Annotated, CallToolResult, Content, ErrorData as RmcpError, GetPromptRequestParams,
     GetPromptResult, ListPromptsResult, ListResourcesResult, PaginatedRequestParams, Prompt,
     PromptArgument, PromptMessage, PromptMessageRole, RawResource, ReadResourceRequestParams,
     ReadResourceResult, ResourceContents, ServerCapabilities, ServerInfo,
 };
-use rmcp::service::{RequestContext, RoleServer};
+use rmcp::service::{Peer, RequestContext, RoleServer};
 use rmcp::{ServerHandler, ServiceExt, schemars, tool, tool_handler, tool_router};
 use serde::Deserialize;
+use tokio::sync::oneshot;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct EchoArgs {
@@ -53,7 +61,7 @@ impl InMemoryServer {
     async fn echo(
         &self,
         Parameters(EchoArgs { text }): Parameters<EchoArgs>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<CallToolResult, RmcpError> {
         Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 }
@@ -74,7 +82,7 @@ impl ServerHandler for InMemoryServer {
         &self,
         _params: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
-    ) -> Result<ListResourcesResult, McpError> {
+    ) -> Result<ListResourcesResult, RmcpError> {
         Ok(ListResourcesResult::with_all_items(vec![Annotated::new(
             RawResource::new("memo:welcome", "welcome"),
             None,
@@ -85,7 +93,7 @@ impl ServerHandler for InMemoryServer {
         &self,
         params: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<ReadResourceResult, McpError> {
+    ) -> Result<ReadResourceResult, RmcpError> {
         if params.uri == "memo:welcome" {
             Ok(ReadResourceResult::new(vec![ResourceContents::text(
                 "hello from the in-memory MCP server",
@@ -93,7 +101,7 @@ impl ServerHandler for InMemoryServer {
             )
             .with_mime_type("text/plain")]))
         } else {
-            Err(McpError::invalid_params("unknown resource", None))
+            Err(RmcpError::invalid_params("unknown resource", None))
         }
     }
 
@@ -101,7 +109,7 @@ impl ServerHandler for InMemoryServer {
         &self,
         _params: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
-    ) -> Result<ListPromptsResult, McpError> {
+    ) -> Result<ListPromptsResult, RmcpError> {
         Ok(ListPromptsResult::with_all_items(vec![Prompt::new(
             "summarize",
             Some("Summarize the supplied text."),
@@ -117,9 +125,9 @@ impl ServerHandler for InMemoryServer {
         &self,
         params: GetPromptRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<GetPromptResult, McpError> {
+    ) -> Result<GetPromptResult, RmcpError> {
         if params.name != "summarize" {
-            return Err(McpError::invalid_params("unknown prompt", None));
+            return Err(RmcpError::invalid_params("unknown prompt", None));
         }
         let argument = params
             .arguments
@@ -137,10 +145,23 @@ impl ServerHandler for InMemoryServer {
 }
 
 async fn connect_in_memory() -> McpConnection {
+    let (connection, _peer) = connect_in_memory_with_server_peer(McpClientHandler::builder()).await;
+    connection
+}
+
+/// Variant that returns the server-side peer alongside the client connection,
+/// so a test can drive server→client requests and notifications (sampling,
+/// elicitation, logging, progress, resource updates) directly.
+async fn connect_in_memory_with_server_peer(
+    builder: agentkit_mcp::McpClientHandlerBuilder,
+) -> (McpConnection, Peer<RoleServer>) {
+    let (handler, channels) = builder.build();
     let (server_io, client_io) = tokio::io::duplex(8 * 1024);
+    let (peer_tx, peer_rx) = oneshot::channel();
     tokio::spawn(async move {
         match InMemoryServer::default().serve(server_io).await {
             Ok(running) => {
+                let _ = peer_tx.send(running.peer().clone());
                 let _ = running.waiting().await;
             }
             Err(error) => {
@@ -149,13 +170,19 @@ async fn connect_in_memory() -> McpConnection {
         }
     });
 
-    let (handler, notifications) = McpClientHandler::with_channel();
     let service = handler
         .serve(client_io)
         .await
         .expect("client init succeeds");
 
-    McpConnection::from_running_service(McpServerId::new("in-memory"), service, notifications)
+    let peer = peer_rx.await.expect("server peer arrives");
+    let connection = McpConnection::from_running_service_with_events(
+        McpServerId::new("in-memory"),
+        service,
+        channels.notifications,
+        channels.events,
+    );
+    (connection, peer)
 }
 
 struct AllowAll;
@@ -356,4 +383,273 @@ async fn none_namespace_strips_prefix() {
         &McpToolNamespace::None,
     );
     assert_eq!(adapter.spec().name.0, "echo");
+}
+
+struct EchoSampling;
+
+#[async_trait]
+impl McpSamplingResponder for EchoSampling {
+    async fn create_message(
+        &self,
+        params: McpCreateMessageRequestParams,
+    ) -> Result<McpCreateMessageResult, McpError> {
+        let last_text = params
+            .messages
+            .iter()
+            .rev()
+            .find_map(|message| match &message.content {
+                rmcp::model::SamplingContent::Single(
+                    rmcp::model::SamplingMessageContent::Text(text),
+                ) => Some(text.text.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| "(no input)".to_string());
+        Ok(McpCreateMessageResult::new(
+            McpSamplingMessage::assistant_text(last_text),
+            "test-model".into(),
+        ))
+    }
+}
+
+struct StaticRoots(Vec<McpRoot>);
+
+#[async_trait]
+impl McpRootsProvider for StaticRoots {
+    async fn list_roots(&self) -> Result<Vec<McpRoot>, McpError> {
+        Ok(self.0.clone())
+    }
+}
+
+struct AcceptingElicitation;
+
+#[async_trait]
+impl McpElicitationResponder for AcceptingElicitation {
+    async fn create_elicitation(
+        &self,
+        _params: McpCreateElicitationRequestParams,
+    ) -> Result<McpCreateElicitationResult, McpError> {
+        Ok(McpCreateElicitationResult::new(McpElicitationAction::Accept))
+    }
+}
+
+#[tokio::test]
+async fn sampling_responder_handles_create_message_request() {
+    let (_connection, peer) = connect_in_memory_with_server_peer(
+        McpClientHandler::builder().with_sampling_responder(Arc::new(EchoSampling)),
+    )
+    .await;
+
+    let mut params = McpCreateMessageRequestParams::default();
+    params.messages = vec![McpSamplingMessage::user_text("ping")];
+    params.max_tokens = 32;
+    let result = peer
+        .create_message(params)
+        .await
+        .expect("server peer create_message succeeds");
+
+    assert_eq!(result.model, "test-model");
+    assert_eq!(result.message.role, rmcp::model::Role::Assistant);
+    let text = match &result.message.content {
+        rmcp::model::SamplingContent::Single(rmcp::model::SamplingMessageContent::Text(text)) => {
+            text.text.clone()
+        }
+        other => panic!("unexpected sampling content: {other:?}"),
+    };
+    assert_eq!(text, "ping");
+}
+
+#[tokio::test]
+async fn sampling_responder_absent_returns_method_not_found() {
+    let (_connection, peer) =
+        connect_in_memory_with_server_peer(McpClientHandler::builder()).await;
+
+    let mut params = McpCreateMessageRequestParams::default();
+    params.messages = vec![McpSamplingMessage::user_text("ping")];
+    params.max_tokens = 32;
+    let outcome = peer.create_message(params).await;
+
+    let error = outcome.expect_err("missing responder rejects sampling");
+    // JSON-RPC code -32601 is METHOD_NOT_FOUND; the rmcp Display impl encodes
+    // the code numerically rather than spelling it out.
+    let message = error.to_string();
+    assert!(
+        message.contains("-32601"),
+        "expected method-not-found error (-32601), got {message}"
+    );
+}
+
+#[tokio::test]
+async fn roots_provider_supplies_list_roots_response() {
+    let roots = vec![
+        McpRoot::new("file:///workspace/a").with_name("a"),
+        McpRoot::new("file:///workspace/b"),
+    ];
+    let (_connection, peer) = connect_in_memory_with_server_peer(
+        McpClientHandler::builder().with_roots_provider(Arc::new(StaticRoots(roots.clone()))),
+    )
+    .await;
+
+    let result = peer.list_roots().await.expect("list_roots succeeds");
+    assert_eq!(result.roots.len(), 2);
+    assert_eq!(result.roots[0].uri, roots[0].uri);
+    assert_eq!(result.roots[0].name.as_deref(), Some("a"));
+    assert_eq!(result.roots[1].uri, roots[1].uri);
+}
+
+#[tokio::test]
+async fn roots_provider_default_returns_empty() {
+    let (_connection, peer) =
+        connect_in_memory_with_server_peer(McpClientHandler::builder()).await;
+    let result = peer.list_roots().await.expect("list_roots succeeds");
+    assert!(result.roots.is_empty());
+}
+
+#[tokio::test]
+async fn elicitation_responder_returns_accept() {
+    use rmcp::model::ElicitationSchema;
+    let (_connection, peer) = connect_in_memory_with_server_peer(
+        McpClientHandler::builder().with_elicitation_responder(Arc::new(AcceptingElicitation)),
+    )
+    .await;
+
+    let outcome = peer
+        .create_elicitation(McpCreateElicitationRequestParams::FormElicitationParams {
+            meta: None,
+            message: "name?".into(),
+            requested_schema: ElicitationSchema::new(Default::default()),
+        })
+        .await
+        .expect("create_elicitation succeeds");
+
+    assert_eq!(outcome.action, McpElicitationAction::Accept);
+}
+
+#[tokio::test]
+async fn progress_notification_reaches_event_subscribers() {
+    let (connection, peer) =
+        connect_in_memory_with_server_peer(McpClientHandler::builder()).await;
+    let mut events = connection.subscribe_events();
+
+    peer.notify_progress(McpProgressNotificationParam {
+        progress_token: rmcp::model::ProgressToken(rmcp::model::NumberOrString::String(
+            "tok".into(),
+        )),
+        progress: 0.5,
+        total: Some(1.0),
+        message: Some("halfway".into()),
+    })
+    .await
+    .expect("server notify_progress succeeds");
+
+    let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
+        .await
+        .expect("event arrives in time")
+        .expect("broadcast not closed");
+    match event {
+        McpServerEvent::Progress(progress) => {
+            assert_eq!(progress.progress, 0.5);
+            assert_eq!(progress.message.as_deref(), Some("halfway"));
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn logging_message_reaches_event_subscribers() {
+    let (connection, peer) =
+        connect_in_memory_with_server_peer(McpClientHandler::builder()).await;
+    let mut events = connection.subscribe_events();
+
+    peer.notify_logging_message(McpLoggingMessageNotificationParam {
+        level: McpLoggingLevel::Info,
+        logger: Some("test".into()),
+        data: serde_json::json!({"msg": "hi"}),
+    })
+    .await
+    .expect("server notify_logging_message succeeds");
+
+    let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
+        .await
+        .expect("event arrives in time")
+        .expect("broadcast not closed");
+    match event {
+        McpServerEvent::Logging(message) => {
+            assert_eq!(message.level, McpLoggingLevel::Info);
+            assert_eq!(message.logger.as_deref(), Some("test"));
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn resource_updated_notification_reaches_event_subscribers() {
+    let (connection, peer) =
+        connect_in_memory_with_server_peer(McpClientHandler::builder()).await;
+    let mut events = connection.subscribe_events();
+
+    peer.notify_resource_updated(McpResourceUpdatedNotificationParam {
+        uri: "memo:welcome".into(),
+    })
+    .await
+    .expect("server notify_resource_updated succeeds");
+
+    let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
+        .await
+        .expect("event arrives in time")
+        .expect("broadcast not closed");
+    match event {
+        McpServerEvent::ResourceUpdated(updated) => {
+            assert_eq!(updated.uri, "memo:welcome");
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn list_changed_notifications_emit_events() {
+    let (connection, peer) =
+        connect_in_memory_with_server_peer(McpClientHandler::builder()).await;
+    let mut events = connection.subscribe_events();
+
+    peer.notify_tool_list_changed()
+        .await
+        .expect("server notify_tool_list_changed succeeds");
+    peer.notify_resource_list_changed()
+        .await
+        .expect("server notify_resource_list_changed succeeds");
+    peer.notify_prompt_list_changed()
+        .await
+        .expect("server notify_prompt_list_changed succeeds");
+
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("event arrives in time")
+            .expect("broadcast not closed");
+        seen.push(event);
+    }
+
+    assert!(seen.iter().any(|event| matches!(event, McpServerEvent::ToolListChanged)));
+    assert!(seen.iter().any(|event| matches!(event, McpServerEvent::ResourceListChanged)));
+    assert!(seen.iter().any(|event| matches!(event, McpServerEvent::PromptListChanged)));
+}
+
+#[tokio::test]
+async fn handler_advertises_responder_capabilities_during_initialize() {
+    let (connection, _peer) = connect_in_memory_with_server_peer(
+        McpClientHandler::builder()
+            .with_sampling_responder(Arc::new(EchoSampling))
+            .with_elicitation_responder(Arc::new(AcceptingElicitation))
+            .with_roots_provider(Arc::new(StaticRoots(Vec::new()))),
+    )
+    .await;
+
+    // Server peer info is only available on the server side; capabilities on the
+    // connection reflect what the *server* advertised. We assert the wiring
+    // doesn't break the handshake — discover still succeeds — and the events
+    // channel is live.
+    let snapshot = connection.discover().await.expect("discover succeeds");
+    assert_eq!(snapshot.tools.len(), 1);
+    let _events = connection.subscribe_events();
 }
