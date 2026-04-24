@@ -510,6 +510,45 @@ pub trait LoopObserver: Send {
     fn handle_event(&mut self, event: AgentEvent);
 }
 
+/// Receives full [`Item`]s as they are appended to the driver's transcript.
+///
+/// While [`LoopObserver`] surfaces operational events (deltas, tool calls,
+/// lifecycle, telemetry), it can't be reconstructed back into a faithful
+/// transcript on its own — content deltas span partial parts and don't
+/// carry their parent-Item identity, and historically tool results were
+/// pushed into the transcript with no observer event at all. A
+/// `TranscriptObserver` is the loss-free counterpart: it fires once per
+/// [`Item`] appended, with the full Item shape ready for persistence,
+/// replication, or audit.
+///
+/// Observers are called *synchronously* from inside the driver, in the
+/// same order items land in the transcript. Compaction-driven transcript
+/// rewrites do **not** fire `on_item_appended` — those are signaled by
+/// [`AgentEvent::CompactionFinished`] instead.
+///
+/// Register via [`AgentBuilder::transcript_observer`]; multiple observers
+/// may be registered and are called in registration order.
+///
+/// # Example
+///
+/// ```rust
+/// use agentkit_core::Item;
+/// use agentkit_loop::TranscriptObserver;
+///
+/// struct CountingObserver { items: usize }
+///
+/// impl TranscriptObserver for CountingObserver {
+///     fn on_item_appended(&mut self, _item: &Item) {
+///         self.items += 1;
+///     }
+/// }
+/// ```
+pub trait TranscriptObserver: Send {
+    /// Called synchronously every time an [`Item`] is appended to the
+    /// driver's transcript, in transcript order.
+    fn on_item_appended(&mut self, item: &Item);
+}
+
 /// Lifecycle and streaming events emitted by the [`LoopDriver`].
 ///
 /// Observers (see [`LoopObserver`]) receive these events in the order they
@@ -532,6 +571,18 @@ pub enum AgentEvent {
     ContentDelta(Delta),
     /// The model has requested a tool call.
     ToolCallRequested(ToolCallPart),
+    /// A tool call's result has landed in the transcript.
+    ///
+    /// Fires once per [`Part::ToolResult`] that's appended, including the
+    /// synthetic placeholder that's pushed when a tool is detached to the
+    /// background — the real result fires a second event with the same
+    /// [`ToolResultPart::call_id`] once the background task completes.
+    /// Cancellation/denial paths (auth cancelled, approval denied) also
+    /// emit this with `is_error = true`.
+    ///
+    /// Correlate with the matching [`AgentEvent::ToolCallRequested`] via
+    /// `call_id`.
+    ToolResultReceived(ToolResultPart),
     /// A tool call requires explicit user approval before execution.
     ApprovalRequired(ApprovalRequest),
     /// A tool call requires authentication before execution.
@@ -966,6 +1017,7 @@ where
     cancellation: Option<CancellationHandle>,
     compaction: Option<CompactionConfig>,
     observers: Vec<Box<dyn LoopObserver>>,
+    transcript_observers: Vec<Box<dyn TranscriptObserver>>,
 }
 
 impl<M> Agent<M>
@@ -1002,6 +1054,7 @@ where
             cancellation: self.cancellation,
             compaction: self.compaction,
             observers: self.observers,
+            transcript_observers: self.transcript_observers,
             transcript: Vec::new(),
             pending_input: Vec::new(),
             pending_approvals: BTreeMap::new(),
@@ -1033,6 +1086,7 @@ where
     cancellation: Option<CancellationHandle>,
     compaction: Option<CompactionConfig>,
     observers: Vec<Box<dyn LoopObserver>>,
+    transcript_observers: Vec<Box<dyn TranscriptObserver>>,
 }
 
 impl<M> Default for AgentBuilder<M>
@@ -1049,6 +1103,7 @@ where
             cancellation: None,
             compaction: None,
             observers: Vec::new(),
+            transcript_observers: Vec::new(),
         }
     }
 }
@@ -1115,6 +1170,22 @@ where
         self
     }
 
+    /// Register a [`TranscriptObserver`] that receives an [`Item`] every
+    /// time one is appended to the transcript.
+    ///
+    /// Multiple observers may be registered; they are called in order.
+    /// Use this when you need a loss-free view of the transcript (e.g.
+    /// for persistence or replication) — [`LoopObserver`] alone is
+    /// insufficient because it doesn't expose item boundaries for model
+    /// output and historically did not surface tool results at all.
+    pub fn transcript_observer(
+        mut self,
+        observer: impl TranscriptObserver + 'static,
+    ) -> Self {
+        self.transcript_observers.push(Box::new(observer));
+        self
+    }
+
     /// Consume the builder and produce an [`Agent`].
     ///
     /// # Errors
@@ -1135,6 +1206,7 @@ where
             cancellation: self.cancellation,
             compaction: self.compaction,
             observers: self.observers,
+            transcript_observers: self.transcript_observers,
         })
     }
 }
@@ -1184,6 +1256,7 @@ where
     cancellation: Option<CancellationHandle>,
     compaction: Option<CompactionConfig>,
     observers: Vec<Box<dyn LoopObserver>>,
+    transcript_observers: Vec<Box<dyn TranscriptObserver>>,
     transcript: Vec<Item>,
     pending_input: Vec<Item>,
     pending_approvals: BTreeMap<ToolCallId, PendingApprovalToolCall>,
@@ -1349,7 +1422,7 @@ where
     ) -> Option<LoopStep> {
         match resolution {
             TaskResolution::Item(item) => {
-                self.transcript.push(item);
+                self.append_tool_result_item(item);
                 None
             }
             TaskResolution::Approval(task) => {
@@ -1370,7 +1443,7 @@ where
         while let Some(resolution) = resolutions.pop_front() {
             match resolution {
                 TaskResolution::Item(item) => {
-                    self.transcript.push(item);
+                    self.append_tool_result_item(item);
                     saw_items = true;
                 }
                 TaskResolution::Approval(task) => {
@@ -1495,7 +1568,7 @@ where
                                 if let Some(active) = self.active_tool_round.as_mut() {
                                     active.foreground_progressed = true;
                                 }
-                                self.transcript.push(item);
+                                self.append_tool_result_item(item);
                             }
                             TaskResolution::Approval(task) => {
                                 self.enqueue_pending_approval(&turn_id, task);
@@ -1530,7 +1603,7 @@ where
                             if let Some(active) = self.active_tool_round.as_mut() {
                                 active.foreground_progressed = true;
                             }
-                            self.transcript.push(item);
+                            self.append_tool_result_item(item);
                         }
                         TaskResolution::Approval(task) => {
                             self.enqueue_pending_approval(&turn_id, task);
@@ -1544,7 +1617,7 @@ where
                     // The task was promoted to background. Push a synthetic
                     // tool result so the model knows the call is still
                     // running and can continue its turn.
-                    self.transcript.push(Item {
+                    self.append_tool_result_item(Item {
                         id: None,
                         kind: ItemKind::Tool,
                         parts: vec![Part::ToolResult(ToolResultPart {
@@ -1713,7 +1786,7 @@ where
         let result = finished_result.ok_or_else(|| {
             LoopError::Provider("model turn ended without a Finished event".into())
         })?;
-        self.transcript.extend(result.output_items.clone());
+        self.extend_transcript(result.output_items.clone());
 
         if saw_tool_call {
             let pending_calls = extract_tool_calls(&result.output_items)
@@ -1789,7 +1862,7 @@ where
                 TaskStartOutcome::Pending { .. } => {}
             },
             AuthResolution::Cancelled { .. } => {
-                self.transcript.push(Item {
+                self.append_tool_result_item(Item {
                     id: None,
                     kind: ItemKind::Tool,
                     parts: vec![Part::ToolResult(ToolResultPart {
@@ -1848,7 +1921,7 @@ where
                 TaskStartOutcome::Pending { .. } => {}
             },
             ApprovalDecision::Deny { reason } => {
-                self.transcript.push(Item {
+                self.append_tool_result_item(Item {
                     id: None,
                     kind: ItemKind::Tool,
                     parts: vec![Part::ToolResult(ToolResultPart {
@@ -1882,7 +1955,7 @@ where
         turn_id: agentkit_core::TurnId,
         items: Vec<Item>,
     ) -> Result<LoopStep, LoopError> {
-        self.transcript.extend(items.clone());
+        self.extend_transcript(items.clone());
         let turn_result = TurnResult {
             turn_id,
             finish_reason: FinishReason::Cancelled,
@@ -2085,7 +2158,8 @@ where
         // continuation turn; background task results drained just above are
         // already in the transcript.
         if let Some(turn_id) = self.pending_round_resume.take() {
-            self.transcript.append(&mut self.pending_input);
+            let drained: Vec<Item> = std::mem::take(&mut self.pending_input);
+            self.extend_transcript(drained);
             return self.drive_turn(turn_id, false).await;
         }
 
@@ -2100,13 +2174,44 @@ where
 
         let turn_id = agentkit_core::TurnId::new(format!("turn-{}", self.next_turn_index));
         self.next_turn_index += 1;
-        self.transcript.append(&mut self.pending_input);
+        let drained: Vec<Item> = std::mem::take(&mut self.pending_input);
+        self.extend_transcript(drained);
         self.drive_turn(turn_id, true).await
     }
 
     fn emit(&mut self, event: AgentEvent) {
         for observer in &mut self.observers {
             observer.handle_event(event.clone());
+        }
+    }
+
+    /// Append a single [`Item`] to the transcript and notify all
+    /// registered [`TranscriptObserver`]s. The single mutation point —
+    /// every push to `self.transcript` should funnel through here so
+    /// observers see exactly what landed in the transcript.
+    fn append_item(&mut self, item: Item) {
+        for observer in &mut self.transcript_observers {
+            observer.on_item_appended(&item);
+        }
+        self.transcript.push(item);
+    }
+
+    /// Append a tool-result Item: emit one [`AgentEvent::ToolResultReceived`]
+    /// per [`Part::ToolResult`] inside the Item, then funnel through
+    /// [`Self::append_item`].
+    fn append_tool_result_item(&mut self, item: Item) {
+        for part in &item.parts {
+            if let Part::ToolResult(result) = part {
+                self.emit(AgentEvent::ToolResultReceived(result.clone()));
+            }
+        }
+        self.append_item(item);
+    }
+
+    /// Append several Items in order through [`Self::append_item`].
+    fn extend_transcript(&mut self, items: impl IntoIterator<Item = Item>) {
+        for item in items {
+            self.append_item(item);
         }
     }
 }
@@ -3763,6 +3868,96 @@ mod tests {
             "injected user message should be in transcript, got: {:?}",
             snapshot.transcript
         );
+    }
+
+    struct RecordingTranscriptObserver {
+        items: StdArc<StdMutex<Vec<Item>>>,
+    }
+
+    impl TranscriptObserver for RecordingTranscriptObserver {
+        fn on_item_appended(&mut self, item: &Item) {
+            self.items.lock().unwrap().push(item.clone());
+        }
+    }
+
+    #[tokio::test]
+    async fn observers_see_full_tool_round() {
+        // A turn with one tool call exercises every interesting path:
+        //   user input drained -> model output_items (assistant w/ tool call)
+        //   -> tool result Item -> next model output_items (assistant text)
+        // The LoopObserver should see exactly one ToolResultReceived; the
+        // TranscriptObserver should see all four items in transcript order.
+        let events = StdArc::new(StdMutex::new(Vec::<AgentEvent>::new()));
+        let items = StdArc::new(StdMutex::new(Vec::<Item>::new()));
+        let agent = Agent::builder()
+            .model(FakeAdapter)
+            .tools(ToolRegistry::new().with(EchoTool::default()))
+            .permissions(AllowAllPermissions)
+            .observer(RecordingObserver {
+                events: events.clone(),
+            })
+            .transcript_observer(RecordingTranscriptObserver {
+                items: items.clone(),
+            })
+            .build()
+            .unwrap();
+
+        let mut driver = agent
+            .start(SessionConfig {
+                session_id: SessionId::new("observer-session"),
+                metadata: MetadataMap::new(),
+                cache: None,
+            })
+            .await
+            .unwrap();
+
+        driver
+            .submit_input(vec![Item {
+                id: None,
+                kind: ItemKind::User,
+                parts: vec![Part::Text(TextPart {
+                    text: "ping".into(),
+                    metadata: MetadataMap::new(),
+                })],
+                metadata: MetadataMap::new(),
+            }])
+            .unwrap();
+
+        let result = run_until_finished(&mut driver).await;
+        assert!(matches!(result, LoopStep::Finished(_)), "got {result:?}");
+
+        // LoopObserver: exactly one ToolResultReceived, with the echo
+        // tool's output, correlating back to the model's tool call.
+        let events = events.lock().unwrap().clone();
+        let tool_call_id = events.iter().find_map(|e| match e {
+            AgentEvent::ToolCallRequested(c) => Some(c.id.clone()),
+            _ => None,
+        });
+        let tool_results: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::ToolResultReceived(r) => Some(r.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tool_results.len(), 1, "events: {events:?}");
+        assert_eq!(Some(tool_results[0].call_id.clone()), tool_call_id);
+        assert!(!tool_results[0].is_error);
+
+        // TranscriptObserver: every transcript mutation surfaces.
+        // Expected order: User("ping"), Assistant(tool call), Tool(result),
+        // Assistant("tool said: pong").
+        let items = items.lock().unwrap().clone();
+        assert_eq!(items.len(), 4, "items: {items:?}");
+        assert_eq!(items[0].kind, ItemKind::User);
+        assert_eq!(items[1].kind, ItemKind::Assistant);
+        assert!(items[1].parts.iter().any(|p| matches!(p, Part::ToolCall(_))));
+        assert_eq!(items[2].kind, ItemKind::Tool);
+        assert!(items[2]
+            .parts
+            .iter()
+            .any(|p| matches!(p, Part::ToolResult(_))));
+        assert_eq!(items[3].kind, ItemKind::Assistant);
     }
 
     #[test]
