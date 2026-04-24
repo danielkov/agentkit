@@ -5,12 +5,11 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use agentkit_core::{DataRef, Item, Part};
 use agentkit_mcp::{
     McpConnection, McpServerConfig, McpTransportBinding, StreamableHttpTransportConfig,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::json;
 use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
 use tokio::time::sleep;
@@ -142,33 +141,36 @@ async fn probe_server(
 
     let snapshot = connection.discover().await?;
     let tool_output = decode_tool_text(
-        &connection
+        connection
             .call_tool(FIXTURE_TOOL_NAME, json!({ "text": PROBE_TEXT }))
             .await?,
     )?;
-    let resource_text = match connection.read_resource(FIXTURE_RESOURCE_URI).await?.data {
-        DataRef::InlineText(text) => text,
-        other => return Err(format!("expected inline text resource, saw {other:?}").into()),
-    };
+    let resource_text = decode_resource_text(
+        connection.read_resource(FIXTURE_RESOURCE_URI).await?,
+    )?;
     let prompt = connection
         .get_prompt(FIXTURE_PROMPT_NAME, json!({ "name": "Ada" }))
         .await?;
-    let prompt_text = collect_prompt_text(&prompt.items)?;
+    let prompt_text = collect_prompt_text(&prompt)?;
     connection.close().await?;
 
     Ok(ProbeResult {
         implementation: implementation.as_str().into(),
         url: url.into(),
-        tool_names: snapshot.tools.into_iter().map(|tool| tool.name).collect(),
+        tool_names: snapshot
+            .tools
+            .into_iter()
+            .map(|tool| tool.name.into_owned())
+            .collect(),
         resource_ids: snapshot
             .resources
             .into_iter()
-            .map(|resource| resource.id)
+            .map(|resource| resource.uri.clone())
             .collect(),
         prompt_ids: snapshot
             .prompts
             .into_iter()
-            .map(|prompt| prompt.id)
+            .map(|prompt| prompt.name)
             .collect(),
         tool_output,
         resource_text,
@@ -176,33 +178,40 @@ async fn probe_server(
     })
 }
 
-fn decode_tool_text(result: &Value) -> Result<String, Box<dyn Error>> {
-    result
-        .get("content")
-        .and_then(Value::as_array)
-        .and_then(|content| content.first())
-        .and_then(|content| content.get("text"))
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .ok_or_else(|| format!("tool result did not contain text content: {result}").into())
-}
-
-fn collect_prompt_text(items: &[Item]) -> Result<String, Box<dyn Error>> {
-    let mut text_parts = Vec::new();
-    for item in items {
-        for part in &item.parts {
-            match part {
-                Part::Text(text) => text_parts.push(text.text.clone()),
-                Part::Structured(value) => text_parts.push(value.value.to_string()),
-                _ => {}
-            }
+fn decode_tool_text(result: agentkit_mcp::CallToolResult) -> Result<String, Box<dyn Error>> {
+    let mut chunks = Vec::new();
+    for content in result.content {
+        if let Some(text) = content.raw.as_text() {
+            chunks.push(text.text.clone());
         }
     }
+    if chunks.is_empty() {
+        return Err("tool result did not contain text content".into());
+    }
+    Ok(chunks.join("\n"))
+}
 
+fn decode_resource_text(
+    result: agentkit_mcp::ReadResourceResult,
+) -> Result<String, Box<dyn Error>> {
+    for content in result.contents {
+        if let agentkit_mcp::McpResourceContents::TextResourceContents { text, .. } = content {
+            return Ok(text);
+        }
+    }
+    Err("expected inline text resource, saw none".into())
+}
+
+fn collect_prompt_text(prompt: &agentkit_mcp::GetPromptResult) -> Result<String, Box<dyn Error>> {
+    let mut text_parts = Vec::new();
+    for message in &prompt.messages {
+        if let agentkit_mcp::PromptMessageContent::Text { text } = &message.content {
+            text_parts.push(text.clone());
+        }
+    }
     if text_parts.is_empty() {
         return Err("prompt result did not contain any textual content".into());
     }
-
     Ok(text_parts.join("\n"))
 }
 

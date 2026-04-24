@@ -5,10 +5,10 @@
 use std::sync::Arc;
 
 use agentkit_capabilities::{CapabilityContext, Invocable, InvocableOutput, InvocableRequest};
-use agentkit_core::{DataRef, MetadataMap, ToolOutput};
+use agentkit_core::{MetadataMap, ToolOutput};
 use agentkit_mcp::{
-    McpClientHandler, McpConnection, McpInvocable, McpServerCapabilities, McpServerId,
-    McpToolAdapter,
+    McpClientHandler, McpConnection, McpInvocable, McpResourceContents, McpServerCapabilities,
+    McpServerId, McpToolAdapter, PromptMessageContent,
 };
 use agentkit_tools_core::{
     PermissionChecker, PermissionDecision, PermissionRequest, Tool, ToolContext, ToolName,
@@ -188,60 +188,69 @@ async fn discovery_returns_advertised_tools_resources_prompts() {
     let snapshot = connection.discover().await.expect("discover succeeds");
 
     assert_eq!(snapshot.tools.len(), 1);
-    assert_eq!(snapshot.tools[0].name, "echo");
+    assert_eq!(snapshot.tools[0].name.as_ref(), "echo");
 
     assert_eq!(snapshot.resources.len(), 1);
-    assert_eq!(snapshot.resources[0].id, "memo:welcome");
+    assert_eq!(snapshot.resources[0].uri, "memo:welcome");
     assert_eq!(snapshot.resources[0].name, "welcome");
 
     assert_eq!(snapshot.prompts.len(), 1);
-    assert_eq!(snapshot.prompts[0].id, "summarize");
+    assert_eq!(snapshot.prompts[0].name, "summarize");
+    let arguments = snapshot.prompts[0].arguments.as_ref().unwrap();
+    assert_eq!(arguments[0].name, "text");
+    assert_eq!(arguments[0].required, Some(true));
+    assert_eq!(arguments[0].description.as_deref(), Some("Text to summarize."));
 }
 
 #[tokio::test]
-async fn call_tool_returns_text_payload() {
+async fn call_tool_returns_typed_result_with_content_blocks() {
     let connection = connect_in_memory().await;
-    let value = connection
+    let result = connection
         .call_tool("echo", serde_json::json!({ "text": "hi" }))
         .await
         .expect("tool call succeeds");
-    let content_text = value
-        .get("content")
-        .and_then(|content| content.as_array())
-        .and_then(|content| content.first())
-        .and_then(|first| first.get("text"))
-        .and_then(|text| text.as_str())
-        .unwrap_or_default();
-    assert_eq!(content_text, "hi");
+    assert_eq!(result.is_error, Some(false));
+    assert_eq!(result.content.len(), 1);
+    let raw = &result.content[0].raw;
+    let text = raw
+        .as_text()
+        .map(|text| text.text.clone())
+        .expect("first content block is text");
+    assert_eq!(text, "hi");
 }
 
 #[tokio::test]
-async fn read_resource_returns_inline_text() {
+async fn read_resource_returns_typed_contents() {
     let connection = connect_in_memory().await;
-    let resource = connection
+    let result = connection
         .read_resource("memo:welcome")
         .await
         .expect("resource read succeeds");
-    match resource.data {
-        DataRef::InlineText(text) => {
+    assert_eq!(result.contents.len(), 1);
+    match &result.contents[0] {
+        McpResourceContents::TextResourceContents {
+            text, mime_type, ..
+        } => {
             assert_eq!(text, "hello from the in-memory MCP server");
+            assert_eq!(mime_type.as_deref(), Some("text/plain"));
         }
-        other => panic!("unexpected data ref: {other:?}"),
+        other => panic!("unexpected resource contents: {other:?}"),
     }
 }
 
 #[tokio::test]
-async fn get_prompt_renders_user_message() {
+async fn get_prompt_returns_typed_messages() {
     let connection = connect_in_memory().await;
     let prompt = connection
         .get_prompt("summarize", serde_json::json!({ "text": "essay body" }))
         .await
         .expect("prompt fetch succeeds");
-    assert_eq!(prompt.items.len(), 1);
-    let Some(agentkit_core::Part::Text(text_part)) = prompt.items[0].parts.first() else {
-        panic!("expected a text prompt message");
+    assert_eq!(prompt.messages.len(), 1);
+    let message = &prompt.messages[0];
+    let PromptMessageContent::Text { text } = &message.content else {
+        panic!("expected text content, saw {:?}", message.content);
     };
-    assert!(text_part.text.contains("essay body"));
+    assert!(text.contains("essay body"));
 }
 
 #[tokio::test]

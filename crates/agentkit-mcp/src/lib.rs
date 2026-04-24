@@ -24,7 +24,8 @@ use agentkit_capabilities::{
     ResourceProvider,
 };
 use agentkit_core::{
-    DataRef, Item, ItemKind, MetadataMap, Part, TextPart, ToolOutput, ToolResultPart,
+    DataRef, Item, ItemKind, MediaPart, MetadataMap, Modality, Part, TextPart, ToolOutput,
+    ToolResultPart,
 };
 use agentkit_tools_core::{
     AuthOperation, AuthRequest, AuthResolution, Tool, ToolAnnotations, ToolCatalogEvent,
@@ -43,6 +44,26 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::sync::{Mutex, broadcast, mpsc};
+
+/// Re-exports of the rmcp wire-protocol types this crate now surfaces directly
+/// instead of wrapping. Pull these in to pattern-match on tool annotations,
+/// content blocks, structured tool output, embedded resources, etc.
+pub use rmcp::model::{
+    Annotations as McpAnnotations, AudioContent, CallToolResult, Content, EmbeddedResource,
+    GetPromptResult, ImageContent, Implementation as McpImplementation, Prompt as McpPrompt,
+    PromptArgument, PromptMessage, PromptMessageContent, PromptMessageRole, RawAudioContent,
+    RawContent, RawEmbeddedResource, RawImageContent, RawResource as McpRawResource,
+    RawTextContent, ReadResourceResult, Resource as McpResource,
+    ResourceContents as McpResourceContents, TextContent, Tool as McpTool,
+    ToolAnnotations as McpToolAnnotations,
+};
+
+/// Backwards-compatible alias — descriptors are now the rmcp wire types.
+pub type McpToolDescriptor = McpTool;
+/// Backwards-compatible alias — descriptors are now the rmcp wire types.
+pub type McpResourceDescriptor = McpResource;
+/// Backwards-compatible alias — descriptors are now the rmcp wire types.
+pub type McpPromptDescriptor = McpPrompt;
 
 /// Unique identifier for a registered MCP server.
 ///
@@ -210,60 +231,24 @@ impl McpServerConfig {
     }
 }
 
-/// Descriptor for a tool advertised by an MCP server.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct McpToolDescriptor {
-    /// The tool name as reported by the MCP server.
-    pub name: String,
-    /// Optional human-readable description of the tool.
-    pub description: Option<String>,
-    /// JSON Schema describing the tool's input parameters.
-    pub input_schema: Value,
-    /// Arbitrary metadata attached to this descriptor.
-    pub metadata: MetadataMap,
-}
-
-/// Descriptor for a resource advertised by an MCP server.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct McpResourceDescriptor {
-    /// The resource URI (e.g. `"file:///tmp/example.txt"`).
-    pub id: String,
-    /// Human-readable name of the resource.
-    pub name: String,
-    /// Optional description of the resource.
-    pub description: Option<String>,
-    /// Optional MIME type (e.g. `"text/plain"`, `"application/json"`).
-    pub mime_type: Option<String>,
-    /// Arbitrary metadata attached to this descriptor.
-    pub metadata: MetadataMap,
-}
-
-/// Descriptor for a prompt template advertised by an MCP server.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct McpPromptDescriptor {
-    /// Unique identifier for the prompt (typically the same as `name`).
-    pub id: String,
-    /// Human-readable name of the prompt.
-    pub name: String,
-    /// Optional description of what the prompt does.
-    pub description: Option<String>,
-    /// JSON Schema describing the prompt's input arguments.
-    pub input_schema: Value,
-    /// Arbitrary metadata attached to this descriptor.
-    pub metadata: MetadataMap,
-}
-
 /// A snapshot of all capabilities discovered from a single MCP server.
+///
+/// Tools, resources, and prompts are stored as raw rmcp wire types
+/// ([`McpTool`], [`McpResource`], [`McpPrompt`]) so that consumers see the
+/// full typed surface — `Tool::annotations`, `Tool::output_schema`,
+/// `Tool::execution`, `Tool::icons`; `Resource::title` / `mime_type` /
+/// `size`; `Prompt::arguments` (with the typed `required` flag and per-arg
+/// `description`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct McpDiscoverySnapshot {
     /// The server this snapshot was taken from.
     pub server_id: McpServerId,
     /// Tools advertised by the server.
-    pub tools: Vec<McpToolDescriptor>,
+    pub tools: Vec<McpTool>,
     /// Resources advertised by the server.
-    pub resources: Vec<McpResourceDescriptor>,
+    pub resources: Vec<McpResource>,
     /// Prompts advertised by the server.
-    pub prompts: Vec<McpPromptDescriptor>,
+    pub prompts: Vec<McpPrompt>,
     /// Arbitrary metadata attached to this snapshot.
     pub metadata: MetadataMap,
 }
@@ -499,12 +484,12 @@ pub struct McpConnection {
 pub enum McpOperationResult {
     /// The server was successfully (re)connected; contains the discovery snapshot.
     Connected(McpDiscoverySnapshot),
-    /// A tool call completed; contains the raw JSON result.
-    Tool(Value),
+    /// A tool call completed; contains the typed rmcp [`CallToolResult`].
+    Tool(CallToolResult),
     /// A resource was read successfully.
-    Resource(ResourceContents),
+    Resource(ReadResourceResult),
     /// A prompt was retrieved successfully.
-    Prompt(PromptContents),
+    Prompt(GetPromptResult),
 }
 
 impl McpConnection {
@@ -669,66 +654,57 @@ impl McpConnection {
     }
 
     /// Lists all tools advertised by the connected MCP server.
-    pub async fn list_tools(&self) -> Result<Vec<McpToolDescriptor>, McpError> {
+    pub async fn list_tools(&self) -> Result<Vec<McpTool>, McpError> {
         let inner = self.inner.lock().await;
-        inner
-            .list_all_tools()
-            .await
-            .map_err(rmcp_service_error)
-            .and_then(|tools| {
-                tools
-                    .into_iter()
-                    .map(rmcp_tool_descriptor)
-                    .collect::<Result<Vec<_>, _>>()
-            })
+        inner.list_all_tools().await.map_err(rmcp_service_error)
     }
 
     /// Lists all resources advertised by the connected MCP server.
-    pub async fn list_resources(&self) -> Result<Vec<McpResourceDescriptor>, McpError> {
+    pub async fn list_resources(&self) -> Result<Vec<McpResource>, McpError> {
         let inner = self.inner.lock().await;
-        inner
-            .list_all_resources()
-            .await
-            .map_err(rmcp_service_error)
-            .map(|resources| {
-                resources
-                    .into_iter()
-                    .map(rmcp_resource_descriptor)
-                    .collect()
-            })
+        inner.list_all_resources().await.map_err(rmcp_service_error)
     }
 
     /// Lists all prompts advertised by the connected MCP server.
-    pub async fn list_prompts(&self) -> Result<Vec<McpPromptDescriptor>, McpError> {
+    pub async fn list_prompts(&self) -> Result<Vec<McpPrompt>, McpError> {
         let inner = self.inner.lock().await;
-        inner
-            .list_all_prompts()
-            .await
-            .map_err(rmcp_service_error)
-            .map(|prompts| prompts.into_iter().map(rmcp_prompt_descriptor).collect())
+        inner.list_all_prompts().await.map_err(rmcp_service_error)
     }
 
-    /// Invokes a tool on the MCP server and returns the raw JSON result.
-    pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, McpError> {
+    /// Invokes a tool on the MCP server.
+    ///
+    /// Returns the typed [`CallToolResult`] — the [`Vec<Content>`] block list,
+    /// the optional `structured_content` field, and the `is_error` flag are
+    /// all preserved. Adapters convert this into agentkit
+    /// [`ToolOutput`]/[`InvocableOutput`] at the boundary.
+    pub async fn call_tool(
+        &self,
+        name: &str,
+        arguments: Value,
+    ) -> Result<CallToolResult, McpError> {
         let inner = self.inner.lock().await;
         let mut params = rmcp_model::CallToolRequestParams::new(name.to_string());
         if !arguments.is_null() {
             params =
                 params.with_arguments(value_to_json_object(arguments, "tools/call arguments")?);
         }
-        let result = inner.call_tool(params).await.map_err(|error| {
+        inner.call_tool(params).await.map_err(|error| {
             rmcp_operation_error(
                 &self.server_id,
                 "tools/call",
                 json!({ "name": name }),
                 error,
             )
-        })?;
-        serde_json::to_value(result).map_err(McpError::Serialize)
+        })
     }
 
     /// Reads a resource from the MCP server by URI.
-    pub async fn read_resource(&self, uri: &str) -> Result<ResourceContents, McpError> {
+    ///
+    /// Returns the typed [`ReadResourceResult`] — the full
+    /// [`Vec<McpResourceContents>`] is preserved (text vs blob, mime types,
+    /// metadata). Use [`McpResourceHandle`] for the agentkit
+    /// [`ResourceProvider`] view that collapses to a single inline `DataRef`.
+    pub async fn read_resource(&self, uri: &str) -> Result<ReadResourceResult, McpError> {
         let inner = self.inner.lock().await;
         inner
             .read_resource(rmcp_model::ReadResourceRequestParams::new(uri))
@@ -741,33 +717,34 @@ impl McpConnection {
                     error,
                 )
             })
-            .and_then(rmcp_resource_contents)
     }
 
-    /// Retrieves a prompt from the MCP server, rendering it with the given arguments.
+    /// Retrieves a prompt from the MCP server, rendering it with the given
+    /// arguments.
+    ///
+    /// Returns the typed [`GetPromptResult`] — message role and content
+    /// blocks (text/image/audio/embedded resource) are preserved. Use
+    /// [`McpPromptHandle`] for the collapsed agentkit [`PromptProvider`]
+    /// view.
     pub async fn get_prompt(
         &self,
         name: &str,
         arguments: Value,
-    ) -> Result<PromptContents, McpError> {
+    ) -> Result<GetPromptResult, McpError> {
         let inner = self.inner.lock().await;
         let mut params = rmcp_model::GetPromptRequestParams::new(name);
         if !arguments.is_null() {
             params =
                 params.with_arguments(value_to_json_object(arguments, "prompts/get arguments")?);
         }
-        inner
-            .get_prompt(params)
-            .await
-            .map_err(|error| {
-                rmcp_operation_error(
-                    &self.server_id,
-                    "prompts/get",
-                    json!({ "name": name }),
-                    error,
-                )
-            })
-            .and_then(rmcp_prompt_contents)
+        inner.get_prompt(params).await.map_err(|error| {
+            rmcp_operation_error(
+                &self.server_id,
+                "prompts/get",
+                json!({ "name": name }),
+                error,
+            )
+        })
     }
 
     /// Replays an MCP operation that previously failed with an auth challenge.
@@ -904,30 +881,18 @@ async fn connect_rmcp_streamable_http(
 /// Adapter exposing an MCP tool as an [`Invocable`] for the capabilities system.
 pub struct McpInvocable {
     connection: Arc<McpConnection>,
-    descriptor: McpToolDescriptor,
+    tool_name: String,
     spec: InvocableSpec,
 }
 
 impl McpInvocable {
     /// Creates a new invocable adapter for the given MCP tool.
-    pub fn new(connection: Arc<McpConnection>, descriptor: McpToolDescriptor) -> Self {
-        let spec = InvocableSpec {
-            name: CapabilityName::new(format!(
-                "mcp_{}_{}",
-                connection.server_id(),
-                descriptor.name
-            )),
-            description: descriptor
-                .description
-                .clone()
-                .unwrap_or_else(|| descriptor.name.clone()),
-            input_schema: descriptor.input_schema.clone(),
-            metadata: descriptor.metadata.clone(),
-        };
-
+    pub fn new(connection: Arc<McpConnection>, tool: McpTool) -> Self {
+        let server_id = connection.server_id().clone();
+        let spec = invocable_spec_from_tool(&server_id, &tool);
         Self {
             connection,
-            descriptor,
+            tool_name: tool.name.into_owned(),
             spec,
         }
     }
@@ -946,7 +911,7 @@ impl Invocable for McpInvocable {
     ) -> Result<InvocableResult, CapabilityError> {
         let result = self
             .connection
-            .call_tool(&self.descriptor.name, request.input)
+            .call_tool(&self.tool_name, request.input)
             .await
             .map_err(|error| match error {
                 McpError::AuthRequired(request) => {
@@ -956,7 +921,7 @@ impl Invocable for McpInvocable {
             })?;
 
         Ok(InvocableResult {
-            output: value_to_invocable_output(result),
+            output: call_tool_result_to_invocable_output(result),
             metadata: MetadataMap::new(),
         })
     }
@@ -979,7 +944,8 @@ impl ResourceProvider for McpResourceHandle {
         id: &ResourceId,
         _ctx: &mut CapabilityContext<'_>,
     ) -> Result<ResourceContents, CapabilityError> {
-        self.connection
+        let result = self
+            .connection
             .read_resource(&id.0)
             .await
             .map_err(|error| match error {
@@ -987,7 +953,9 @@ impl ResourceProvider for McpResourceHandle {
                     CapabilityError::Unavailable(format!("auth required: {:?}", request))
                 }
                 other => CapabilityError::ExecutionFailed(other.to_string()),
-            })
+            })?;
+        read_resource_result_to_capabilities(result)
+            .map_err(|error| CapabilityError::ExecutionFailed(error.to_string()))
     }
 }
 
@@ -1009,7 +977,8 @@ impl PromptProvider for McpPromptHandle {
         args: Value,
         _ctx: &mut CapabilityContext<'_>,
     ) -> Result<PromptContents, CapabilityError> {
-        self.connection
+        let result = self
+            .connection
             .get_prompt(&id.0, args)
             .await
             .map_err(|error| match error {
@@ -1017,7 +986,8 @@ impl PromptProvider for McpPromptHandle {
                     CapabilityError::Unavailable(format!("auth required: {:?}", request))
                 }
                 other => CapabilityError::ExecutionFailed(other.to_string()),
-            })
+            })?;
+        Ok(get_prompt_result_to_capabilities(result))
     }
 }
 
@@ -1035,8 +1005,8 @@ impl McpCapabilityProvider {
             .tools
             .iter()
             .cloned()
-            .map(|descriptor| {
-                Arc::new(McpInvocable::new(connection.clone(), descriptor)) as Arc<dyn Invocable>
+            .map(|tool| {
+                Arc::new(McpInvocable::new(connection.clone(), tool)) as Arc<dyn Invocable>
             })
             .collect();
 
@@ -1044,16 +1014,10 @@ impl McpCapabilityProvider {
             .resources
             .iter()
             .cloned()
-            .map(|descriptor| {
+            .map(|resource| {
                 Arc::new(McpResourceHandle {
                     connection: connection.clone(),
-                    descriptor: ResourceDescriptor {
-                        id: ResourceId::new(descriptor.id),
-                        name: descriptor.name,
-                        description: descriptor.description,
-                        mime_type: descriptor.mime_type,
-                        metadata: descriptor.metadata,
-                    },
+                    descriptor: resource_descriptor_from_rmcp(resource),
                 }) as Arc<dyn ResourceProvider>
             })
             .collect();
@@ -1062,16 +1026,10 @@ impl McpCapabilityProvider {
             .prompts
             .iter()
             .cloned()
-            .map(|descriptor| {
+            .map(|prompt| {
                 Arc::new(McpPromptHandle {
                     connection: connection.clone(),
-                    descriptor: PromptDescriptor {
-                        id: PromptId::new(descriptor.id),
-                        name: descriptor.name,
-                        description: descriptor.description,
-                        input_schema: descriptor.input_schema,
-                        metadata: descriptor.metadata,
-                    },
+                    descriptor: prompt_descriptor_from_rmcp(prompt),
                 }) as Arc<dyn PromptProvider>
             })
             .collect();
@@ -1493,8 +1451,14 @@ fn diff_discovery_snapshots(
 ) -> Vec<McpCatalogEvent> {
     let mut events = Vec::new();
     let (added, removed, changed) = diff_named_items(
-        previous.tools.iter().map(|item| (item.name.clone(), item)),
-        current.tools.iter().map(|item| (item.name.clone(), item)),
+        previous
+            .tools
+            .iter()
+            .map(|item| (item.name.to_string(), item)),
+        current
+            .tools
+            .iter()
+            .map(|item| (item.name.to_string(), item)),
     );
     if !added.is_empty() || !removed.is_empty() || !changed.is_empty() {
         events.push(McpCatalogEvent::ToolsChanged {
@@ -1509,8 +1473,11 @@ fn diff_discovery_snapshots(
         previous
             .resources
             .iter()
-            .map(|item| (item.id.clone(), item)),
-        current.resources.iter().map(|item| (item.id.clone(), item)),
+            .map(|item| (item.uri.clone(), item)),
+        current
+            .resources
+            .iter()
+            .map(|item| (item.uri.clone(), item)),
     );
     if !added.is_empty() || !removed.is_empty() || !changed.is_empty() {
         events.push(McpCatalogEvent::ResourcesChanged {
@@ -1522,8 +1489,14 @@ fn diff_discovery_snapshots(
     }
 
     let (added, removed, changed) = diff_named_items(
-        previous.prompts.iter().map(|item| (item.id.clone(), item)),
-        current.prompts.iter().map(|item| (item.id.clone(), item)),
+        previous
+            .prompts
+            .iter()
+            .map(|item| (item.name.clone(), item)),
+        current
+            .prompts
+            .iter()
+            .map(|item| (item.name.clone(), item)),
     );
     if !added.is_empty() || !removed.is_empty() || !changed.is_empty() {
         events.push(McpCatalogEvent::PromptsChanged {
@@ -1706,31 +1679,17 @@ impl ToolExecutor for McpToolExecutor {
 
 /// Adapter exposing an MCP tool as an agentkit [`Tool`].
 pub struct McpToolAdapter {
-    descriptor: McpToolDescriptor,
+    tool_name: String,
     connection: Arc<McpConnection>,
     spec: ToolSpec,
 }
 
 impl McpToolAdapter {
     /// Creates a new tool adapter for the given MCP tool.
-    pub fn new(
-        server_id: &McpServerId,
-        connection: Arc<McpConnection>,
-        descriptor: McpToolDescriptor,
-    ) -> Self {
-        let spec = ToolSpec {
-            name: ToolName::new(format!("mcp_{}_{}", server_id, descriptor.name)),
-            description: descriptor
-                .description
-                .clone()
-                .unwrap_or_else(|| descriptor.name.clone()),
-            input_schema: descriptor.input_schema.clone(),
-            annotations: ToolAnnotations::default(),
-            metadata: descriptor.metadata.clone(),
-        };
-
+    pub fn new(server_id: &McpServerId, connection: Arc<McpConnection>, tool: McpTool) -> Self {
+        let spec = tool_spec_from_tool(server_id, &tool);
         Self {
-            descriptor,
+            tool_name: tool.name.into_owned(),
             connection,
             spec,
         }
@@ -1750,18 +1709,19 @@ impl Tool for McpToolAdapter {
     ) -> Result<ToolResult, ToolError> {
         let result = self
             .connection
-            .call_tool(&self.descriptor.name, request.input)
+            .call_tool(&self.tool_name, request.input)
             .await
             .map_err(|error| match error {
                 McpError::AuthRequired(request) => ToolError::AuthRequired(request),
                 other => ToolError::ExecutionFailed(other.to_string()),
             })?;
 
+        let is_error = result.is_error.unwrap_or(false);
         Ok(ToolResult {
             result: ToolResultPart {
                 call_id: request.call_id,
-                output: invocable_output_to_tool_output(value_to_invocable_output(result)),
-                is_error: false,
+                output: call_tool_result_to_tool_output(result),
+                is_error,
                 metadata: MetadataMap::new(),
             },
             duration: None,
@@ -1794,204 +1754,253 @@ fn rmcp_server_capabilities_to_agentkit(
     }
 }
 
-fn rmcp_tool_descriptor(tool: rmcp_model::Tool) -> Result<McpToolDescriptor, McpError> {
-    let mut metadata = MetadataMap::new();
-    if let Some(title) = tool.title.clone() {
-        metadata.insert("title".into(), Value::String(title));
-    }
-    if let Some(output_schema) = tool.output_schema.as_ref() {
-        metadata.insert(
-            "output_schema".into(),
-            Value::Object((**output_schema).clone()),
-        );
-    }
-    if let Some(annotations) = tool.annotations.as_ref() {
-        metadata.insert(
-            "annotations".into(),
-            serde_json::to_value(annotations).map_err(McpError::Serialize)?,
-        );
-    }
-    if let Some(execution) = tool.execution.as_ref() {
-        metadata.insert(
-            "execution".into(),
-            serde_json::to_value(execution).map_err(McpError::Serialize)?,
-        );
-    }
-    if let Some(icons) = tool.icons.as_ref() {
-        metadata.insert(
-            "icons".into(),
-            serde_json::to_value(icons).map_err(McpError::Serialize)?,
-        );
-    }
-    if let Some(meta) = tool.meta.as_ref() {
-        metadata.insert(
-            "_meta".into(),
-            serde_json::to_value(meta).map_err(McpError::Serialize)?,
-        );
-    }
-
-    Ok(McpToolDescriptor {
-        name: tool.name.into_owned(),
-        description: tool.description.map(|description| description.into_owned()),
+fn invocable_spec_from_tool(server_id: &McpServerId, tool: &McpTool) -> InvocableSpec {
+    InvocableSpec {
+        name: CapabilityName::new(format!("mcp_{}_{}", server_id, tool.name)),
+        description: tool
+            .description
+            .as_ref()
+            .map(|d| d.to_string())
+            .unwrap_or_else(|| tool.name.to_string()),
         input_schema: Value::Object((*tool.input_schema).clone()),
-        metadata,
-    })
-}
-
-fn rmcp_resource_descriptor(resource: rmcp_model::Resource) -> McpResourceDescriptor {
-    let mut metadata = MetadataMap::new();
-    if let Some(title) = resource.title.clone() {
-        metadata.insert("title".into(), Value::String(title));
-    }
-    if let Some(size) = resource.size {
-        metadata.insert("size".into(), Value::Number(size.into()));
-    }
-    if let Some(icons) = resource.icons.as_ref()
-        && let Ok(value) = serde_json::to_value(icons)
-    {
-        metadata.insert("icons".into(), value);
-    }
-    if let Some(meta) = resource.meta.as_ref()
-        && let Ok(value) = serde_json::to_value(meta)
-    {
-        metadata.insert("_meta".into(), value);
-    }
-
-    McpResourceDescriptor {
-        id: resource.uri.clone(),
-        name: resource.name.clone(),
-        description: resource.description.clone(),
-        mime_type: resource.mime_type.clone(),
-        metadata,
+        metadata: MetadataMap::new(),
     }
 }
 
-fn rmcp_prompt_descriptor(prompt: rmcp_model::Prompt) -> McpPromptDescriptor {
-    let mut metadata = MetadataMap::new();
-    if let Some(title) = prompt.title.clone() {
-        metadata.insert("title".into(), Value::String(title));
+fn tool_spec_from_tool(server_id: &McpServerId, tool: &McpTool) -> ToolSpec {
+    ToolSpec {
+        name: ToolName::new(format!("mcp_{}_{}", server_id, tool.name)),
+        description: tool
+            .description
+            .as_ref()
+            .map(|d| d.to_string())
+            .unwrap_or_else(|| tool.name.to_string()),
+        input_schema: Value::Object((*tool.input_schema).clone()),
+        annotations: tool_annotations_from_rmcp(tool.annotations.as_ref()),
+        metadata: MetadataMap::new(),
     }
-    if let Some(icons) = prompt.icons.as_ref()
-        && let Ok(value) = serde_json::to_value(icons)
-    {
-        metadata.insert("icons".into(), value);
-    }
-    if let Some(meta) = prompt.meta.as_ref()
-        && let Ok(value) = serde_json::to_value(meta)
-    {
-        metadata.insert("_meta".into(), value);
-    }
+}
 
-    let properties = prompt
-        .arguments
-        .unwrap_or_default()
+fn tool_annotations_from_rmcp(annotations: Option<&McpToolAnnotations>) -> ToolAnnotations {
+    let Some(annotations) = annotations else {
+        return ToolAnnotations::default();
+    };
+    // rmcp expresses each hint as `Option<bool>` (advisory; absent means
+    // unspecified). agentkit collapses absent → false. Tools that need to
+    // distinguish "absent" from "false" should inspect the underlying
+    // `McpTool::annotations` directly via the snapshot.
+    ToolAnnotations {
+        read_only_hint: annotations.read_only_hint.unwrap_or(false),
+        destructive_hint: annotations.destructive_hint.unwrap_or(false),
+        idempotent_hint: annotations.idempotent_hint.unwrap_or(false),
+        needs_approval_hint: annotations.destructive_hint.unwrap_or(false),
+        supports_streaming_hint: false,
+    }
+}
+
+fn resource_descriptor_from_rmcp(resource: McpResource) -> ResourceDescriptor {
+    let raw = resource.raw;
+    ResourceDescriptor {
+        id: ResourceId::new(raw.uri),
+        name: raw.name,
+        description: raw.description,
+        mime_type: raw.mime_type,
+        metadata: MetadataMap::new(),
+    }
+}
+
+fn prompt_descriptor_from_rmcp(prompt: McpPrompt) -> PromptDescriptor {
+    let arguments = prompt.arguments.unwrap_or_default();
+    let mut required = Vec::new();
+    let properties = arguments
         .into_iter()
-        .map(|argument| (argument.name, json!({ "type": "string" })))
+        .map(|argument| {
+            let mut schema = serde_json::Map::new();
+            schema.insert("type".into(), Value::String("string".into()));
+            if let Some(description) = argument.description {
+                schema.insert("description".into(), Value::String(description));
+            }
+            if argument.required.unwrap_or(false) {
+                required.push(Value::String(argument.name.clone()));
+            }
+            (argument.name, Value::Object(schema))
+        })
         .collect::<serde_json::Map<String, Value>>();
+    let mut input_schema = serde_json::Map::new();
+    input_schema.insert("type".into(), Value::String("object".into()));
+    input_schema.insert("properties".into(), Value::Object(properties));
+    if !required.is_empty() {
+        input_schema.insert("required".into(), Value::Array(required));
+    }
 
-    McpPromptDescriptor {
-        id: prompt.name.clone(),
+    PromptDescriptor {
+        id: PromptId::new(prompt.name.clone()),
         name: prompt.name,
         description: prompt.description,
-        input_schema: json!({
-            "type": "object",
-            "properties": properties,
-        }),
-        metadata,
+        input_schema: Value::Object(input_schema),
+        metadata: MetadataMap::new(),
     }
 }
 
-fn rmcp_resource_contents(
-    result: rmcp_model::ReadResourceResult,
+fn read_resource_result_to_capabilities(
+    result: ReadResourceResult,
 ) -> Result<ResourceContents, McpError> {
     let content = result
         .contents
         .into_iter()
         .next()
         .ok_or_else(|| McpError::Protocol("resources/read returned no contents".into()))?;
-
-    let data = match content {
-        rmcp_model::ResourceContents::TextResourceContents { text, .. } => {
-            DataRef::InlineText(text)
-        }
-        rmcp_model::ResourceContents::BlobResourceContents { uri, .. } => DataRef::Uri(uri),
-    };
-
-    Ok(ResourceContents {
-        data,
-        metadata: MetadataMap::new(),
-    })
+    Ok(resource_contents_to_capabilities(content))
 }
 
-fn rmcp_prompt_contents(result: rmcp_model::GetPromptResult) -> Result<PromptContents, McpError> {
+fn resource_contents_to_capabilities(content: McpResourceContents) -> ResourceContents {
+    let mut metadata = MetadataMap::new();
+    let data = match content {
+        McpResourceContents::TextResourceContents {
+            text, mime_type, ..
+        } => {
+            if let Some(mime) = mime_type {
+                metadata.insert("mime_type".into(), Value::String(mime));
+            }
+            DataRef::InlineText(text)
+        }
+        McpResourceContents::BlobResourceContents {
+            blob,
+            mime_type,
+            uri,
+            ..
+        } => {
+            if let Some(mime) = mime_type {
+                metadata.insert("mime_type".into(), Value::String(mime));
+            }
+            metadata.insert("uri".into(), Value::String(uri));
+            // rmcp delivers blobs as base64-encoded text on the wire.
+            DataRef::InlineText(blob)
+        }
+    };
+    ResourceContents { data, metadata }
+}
+
+fn get_prompt_result_to_capabilities(result: GetPromptResult) -> PromptContents {
     let items = result
         .messages
         .into_iter()
-        .map(|message| serde_json::to_value(message).map_err(McpError::Serialize))
-        .map(|value| value.and_then(parse_prompt_message))
-        .collect::<Result<Vec<_>, _>>()?;
-
-    Ok(PromptContents {
-        items,
-        metadata: MetadataMap::new(),
-    })
+        .map(prompt_message_to_item)
+        .collect();
+    let mut metadata = MetadataMap::new();
+    if let Some(description) = result.description {
+        metadata.insert("description".into(), Value::String(description));
+    }
+    PromptContents { items, metadata }
 }
 
-fn parse_prompt_message(value: Value) -> Result<Item, McpError> {
-    let role = value.get("role").and_then(Value::as_str).unwrap_or("user");
-    let kind = match role {
-        "assistant" => ItemKind::Assistant,
-        "system" => ItemKind::System,
-        _ => ItemKind::User,
+fn prompt_message_to_item(message: PromptMessage) -> Item {
+    let kind = match message.role {
+        PromptMessageRole::Assistant => ItemKind::Assistant,
+        PromptMessageRole::User => ItemKind::User,
     };
-
-    let content = value.get("content").cloned().unwrap_or(Value::Null);
-    let text = if let Some(text) = content.get("text").and_then(Value::as_str) {
-        text.to_string()
-    } else if let Some(text) = content.as_str() {
-        text.to_string()
-    } else {
-        content.to_string()
-    };
-
-    Ok(Item {
+    Item {
         id: None,
         kind,
-        parts: vec![Part::Text(TextPart {
-            text,
-            metadata: MetadataMap::new(),
-        })],
+        parts: vec![prompt_message_content_to_part(message.content)],
         metadata: MetadataMap::new(),
-    })
+    }
 }
 
-fn value_to_invocable_output(value: Value) -> InvocableOutput {
-    if let Some(content) = value.get("content").and_then(Value::as_array) {
-        let text = content
+fn prompt_message_content_to_part(content: PromptMessageContent) -> Part {
+    match content {
+        PromptMessageContent::Text { text } => Part::Text(TextPart::new(text)),
+        PromptMessageContent::Image { image } => Part::Media(MediaPart::new(
+            Modality::Image,
+            image.mime_type.clone(),
+            DataRef::InlineText(image.data.clone()),
+        )),
+        PromptMessageContent::Resource { resource } => {
+            let agentkit_resource = resource_contents_to_capabilities(resource.resource.clone());
+            agentkit_part_from_resource(agentkit_resource)
+        }
+        PromptMessageContent::ResourceLink { link } => {
+            Part::Text(TextPart::new(link.uri.clone()))
+        }
+    }
+}
+
+fn agentkit_part_from_resource(resource: ResourceContents) -> Part {
+    let mime = resource
+        .metadata
+        .get("mime_type")
+        .and_then(Value::as_str)
+        .unwrap_or("text/plain")
+        .to_string();
+    Part::Media(MediaPart::new(Modality::Binary, mime, resource.data))
+}
+
+fn call_tool_result_to_invocable_output(result: CallToolResult) -> InvocableOutput {
+    if let Some(structured) = result.structured_content {
+        return InvocableOutput::Structured(structured);
+    }
+    let parts = call_tool_content_to_parts(result.content);
+    if parts.iter().all(|part| matches!(part, Part::Text(_))) {
+        let text = parts
             .iter()
-            .filter_map(|item| item.get("text").and_then(Value::as_str))
+            .filter_map(|part| match part {
+                Part::Text(text) => Some(text.text.clone()),
+                _ => None,
+            })
             .collect::<Vec<_>>()
             .join("\n");
-        if !text.is_empty() {
-            return InvocableOutput::Text(text);
-        }
-    }
-
-    if let Some(text) = value.as_str() {
-        InvocableOutput::Text(text.to_string())
+        InvocableOutput::Text(text)
     } else {
-        InvocableOutput::Structured(value)
+        InvocableOutput::Items(vec![Item {
+            id: None,
+            kind: ItemKind::Tool,
+            parts,
+            metadata: MetadataMap::new(),
+        }])
     }
 }
 
-fn invocable_output_to_tool_output(output: InvocableOutput) -> ToolOutput {
-    match output {
-        InvocableOutput::Text(text) => ToolOutput::Text(text),
-        InvocableOutput::Structured(value) => ToolOutput::Structured(value),
-        InvocableOutput::Items(items) => {
-            ToolOutput::Parts(items.into_iter().flat_map(|item| item.parts).collect())
+fn call_tool_result_to_tool_output(result: CallToolResult) -> ToolOutput {
+    if let Some(structured) = result.structured_content {
+        return ToolOutput::Structured(structured);
+    }
+    let parts = call_tool_content_to_parts(result.content);
+    if parts.iter().all(|part| matches!(part, Part::Text(_))) {
+        let text = parts
+            .iter()
+            .filter_map(|part| match part {
+                Part::Text(text) => Some(text.text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        ToolOutput::Text(text)
+    } else {
+        ToolOutput::Parts(parts)
+    }
+}
+
+fn call_tool_content_to_parts(contents: Vec<Content>) -> Vec<Part> {
+    contents.into_iter().map(content_to_part).collect()
+}
+
+fn content_to_part(content: Content) -> Part {
+    match content.raw {
+        RawContent::Text(text) => Part::Text(TextPart::new(text.text)),
+        RawContent::Image(image) => Part::Media(MediaPart::new(
+            Modality::Image,
+            image.mime_type,
+            DataRef::InlineText(image.data),
+        )),
+        RawContent::Audio(audio) => Part::Media(MediaPart::new(
+            Modality::Audio,
+            audio.mime_type,
+            DataRef::InlineText(audio.data),
+        )),
+        RawContent::Resource(embedded) => {
+            agentkit_part_from_resource(resource_contents_to_capabilities(embedded.resource))
         }
-        InvocableOutput::Data(data) => ToolOutput::Structured(json!({ "data": data })),
+        RawContent::ResourceLink(link) => Part::Text(TextPart::new(link.uri)),
     }
 }
 
