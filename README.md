@@ -13,7 +13,7 @@ The project is intentionally split into small crates behind feature flags so hos
 - trait-based tools, permissions, approvals, and auth handoff
 - built-in filesystem, shell, and skills tools
 - context loading for `AGENTS.md` and skills directories
-- MCP transports, discovery, tool/resource/prompt adapters, auth replay, and lifecycle management
+- MCP integration on top of [`rmcp`](https://crates.io/crates/rmcp): stdio + Streamable HTTP transports, discovery, tool/resource/prompt adapters, auth replay, lifecycle management, pluggable sampling/elicitation/roots responders, and a broadcast subscription for server-pushed progress, logging, resource updates, list-changed, and cancellation events
 - reporting observers
 - compaction triggers, strategy pipelines, and backend-driven semantic compaction
 - async task management with foreground/background scheduling, routing policies, and detach-after-timeout
@@ -37,7 +37,7 @@ The repo also ships multiple examples that exercise these pieces end to end.
 - `agentkit-context`
   - `AGENTS.md` and skills loading
 - `agentkit-mcp`
-  - MCP transports, discovery, lifecycle, auth, replay, adapters
+  - MCP integration built on `rmcp`: stdio + Streamable HTTP transports, discovery, lifecycle, auth + replay, tool/resource/prompt adapters, sampling/elicitation/roots responders, and a server-event broadcast
 - `agentkit-reporting`
   - loop observers and reporting adapters
 - `agentkit-compaction`
