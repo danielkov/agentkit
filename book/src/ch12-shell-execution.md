@@ -4,7 +4,7 @@ Shell access is the most powerful and most dangerous tool an agent can have. Thi
 
 ## ShellExecTool
 
-The crate provides a single tool: `shell.exec`.
+The crate provides a single tool: `shell_exec`.
 
 ```rust
 let registry = agentkit_tool_shell::registry();
@@ -84,7 +84,7 @@ Shell execution is where the agent loop interacts most visibly with the outside 
 ```text
 Sequential (SimpleTaskManager):
 
-  Model: ToolCall(shell.exec, { executable: "cargo", argv: ["build"] })
+  Model: ToolCall(shell_exec, { executable: "cargo", argv: ["build"] })
   Driver: execute inline, wait for completion (10 seconds)
   Driver: append result to transcript
   Driver: start next model turn
@@ -92,7 +92,7 @@ Sequential (SimpleTaskManager):
 
 With ForegroundThenDetachAfter(5s):
 
-  Model: ToolCall(shell.exec, { executable: "cargo", argv: ["build"] })
+  Model: ToolCall(shell_exec, { executable: "cargo", argv: ["build"] })
   Driver: start executing, wait up to 5 seconds
   └── if finishes in 3s → result appended, loop continues normally
   └── if still running at 5s → detach to background

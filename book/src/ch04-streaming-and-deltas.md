@@ -109,7 +109,7 @@ An assistant response with both text and a tool call:
 4. BeginPart { id: "p2", kind: ToolCall }
 5. AppendText { id: "p2", chunk: "{\"path\":" }          ← JSON argument streaming
 6. AppendText { id: "p2", chunk: " \"src/main.rs\"}" }
-7. CommitPart { part: ToolCall { name: "fs.read_file", input: {...} } }
+7. CommitPart { part: ToolCall { name: "fs_read_file", input: {...} } }
 ```
 
 Note that `part_id` distinguishes concurrent parts. The protocol supports interleaved deltas for different parts, though most providers emit parts sequentially.
@@ -144,7 +144,7 @@ Tool calls stream differently from text. The model emits the tool name upfront (
 ```text
 SSE from provider:
 
-  data: {"delta":{"tool_calls":[{"index":0,"id":"call-7","function":{"name":"fs.read_file"}}]}}
+  data: {"delta":{"tool_calls":[{"index":0,"id":"call-7","function":{"name":"fs_read_file"}}]}}
   data: {"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"pa"}}]}}
   data: {"delta":{"tool_calls":[{"index":0,"function":{"arguments":"th\":"}}]}}
   data: {"delta":{"tool_calls":[{"index":0,"function":{"arguments":" \"sr"}}]}}
@@ -159,7 +159,7 @@ What the adapter emits:
   AppendText { id: "tc0", chunk: "th\": " }
   AppendText { id: "tc0", chunk: "\"src/mai" }
   AppendText { id: "tc0", chunk: "n.rs\"}" }
-  CommitPart { part: ToolCall { id: "call-7", name: "fs.read_file", input: {"path":"src/main.rs"} } }
+  CommitPart { part: ToolCall { id: "call-7", name: "fs_read_file", input: {"path":"src/main.rs"} } }
 ```
 
 The loop waits for `CommitPart` before executing the tool. Partial JSON arguments are not actionable — `{"pa` is not a valid tool input. This is why tool calls use the same `AppendText` mechanism as regular text but the driver only acts on the committed `ToolCallPart`.
@@ -169,8 +169,8 @@ The loop waits for `CommitPart` before executing the tool. Partial JSON argument
 When the model requests multiple tool calls in a single response, the SSE stream interleaves them by index:
 
 ```text
-data: {"delta":{"tool_calls":[{"index":0,"id":"call-1","function":{"name":"fs.read_file"}}]}}
-data: {"delta":{"tool_calls":[{"index":1,"id":"call-2","function":{"name":"shell.exec"}}]}}
+data: {"delta":{"tool_calls":[{"index":0,"id":"call-1","function":{"name":"fs_read_file"}}]}}
+data: {"delta":{"tool_calls":[{"index":1,"id":"call-2","function":{"name":"shell_exec"}}]}}
 data: {"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\":"}}]}}
 data: {"delta":{"tool_calls":[{"index":1,"function":{"arguments":"{\"exec"}}]}}
 ...

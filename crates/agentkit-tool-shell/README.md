@@ -2,7 +2,7 @@
 
 Shell execution tool for running subprocesses inside an agentkit agent loop.
 
-This crate provides `ShellExecTool`, registered under the name `shell.exec`.
+This crate provides `ShellExecTool`, registered under the name `shell_exec`.
 When invoked it spawns a subprocess and returns structured JSON containing
 `stdout`, `stderr`, `success`, and `exit_code`.
 
@@ -20,7 +20,7 @@ permitted.
 
 ## Quick start
 
-Use `registry()` to get a `ToolRegistry` pre-loaded with the `shell.exec` tool:
+Use `registry()` to get a `ToolRegistry` pre-loaded with the `shell_exec` tool:
 
 ```rust
 use agentkit_tool_shell::registry;
@@ -28,7 +28,7 @@ use agentkit_tool_shell::registry;
 let reg = registry();
 let specs = reg.specs();
 assert_eq!(specs.len(), 1);
-assert_eq!(specs[0].name.0, "shell.exec");
+assert_eq!(specs[0].name.0, "shell_exec");
 ```
 
 ## Constructing the tool manually
@@ -43,7 +43,7 @@ use agentkit_tools_core::ToolRegistry;
 let reg = ToolRegistry::new()
     .with(ShellExecTool::default());
 
-assert!(reg.specs().iter().any(|s| s.name.0 == "shell.exec"));
+assert!(reg.specs().iter().any(|s| s.name.0 == "shell_exec"));
 ```
 
 ## Executing a command with `BasicToolExecutor`
@@ -87,7 +87,7 @@ async fn main() {
 
     let request = ToolRequest {
         call_id: "call-1".into(),
-        tool_name: ToolName::new("shell.exec"),
+        tool_name: ToolName::new("shell_exec"),
         input: json!({
             "executable": "echo",
             "argv": ["hello", "world"],

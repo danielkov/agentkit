@@ -92,7 +92,7 @@ use tokio::sync::mpsc;
 
 const SYSTEM_PROMPT: &str = "\
 You are a careful repository assistant operating inside a Claude-Code-style REPL.
-Inspect the repository with the available fs.* and shell.exec tools instead of guessing.
+Inspect the repository with the available fs.* and shell_exec tools instead of guessing.
 Prefer concise answers. When using tools, use paths relative to the working directory.
 If the user sends a new message while you're mid-task, integrate it into your plan for
 the next step rather than restarting.

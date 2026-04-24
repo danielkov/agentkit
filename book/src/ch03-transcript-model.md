@@ -14,7 +14,7 @@ Vec<Item>
 ├── Item { kind: Context,    parts: [Text("Project uses Rust 2024 edition...")] }
 ├── Item { kind: User,       parts: [Text("Read src/main.rs")] }
 ├── Item { kind: Assistant,  parts: [Text("I'll read that file."),
-│                                    ToolCall { name: "fs.read_file", ... }] }
+│                                    ToolCall { name: "fs_read_file", ... }] }
 ├── Item { kind: Tool,       parts: [ToolResult { output: "fn main() {...}", ... }] }
 └── Item { kind: Assistant,  parts: [Text("The file contains...")] }
 ```
@@ -82,7 +82,7 @@ Item + parts model (agentkit):
       kind: Assistant,
       parts: [
           Text("I'll read main.rs"),
-          ToolCall { name: "fs.read_file", input: { "path": "src/main.rs" } },
+          ToolCall { name: "fs_read_file", input: { "path": "src/main.rs" } },
       ]
   }
 
@@ -116,7 +116,7 @@ The part types cover the full range of content that flows through an agent:
 | `File`       | File attachments                  | `report.csv`                  |
 | `Structured` | JSON output, function returns     | `{ "status": "ok" }`          |
 | `Reasoning`  | Chain-of-thought, thinking blocks | Model's internal reasoning    |
-| `ToolCall`   | Model requests a tool invocation  | `fs.read_file("src/main.rs")` |
+| `ToolCall`   | Model requests a tool invocation  | `fs_read_file("src/main.rs")` |
 | `ToolResult` | Tool execution output             | `"fn main() { ... }"`         |
 | `Custom`     | Provider-specific extensions      | Raw provider-specific content |
 
@@ -230,8 +230,8 @@ The `call_id` on `ToolResultPart` references the `id` on `ToolCallPart`. This co
 Correlation between tool calls and results:
 
   Item { kind: Assistant, parts: [
-      ToolCall { id: "call-1", name: "fs.read_file", input: {...} },
-      ToolCall { id: "call-2", name: "shell.exec",   input: {...} },
+      ToolCall { id: "call-1", name: "fs_read_file", input: {...} },
+      ToolCall { id: "call-2", name: "shell_exec",   input: {...} },
   ]}
        │                                │
        │ call_id: "call-1"              │ call_id: "call-2"

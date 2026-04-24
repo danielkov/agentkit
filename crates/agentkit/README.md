@@ -19,7 +19,7 @@ Additional integrations are available behind optional Cargo features:
 | `mcp`                 | `agentkit-mcp`                 | Model Context Protocol server connections                       |
 | `provider-openrouter` | `agentkit-provider-openrouter` | OpenRouter `ModelAdapter` implementation                        |
 | `tool-fs`             | `agentkit-tool-fs`             | Filesystem tools (read, write, edit, move, delete, list, mkdir) |
-| `tool-shell`          | `agentkit-tool-shell`          | Shell execution tool (`shell.exec`)                             |
+| `tool-shell`          | `agentkit-tool-shell`          | Shell execution tool (`shell_exec`)                             |
 | `tool-skills`         | `agentkit-tool-skills`         | Progressive Agent Skills discovery and activation               |
 
 ## Quick start

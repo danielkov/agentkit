@@ -217,7 +217,7 @@ Tools add model-facing schema and permission semantics on top of the base invoca
 
 ### Why ToolName as a newtype?
 
-`ToolName` prevents accidental confusion with other string identifiers. It also centralizes validation and supports namespacing conventions like `fs.read_file` or `mcp.github.search`.
+`ToolName` prevents accidental confusion with other string identifiers. It also centralizes validation and supports namespacing conventions like `fs_read_file` or `mcp.github.search`.
 
 ### Why [JSON Schema](https://json-schema.org) for input?
 

@@ -362,7 +362,7 @@ impl TaskRoutingPolicy for MyRoutingPolicy {
     fn route(&self, request: &ToolRequest) -> RoutingDecision {
         if request.tool_name == "subagent.launch" {
             RoutingDecision::Background
-        } else if request.tool_name == "shell.exec" {
+        } else if request.tool_name == "shell_exec" {
             RoutingDecision::Foreground
         } else if request.metadata.get("background") == Some(&true.into()) {
             RoutingDecision::Background

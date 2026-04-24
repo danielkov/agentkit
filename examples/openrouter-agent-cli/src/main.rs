@@ -29,12 +29,12 @@ const SYSTEM_PROMPT: &str = "\
 You are a careful coding agent.
 Use loaded context as authoritative project guidance.
 Use fs.* tools for repository inspection and edits.
-Use shell.exec only for simple read-only inspection commands when that is more appropriate than fs tools.
+Use shell_exec only for simple read-only inspection commands when that is more appropriate than fs tools.
 If an MCP tool is available and relevant, use it instead of guessing.
 Prefer concise answers and avoid making claims you did not verify.
 ";
 
-const DEFAULT_PROMPT: &str = "Use fs.read_file on ./Cargo.toml and report the workspace member count. Return only the integer.";
+const DEFAULT_PROMPT: &str = "Use fs_read_file on ./Cargo.toml and report the workspace member count. Return only the integer.";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {

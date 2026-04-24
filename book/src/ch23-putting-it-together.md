@@ -33,7 +33,7 @@ The driver checks the compaction trigger. If the transcript exceeds the configur
 The driver builds a `TurnRequest` containing:
 
 - The working transcript (system prompt, context items, conversation history)
-- Tool specs from the registry (fs.read_file, fs.write_file, fs.replace_in_file, shell.exec, etc.)
+- Tool specs from the registry (fs_read_file, fs_write_file, fs_replace_in_file, shell_exec, etc.)
 - The normalized prompt cache request for the turn
 
 ### 4. Model invocation
@@ -45,12 +45,12 @@ The adapter serializes the request and sends it to the provider. The response st
 The model decides it needs to see the file first. It emits a `ToolCallPart`:
 
 ```json
-{ "name": "fs.read_file", "input": { "path": "src/parser.rs" } }
+{ "name": "fs_read_file", "input": { "path": "src/parser.rs" } }
 ```
 
 The driver:
 
-1. Looks up `fs.read_file` in the registry
+1. Looks up `fs_read_file` in the registry
 2. Evaluates the `FileSystemPermissionRequest::Read` against the permission checker
 3. The `PathPolicy` allows reads under the workspace root → `Allow`
 4. Executes the tool
@@ -63,7 +63,7 @@ The driver starts another model turn with the updated transcript. The model now 
 
 ### 7. Second tool call — edit the file
 
-The model emits a `fs.replace_in_file` call with the old and new text.
+The model emits a `fs_replace_in_file` call with the old and new text.
 
 The driver:
 
@@ -74,7 +74,7 @@ The driver:
 
 ### 8. Third tool call — verify the change
 
-The model runs `shell.exec` with `cargo check`:
+The model runs `shell_exec` with `cargo check`:
 
 The driver:
 

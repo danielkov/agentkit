@@ -77,18 +77,18 @@ The repo also ships multiple examples that exercise these pieces end to end.
 
 Filesystem:
 
-- `fs.read_file`
+- `fs_read_file`
   - supports optional `from` / `to` line ranges
-- `fs.write_file`
-- `fs.replace_in_file`
-- `fs.move`
-- `fs.delete`
-- `fs.list_directory`
-- `fs.create_directory`
+- `fs_write_file`
+- `fs_replace_in_file`
+- `fs_move`
+- `fs_delete`
+- `fs_list_directory`
+- `fs_create_directory`
 
 Shell:
 
-- `shell.exec`
+- `shell_exec`
 
 The filesystem crate also supports session-scoped read-before-write enforcement through `FileSystemToolResources` and `FileSystemToolPolicy`.
 
@@ -105,7 +105,7 @@ cargo run -p openrouter-chat -- "hello"
 
 ```bash
 cargo run -p openrouter-coding-agent -- \
-  "Use fs.read_file on ./Cargo.toml and return only the workspace member count as an integer."
+  "Use fs_read_file on ./Cargo.toml and return only the workspace member count as an integer."
 ```
 
 ```bash
@@ -269,7 +269,7 @@ use agentkit_task_manager::{AsyncTaskManager, RoutingDecision};
 use std::time::Duration;
 
 let task_manager = AsyncTaskManager::new().routing(|req: &agentkit_tools_core::ToolRequest| {
-    if req.tool_name.0 == "shell.exec" {
+    if req.tool_name.0 == "shell_exec" {
         RoutingDecision::ForegroundThenDetachAfter(Duration::from_secs(5))
     } else {
         RoutingDecision::Foreground

@@ -110,7 +110,7 @@ After resolution, the host calls `next()` again. If approved, the tool executes 
 ### The approval flow in detail
 
 ```text
-1. Model emits ToolCall(fs.replace_in_file, { path: "/etc/hosts", ... })
+1. Model emits ToolCall(fs_replace_in_file, { path: "/etc/hosts", ... })
                           │
 2. Executor runs permission preflight
    └── PathPolicy: /etc/hosts is outside workspace → RequireApproval(SensitivePath)
@@ -134,18 +134,18 @@ After resolution, the host calls `next()` again. If approved, the tool executes 
 When the model requests several tool calls in a single turn, some may require approval while others don't. The driver surfaces one approval at a time, in the order the model emitted them:
 
 ```text
-Model response: [ToolCall("fs.write", ...), ToolCall("shell.exec", ...), ToolCall("fs.read", ...)]
+Model response: [ToolCall("fs.write", ...), ToolCall("shell_exec", ...), ToolCall("fs.read", ...)]
 
 Permission check:
   fs.write     → RequireApproval (outside workspace)
-  shell.exec   → RequireApproval (unknown command)
+  shell_exec   → RequireApproval (unknown command)
   fs.read      → Allow
 
 next() → Interrupt(ApprovalRequest for fs.write)
   host approves
-next() → Interrupt(ApprovalRequest for shell.exec)
+next() → Interrupt(ApprovalRequest for shell_exec)
   host denies
-next() → tools execute (fs.write runs, shell.exec denied, fs.read runs)
+next() → tools execute (fs.write runs, shell_exec denied, fs.read runs)
        → results appended, loop continues
 ```
 

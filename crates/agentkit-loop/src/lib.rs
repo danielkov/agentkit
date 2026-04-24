@@ -64,8 +64,8 @@ use agentkit_task_manager::{
 use agentkit_tools_core::ToolContext;
 use agentkit_tools_core::{
     ApprovalDecision, ApprovalRequest, AuthOperation, AuthRequest, AuthResolution,
-    BasicToolExecutor, OwnedToolContext, PermissionChecker, ToolError, ToolExecutor, ToolRegistry,
-    ToolRequest, ToolResources, ToolSpec,
+    BasicToolExecutor, OwnedToolContext, PermissionChecker, ToolCatalogEvent, ToolError,
+    ToolExecutor, ToolRegistry, ToolRequest, ToolResources, ToolSpec,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -591,6 +591,17 @@ pub enum AgentEvent {
     ApprovalResolved { approved: bool },
     /// An authentication interrupt has been resolved.
     AuthResolved { provided: bool },
+    /// The available tool catalog changed and will be reflected on the next model request.
+    ToolCatalogChanged {
+        /// Stable source identifier for the catalog that changed.
+        source: String,
+        /// Tool names that became available.
+        added: Vec<String>,
+        /// Tool names that are no longer available.
+        removed: Vec<String>,
+        /// Tool names whose schema, description, or metadata changed.
+        changed: Vec<String>,
+    },
     /// Transcript compaction is about to begin.
     CompactionStarted {
         session_id: SessionId,
@@ -1011,6 +1022,7 @@ where
 {
     model: M,
     tools: ToolRegistry,
+    tool_executor: Option<Arc<dyn ToolExecutor>>,
     task_manager: Arc<dyn TaskManager>,
     permissions: Arc<dyn PermissionChecker>,
     resources: Arc<dyn ToolResources>,
@@ -1041,7 +1053,9 @@ where
         let session_id = config.session_id.clone();
         let default_cache = config.cache.clone();
         let session = self.model.start_session(config).await?;
-        let tool_executor = Arc::new(BasicToolExecutor::new(self.tools.clone()));
+        let tool_executor = self
+            .tool_executor
+            .unwrap_or_else(|| Arc::new(BasicToolExecutor::new(self.tools.clone())));
         let mut driver = LoopDriver {
             session_id: session_id.clone(),
             default_cache,
@@ -1080,6 +1094,7 @@ where
 {
     model: Option<M>,
     tools: ToolRegistry,
+    tool_executor: Option<Arc<dyn ToolExecutor>>,
     task_manager: Option<Arc<dyn TaskManager>>,
     permissions: Arc<dyn PermissionChecker>,
     resources: Arc<dyn ToolResources>,
@@ -1097,6 +1112,7 @@ where
         Self {
             model: None,
             tools: ToolRegistry::new(),
+            tool_executor: None,
             task_manager: None,
             permissions: Arc::new(AllowAllPermissions),
             resources: Arc::new(()),
@@ -1121,6 +1137,21 @@ where
     /// Set the tool registry.  Defaults to an empty [`ToolRegistry`].
     pub fn tools(mut self, tools: ToolRegistry) -> Self {
         self.tools = tools;
+        self
+    }
+
+    /// Set a dynamic tool executor.
+    ///
+    /// When this is provided, the agent uses it instead of wrapping the static
+    /// [`ToolRegistry`] in a [`BasicToolExecutor`].
+    pub fn tool_executor(mut self, executor: impl ToolExecutor + 'static) -> Self {
+        self.tool_executor = Some(Arc::new(executor));
+        self
+    }
+
+    /// Set a shared dynamic tool executor.
+    pub fn tool_executor_arc(mut self, executor: Arc<dyn ToolExecutor>) -> Self {
+        self.tool_executor = Some(executor);
         self
     }
 
@@ -1198,6 +1229,7 @@ where
         Ok(Agent {
             model,
             tools: self.tools,
+            tool_executor: self.tool_executor,
             task_manager: self
                 .task_manager
                 .unwrap_or_else(|| Arc::new(SimpleTaskManager::new())),
@@ -1276,6 +1308,7 @@ where
         task_id: Option<TaskId>,
         tool_request: ToolRequest,
         approved_request: Option<ApprovalRequest>,
+        auth_resolution: Option<AuthResolution>,
         cancellation: Option<TurnCancellation>,
     ) -> impl std::future::Future<Output = Result<TaskStartOutcome, LoopError>> + Send + 'static
     {
@@ -1294,6 +1327,7 @@ where
                         task_id,
                         request: tool_request.clone(),
                         approved_request,
+                        auth_resolution,
                     },
                     TaskStartContext {
                         executor: tool_executor,
@@ -1314,6 +1348,17 @@ where
 
     fn has_pending_interrupts(&self) -> bool {
         self.pending_auth.is_some() || !self.pending_approvals.is_empty()
+    }
+
+    fn emit_tool_catalog_events(&mut self, events: Vec<ToolCatalogEvent>) {
+        for event in events {
+            self.emit(AgentEvent::ToolCatalogChanged {
+                source: event.source,
+                added: event.added,
+                removed: event.removed,
+                changed: event.changed,
+            });
+        }
     }
 
     fn enqueue_pending_approval(&mut self, turn_id: &agentkit_core::TurnId, task: TaskApproval) {
@@ -1558,7 +1603,13 @@ where
                 .and_then(|active| active.pending_calls.pop_front());
             if let Some((_call, tool_request)) = next_call {
                 match self
-                    .start_task_via_manager(None, tool_request.clone(), None, cancellation.clone())
+                    .start_task_via_manager(
+                        None,
+                        tool_request.clone(),
+                        None,
+                        None,
+                        cancellation.clone(),
+                    )
                     .await?
                 {
                     TaskStartOutcome::Ready(resolution) => {
@@ -1718,6 +1769,9 @@ where
             return self.finish_cancelled(turn_id, interrupted_assistant_items());
         }
 
+        let catalog_events = self.tool_executor.drain_catalog_events();
+        self.emit_tool_catalog_events(catalog_events);
+
         let request = TurnRequest {
             session_id: self.session_id.clone(),
             turn_id: turn_id.clone(),
@@ -1845,6 +1899,7 @@ where
                     Some(pending.task_id.clone()),
                     pending.tool_request.clone(),
                     None,
+                    Some(resolution.clone()),
                     self.cancellation
                         .as_ref()
                         .map(CancellationHandle::checkpoint),
@@ -1904,6 +1959,7 @@ where
                     Some(pending.task_id.clone()),
                     pending.tool_request.clone(),
                     Some(pending.request.clone()),
+                    None,
                     self.cancellation
                         .as_ref()
                         .map(CancellationHandle::checkpoint),
@@ -2327,7 +2383,7 @@ mod tests {
     };
     use agentkit_tools_core::{
         FileSystemPermissionRequest, PermissionCode, PermissionDecision, PermissionDenial, Tool,
-        ToolAnnotations, ToolName, ToolResult, ToolSpec,
+        ToolAnnotations, ToolCatalogEvent, ToolExecutionOutcome, ToolName, ToolResult, ToolSpec,
     };
     use serde_json::{Value, json};
     use tokio::sync::Notify;
@@ -3025,6 +3081,139 @@ mod tests {
         }
     }
 
+    struct CatalogExecutor {
+        version: AtomicUsize,
+        events: StdMutex<Vec<ToolCatalogEvent>>,
+    }
+
+    impl CatalogExecutor {
+        fn new() -> Self {
+            Self {
+                version: AtomicUsize::new(0),
+                events: StdMutex::new(Vec::new()),
+            }
+        }
+
+        fn publish_change(&self, version: usize, event: ToolCatalogEvent) {
+            self.version.store(version, Ordering::SeqCst);
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
+    #[async_trait]
+    impl ToolExecutor for CatalogExecutor {
+        fn specs(&self) -> Vec<ToolSpec> {
+            vec![ToolSpec {
+                name: ToolName::new("dynamic"),
+                description: format!("dynamic version {}", self.version.load(Ordering::SeqCst)),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }),
+                annotations: ToolAnnotations::default(),
+                metadata: MetadataMap::new(),
+            }]
+        }
+
+        fn drain_catalog_events(&self) -> Vec<ToolCatalogEvent> {
+            std::mem::take(&mut *self.events.lock().unwrap())
+        }
+
+        async fn execute(
+            &self,
+            request: ToolRequest,
+            _ctx: &mut ToolContext<'_>,
+        ) -> ToolExecutionOutcome {
+            ToolExecutionOutcome::Completed(ToolResult {
+                result: ToolResultPart {
+                    call_id: request.call_id,
+                    output: ToolOutput::Text("dynamic-ok".into()),
+                    is_error: false,
+                    metadata: MetadataMap::new(),
+                },
+                duration: None,
+                metadata: MetadataMap::new(),
+            })
+        }
+    }
+
+    struct AuthResumeExecutor {
+        credentials_seen: StdArc<StdMutex<Option<MetadataMap>>>,
+    }
+
+    impl AuthResumeExecutor {
+        fn new(credentials_seen: StdArc<StdMutex<Option<MetadataMap>>>) -> Self {
+            Self { credentials_seen }
+        }
+
+        fn auth_request(&self, request: &ToolRequest) -> AuthRequest {
+            AuthRequest {
+                task_id: None,
+                id: "auth-resume-1".into(),
+                provider: "mcp.mock".into(),
+                operation: AuthOperation::ToolCall {
+                    tool_name: request.tool_name.0.clone(),
+                    input: request.input.clone(),
+                    call_id: Some(request.call_id.clone()),
+                    session_id: Some(request.session_id.clone()),
+                    turn_id: Some(request.turn_id.clone()),
+                    metadata: request.metadata.clone(),
+                },
+                challenge: MetadataMap::new(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ToolExecutor for AuthResumeExecutor {
+        fn specs(&self) -> Vec<ToolSpec> {
+            vec![ToolSpec {
+                name: ToolName::new("auth-tool"),
+                description: "Requires resumable auth".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }),
+                annotations: ToolAnnotations::default(),
+                metadata: MetadataMap::new(),
+            }]
+        }
+
+        async fn execute(
+            &self,
+            request: ToolRequest,
+            _ctx: &mut ToolContext<'_>,
+        ) -> ToolExecutionOutcome {
+            ToolExecutionOutcome::Interrupted(agentkit_tools_core::ToolInterruption::AuthRequired(
+                self.auth_request(&request),
+            ))
+        }
+
+        async fn execute_after_auth(
+            &self,
+            request: ToolRequest,
+            auth_resolution: &AuthResolution,
+            _ctx: &mut ToolContext<'_>,
+        ) -> ToolExecutionOutcome {
+            if let AuthResolution::Provided { credentials, .. } = auth_resolution {
+                *self.credentials_seen.lock().unwrap() = Some(credentials.clone());
+            }
+
+            ToolExecutionOutcome::Completed(ToolResult {
+                result: ToolResultPart {
+                    call_id: request.call_id,
+                    output: ToolOutput::Text("auth-resumed".into()),
+                    is_error: false,
+                    metadata: MetadataMap::new(),
+                },
+                duration: None,
+                metadata: MetadataMap::new(),
+            })
+        }
+    }
+
     #[derive(Clone)]
     struct BlockingTool {
         spec: ToolSpec,
@@ -3275,6 +3464,57 @@ mod tests {
             }
             other => panic!("unexpected loop step: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn loop_passes_auth_resolution_to_executor_resume_path() {
+        let credentials_seen = StdArc::new(StdMutex::new(None));
+        let agent = Agent::builder()
+            .model(FakeAdapter)
+            .tool_executor(AuthResumeExecutor::new(credentials_seen.clone()))
+            .permissions(AllowAllPermissions)
+            .build()
+            .unwrap();
+
+        let mut driver = agent
+            .start(SessionConfig {
+                session_id: SessionId::new("session-auth-resume"),
+                metadata: MetadataMap::new(),
+                cache: None,
+            })
+            .await
+            .unwrap();
+
+        driver
+            .submit_input(vec![Item {
+                id: None,
+                kind: ItemKind::User,
+                parts: vec![Part::Text(TextPart {
+                    text: "ping".into(),
+                    metadata: MetadataMap::new(),
+                })],
+                metadata: MetadataMap::new(),
+            }])
+            .unwrap();
+
+        let pending = match driver.next().await.unwrap() {
+            LoopStep::Interrupt(LoopInterrupt::AuthRequest(pending)) => pending,
+            other => panic!("unexpected loop step: {other:?}"),
+        };
+        let mut credentials = MetadataMap::new();
+        credentials.insert("access_token".into(), json!("token-123"));
+        pending.provide(&mut driver, credentials.clone()).unwrap();
+
+        let result = run_until_finished(&mut driver).await;
+        match result {
+            LoopStep::Finished(turn) => match &turn.items[0].parts[0] {
+                Part::Text(text) => assert!(text.text.contains("auth-resumed")),
+                other => panic!("unexpected part: {other:?}"),
+            },
+            other => panic!("unexpected loop step: {other:?}"),
+        }
+
+        assert_eq!(*credentials_seen.lock().unwrap(), Some(credentials));
     }
 
     #[tokio::test]
@@ -3737,6 +3977,74 @@ mod tests {
         assert_eq!(seen_descriptions.len(), 2);
         assert_eq!(seen_descriptions[0], vec!["dynamic version 1".to_string()]);
         assert_eq!(seen_descriptions[1], vec!["dynamic version 2".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn loop_emits_catalog_change_and_uses_updated_specs_next_turn() {
+        let seen_descriptions = StdArc::new(StdMutex::new(Vec::new()));
+        let events = StdArc::new(StdMutex::new(Vec::new()));
+        let executor = StdArc::new(CatalogExecutor::new());
+        let executor_for_agent: Arc<dyn ToolExecutor> = executor.clone();
+        let agent = Agent::builder()
+            .model(RecordingAdapter {
+                seen_descriptions: seen_descriptions.clone(),
+                seen_caches: StdArc::new(StdMutex::new(Vec::new())),
+            })
+            .tool_executor_arc(executor_for_agent)
+            .permissions(AllowAllPermissions)
+            .observer(RecordingObserver {
+                events: events.clone(),
+            })
+            .build()
+            .unwrap();
+
+        let mut driver = agent
+            .start(SessionConfig {
+                session_id: SessionId::new("session-catalog-events"),
+                metadata: MetadataMap::new(),
+                cache: None,
+            })
+            .await
+            .unwrap();
+
+        driver
+            .submit_input(vec![Item::text(ItemKind::User, "first")])
+            .unwrap();
+        let _ = driver.next().await.unwrap();
+
+        executor.publish_change(
+            1,
+            ToolCatalogEvent {
+                source: "mcp:mock".into(),
+                added: vec!["dynamic".into()],
+                removed: Vec::new(),
+                changed: Vec::new(),
+            },
+        );
+
+        driver
+            .submit_input(vec![Item::text(ItemKind::User, "second")])
+            .unwrap();
+        let _ = driver.next().await.unwrap();
+
+        let seen_descriptions = seen_descriptions.lock().unwrap();
+        assert_eq!(seen_descriptions.len(), 2);
+        assert_eq!(seen_descriptions[0], vec!["dynamic version 0".to_string()]);
+        assert_eq!(seen_descriptions[1], vec!["dynamic version 1".to_string()]);
+
+        let events = events.lock().unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolCatalogChanged {
+                source,
+                added,
+                removed,
+                changed,
+            } if source == "mcp:mock"
+                && added == &vec!["dynamic".to_string()]
+                && removed.is_empty()
+                && changed.is_empty()
+        )));
     }
 
     #[tokio::test]

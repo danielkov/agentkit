@@ -190,6 +190,35 @@ pub struct ToolSpec {
     pub metadata: MetadataMap,
 }
 
+/// A change notification for a dynamic tool catalog.
+///
+/// Dynamic executors, such as MCP-backed executors, use this to tell the
+/// agent loop that the model should see a refreshed tool list on the next
+/// provider request.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolCatalogEvent {
+    /// Stable source identifier for the catalog that changed.
+    pub source: String,
+    /// Tool names that became available.
+    pub added: Vec<String>,
+    /// Tool names that are no longer available.
+    pub removed: Vec<String>,
+    /// Tool names whose schema, description, or metadata changed.
+    pub changed: Vec<String>,
+}
+
+impl ToolCatalogEvent {
+    /// Builds a catalog event with empty change sets.
+    pub fn new(source: impl Into<String>) -> Self {
+        Self {
+            source: source.into(),
+            added: Vec::new(),
+            removed: Vec::new(),
+            changed: Vec::new(),
+        }
+    }
+}
+
 impl ToolSpec {
     /// Builds a tool spec with default annotations and empty metadata.
     pub fn new(
@@ -1982,6 +2011,14 @@ pub trait ToolExecutor: Send + Sync {
     /// Returns the current specification for every available tool.
     fn specs(&self) -> Vec<ToolSpec>;
 
+    /// Drains any pending dynamic catalog events.
+    ///
+    /// Static executors return an empty list. Dynamic executors should use
+    /// interior mutability to return each catalog event once.
+    fn drain_catalog_events(&self) -> Vec<ToolCatalogEvent> {
+        Vec::new()
+    }
+
     /// Looks up the tool, evaluates permissions, and invokes it.
     async fn execute(
         &self,
@@ -2025,6 +2062,135 @@ pub trait ToolExecutor: Send + Sync {
     ) -> ToolExecutionOutcome {
         let mut borrowed = ctx.borrowed();
         self.execute_approved(request, approved_request, &mut borrowed)
+            .await
+    }
+
+    /// Re-executes a tool call that was previously interrupted for auth.
+    ///
+    /// The default implementation ignores the resolution and delegates to
+    /// [`execute`](ToolExecutor::execute), preserving compatibility for
+    /// executors that do not implement resumable authentication.
+    async fn execute_after_auth(
+        &self,
+        request: ToolRequest,
+        auth_resolution: &AuthResolution,
+        ctx: &mut ToolContext<'_>,
+    ) -> ToolExecutionOutcome {
+        let _ = auth_resolution;
+        self.execute(request, ctx).await
+    }
+
+    /// Re-executes a tool call after auth using an owned execution context.
+    async fn execute_after_auth_owned(
+        &self,
+        request: ToolRequest,
+        auth_resolution: &AuthResolution,
+        ctx: OwnedToolContext,
+    ) -> ToolExecutionOutcome {
+        let mut borrowed = ctx.borrowed();
+        self.execute_after_auth(request, auth_resolution, &mut borrowed)
+            .await
+    }
+}
+
+/// A [`ToolExecutor`] that routes requests across multiple executors.
+///
+/// This is intended for hosts that combine static local tools with one or
+/// more dynamic catalogs, such as MCP servers.
+pub struct CompositeToolExecutor {
+    executors: Vec<Arc<dyn ToolExecutor>>,
+}
+
+impl CompositeToolExecutor {
+    /// Builds an empty composite executor.
+    pub fn new() -> Self {
+        Self {
+            executors: Vec::new(),
+        }
+    }
+
+    /// Builds a composite executor from existing executor instances.
+    pub fn from_executors(executors: Vec<Arc<dyn ToolExecutor>>) -> Self {
+        Self { executors }
+    }
+
+    /// Appends an executor.
+    pub fn push(mut self, executor: impl ToolExecutor + 'static) -> Self {
+        self.executors.push(Arc::new(executor));
+        self
+    }
+
+    /// Appends a shared executor.
+    pub fn push_arc(mut self, executor: Arc<dyn ToolExecutor>) -> Self {
+        self.executors.push(executor);
+        self
+    }
+
+    fn executor_for(&self, name: &ToolName) -> Option<&Arc<dyn ToolExecutor>> {
+        self.executors
+            .iter()
+            .find(|executor| executor.specs().iter().any(|spec| &spec.name == name))
+    }
+}
+
+impl Default for CompositeToolExecutor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl ToolExecutor for CompositeToolExecutor {
+    fn specs(&self) -> Vec<ToolSpec> {
+        self.executors
+            .iter()
+            .flat_map(|executor| executor.specs())
+            .collect()
+    }
+
+    fn drain_catalog_events(&self) -> Vec<ToolCatalogEvent> {
+        self.executors
+            .iter()
+            .flat_map(|executor| executor.drain_catalog_events())
+            .collect()
+    }
+
+    async fn execute(
+        &self,
+        request: ToolRequest,
+        ctx: &mut ToolContext<'_>,
+    ) -> ToolExecutionOutcome {
+        let Some(executor) = self.executor_for(&request.tool_name) else {
+            return ToolExecutionOutcome::Failed(ToolError::NotFound(request.tool_name));
+        };
+        executor.execute(request, ctx).await
+    }
+
+    async fn execute_approved(
+        &self,
+        request: ToolRequest,
+        approved_request: &ApprovalRequest,
+        ctx: &mut ToolContext<'_>,
+    ) -> ToolExecutionOutcome {
+        let Some(executor) = self.executor_for(&request.tool_name) else {
+            return ToolExecutionOutcome::Failed(ToolError::NotFound(request.tool_name));
+        };
+        executor
+            .execute_approved(request, approved_request, ctx)
+            .await
+    }
+
+    async fn execute_after_auth(
+        &self,
+        request: ToolRequest,
+        auth_resolution: &AuthResolution,
+        ctx: &mut ToolContext<'_>,
+    ) -> ToolExecutionOutcome {
+        let Some(executor) = self.executor_for(&request.tool_name) else {
+            return ToolExecutionOutcome::Failed(ToolError::NotFound(request.tool_name));
+        };
+        executor
+            .execute_after_auth(request, auth_resolution, ctx)
             .await
     }
 }

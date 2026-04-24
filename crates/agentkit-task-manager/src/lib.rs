@@ -7,8 +7,8 @@ use agentkit_core::{
     Item, MetadataMap, TaskId, ToolCallId, ToolResultPart, TurnCancellation, TurnId,
 };
 use agentkit_tools_core::{
-    ApprovalRequest, AuthRequest, OwnedToolContext, ToolError, ToolExecutionOutcome, ToolExecutor,
-    ToolRequest,
+    ApprovalRequest, AuthRequest, AuthResolution, OwnedToolContext, ToolError,
+    ToolExecutionOutcome, ToolExecutor, ToolRequest,
 };
 use async_trait::async_trait;
 use thiserror::Error;
@@ -96,6 +96,7 @@ pub struct TaskLaunchRequest {
     pub task_id: Option<TaskId>,
     pub request: ToolRequest,
     pub approved_request: Option<ApprovalRequest>,
+    pub auth_resolution: Option<AuthResolution>,
 }
 
 #[derive(Clone)]
@@ -258,13 +259,25 @@ impl TaskManager for SimpleTaskManager {
             .task_id
             .clone()
             .unwrap_or_else(|| self.state.next_task_id());
-        let outcome = match request.approved_request.as_ref() {
-            Some(approved) => {
+        let outcome = match (
+            request.auth_resolution.as_ref(),
+            request.approved_request.as_ref(),
+        ) {
+            (Some(auth_resolution), _) => {
+                ctx.executor
+                    .execute_after_auth_owned(
+                        request.request.clone(),
+                        auth_resolution,
+                        ctx.tool_context,
+                    )
+                    .await
+            }
+            (None, Some(approved)) => {
                 ctx.executor
                     .execute_approved_owned(request.request.clone(), approved, ctx.tool_context)
                     .await
             }
-            None => {
+            (None, None) => {
                 ctx.executor
                     .execute_owned(request.request.clone(), ctx.tool_context)
                     .await
@@ -475,6 +488,7 @@ impl TaskManager for AsyncTaskManager {
         let task_id_for_future = task_id.clone();
         let turn_id = snapshot.turn_id.clone();
         let approved = request.approved_request.clone();
+        let auth_resolution = request.auth_resolution.clone();
         let exec_request = request.request.clone();
         let owned_ctx = ctx.tool_context.clone();
         let executor = ctx.executor.clone();
@@ -515,13 +529,18 @@ impl TaskManager for AsyncTaskManager {
                 });
             }
 
-            let outcome = match approved.as_ref() {
-                Some(approval) => {
+            let outcome = match (auth_resolution.as_ref(), approved.as_ref()) {
+                (Some(auth_resolution), _) => {
+                    executor
+                        .execute_after_auth_owned(exec_request.clone(), auth_resolution, owned_ctx)
+                        .await
+                }
+                (None, Some(approval)) => {
                     executor
                         .execute_approved_owned(exec_request.clone(), approval, owned_ctx)
                         .await
                 }
-                None => {
+                (None, None) => {
                     executor
                         .execute_owned(exec_request.clone(), owned_ctx)
                         .await
@@ -1036,6 +1055,7 @@ mod tests {
                     task_id: None,
                     request: request.clone(),
                     approved_request: None,
+                    auth_resolution: None,
                 },
                 make_context(executor, &request.turn_id, None),
             )
@@ -1094,6 +1114,7 @@ mod tests {
                     task_id: None,
                     request: make_request("foreground", "turn-1", "call-fg"),
                     approved_request: None,
+                    auth_resolution: None,
                 },
                 make_context(executor.clone(), &turn_id, None),
             )
@@ -1105,6 +1126,7 @@ mod tests {
                     task_id: None,
                     request: make_request("background", "turn-1", "call-bg"),
                     approved_request: None,
+                    auth_resolution: None,
                 },
                 make_context(executor.clone(), &turn_id, None),
             )
@@ -1178,6 +1200,7 @@ mod tests {
                     task_id: None,
                     request: request.clone(),
                     approved_request: None,
+                    auth_resolution: None,
                 },
                 make_context(executor, &request.turn_id, None),
             )
@@ -1225,6 +1248,7 @@ mod tests {
                     task_id: None,
                     request: request.clone(),
                     approved_request: None,
+                    auth_resolution: None,
                 },
                 make_context(executor, &request.turn_id, None),
             )
@@ -1304,6 +1328,7 @@ mod tests {
                     task_id: None,
                     request: request.clone(),
                     approved_request: None,
+                    auth_resolution: None,
                 },
                 make_context(
                     executor,
@@ -1369,6 +1394,7 @@ mod tests {
                     task_id: None,
                     request: request.clone(),
                     approved_request: None,
+                    auth_resolution: None,
                 },
                 make_context(executor, &request.turn_id, None),
             )

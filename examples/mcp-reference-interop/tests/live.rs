@@ -178,7 +178,7 @@ async fn rust_sdk_stateless_transport_skips_session_and_delete() {
 }
 
 #[tokio::test]
-async fn streamable_http_resumes_interrupted_sse_response() {
+async fn streamable_http_accepts_sse_responses_from_common_stream() {
     let (base_url, requests, shutdown) = spawn_resume_server().await;
     let url = format!("{base_url}/mcp");
 
@@ -207,15 +207,11 @@ async fn streamable_http_resumes_interrupted_sse_response() {
         Some("2025-11-25")
     );
 
-    let resume_get = requests
+    let common_stream_get = requests
         .iter()
         .find(|request| request.method == "GET" && request.path == "/mcp")
-        .expect("expected GET resume request");
-    assert_eq!(
-        resume_get.headers.get("last-event-id").map(String::as_str),
-        Some("evt-1")
-    );
-    assert!(resume_get.headers.contains_key("mcp-session-id"));
+        .expect("expected RMCP Streamable HTTP client to open the common SSE GET stream");
+    assert!(common_stream_get.headers.contains_key("mcp-session-id"));
 }
 
 fn find_jsonrpc_request<'a>(requests: &'a [RecordedRequest], method: &str) -> &'a RecordedRequest {

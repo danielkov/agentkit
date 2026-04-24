@@ -256,7 +256,7 @@ impl ToolResources for FileSystemToolResources {
 
 /// Reads a UTF-8 text file, optionally limited to a 1-based inclusive line range.
 ///
-/// Tool name: `fs.read_file`
+/// Tool name: `fs_read_file`
 ///
 /// When [`FileSystemToolResources`] is available in the tool context, a
 /// successful read marks the path as inspected for the current session.
@@ -268,7 +268,7 @@ impl ToolResources for FileSystemToolResources {
 /// use agentkit_tools_core::Tool;
 ///
 /// let tool = ReadFileTool::default();
-/// assert_eq!(&tool.spec().name.0, "fs.read_file");
+/// assert_eq!(&tool.spec().name.0, "fs_read_file");
 /// ```
 #[derive(Clone, Debug)]
 pub struct ReadFileTool {
@@ -279,7 +279,7 @@ impl Default for ReadFileTool {
     fn default() -> Self {
         Self {
             spec: ToolSpec {
-                name: ToolName::new("fs.read_file"),
+                name: ToolName::new("fs_read_file"),
                 description: "Read a UTF-8 text file from disk, optionally limited to a 1-based inclusive line range."
                     .into(),
                 input_schema: json!({
@@ -363,7 +363,7 @@ impl Tool for ReadFileTool {
 
 /// Writes UTF-8 text to a file, creating parent directories if needed.
 ///
-/// Tool name: `fs.write_file`
+/// Tool name: `fs_write_file`
 ///
 /// If `require_read_before_write` is active and the target file already exists,
 /// this tool will refuse to execute unless the path was previously inspected
@@ -376,7 +376,7 @@ impl Tool for ReadFileTool {
 /// use agentkit_tools_core::Tool;
 ///
 /// let tool = WriteFileTool::default();
-/// assert_eq!(&tool.spec().name.0, "fs.write_file");
+/// assert_eq!(&tool.spec().name.0, "fs_write_file");
 /// ```
 #[derive(Clone, Debug)]
 pub struct WriteFileTool {
@@ -387,7 +387,7 @@ impl Default for WriteFileTool {
     fn default() -> Self {
         Self {
             spec: ToolSpec {
-                name: ToolName::new("fs.write_file"),
+                name: ToolName::new("fs_write_file"),
                 description: "Write UTF-8 text to a file, creating parent directories if needed."
                     .into(),
                 input_schema: json!({
@@ -489,7 +489,7 @@ impl Tool for WriteFileTool {
 
 /// Replaces exact text within a UTF-8 file.
 ///
-/// Tool name: `fs.replace_in_file`
+/// Tool name: `fs_replace_in_file`
 ///
 /// Fails if the search text is not found. Supports replacing only the first
 /// occurrence (default) or all occurrences via the `replace_all` input flag.
@@ -501,7 +501,7 @@ impl Tool for WriteFileTool {
 /// use agentkit_tools_core::Tool;
 ///
 /// let tool = ReplaceInFileTool::default();
-/// assert_eq!(&tool.spec().name.0, "fs.replace_in_file");
+/// assert_eq!(&tool.spec().name.0, "fs_replace_in_file");
 /// ```
 #[derive(Clone, Debug)]
 pub struct ReplaceInFileTool {
@@ -512,7 +512,7 @@ impl Default for ReplaceInFileTool {
     fn default() -> Self {
         Self {
             spec: ToolSpec {
-                name: ToolName::new("fs.replace_in_file"),
+                name: ToolName::new("fs_replace_in_file"),
                 description:
                     "Replace exact text in a UTF-8 file. Fails if the search text is not found."
                         .into(),
@@ -627,7 +627,7 @@ impl Tool for ReplaceInFileTool {
 
 /// Moves or renames a file or directory.
 ///
-/// Tool name: `fs.move`
+/// Tool name: `fs_move`
 ///
 /// Optionally creates parent directories for the destination and can overwrite
 /// an existing target when `overwrite` is set. Subject to `require_read_before_write`
@@ -640,7 +640,7 @@ impl Tool for ReplaceInFileTool {
 /// use agentkit_tools_core::Tool;
 ///
 /// let tool = MoveTool::default();
-/// assert_eq!(&tool.spec().name.0, "fs.move");
+/// assert_eq!(&tool.spec().name.0, "fs_move");
 /// ```
 #[derive(Clone, Debug)]
 pub struct MoveTool {
@@ -651,7 +651,7 @@ impl Default for MoveTool {
     fn default() -> Self {
         Self {
             spec: ToolSpec {
-                name: ToolName::new("fs.move"),
+                name: ToolName::new("fs_move"),
                 description: "Move or rename a file or directory.".into(),
                 input_schema: json!({
                     "type": "object",
@@ -770,7 +770,7 @@ impl Tool for MoveTool {
 
 /// Deletes a file or directory.
 ///
-/// Tool name: `fs.delete`
+/// Tool name: `fs_delete`
 ///
 /// For directories, set `recursive` to remove non-empty directories. The
 /// `missing_ok` flag suppresses errors when the target does not exist.
@@ -782,7 +782,7 @@ impl Tool for MoveTool {
 /// use agentkit_tools_core::Tool;
 ///
 /// let tool = DeleteTool::default();
-/// assert_eq!(&tool.spec().name.0, "fs.delete");
+/// assert_eq!(&tool.spec().name.0, "fs_delete");
 /// ```
 #[derive(Clone, Debug)]
 pub struct DeleteTool {
@@ -793,7 +793,7 @@ impl Default for DeleteTool {
     fn default() -> Self {
         Self {
             spec: ToolSpec {
-                name: ToolName::new("fs.delete"),
+                name: ToolName::new("fs_delete"),
                 description: "Delete a file or directory.".into(),
                 input_schema: json!({
                     "type": "object",
@@ -888,7 +888,7 @@ impl Tool for DeleteTool {
 
 /// Lists entries in a directory.
 ///
-/// Tool name: `fs.list_directory`
+/// Tool name: `fs_list_directory`
 ///
 /// Returns a JSON array of objects with `name`, `path`, and `kind` (one of
 /// `"file"`, `"directory"`, or `"symlink"`) for each entry. A successful list
@@ -901,7 +901,7 @@ impl Tool for DeleteTool {
 /// use agentkit_tools_core::Tool;
 ///
 /// let tool = ListDirectoryTool::default();
-/// assert_eq!(&tool.spec().name.0, "fs.list_directory");
+/// assert_eq!(&tool.spec().name.0, "fs_list_directory");
 /// ```
 #[derive(Clone, Debug)]
 pub struct ListDirectoryTool {
@@ -912,7 +912,7 @@ impl Default for ListDirectoryTool {
     fn default() -> Self {
         Self {
             spec: ToolSpec {
-                name: ToolName::new("fs.list_directory"),
+                name: ToolName::new("fs_list_directory"),
                 description: "List the entries in a directory.".into(),
                 input_schema: json!({
                     "type": "object",
@@ -1012,7 +1012,7 @@ impl Tool for ListDirectoryTool {
 
 /// Creates a directory and any missing parent directories.
 ///
-/// Tool name: `fs.create_directory`
+/// Tool name: `fs_create_directory`
 ///
 /// This is idempotent: calling it on an already-existing directory succeeds
 /// without error.
@@ -1024,7 +1024,7 @@ impl Tool for ListDirectoryTool {
 /// use agentkit_tools_core::Tool;
 ///
 /// let tool = CreateDirectoryTool::default();
-/// assert_eq!(&tool.spec().name.0, "fs.create_directory");
+/// assert_eq!(&tool.spec().name.0, "fs_create_directory");
 /// ```
 #[derive(Clone, Debug)]
 pub struct CreateDirectoryTool {
@@ -1035,7 +1035,7 @@ impl Default for CreateDirectoryTool {
     fn default() -> Self {
         Self {
             spec: ToolSpec {
-                name: ToolName::new("fs.create_directory"),
+                name: ToolName::new("fs_create_directory"),
                 description: "Create a directory and any missing parent directories.".into(),
                 input_schema: json!({
                     "type": "object",
@@ -1311,13 +1311,13 @@ mod tests {
     fn registry_exposes_expected_tools() {
         let specs = registry().specs();
         let names: Vec<_> = specs.into_iter().map(|spec| spec.name.0).collect();
-        assert!(names.contains(&"fs.read_file".into()));
-        assert!(names.contains(&"fs.write_file".into()));
-        assert!(names.contains(&"fs.replace_in_file".into()));
-        assert!(names.contains(&"fs.move".into()));
-        assert!(names.contains(&"fs.delete".into()));
-        assert!(names.contains(&"fs.list_directory".into()));
-        assert!(names.contains(&"fs.create_directory".into()));
+        assert!(names.contains(&"fs_read_file".into()));
+        assert!(names.contains(&"fs_write_file".into()));
+        assert!(names.contains(&"fs_replace_in_file".into()));
+        assert!(names.contains(&"fs_move".into()));
+        assert!(names.contains(&"fs_delete".into()));
+        assert!(names.contains(&"fs_list_directory".into()));
+        assert!(names.contains(&"fs_create_directory".into()));
     }
 
     #[tokio::test]
@@ -1335,7 +1335,7 @@ mod tests {
         let write = executor
             .execute(
                 request(
-                    "fs.write_file",
+                    "fs_write_file",
                     json!({
                         "path": target.display().to_string(),
                         "contents": "alpha\nbeta\ngamma"
@@ -1351,7 +1351,7 @@ mod tests {
         let read = executor
             .execute(
                 request(
-                    "fs.read_file",
+                    "fs_read_file",
                     json!({
                         "path": target.display().to_string(),
                         "from": 2,
@@ -1393,7 +1393,7 @@ mod tests {
         let denied_edit = executor
             .execute(
                 request(
-                    "fs.replace_in_file",
+                    "fs_replace_in_file",
                     json!({
                         "path": source.display().to_string(),
                         "find": "world",
@@ -1413,7 +1413,7 @@ mod tests {
         let read = executor
             .execute(
                 request(
-                    "fs.read_file",
+                    "fs_read_file",
                     json!({
                         "path": source.display().to_string()
                     }),
@@ -1428,7 +1428,7 @@ mod tests {
         let replace = executor
             .execute(
                 request(
-                    "fs.replace_in_file",
+                    "fs_replace_in_file",
                     json!({
                         "path": source.display().to_string(),
                         "find": "world",
@@ -1445,7 +1445,7 @@ mod tests {
         let move_result = executor
             .execute(
                 request(
-                    "fs.move",
+                    "fs_move",
                     json!({
                         "from": source.display().to_string(),
                         "to": destination.display().to_string()
@@ -1464,7 +1464,7 @@ mod tests {
         let delete = executor
             .execute(
                 request(
-                    "fs.delete",
+                    "fs_delete",
                     json!({
                         "path": destination.display().to_string()
                     }),

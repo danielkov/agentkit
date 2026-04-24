@@ -12,6 +12,7 @@ rust-version.workspace = true
 [features]
 default = ["reqwest-client"]
 reqwest-client = ["agentkit-http/reqwest-client", "dep:reqwest"]
+legacy-sse = ["reqwest-client"]
 
 [dependencies]
 agentkit-capabilities = { version = "0.4.0", path = "../agentkit-capabilities" }
@@ -20,6 +21,7 @@ agentkit-http = { version = "0.4.0", path = "../agentkit-http", default-features
 agentkit-tools-core = { version = "0.4.0", path = "../agentkit-tools-core" }
 async-trait.workspace = true
 futures-util = "0.3.31"
+rmcp = { version = "1.5.0", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest", "auth"] }
 url = "2"
 serde.workspace = true
 serde_json.workspace = true

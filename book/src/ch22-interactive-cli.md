@@ -226,9 +226,9 @@ fn handle_event(&mut self, event: AgentEvent) {
 Display tool calls as they happen so the user knows what the agent is doing:
 
 ```
-→ fs.read_file(path: "src/main.rs")
-→ fs.replace_in_file(path: "src/main.rs", ...)
-→ shell.exec(executable: "cargo", argv: ["build"])
+→ fs_read_file(path: "src/main.rs")
+→ fs_replace_in_file(path: "src/main.rs", ...)
+→ shell_exec(executable: "cargo", argv: ["build"])
 ```
 
 ### Usage reporting
@@ -244,7 +244,7 @@ tokens: 1,234 in / 567 out | cost: $0.02
 When the loop returns an approval interrupt, present it clearly:
 
 ```
-⚠ shell.exec wants to run: rm -rf target/
+⚠ shell_exec wants to run: rm -rf target/
   Allow? [y/n/always]:
 ```
 
@@ -300,12 +300,12 @@ Tool failures are returned to the model as a `ToolResultPart` with `is_error: tr
 ```text
 Tool error flow (handled entirely within the loop):
 
-  Model: ToolCall(fs.read_file, { path: "main.rs" })
+  Model: ToolCall(fs_read_file, { path: "main.rs" })
   Tool:  ToolResultPart { is_error: true, output: "File not found" }
   Model: "The file doesn't exist in the current directory. Let me check..."
-  Model: ToolCall(shell.exec, { executable: "find", argv: [".", "-name", "main.rs"] })
+  Model: ToolCall(shell_exec, { executable: "find", argv: [".", "-name", "main.rs"] })
   Tool:  ToolResultPart { output: "./src/main.rs" }
-  Model: ToolCall(fs.read_file, { path: "./src/main.rs" })
+  Model: ToolCall(fs_read_file, { path: "./src/main.rs" })
   Tool:  ToolResultPart { output: "fn main() { ... }" }
 
   The host never saw the error — the model handled it autonomously.
