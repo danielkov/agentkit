@@ -4,11 +4,13 @@
 
 use std::sync::Arc;
 
-use agentkit_capabilities::{CapabilityContext, Invocable, InvocableOutput, InvocableRequest};
+use agentkit_capabilities::{
+    CapabilityContext, CapabilityProvider, Invocable, InvocableOutput, InvocableRequest,
+};
 use agentkit_core::{MetadataMap, ToolOutput};
 use agentkit_mcp::{
-    McpClientHandler, McpConnection, McpInvocable, McpResourceContents, McpServerCapabilities,
-    McpServerId, McpToolAdapter, PromptMessageContent,
+    McpCapabilityProvider, McpClientHandler, McpConnection, McpResourceContents,
+    McpServerCapabilities, McpServerId, McpToolAdapter, McpToolNamespace, PromptMessageContent,
 };
 use agentkit_tools_core::{
     PermissionChecker, PermissionDecision, PermissionRequest, Tool, ToolContext, ToolName,
@@ -297,10 +299,14 @@ async fn tool_adapter_propagates_call_through_running_service() {
 }
 
 #[tokio::test]
-async fn invocable_adapter_returns_text_output() {
+async fn capability_provider_invocable_returns_text_output() {
     let connection = Arc::new(connect_in_memory().await);
     let snapshot = connection.discover().await.unwrap();
-    let invocable = McpInvocable::new(connection.clone(), snapshot.tools[0].clone());
+    let provider = McpCapabilityProvider::from_snapshot(connection.clone(), &snapshot);
+    let invocables = provider.invocables();
+    assert_eq!(invocables.len(), 1);
+    let invocable = invocables[0].clone();
+    assert_eq!(invocable.spec().name.0, "mcp_in-memory_echo");
 
     let metadata = MetadataMap::new();
     let mut ctx = CapabilityContext {
@@ -321,4 +327,33 @@ async fn invocable_adapter_returns_text_output() {
         InvocableOutput::Text(text) => assert_eq!(text, "hello-invocable"),
         other => panic!("unexpected output: {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn custom_namespace_overrides_default_prefix() {
+    let connection = Arc::new(connect_in_memory().await);
+    let snapshot = connection.discover().await.unwrap();
+    let server_id = connection.server_id().clone();
+    let namespace = McpToolNamespace::custom(|server, name| format!("remote.{server}.{name}"));
+    let adapter = McpToolAdapter::with_namespace(
+        &server_id,
+        connection,
+        snapshot.tools[0].clone(),
+        &namespace,
+    );
+    assert_eq!(adapter.spec().name.0, "remote.in-memory.echo");
+}
+
+#[tokio::test]
+async fn none_namespace_strips_prefix() {
+    let connection = Arc::new(connect_in_memory().await);
+    let snapshot = connection.discover().await.unwrap();
+    let server_id = connection.server_id().clone();
+    let adapter = McpToolAdapter::with_namespace(
+        &server_id,
+        connection,
+        snapshot.tools[0].clone(),
+        &McpToolNamespace::None,
+    );
+    assert_eq!(adapter.spec().name.0, "echo");
 }
