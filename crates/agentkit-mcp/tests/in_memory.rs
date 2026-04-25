@@ -10,13 +10,13 @@ use agentkit_capabilities::{
 };
 use agentkit_core::{MetadataMap, ToolOutput};
 use agentkit_mcp::{
-    McpCapabilityProvider, McpClientHandler, McpConnection, McpCreateElicitationRequestParams,
+    McpCapabilityProvider, McpConnection, McpCreateElicitationRequestParams,
     McpCreateElicitationResult, McpCreateMessageRequestParams, McpCreateMessageResult,
-    McpElicitationAction, McpElicitationResponder, McpError, McpLoggingLevel,
-    McpLoggingMessageNotificationParam, McpProgressNotificationParam,
-    McpResourceContents, McpResourceUpdatedNotificationParam, McpRoot, McpRootsProvider,
-    McpSamplingMessage, McpSamplingResponder, McpServerCapabilities, McpServerEvent, McpServerId,
-    McpToolAdapter, McpToolNamespace, PromptMessageContent,
+    McpElicitationAction, McpElicitationResponder, McpError, McpHandlerConfig, McpLoggingLevel,
+    McpLoggingMessageNotificationParam, McpProgressNotificationParam, McpResourceContents,
+    McpResourceUpdatedNotificationParam, McpRoot, McpRootsProvider, McpSamplingMessage,
+    McpSamplingResponder, McpServerCapabilities, McpServerEvent, McpServerId, McpToolAdapter,
+    McpToolNamespace, PromptMessageContent,
 };
 use agentkit_tools_core::{
     PermissionChecker, PermissionDecision, PermissionRequest, Tool, ToolContext, ToolName,
@@ -95,11 +95,10 @@ impl ServerHandler for InMemoryServer {
         _context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResult, RmcpError> {
         if params.uri == "memo:welcome" {
-            Ok(ReadResourceResult::new(vec![ResourceContents::text(
-                "hello from the in-memory MCP server",
-                params.uri,
-            )
-            .with_mime_type("text/plain")]))
+            Ok(ReadResourceResult::new(vec![
+                ResourceContents::text("hello from the in-memory MCP server", params.uri)
+                    .with_mime_type("text/plain"),
+            ]))
         } else {
             Err(RmcpError::invalid_params("unknown resource", None))
         }
@@ -145,7 +144,7 @@ impl ServerHandler for InMemoryServer {
 }
 
 async fn connect_in_memory() -> McpConnection {
-    let (connection, _peer) = connect_in_memory_with_server_peer(McpClientHandler::builder()).await;
+    let (connection, _peer) = connect_in_memory_with_server_peer(McpHandlerConfig::new()).await;
     connection
 }
 
@@ -153,7 +152,7 @@ async fn connect_in_memory() -> McpConnection {
 /// so a test can drive server→client requests and notifications (sampling,
 /// elicitation, logging, progress, resource updates) directly.
 async fn connect_in_memory_with_server_peer(
-    builder: agentkit_mcp::McpClientHandlerBuilder,
+    builder: agentkit_mcp::McpHandlerConfig,
 ) -> (McpConnection, Peer<RoleServer>) {
     let (handler, channels) = builder.build();
     let (server_io, client_io) = tokio::io::duplex(8 * 1024);
@@ -228,7 +227,10 @@ async fn discovery_returns_advertised_tools_resources_prompts() {
     let arguments = snapshot.prompts[0].arguments.as_ref().unwrap();
     assert_eq!(arguments[0].name, "text");
     assert_eq!(arguments[0].required, Some(true));
-    assert_eq!(arguments[0].description.as_deref(), Some("Text to summarize."));
+    assert_eq!(
+        arguments[0].description.as_deref(),
+        Some("Text to summarize.")
+    );
 }
 
 #[tokio::test]
@@ -428,14 +430,16 @@ impl McpElicitationResponder for AcceptingElicitation {
         &self,
         _params: McpCreateElicitationRequestParams,
     ) -> Result<McpCreateElicitationResult, McpError> {
-        Ok(McpCreateElicitationResult::new(McpElicitationAction::Accept))
+        Ok(McpCreateElicitationResult::new(
+            McpElicitationAction::Accept,
+        ))
     }
 }
 
 #[tokio::test]
 async fn sampling_responder_handles_create_message_request() {
     let (_connection, peer) = connect_in_memory_with_server_peer(
-        McpClientHandler::builder().with_sampling_responder(Arc::new(EchoSampling)),
+        McpHandlerConfig::new().with_sampling_responder(Arc::new(EchoSampling)),
     )
     .await;
 
@@ -460,8 +464,7 @@ async fn sampling_responder_handles_create_message_request() {
 
 #[tokio::test]
 async fn sampling_responder_absent_returns_method_not_found() {
-    let (_connection, peer) =
-        connect_in_memory_with_server_peer(McpClientHandler::builder()).await;
+    let (_connection, peer) = connect_in_memory_with_server_peer(McpHandlerConfig::new()).await;
 
     let mut params = McpCreateMessageRequestParams::default();
     params.messages = vec![McpSamplingMessage::user_text("ping")];
@@ -485,7 +488,7 @@ async fn roots_provider_supplies_list_roots_response() {
         McpRoot::new("file:///workspace/b"),
     ];
     let (_connection, peer) = connect_in_memory_with_server_peer(
-        McpClientHandler::builder().with_roots_provider(Arc::new(StaticRoots(roots.clone()))),
+        McpHandlerConfig::new().with_roots_provider(Arc::new(StaticRoots(roots.clone()))),
     )
     .await;
 
@@ -498,8 +501,7 @@ async fn roots_provider_supplies_list_roots_response() {
 
 #[tokio::test]
 async fn roots_provider_default_returns_empty() {
-    let (_connection, peer) =
-        connect_in_memory_with_server_peer(McpClientHandler::builder()).await;
+    let (_connection, peer) = connect_in_memory_with_server_peer(McpHandlerConfig::new()).await;
     let result = peer.list_roots().await.expect("list_roots succeeds");
     assert!(result.roots.is_empty());
 }
@@ -508,7 +510,7 @@ async fn roots_provider_default_returns_empty() {
 async fn elicitation_responder_returns_accept() {
     use rmcp::model::ElicitationSchema;
     let (_connection, peer) = connect_in_memory_with_server_peer(
-        McpClientHandler::builder().with_elicitation_responder(Arc::new(AcceptingElicitation)),
+        McpHandlerConfig::new().with_elicitation_responder(Arc::new(AcceptingElicitation)),
     )
     .await;
 
@@ -526,8 +528,7 @@ async fn elicitation_responder_returns_accept() {
 
 #[tokio::test]
 async fn progress_notification_reaches_event_subscribers() {
-    let (connection, peer) =
-        connect_in_memory_with_server_peer(McpClientHandler::builder()).await;
+    let (connection, peer) = connect_in_memory_with_server_peer(McpHandlerConfig::new()).await;
     let mut events = connection.subscribe_events();
 
     peer.notify_progress(McpProgressNotificationParam {
@@ -556,8 +557,7 @@ async fn progress_notification_reaches_event_subscribers() {
 
 #[tokio::test]
 async fn logging_message_reaches_event_subscribers() {
-    let (connection, peer) =
-        connect_in_memory_with_server_peer(McpClientHandler::builder()).await;
+    let (connection, peer) = connect_in_memory_with_server_peer(McpHandlerConfig::new()).await;
     let mut events = connection.subscribe_events();
 
     peer.notify_logging_message(McpLoggingMessageNotificationParam {
@@ -583,8 +583,7 @@ async fn logging_message_reaches_event_subscribers() {
 
 #[tokio::test]
 async fn resource_updated_notification_reaches_event_subscribers() {
-    let (connection, peer) =
-        connect_in_memory_with_server_peer(McpClientHandler::builder()).await;
+    let (connection, peer) = connect_in_memory_with_server_peer(McpHandlerConfig::new()).await;
     let mut events = connection.subscribe_events();
 
     peer.notify_resource_updated(McpResourceUpdatedNotificationParam {
@@ -607,8 +606,7 @@ async fn resource_updated_notification_reaches_event_subscribers() {
 
 #[tokio::test]
 async fn list_changed_notifications_emit_events() {
-    let (connection, peer) =
-        connect_in_memory_with_server_peer(McpClientHandler::builder()).await;
+    let (connection, peer) = connect_in_memory_with_server_peer(McpHandlerConfig::new()).await;
     let mut events = connection.subscribe_events();
 
     peer.notify_tool_list_changed()
@@ -630,15 +628,24 @@ async fn list_changed_notifications_emit_events() {
         seen.push(event);
     }
 
-    assert!(seen.iter().any(|event| matches!(event, McpServerEvent::ToolListChanged)));
-    assert!(seen.iter().any(|event| matches!(event, McpServerEvent::ResourceListChanged)));
-    assert!(seen.iter().any(|event| matches!(event, McpServerEvent::PromptListChanged)));
+    assert!(
+        seen.iter()
+            .any(|event| matches!(event, McpServerEvent::ToolListChanged))
+    );
+    assert!(
+        seen.iter()
+            .any(|event| matches!(event, McpServerEvent::ResourceListChanged))
+    );
+    assert!(
+        seen.iter()
+            .any(|event| matches!(event, McpServerEvent::PromptListChanged))
+    );
 }
 
 #[tokio::test]
 async fn handler_advertises_responder_capabilities_during_initialize() {
     let (connection, _peer) = connect_in_memory_with_server_peer(
-        McpClientHandler::builder()
+        McpHandlerConfig::new()
             .with_sampling_responder(Arc::new(EchoSampling))
             .with_elicitation_responder(Arc::new(AcceptingElicitation))
             .with_roots_provider(Arc::new(StaticRoots(Vec::new()))),

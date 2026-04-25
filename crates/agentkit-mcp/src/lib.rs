@@ -9,9 +9,15 @@
 //! - [`McpServerManager`] — multi-server lifecycle, discovery, catalog diffing,
 //!   and auth replay.
 //! - [`McpServerHandle`], [`McpToolExecutor`], [`McpToolAdapter`],
-//!   [`McpInvocable`], [`McpResourceHandle`], [`McpPromptHandle`],
+//!   [`McpResourceHandle`], [`McpPromptHandle`],
 //!   [`McpCapabilityProvider`] — bridges into the agentkit `Tool` / capabilities
 //!   systems.
+//!
+//! Wire-protocol types (`CallToolResult`, `ReadResourceResult`, `Content`,
+//! `ToolAnnotations`, `Prompt`, sampling/elicitation/roots payloads, …) are
+//! re-exported from [`rmcp::model`] directly — there is no parallel
+//! agentkit-side vocabulary. As `rmcp` tracks new MCP spec revisions, those
+//! types and their fields propagate into agentkit unchanged.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -27,19 +33,26 @@ use agentkit_core::{
     ToolResultPart,
 };
 use agentkit_tools_core::{
-    AuthOperation, AuthRequest, AuthResolution, PermissionChecker, PermissionDecision,
-    PermissionRequest, Tool, ToolAnnotations, ToolCapabilityProvider, ToolCatalogEvent,
+    AllowAllPermissions, AuthOperation, AuthRequest, AuthResolution, BasicToolExecutor,
+    PermissionChecker, Tool, ToolAnnotations, ToolCapabilityProvider, ToolCatalogEvent,
     ToolContext, ToolError, ToolExecutionOutcome, ToolExecutor, ToolName, ToolRegistry,
     ToolRequest, ToolResult, ToolSpec,
 };
 use async_trait::async_trait;
+use futures_util::future::try_join_all;
 use http::{HeaderName, HeaderValue};
 use rmcp::ServiceExt;
 use rmcp::handler::client::ClientHandler;
 use rmcp::model as rmcp_model;
-use rmcp::service::{RoleClient, RunningService};
-use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig as RmcpStreamableHttpClientTransportConfig;
-use rmcp::transport::{ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess};
+use rmcp::service::{ClientInitializeError, Peer, RoleClient, RunningService, ServiceError};
+use rmcp::transport::streamable_http_client::{
+    AuthRequiredError, InsufficientScopeError,
+    StreamableHttpClientTransportConfig as RmcpStreamableHttpClientTransportConfig,
+    StreamableHttpError,
+};
+use rmcp::transport::{
+    ConfigureCommandExt, DynamicTransportError, StreamableHttpClientTransport, TokioChildProcess,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -65,8 +78,7 @@ pub use rmcp::model::{
     ProgressNotificationParam as McpProgressNotificationParam, Prompt as McpPrompt, PromptArgument,
     PromptMessage, PromptMessageContent, PromptMessageRole, RawAudioContent, RawContent,
     RawEmbeddedResource, RawImageContent, RawResource as McpRawResource, RawTextContent,
-    ReadResourceResult, Resource as McpResource,
-    ResourceContents as McpResourceContents,
+    ReadResourceResult, Resource as McpResource, ResourceContents as McpResourceContents,
     ResourceUpdatedNotificationParam as McpResourceUpdatedNotificationParam, Root as McpRoot,
     RootsCapabilities as McpRootsCapabilities, SamplingCapability as McpSamplingCapability,
     SamplingMessage as McpSamplingMessage, SetLevelRequestParams as McpSetLevelRequestParams,
@@ -74,11 +86,11 @@ pub use rmcp::model::{
     UrlElicitationCapability as McpUrlElicitationCapability,
 };
 
-/// Backwards-compatible alias — descriptors are now the rmcp wire types.
+/// Alias for [`McpTool`].
 pub type McpToolDescriptor = McpTool;
-/// Backwards-compatible alias — descriptors are now the rmcp wire types.
+/// Alias for [`McpResource`].
 pub type McpResourceDescriptor = McpResource;
-/// Backwards-compatible alias — descriptors are now the rmcp wire types.
+/// Alias for [`McpPrompt`].
 pub type McpPromptDescriptor = McpPrompt;
 
 /// Unique identifier for a registered MCP server.
@@ -247,6 +259,8 @@ impl McpServerConfig {
     }
 }
 
+type CustomNamespace = Arc<dyn Fn(&McpServerId, &str) -> String + Send + Sync>;
+
 /// Strategy used to derive the agentkit-side tool name for an MCP tool.
 ///
 /// The default (`Default`) preserves agentkit's historical
@@ -254,20 +268,15 @@ impl McpServerConfig {
 /// that only allow `[a-zA-Z0-9_-]` (e.g. Anthropic on Vertex). Use
 /// [`McpToolNamespace::None`] when the calling provider already namespaces
 /// remote tools, or [`McpToolNamespace::Custom`] for a bespoke scheme.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub enum McpToolNamespace {
     /// Format names as `mcp_<server>_<tool>`.
+    #[default]
     Default,
     /// Use the raw MCP tool name with no prefix at all.
     None,
     /// Apply a caller-supplied function for full control.
-    Custom(Arc<dyn Fn(&McpServerId, &str) -> String + Send + Sync>),
-}
-
-impl Default for McpToolNamespace {
-    fn default() -> Self {
-        Self::Default
-    }
+    Custom(CustomNamespace),
 }
 
 impl fmt::Debug for McpToolNamespace {
@@ -282,9 +291,7 @@ impl fmt::Debug for McpToolNamespace {
 
 impl McpToolNamespace {
     /// Builds a custom namespace from a closure.
-    pub fn custom(
-        f: impl Fn(&McpServerId, &str) -> String + Send + Sync + 'static,
-    ) -> Self {
+    pub fn custom(f: impl Fn(&McpServerId, &str) -> String + Send + Sync + 'static) -> Self {
         Self::Custom(Arc::new(f))
     }
 
@@ -294,6 +301,19 @@ impl McpToolNamespace {
             Self::Default => format!("mcp_{server_id}_{tool_name}"),
             Self::None => tool_name.to_string(),
             Self::Custom(f) => f(server_id, tool_name),
+        }
+    }
+
+    /// Recovers the raw MCP tool name from an agentkit-side name. Returns
+    /// `None` for [`Self::Custom`] (no general inverse) or when the name
+    /// doesn't match the expected shape.
+    pub fn unapply(&self, server_id: &McpServerId, agentkit_name: &str) -> Option<String> {
+        match self {
+            Self::Default => agentkit_name
+                .strip_prefix(&format!("mcp_{server_id}_"))
+                .map(str::to_string),
+            Self::None => Some(agentkit_name.to_string()),
+            Self::Custom(_) => None,
         }
     }
 }
@@ -358,30 +378,28 @@ pub enum McpCatalogEvent {
 }
 
 impl McpCatalogEvent {
-    fn as_tool_catalog_event(&self) -> Option<ToolCatalogEvent> {
-        match self {
-            Self::ToolsChanged {
-                server_id,
-                added,
-                removed,
-                changed,
-            } => Some(ToolCatalogEvent {
-                source: format!("mcp:{server_id}"),
-                added: added
-                    .iter()
-                    .map(|name| format!("mcp_{server_id}_{name}"))
-                    .collect(),
-                removed: removed
-                    .iter()
-                    .map(|name| format!("mcp_{server_id}_{name}"))
-                    .collect(),
-                changed: changed
-                    .iter()
-                    .map(|name| format!("mcp_{server_id}_{name}"))
-                    .collect(),
-            }),
-            _ => None,
-        }
+    fn as_tool_catalog_event(&self, namespace: &McpToolNamespace) -> Option<ToolCatalogEvent> {
+        let Self::ToolsChanged {
+            server_id,
+            added,
+            removed,
+            changed,
+        } = self
+        else {
+            return None;
+        };
+        let map = |names: &[String]| -> Vec<String> {
+            names
+                .iter()
+                .map(|name| namespace.apply(server_id, name))
+                .collect()
+        };
+        Some(ToolCatalogEvent {
+            source: format!("mcp:{server_id}"),
+            added: map(added),
+            removed: map(removed),
+            changed: map(changed),
+        })
     }
 }
 
@@ -499,10 +517,8 @@ pub enum McpServerEvent {
 
 /// Pluggable handler invoked when an MCP server issues `sampling/createMessage`.
 ///
-/// Wire one in via
-/// [`McpClientHandlerBuilder::with_sampling_responder`] (or
-/// [`McpServerManager::with_sampling_responder`]) to expose the host
-/// application's LLM as a sampling target for connected MCP servers.
+/// Install one via [`McpHandlerConfig::with_sampling_responder`] to expose
+/// the host application's LLM as a sampling target for connected MCP servers.
 #[async_trait]
 pub trait McpSamplingResponder: Send + Sync + 'static {
     /// Produces a sampled completion in response to a server-initiated
@@ -515,10 +531,8 @@ pub trait McpSamplingResponder: Send + Sync + 'static {
 
 /// Pluggable handler invoked when an MCP server issues `elicitation/create`.
 ///
-/// Wire one in via
-/// [`McpClientHandlerBuilder::with_elicitation_responder`] (or
-/// [`McpServerManager::with_elicitation_responder`]) to drive the
-/// host application's user-input UI.
+/// Install one via [`McpHandlerConfig::with_elicitation_responder`] to drive
+/// the host application's user-input UI.
 #[async_trait]
 pub trait McpElicitationResponder: Send + Sync + 'static {
     /// Returns the user's response to a server-initiated elicitation request.
@@ -530,10 +544,8 @@ pub trait McpElicitationResponder: Send + Sync + 'static {
 
 /// Pluggable handler invoked when an MCP server issues `roots/list`.
 ///
-/// Wire one in via
-/// [`McpClientHandlerBuilder::with_roots_provider`] (or
-/// [`McpServerManager::with_roots_provider`]) to surface workspace roots
-/// that scope the server's filesystem access.
+/// Install one via [`McpHandlerConfig::with_roots_provider`] to surface
+/// workspace roots that scope the server's filesystem access.
 #[async_trait]
 pub trait McpRootsProvider: Send + Sync + 'static {
     /// Returns the roots the server should consider in scope.
@@ -544,7 +556,7 @@ pub trait McpRootsProvider: Send + Sync + 'static {
 const DEFAULT_EVENTS_CAPACITY: usize = 128;
 
 /// Channels paired with an [`McpClientHandler`] returned by
-/// [`McpClientHandlerBuilder::build`].
+/// [`McpHandlerConfig::build`].
 ///
 /// `notifications` is the legacy mpsc receiver consumed by the catalog refresh
 /// path inside [`McpServerManager::refresh_changed_catalogs`]. `events` is the
@@ -558,109 +570,12 @@ pub struct McpClientChannels {
     pub events: broadcast::Sender<McpServerEvent>,
 }
 
-/// Builder for [`McpClientHandler`].
-///
-/// Configure responders for server-initiated `sampling/createMessage`,
-/// `elicitation/create`, and `roots/list` requests, then call [`Self::build`]
-/// to obtain the handler and its paired [`McpClientChannels`].
-#[derive(Clone, Default)]
-pub struct McpClientHandlerBuilder {
-    sampling: Option<Arc<dyn McpSamplingResponder>>,
-    elicitation: Option<Arc<dyn McpElicitationResponder>>,
-    roots: Option<Arc<dyn McpRootsProvider>>,
-    events_capacity: Option<usize>,
-}
-
-impl McpClientHandlerBuilder {
-    /// Creates an empty builder. By default no responders are wired.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Registers a responder for server-initiated `sampling/createMessage`
-    /// requests. The handler advertises `sampling` in `ClientCapabilities`.
-    pub fn with_sampling_responder(mut self, responder: Arc<dyn McpSamplingResponder>) -> Self {
-        self.sampling = Some(responder);
-        self
-    }
-
-    /// Registers a responder for server-initiated `elicitation/create`
-    /// requests. The handler advertises `elicitation` (form mode) in
-    /// `ClientCapabilities`.
-    pub fn with_elicitation_responder(
-        mut self,
-        responder: Arc<dyn McpElicitationResponder>,
-    ) -> Self {
-        self.elicitation = Some(responder);
-        self
-    }
-
-    /// Registers a provider for `roots/list`. The handler advertises `roots`
-    /// in `ClientCapabilities`.
-    pub fn with_roots_provider(mut self, provider: Arc<dyn McpRootsProvider>) -> Self {
-        self.roots = Some(provider);
-        self
-    }
-
-    /// Overrides the default broadcast capacity for the [`McpServerEvent`]
-    /// channel.
-    pub fn with_events_capacity(mut self, capacity: usize) -> Self {
-        self.events_capacity = Some(capacity);
-        self
-    }
-
-    /// Consumes the builder, returning the configured handler plus the channel
-    /// receiver and broadcast sender it writes into.
-    pub fn build(self) -> (McpClientHandler, McpClientChannels) {
-        let (notifications_tx, notifications_rx) = mpsc::unbounded_channel();
-        let events_capacity = self.events_capacity.unwrap_or(DEFAULT_EVENTS_CAPACITY);
-        let (events_tx, _) = broadcast::channel(events_capacity);
-
-        let mut capabilities = rmcp_model::ClientCapabilities::default();
-        if self.sampling.is_some() {
-            capabilities.sampling = Some(McpSamplingCapability::default());
-        }
-        if self.elicitation.is_some() {
-            capabilities.elicitation = Some(McpElicitationCapability {
-                form: Some(McpFormElicitationCapability::default()),
-                url: None,
-            });
-        }
-        if self.roots.is_some() {
-            capabilities.roots = Some(McpRootsCapabilities::default());
-        }
-
-        let handler = McpClientHandler {
-            info: rmcp_model::ClientInfo::new(
-                capabilities,
-                rmcp_model::Implementation::new("agentkit-mcp", env!("CARGO_PKG_VERSION"))
-                    .with_title("agentkit MCP client"),
-            )
-            .with_protocol_version(rmcp_model::ProtocolVersion::LATEST),
-            notifications: notifications_tx,
-            events: events_tx.clone(),
-            sampling: self.sampling,
-            elicitation: self.elicitation,
-            roots: self.roots,
-        };
-
-        (
-            handler,
-            McpClientChannels {
-                notifications: notifications_rx,
-                events: events_tx,
-            },
-        )
-    }
-}
-
 /// rmcp [`ClientHandler`] used by [`McpConnection`].
 ///
 /// You only need to construct this directly if you're wiring rmcp transports
 /// that [`McpTransportBinding`] does not cover (in-memory pipes, websockets,
-/// custom IO). Build one via [`McpClientHandlerBuilder`] (for full event +
-/// responder access) or the back-compat [`Self::with_channel`] shortcut, then
-/// pair the resulting service with [`McpConnection::from_running_service`] /
+/// custom IO). Build one via [`McpHandlerConfig::build`], then pair the
+/// resulting service with [`McpConnection::from_running_service`] or
 /// [`McpConnection::from_running_service_with_events`].
 #[derive(Clone)]
 pub struct McpClientHandler {
@@ -670,23 +585,6 @@ pub struct McpClientHandler {
     sampling: Option<Arc<dyn McpSamplingResponder>>,
     elicitation: Option<Arc<dyn McpElicitationResponder>>,
     roots: Option<Arc<dyn McpRootsProvider>>,
-}
-
-impl McpClientHandler {
-    /// Returns a default [`McpClientHandlerBuilder`].
-    pub fn builder() -> McpClientHandlerBuilder {
-        McpClientHandlerBuilder::new()
-    }
-
-    /// Builds a handler together with the notification receiver that
-    /// [`McpConnection::from_running_service`] expects. No responders are
-    /// wired, and the broadcast events sender is dropped — use
-    /// [`McpClientHandlerBuilder`] + [`McpConnection::from_running_service_with_events`]
-    /// when you need server-initiated request handling or event subscription.
-    pub fn with_channel() -> (Self, mpsc::UnboundedReceiver<McpServerNotification>) {
-        let (handler, channels) = McpClientHandlerBuilder::new().build();
-        (handler, channels.notifications)
-    }
 }
 
 impl ClientHandler for McpClientHandler {
@@ -741,7 +639,9 @@ impl ClientHandler for McpClientHandler {
                     .create_elicitation(params)
                     .await
                     .map_err(Into::into),
-                None => Ok(McpCreateElicitationResult::new(McpElicitationAction::Decline)),
+                None => Ok(McpCreateElicitationResult::new(
+                    McpElicitationAction::Decline,
+                )),
             }
         }
     }
@@ -880,7 +780,25 @@ impl McpHandlerConfig {
         self
     }
 
-    fn build_handler(
+    /// Builds a handler together with a fresh [`McpClientChannels`] pair —
+    /// the notification receiver and a new broadcast sender for
+    /// [`McpServerEvent`].
+    pub fn build(&self) -> (McpClientHandler, McpClientChannels) {
+        self.build_inner(None)
+    }
+
+    /// Builds a handler that publishes [`McpServerEvent`] into the provided
+    /// broadcast sender. Use this when adopting an externally constructed
+    /// rmcp service via [`McpConnection::from_running_service_with_events`]
+    /// so subscribers see the same stream.
+    pub fn build_with(
+        &self,
+        events: broadcast::Sender<McpServerEvent>,
+    ) -> (McpClientHandler, McpClientChannels) {
+        self.build_inner(Some(events))
+    }
+
+    fn build_inner(
         &self,
         events: Option<broadcast::Sender<McpServerEvent>>,
     ) -> (McpClientHandler, McpClientChannels) {
@@ -935,6 +853,7 @@ pub struct McpConnection {
     server_id: McpServerId,
     config: Option<McpServerConfig>,
     inner: Mutex<RmcpClientService>,
+    peer: RwLock<Peer<RoleClient>>,
     auth: Mutex<Option<MetadataMap>>,
     notifications: Mutex<mpsc::UnboundedReceiver<McpServerNotification>>,
     events: broadcast::Sender<McpServerEvent>,
@@ -977,7 +896,7 @@ impl McpConnection {
         auth: Option<&MetadataMap>,
         handler_config: McpHandlerConfig,
     ) -> Result<Self, McpError> {
-        let (handler, channels) = handler_config.build_handler(None);
+        let (handler, channels) = handler_config.build();
         let McpClientChannels {
             notifications: notification_rx,
             events: events_tx,
@@ -991,10 +910,12 @@ impl McpConnection {
             }
         };
 
+        let peer = service.peer().clone();
         Ok(Self {
             server_id: config.id.clone(),
             config: Some(config.clone()),
             inner: Mutex::new(service),
+            peer: RwLock::new(peer),
             auth: Mutex::new(auth.cloned()),
             notifications: Mutex::new(notification_rx),
             events: events_tx,
@@ -1009,7 +930,7 @@ impl McpConnection {
     /// Use this when you need a transport rmcp supports but
     /// [`McpTransportBinding`] does not (in-memory pipes for tests, websockets,
     /// custom IO). Pair the service with the notification receiver returned by
-    /// [`McpClientHandler::with_channel`] so list-change notifications stay
+    /// [`McpHandlerConfig::build`] so list-change notifications stay
     /// observable.
     ///
     /// The connection has no [`McpServerConfig`] attached, so reconnect-on-auth
@@ -1028,9 +949,11 @@ impl McpConnection {
     }
 
     /// Variant of [`Self::from_running_service`] that wires the broadcast
-    /// sender returned by [`McpClientHandlerBuilder::build`] / [`McpClientHandler::builder`]
+    /// sender returned by [`McpHandlerConfig::build`] (or [`build_with`])
     /// so [`Self::subscribe_events`] receivers observe the same stream the
     /// handler is publishing into.
+    ///
+    /// [`build_with`]: McpHandlerConfig::build_with
     pub fn from_running_service_with_events(
         server_id: impl Into<McpServerId>,
         service: RmcpClientService,
@@ -1041,10 +964,12 @@ impl McpConnection {
             .peer_info()
             .map(|info| rmcp_server_capabilities_to_agentkit(&info.capabilities))
             .unwrap_or_default();
+        let peer = service.peer().clone();
         Self {
             server_id: server_id.into(),
             config: None,
             inner: Mutex::new(service),
+            peer: RwLock::new(peer),
             auth: Mutex::new(None),
             notifications: Mutex::new(notifications),
             events,
@@ -1057,9 +982,7 @@ impl McpConnection {
         let Some(config) = self.config.clone() else {
             return Ok(());
         };
-        let (handler, channels) = self
-            .handler_config
-            .build_handler(Some(self.events.clone()));
+        let (handler, channels) = self.handler_config.build_with(self.events.clone());
         let McpClientChannels {
             notifications: notification_rx,
             ..
@@ -1072,9 +995,15 @@ impl McpConnection {
                 connect_rmcp_streamable_http(&config, binding, auth, handler).await?
             }
         };
+        let new_peer = service.peer().clone();
         *self.notifications.lock().await = notification_rx;
         *self.inner.lock().await = service;
+        *self.peer.write().expect("MCP peer lock poisoned") = new_peer;
         Ok(())
+    }
+
+    fn peer(&self) -> Peer<RoleClient> {
+        self.peer.read().expect("MCP peer lock poisoned").clone()
     }
 
     /// Returns the [`McpServerId`] for this connection.
@@ -1105,8 +1034,7 @@ impl McpConnection {
     /// receiver returned by [`Self::subscribe_events`].
     pub async fn subscribe_resource(&self, uri: impl Into<String>) -> Result<(), McpError> {
         let uri = uri.into();
-        let inner = self.inner.lock().await;
-        inner
+        self.peer()
             .subscribe(rmcp_model::SubscribeRequestParams::new(uri.clone()))
             .await
             .map_err(|error| {
@@ -1122,8 +1050,7 @@ impl McpConnection {
     /// Cancels a previous [`Self::subscribe_resource`] subscription.
     pub async fn unsubscribe_resource(&self, uri: impl Into<String>) -> Result<(), McpError> {
         let uri = uri.into();
-        let inner = self.inner.lock().await;
-        inner
+        self.peer()
             .unsubscribe(rmcp_model::UnsubscribeRequestParams::new(uri.clone()))
             .await
             .map_err(|error| {
@@ -1139,8 +1066,7 @@ impl McpConnection {
     /// Negotiates the minimum severity the server should emit through
     /// `notifications/message`. Surfaced as [`McpServerEvent::Logging`].
     pub async fn set_logging_level(&self, level: McpLoggingLevel) -> Result<(), McpError> {
-        let inner = self.inner.lock().await;
-        inner
+        self.peer()
             .set_level(rmcp_model::SetLevelRequestParams::new(level))
             .await
             .map_err(|error| {
@@ -1159,8 +1085,7 @@ impl McpConnection {
         &self,
         params: McpCancelledNotificationParam,
     ) -> Result<(), McpError> {
-        let inner = self.inner.lock().await;
-        inner
+        self.peer()
             .notify_cancelled(params)
             .await
             .map_err(rmcp_service_error)
@@ -1169,8 +1094,7 @@ impl McpConnection {
     /// Notifies the server that the client's roots list has changed; servers
     /// may respond by re-issuing `roots/list`.
     pub async fn notify_roots_list_changed(&self) -> Result<(), McpError> {
-        let inner = self.inner.lock().await;
-        inner
+        self.peer()
             .notify_roots_list_changed()
             .await
             .map_err(rmcp_service_error)
@@ -1214,21 +1138,25 @@ impl McpConnection {
 
     /// Discovers tools, resources, and prompts that the server advertised.
     pub async fn discover(&self) -> Result<McpDiscoverySnapshot, McpError> {
-        let tools = if self.capabilities.tools.is_some() {
-            self.list_tools().await?
-        } else {
-            Vec::new()
+        let tools = async {
+            match self.capabilities.tools {
+                Some(_) => self.list_tools().await,
+                None => Ok(Vec::new()),
+            }
         };
-        let resources = if self.capabilities.resources.is_some() {
-            self.list_resources().await?
-        } else {
-            Vec::new()
+        let resources = async {
+            match self.capabilities.resources {
+                Some(_) => self.list_resources().await,
+                None => Ok(Vec::new()),
+            }
         };
-        let prompts = if self.capabilities.prompts.is_some() {
-            self.list_prompts().await?
-        } else {
-            Vec::new()
+        let prompts = async {
+            match self.capabilities.prompts {
+                Some(_) => self.list_prompts().await,
+                None => Ok(Vec::new()),
+            }
         };
+        let (tools, resources, prompts) = tokio::try_join!(tools, resources, prompts)?;
         Ok(McpDiscoverySnapshot {
             server_id: self.server_id.clone(),
             tools,
@@ -1249,20 +1177,26 @@ impl McpConnection {
 
     /// Lists all tools advertised by the connected MCP server.
     pub async fn list_tools(&self) -> Result<Vec<McpTool>, McpError> {
-        let inner = self.inner.lock().await;
-        inner.list_all_tools().await.map_err(rmcp_service_error)
+        self.peer()
+            .list_all_tools()
+            .await
+            .map_err(rmcp_service_error)
     }
 
     /// Lists all resources advertised by the connected MCP server.
     pub async fn list_resources(&self) -> Result<Vec<McpResource>, McpError> {
-        let inner = self.inner.lock().await;
-        inner.list_all_resources().await.map_err(rmcp_service_error)
+        self.peer()
+            .list_all_resources()
+            .await
+            .map_err(rmcp_service_error)
     }
 
     /// Lists all prompts advertised by the connected MCP server.
     pub async fn list_prompts(&self) -> Result<Vec<McpPrompt>, McpError> {
-        let inner = self.inner.lock().await;
-        inner.list_all_prompts().await.map_err(rmcp_service_error)
+        self.peer()
+            .list_all_prompts()
+            .await
+            .map_err(rmcp_service_error)
     }
 
     /// Invokes a tool on the MCP server.
@@ -1276,13 +1210,12 @@ impl McpConnection {
         name: &str,
         arguments: Value,
     ) -> Result<CallToolResult, McpError> {
-        let inner = self.inner.lock().await;
         let mut params = rmcp_model::CallToolRequestParams::new(name.to_string());
         if !arguments.is_null() {
             params =
                 params.with_arguments(value_to_json_object(arguments, "tools/call arguments")?);
         }
-        inner.call_tool(params).await.map_err(|error| {
+        self.peer().call_tool(params).await.map_err(|error| {
             rmcp_operation_error(
                 &self.server_id,
                 "tools/call",
@@ -1299,8 +1232,7 @@ impl McpConnection {
     /// metadata). Use [`McpResourceHandle`] for the agentkit
     /// [`ResourceProvider`] view that collapses to a single inline `DataRef`.
     pub async fn read_resource(&self, uri: &str) -> Result<ReadResourceResult, McpError> {
-        let inner = self.inner.lock().await;
-        inner
+        self.peer()
             .read_resource(rmcp_model::ReadResourceRequestParams::new(uri))
             .await
             .map_err(|error| {
@@ -1325,13 +1257,12 @@ impl McpConnection {
         name: &str,
         arguments: Value,
     ) -> Result<GetPromptResult, McpError> {
-        let inner = self.inner.lock().await;
         let mut params = rmcp_model::GetPromptRequestParams::new(name);
         if !arguments.is_null() {
             params =
                 params.with_arguments(value_to_json_object(arguments, "prompts/get arguments")?);
         }
-        inner.get_prompt(params).await.map_err(|error| {
+        self.peer().get_prompt(params).await.map_err(|error| {
             rmcp_operation_error(
                 &self.server_id,
                 "prompts/get",
@@ -1388,8 +1319,7 @@ impl McpConnection {
                 if let Some(server_id) = metadata.get("server_id").and_then(Value::as_str) {
                     self.ensure_server_match(server_id)?;
                 }
-                let tool_name = normalize_mcp_tool_name(self.server_id(), tool_name);
-                self.call_tool(&tool_name, input.clone())
+                self.call_tool(tool_name, input.clone())
                     .await
                     .map(McpOperationResult::Tool)
             }
@@ -1522,16 +1452,16 @@ impl PromptProvider for McpPromptHandle {
         args: Value,
         _ctx: &mut CapabilityContext<'_>,
     ) -> Result<PromptContents, CapabilityError> {
-        let result = self
-            .connection
-            .get_prompt(&id.0, args)
-            .await
-            .map_err(|error| match error {
-                McpError::AuthRequired(request) => {
-                    CapabilityError::Unavailable(format!("auth required: {:?}", request))
-                }
-                other => CapabilityError::ExecutionFailed(other.to_string()),
-            })?;
+        let result =
+            self.connection
+                .get_prompt(&id.0, args)
+                .await
+                .map_err(|error| match error {
+                    McpError::AuthRequired(request) => {
+                        CapabilityError::Unavailable(format!("auth required: {:?}", request))
+                    }
+                    other => CapabilityError::ExecutionFailed(other.to_string()),
+                })?;
         Ok(get_prompt_result_to_capabilities(result))
     }
 }
@@ -1563,25 +1493,24 @@ impl McpCapabilityProvider {
         namespace: &McpToolNamespace,
     ) -> Self {
         let server_id = connection.server_id().clone();
-        let registry = snapshot.tools.iter().cloned().fold(
-            ToolRegistry::new(),
-            |registry, tool| {
-                registry.with(McpToolAdapter::with_namespace(
-                    &server_id,
-                    connection.clone(),
-                    tool,
-                    namespace,
-                ))
-            },
-        );
-        let permissions: Arc<dyn PermissionChecker> = Arc::new(McpAllowAllPermissions);
+        let registry =
+            snapshot
+                .tools
+                .iter()
+                .cloned()
+                .fold(ToolRegistry::new(), |registry, tool| {
+                    registry.with(McpToolAdapter::with_namespace(
+                        &server_id,
+                        connection.clone(),
+                        tool,
+                        namespace,
+                    ))
+                });
+        let permissions: Arc<dyn PermissionChecker> = Arc::new(AllowAllPermissions);
         let resources_arc: Arc<dyn agentkit_tools_core::ToolResources> = Arc::new(());
-        let invocables = ToolCapabilityProvider::from_registry(
-            &registry,
-            permissions,
-            resources_arc,
-        )
-        .invocables();
+        let invocables =
+            ToolCapabilityProvider::from_registry(&registry, permissions, resources_arc)
+                .invocables();
 
         let resources = snapshot
             .resources
@@ -1659,18 +1588,6 @@ impl CapabilityProvider for McpCapabilityProvider {
 
     fn prompts(&self) -> Vec<Arc<dyn PromptProvider>> {
         self.prompts.clone()
-    }
-}
-
-/// Permission checker that approves every request. Used internally by
-/// [`McpCapabilityProvider`] when bridging MCP tools through the standard
-/// agentkit invocable adapter — MCP servers are gated upstream at connection
-/// time, not per-call.
-struct McpAllowAllPermissions;
-
-impl PermissionChecker for McpAllowAllPermissions {
-    fn evaluate(&self, _request: &dyn PermissionRequest) -> PermissionDecision {
-        PermissionDecision::Allow
     }
 }
 
@@ -1800,29 +1717,6 @@ impl McpServerManager {
         &self.handler_config
     }
 
-    /// Convenience builder that installs a sampling responder on the manager's
-    /// [`McpHandlerConfig`]. Subsequent connections will advertise the
-    /// `sampling` client capability.
-    pub fn with_sampling_responder(mut self, responder: Arc<dyn McpSamplingResponder>) -> Self {
-        self.handler_config.sampling = Some(responder);
-        self
-    }
-
-    /// Convenience builder that installs an elicitation responder.
-    pub fn with_elicitation_responder(
-        mut self,
-        responder: Arc<dyn McpElicitationResponder>,
-    ) -> Self {
-        self.handler_config.elicitation = Some(responder);
-        self
-    }
-
-    /// Convenience builder that installs a roots provider.
-    pub fn with_roots_provider(mut self, provider: Arc<dyn McpRootsProvider>) -> Self {
-        self.handler_config.roots = Some(provider);
-        self
-    }
-
     /// Registers a server configuration. Returns `self` for chaining.
     pub fn with_server(mut self, config: McpServerConfig) -> Self {
         self.register_server(config);
@@ -1886,12 +1780,43 @@ impl McpServerManager {
         Ok(handle)
     }
 
-    /// Connects all registered servers sequentially.
+    /// Connects all registered servers concurrently.
     pub async fn connect_all(&mut self) -> Result<Vec<McpServerHandle>, McpError> {
-        let server_ids = self.configs.keys().cloned().collect::<Vec<_>>();
-        let mut handles = Vec::with_capacity(server_ids.len());
-        for server_id in server_ids {
-            handles.push(self.connect_server(&server_id).await?);
+        let plans: Vec<(McpServerId, McpServerConfig, Option<MetadataMap>)> = self
+            .configs
+            .iter()
+            .map(|(id, cfg)| (id.clone(), cfg.clone(), self.auth.get(id).cloned()))
+            .collect();
+        let handler_config = self.handler_config.clone();
+        let namespace = self.namespace.clone();
+
+        let futures = plans.into_iter().map(|(server_id, config, auth)| {
+            let handler_config = handler_config.clone();
+            let namespace = namespace.clone();
+            async move {
+                let connection = Arc::new(
+                    McpConnection::connect_with_auth(&config, auth.as_ref(), handler_config)
+                        .await?,
+                );
+                let snapshot = connection.discover().await?;
+                Ok::<(McpServerId, McpServerHandle), McpError>((
+                    server_id,
+                    McpServerHandle {
+                        config,
+                        connection,
+                        snapshot,
+                        namespace,
+                    },
+                ))
+            }
+        });
+
+        let results = try_join_all(futures).await?;
+        let mut handles = Vec::with_capacity(results.len());
+        for (server_id, handle) in results {
+            self.connections.insert(server_id.clone(), handle.clone());
+            self.emit_catalog_event(McpCatalogEvent::ServerConnected { server_id });
+            handles.push(handle);
         }
         Ok(handles)
     }
@@ -1998,16 +1923,11 @@ impl McpServerManager {
 
         if let Some(handle) = self.connections.get(&server_id) {
             handle.connection.resolve_auth(resolution).await?;
-            self.emit_catalog_event(McpCatalogEvent::AuthChanged { server_id });
-            return Ok(());
+        } else if !self.configs.contains_key(&server_id) {
+            return Err(McpError::UnknownServer(server_id.to_string()));
         }
-
-        if self.configs.contains_key(&server_id) {
-            self.emit_catalog_event(McpCatalogEvent::AuthChanged { server_id });
-            Ok(())
-        } else {
-            Err(McpError::UnknownServer(server_id.to_string()))
-        }
+        self.emit_catalog_event(McpCatalogEvent::AuthChanged { server_id });
+        Ok(())
     }
 
     /// Resolves auth and immediately replays the operation that triggered the challenge.
@@ -2037,7 +1957,14 @@ impl McpServerManager {
                 let connection = self.connection_for_auth_server(server_id).await?;
                 connection.replay_auth_operation(&request.operation).await
             }
-            AuthOperation::ToolCall { metadata, .. } => {
+            AuthOperation::ToolCall {
+                tool_name,
+                input,
+                call_id,
+                session_id,
+                turn_id,
+                metadata,
+            } => {
                 let server_id = metadata
                     .get("server_id")
                     .and_then(Value::as_str)
@@ -2046,8 +1973,21 @@ impl McpServerManager {
                             "tool-call auth replay requires metadata.server_id".into(),
                         )
                     })?;
+                let server = McpServerId::new(server_id);
+                let raw_name = self
+                    .namespace
+                    .unapply(&server, tool_name)
+                    .unwrap_or_else(|| tool_name.clone());
                 let connection = self.connection_for_auth_server(server_id).await?;
-                connection.replay_auth_operation(&request.operation).await
+                let normalized = AuthOperation::ToolCall {
+                    tool_name: raw_name,
+                    input: input.clone(),
+                    call_id: call_id.clone(),
+                    session_id: session_id.clone(),
+                    turn_id: turn_id.clone(),
+                    metadata: metadata.clone(),
+                };
+                connection.replay_auth_operation(&normalized).await
             }
             AuthOperation::Custom { kind, .. } => Err(McpError::AuthResolution(format!(
                 "unsupported auth operation for replay: {kind}"
@@ -2071,16 +2011,18 @@ impl McpServerManager {
 
     /// Builds a combined [`ToolRegistry`] for every tool across all connected servers.
     ///
-    /// Tool names are prefixed `mcp_<server_id>_<tool_name>`.
+    /// Tool names are produced by the manager's [`McpToolNamespace`] (defaults
+    /// to `mcp_<server_id>_<tool_name>`).
     pub fn tool_registry(&self) -> ToolRegistry {
         self.connections
             .values()
             .fold(ToolRegistry::new(), |mut registry, handle| {
                 for tool in handle.snapshot.tools.iter().cloned() {
-                    registry.register(McpToolAdapter::new(
+                    registry.register(McpToolAdapter::with_namespace(
                         handle.server_id(),
                         handle.connection.clone(),
                         tool,
+                        &self.namespace,
                     ));
                 }
                 registry
@@ -2116,14 +2058,8 @@ fn diff_discovery_snapshots(
 ) -> Vec<McpCatalogEvent> {
     let mut events = Vec::new();
     let (added, removed, changed) = diff_named_items(
-        previous
-            .tools
-            .iter()
-            .map(|item| (item.name.to_string(), item)),
-        current
-            .tools
-            .iter()
-            .map(|item| (item.name.to_string(), item)),
+        previous.tools.iter().map(|item| (item.name.as_ref(), item)),
+        current.tools.iter().map(|item| (item.name.as_ref(), item)),
     );
     if !added.is_empty() || !removed.is_empty() || !changed.is_empty() {
         events.push(McpCatalogEvent::ToolsChanged {
@@ -2138,11 +2074,11 @@ fn diff_discovery_snapshots(
         previous
             .resources
             .iter()
-            .map(|item| (item.uri.clone(), item)),
+            .map(|item| (item.uri.as_str(), item)),
         current
             .resources
             .iter()
-            .map(|item| (item.uri.clone(), item)),
+            .map(|item| (item.uri.as_str(), item)),
     );
     if !added.is_empty() || !removed.is_empty() || !changed.is_empty() {
         events.push(McpCatalogEvent::ResourcesChanged {
@@ -2157,11 +2093,11 @@ fn diff_discovery_snapshots(
         previous
             .prompts
             .iter()
-            .map(|item| (item.name.clone(), item)),
+            .map(|item| (item.name.as_str(), item)),
         current
             .prompts
             .iter()
-            .map(|item| (item.name.clone(), item)),
+            .map(|item| (item.name.as_str(), item)),
     );
     if !added.is_empty() || !removed.is_empty() || !changed.is_empty() {
         events.push(McpCatalogEvent::PromptsChanged {
@@ -2175,100 +2111,145 @@ fn diff_discovery_snapshots(
     events
 }
 
+/// Merge-walks two name-keyed sequences and produces added/removed/changed
+/// name lists. Each side is sorted in place; no intermediate maps are
+/// allocated. Names are cloned only at output time.
 fn diff_named_items<'a, T>(
-    previous: impl IntoIterator<Item = (String, &'a T)>,
-    current: impl IntoIterator<Item = (String, &'a T)>,
+    previous: impl IntoIterator<Item = (&'a str, &'a T)>,
+    current: impl IntoIterator<Item = (&'a str, &'a T)>,
 ) -> (Vec<String>, Vec<String>, Vec<String>)
 where
     T: PartialEq + 'a,
 {
-    let previous = previous.into_iter().collect::<BTreeMap<_, _>>();
-    let current = current.into_iter().collect::<BTreeMap<_, _>>();
+    let mut prev: Vec<(&str, &T)> = previous.into_iter().collect();
+    let mut curr: Vec<(&str, &T)> = current.into_iter().collect();
+    prev.sort_unstable_by_key(|(name, _)| *name);
+    curr.sort_unstable_by_key(|(name, _)| *name);
 
-    let added = current
-        .keys()
-        .filter(|name| !previous.contains_key(*name))
-        .cloned()
-        .collect();
-    let removed = previous
-        .keys()
-        .filter(|name| !current.contains_key(*name))
-        .cloned()
-        .collect();
-    let changed = current
-        .iter()
-        .filter(|(name, item)| {
-            previous
-                .get(*name)
-                .is_some_and(|previous_item| previous_item != *item)
-        })
-        .map(|(name, _)| name.clone())
-        .collect();
+    let mut added = Vec::new();
+    let mut removed = Vec::new();
+    let mut changed = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    while i < prev.len() && j < curr.len() {
+        match prev[i].0.cmp(curr[j].0) {
+            std::cmp::Ordering::Less => {
+                removed.push(prev[i].0.to_string());
+                i += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                added.push(curr[j].0.to_string());
+                j += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                if prev[i].1 != curr[j].1 {
+                    changed.push(curr[j].0.to_string());
+                }
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    while i < prev.len() {
+        removed.push(prev[i].0.to_string());
+        i += 1;
+    }
+    while j < curr.len() {
+        added.push(curr[j].0.to_string());
+        j += 1;
+    }
 
     (added, removed, changed)
 }
 
 /// A tool executor backed by MCP tool adapters.
+///
+/// On construction the executor subscribes to the manager's catalog event
+/// broadcast and surfaces translated [`ToolCatalogEvent`]s through
+/// [`ToolExecutor::drain_catalog_events`]. Hosts wire the executor into the
+/// loop and catalog changes flow through automatically — there is no manual
+/// forwarding step.
 #[derive(Clone)]
 pub struct McpToolExecutor {
-    registry: Arc<RwLock<ToolRegistry>>,
+    executor: Arc<RwLock<Arc<BasicToolExecutor>>>,
     connections: Arc<RwLock<BTreeMap<McpServerId, Arc<McpConnection>>>>,
-    events: Arc<StdMutex<Vec<ToolCatalogEvent>>>,
+    namespace: Arc<RwLock<McpToolNamespace>>,
+    catalog_rx: Arc<StdMutex<broadcast::Receiver<McpCatalogEvent>>>,
 }
 
 impl McpToolExecutor {
     /// Creates an executor from a manager's current connected snapshot.
     pub fn from_manager(manager: &McpServerManager) -> Self {
         Self {
-            registry: Arc::new(RwLock::new(manager.tool_registry())),
+            executor: Arc::new(RwLock::new(Arc::new(BasicToolExecutor::new(
+                manager.tool_registry(),
+            )))),
             connections: Arc::new(RwLock::new(manager.connection_map())),
-            events: Arc::new(StdMutex::new(Vec::new())),
+            namespace: Arc::new(RwLock::new(manager.namespace().clone())),
+            catalog_rx: Arc::new(StdMutex::new(manager.subscribe_catalog_events())),
         }
     }
 
     /// Refreshes the executor registry from the manager's current snapshot.
+    ///
+    /// Re-subscribes to the manager's catalog broadcast so events from the
+    /// new manager flow into [`ToolExecutor::drain_catalog_events`].
     pub fn refresh_from_manager(&self, manager: &McpServerManager) {
         *self
-            .registry
+            .executor
             .write()
-            .expect("MCP tool registry lock poisoned") = manager.tool_registry();
+            .expect("MCP tool executor lock poisoned") =
+            Arc::new(BasicToolExecutor::new(manager.tool_registry()));
         *self
             .connections
             .write()
             .expect("MCP connection map lock poisoned") = manager.connection_map();
+        *self.namespace.write().expect("MCP namespace lock poisoned") = manager.namespace().clone();
+        *self
+            .catalog_rx
+            .lock()
+            .expect("MCP catalog event lock poisoned") = manager.subscribe_catalog_events();
     }
 
-    /// Queues a catalog event for the loop-facing [`ToolExecutor`] API.
-    pub fn push_catalog_event(&self, event: McpCatalogEvent) {
-        if let Some(event) = event.as_tool_catalog_event() {
-            self.events
-                .lock()
-                .expect("MCP catalog event lock poisoned")
-                .push(event);
-        }
-    }
-
-    fn executor(&self) -> Result<agentkit_tools_core::BasicToolExecutor, ToolError> {
-        let registry = self
-            .registry
+    fn current(&self) -> Result<Arc<BasicToolExecutor>, ToolError> {
+        self.executor
             .read()
-            .map_err(|_| ToolError::Internal("MCP tool registry lock poisoned".into()))?
-            .clone();
-        Ok(agentkit_tools_core::BasicToolExecutor::new(registry))
+            .map(|guard| guard.clone())
+            .map_err(|_| ToolError::Internal("MCP tool executor lock poisoned".into()))
     }
 }
 
 #[async_trait]
 impl ToolExecutor for McpToolExecutor {
     fn specs(&self) -> Vec<ToolSpec> {
-        self.registry
-            .read()
-            .expect("MCP tool registry lock poisoned")
-            .specs()
+        self.current().map(|exec| exec.specs()).unwrap_or_default()
     }
 
     fn drain_catalog_events(&self) -> Vec<ToolCatalogEvent> {
-        std::mem::take(&mut *self.events.lock().expect("MCP catalog event lock poisoned"))
+        let mut rx = self
+            .catalog_rx
+            .lock()
+            .expect("MCP catalog event lock poisoned");
+        let namespace = self
+            .namespace
+            .read()
+            .expect("MCP namespace lock poisoned")
+            .clone();
+        let mut out = Vec::new();
+        loop {
+            match rx.try_recv() {
+                Ok(event) => {
+                    if let Some(translated) = event.as_tool_catalog_event(&namespace) {
+                        out.push(translated);
+                    }
+                }
+                Err(broadcast::error::TryRecvError::Empty)
+                | Err(broadcast::error::TryRecvError::Closed) => break,
+                // Buffer overran (manager emitted more than 128 events between drains);
+                // keep draining, the missed events are dropped intentionally.
+                Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+            }
+        }
+        out
     }
 
     async fn execute(
@@ -2276,9 +2257,9 @@ impl ToolExecutor for McpToolExecutor {
         request: ToolRequest,
         ctx: &mut ToolContext<'_>,
     ) -> ToolExecutionOutcome {
-        let Ok(executor) = self.executor() else {
+        let Ok(executor) = self.current() else {
             return ToolExecutionOutcome::Failed(ToolError::Internal(
-                "MCP tool registry lock poisoned".into(),
+                "MCP tool executor lock poisoned".into(),
             ));
         };
         executor.execute(request, ctx).await
@@ -2290,9 +2271,9 @@ impl ToolExecutor for McpToolExecutor {
         approved_request: &agentkit_tools_core::ApprovalRequest,
         ctx: &mut ToolContext<'_>,
     ) -> ToolExecutionOutcome {
-        let Ok(executor) = self.executor() else {
+        let Ok(executor) = self.current() else {
             return ToolExecutionOutcome::Failed(ToolError::Internal(
-                "MCP tool registry lock poisoned".into(),
+                "MCP tool executor lock poisoned".into(),
             ));
         };
         executor
@@ -2307,38 +2288,34 @@ impl ToolExecutor for McpToolExecutor {
         ctx: &mut ToolContext<'_>,
     ) -> ToolExecutionOutcome {
         if let Some(server_id) = auth_resolution.request().server_id() {
-            let connection = self
-                .connections
-                .read()
-                .map_err(|_| ToolError::Internal("MCP connection map lock poisoned".into()))
-                .and_then(|connections| {
-                    connections
-                        .get(&McpServerId::new(server_id))
-                        .cloned()
-                        .ok_or_else(|| {
-                            ToolError::Unavailable(format!("MCP server not connected: {server_id}"))
-                        })
-                });
-            match connection {
-                Ok(connection) => {
-                    if let Err(error) = connection.resolve_auth(auth_resolution.clone()).await {
-                        return ToolExecutionOutcome::Failed(ToolError::ExecutionFailed(
-                            error.to_string(),
-                        ));
-                    }
-                }
+            let connection = match self.connection_for(server_id) {
+                Ok(connection) => connection,
                 Err(error) => return ToolExecutionOutcome::Failed(error),
+            };
+            if let Err(error) = connection.resolve_auth(auth_resolution.clone()).await {
+                return ToolExecutionOutcome::Failed(ToolError::ExecutionFailed(error.to_string()));
             }
         }
 
-        let Ok(executor) = self.executor() else {
+        let Ok(executor) = self.current() else {
             return ToolExecutionOutcome::Failed(ToolError::Internal(
-                "MCP tool registry lock poisoned".into(),
+                "MCP tool executor lock poisoned".into(),
             ));
         };
         executor
             .execute_after_auth(request, auth_resolution, ctx)
             .await
+    }
+}
+
+impl McpToolExecutor {
+    fn connection_for(&self, server_id: &str) -> Result<Arc<McpConnection>, ToolError> {
+        self.connections
+            .read()
+            .map_err(|_| ToolError::Internal("MCP connection map lock poisoned".into()))?
+            .get(&McpServerId::new(server_id))
+            .cloned()
+            .ok_or_else(|| ToolError::Unavailable(format!("MCP server not connected: {server_id}")))
     }
 }
 
@@ -2455,12 +2432,14 @@ fn tool_annotations_from_rmcp(annotations: Option<&McpToolAnnotations>) -> ToolA
     // rmcp expresses each hint as `Option<bool>` (advisory; absent means
     // unspecified). agentkit collapses absent → false. Tools that need to
     // distinguish "absent" from "false" should inspect the underlying
-    // `McpTool::annotations` directly via the snapshot.
+    // `McpTool::annotations` directly via the snapshot. MCP has no
+    // `needs_approval` hint, so leave it unset and let the loop's permission
+    // policy drive approval.
     ToolAnnotations {
         read_only_hint: annotations.read_only_hint.unwrap_or(false),
         destructive_hint: annotations.destructive_hint.unwrap_or(false),
         idempotent_hint: annotations.idempotent_hint.unwrap_or(false),
-        needs_approval_hint: annotations.destructive_hint.unwrap_or(false),
+        needs_approval_hint: false,
         supports_streaming_hint: false,
     }
 }
@@ -2586,9 +2565,7 @@ fn prompt_message_content_to_part(content: PromptMessageContent) -> Part {
             let agentkit_resource = resource_contents_to_capabilities(resource.resource.clone());
             agentkit_part_from_resource(agentkit_resource)
         }
-        PromptMessageContent::ResourceLink { link } => {
-            Part::Text(TextPart::new(link.uri.clone()))
-        }
+        PromptMessageContent::ResourceLink { link } => Part::Text(TextPart::new(link.uri.clone())),
     }
 }
 
@@ -2662,20 +2639,25 @@ fn bearer_token_from_metadata(metadata: &MetadataMap) -> Option<String> {
         .find_map(|key| metadata.get(key).and_then(Value::as_str).map(str::to_owned))
 }
 
-fn rmcp_initialize_error(
-    config: &McpServerConfig,
-    error: rmcp::service::ClientInitializeError,
-) -> McpError {
-    let message = error.to_string();
-    if let Some(auth_request) =
-        parse_transport_auth_request(&config.id, "initialize", &json!({}), &message)
-    {
-        return McpError::AuthRequired(Box::new(auth_request));
+fn rmcp_initialize_error(config: &McpServerConfig, error: ClientInitializeError) -> McpError {
+    if let Some(signal) = match &error {
+        ClientInitializeError::TransportError { error: dyn_err, .. } => {
+            transport_auth_signal(dyn_err)
+        }
+        _ => None,
+    } {
+        return McpError::AuthRequired(Box::new(auth_request_from_signal(
+            &config.id,
+            "initialize",
+            &json!({}),
+            signal,
+            &error.to_string(),
+        )));
     }
-    McpError::Transport(message)
+    McpError::Transport(error.to_string())
 }
 
-fn rmcp_service_error(error: rmcp::ServiceError) -> McpError {
+fn rmcp_service_error(error: ServiceError) -> McpError {
     McpError::Invocation(error.to_string())
 }
 
@@ -2683,46 +2665,99 @@ fn rmcp_operation_error(
     server_id: &McpServerId,
     method: &str,
     params: Value,
-    error: rmcp::ServiceError,
+    error: ServiceError,
 ) -> McpError {
-    let message = error.to_string();
-    if let Some(auth_request) = parse_transport_auth_request(server_id, method, &params, &message) {
-        return McpError::AuthRequired(Box::new(auth_request));
+    if let Some(signal) = service_auth_signal(&error) {
+        return McpError::AuthRequired(Box::new(auth_request_from_signal(
+            server_id,
+            method,
+            &params,
+            signal,
+            &error.to_string(),
+        )));
     }
-    McpError::Invocation(message)
+    McpError::Invocation(error.to_string())
 }
 
-fn parse_transport_auth_request(
+#[derive(Debug)]
+enum AuthSignal {
+    Required {
+        www_authenticate: Option<String>,
+    },
+    InsufficientScope {
+        www_authenticate: Option<String>,
+        required_scope: Option<String>,
+    },
+}
+
+fn service_auth_signal(error: &ServiceError) -> Option<AuthSignal> {
+    match error {
+        ServiceError::TransportSend(dyn_err) => transport_auth_signal(dyn_err),
+        _ => None,
+    }
+}
+
+fn transport_auth_signal(error: &DynamicTransportError) -> Option<AuthSignal> {
+    let inner = error
+        .error
+        .downcast_ref::<StreamableHttpError<reqwest::Error>>()?;
+    match inner {
+        StreamableHttpError::AuthRequired(AuthRequiredError {
+            www_authenticate_header,
+            ..
+        }) => Some(AuthSignal::Required {
+            www_authenticate: Some(www_authenticate_header.clone()),
+        }),
+        StreamableHttpError::InsufficientScope(InsufficientScopeError {
+            www_authenticate_header,
+            required_scope,
+            ..
+        }) => Some(AuthSignal::InsufficientScope {
+            www_authenticate: Some(www_authenticate_header.clone()),
+            required_scope: required_scope.clone(),
+        }),
+        _ => None,
+    }
+}
+
+fn auth_request_from_signal(
     server_id: &McpServerId,
     method: &str,
     params: &Value,
+    signal: AuthSignal,
     message: &str,
-) -> Option<AuthRequest> {
-    let lower = message.to_ascii_lowercase();
-    if !(lower.contains("auth required")
-        || lower.contains("unauthorized")
-        || lower.contains("insufficient scope")
-        || lower.contains("insufficient_scope"))
-    {
-        return None;
-    }
-
+) -> AuthRequest {
     let mut challenge = MetadataMap::new();
     challenge.insert("server_id".into(), Value::String(server_id.to_string()));
     challenge.insert("method".into(), Value::String(method.into()));
     challenge.insert("message".into(), Value::String(message.into()));
     challenge.insert("flow_kind".into(), Value::String("http_bearer".into()));
-    if lower.contains("insufficient scope") || lower.contains("insufficient_scope") {
-        challenge.insert("insufficient_scope".into(), Value::Bool(true));
+    match signal {
+        AuthSignal::Required { www_authenticate } => {
+            if let Some(header) = www_authenticate {
+                challenge.insert("www_authenticate".into(), Value::String(header));
+            }
+        }
+        AuthSignal::InsufficientScope {
+            www_authenticate,
+            required_scope,
+        } => {
+            challenge.insert("insufficient_scope".into(), Value::Bool(true));
+            if let Some(header) = www_authenticate {
+                challenge.insert("www_authenticate".into(), Value::String(header));
+            }
+            if let Some(scope) = required_scope {
+                challenge.insert("required_scope".into(), Value::String(scope));
+            }
+        }
     }
-
-    Some(AuthRequest {
+    AuthRequest {
         task_id: None,
         id: format!("mcp:{}:{}", server_id, method),
         provider: format!("mcp.{}", server_id),
         operation: auth_operation_for_method(server_id, method, params),
         challenge,
-    })
+    }
 }
 
 fn auth_operation_for_method(
@@ -2780,14 +2815,6 @@ fn auth_operation_for_method(
             },
         },
     }
-}
-
-fn normalize_mcp_tool_name(server_id: &McpServerId, tool_name: &str) -> String {
-    let prefix = format!("mcp_{server_id}_");
-    tool_name
-        .strip_prefix(&prefix)
-        .unwrap_or(tool_name)
-        .to_string()
 }
 
 /// Errors produced by MCP transport, protocol, and lifecycle operations.

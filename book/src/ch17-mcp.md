@@ -23,6 +23,15 @@ Without MCP:                          With MCP:
 
 `agentkit-mcp` is built on top of the official [`rmcp`](https://crates.io/crates/rmcp) Rust SDK. The wire-protocol types (`CallToolResult`, `ReadResourceResult`, `Content`, `Tool`, `Prompt`, …) are re-exported as `McpTool`, `McpResource`, `McpPrompt`, etc. — there is no parallel agentkit-side vocabulary.
 
+## Built on rmcp: spec changes propagate for free
+
+The MCP specification moves quickly. Because agentkit-mcp re-exports [`rmcp::model`](https://docs.rs/rmcp/latest/rmcp/model/index.html) types as-is rather than wrapping them in a parallel hierarchy, new fields, content variants, capability flags, server-initiated requests, and notification payloads land in agentkit hosts the moment `rmcp` ships them — there is no agentkit-flavored "view" of the wire format to keep in sync.
+
+- **Spec:** [modelcontextprotocol.io](https://modelcontextprotocol.io)
+- **Rust SDK:** [`rmcp` on crates.io](https://crates.io/crates/rmcp)
+
+The same logic applies to transports: stdio and Streamable HTTP are rmcp implementations driven declaratively here; future rmcp transports are reachable through `McpConnection::from_running_service_with_events` without touching `McpTransportBinding`.
+
 ## MCP in the capability model
 
 MCP servers expose three capability types, which map directly to agentkit's capability layer:
@@ -86,17 +95,19 @@ let manager = McpServerManager::new().with_namespace(McpToolNamespace::custom(
 
 MCP is bidirectional: a server can ask the client to do work too. agentkit-mcp surfaces three responder traits — install one to handle each request type. The client only advertises the corresponding `ClientCapabilities` entry when a responder is wired in, so servers see exactly the surface the host opted into.
 
-| Server request             | Trait                       | Use                                                |
-| -------------------------- | --------------------------- | -------------------------------------------------- |
-| `sampling/createMessage`   | `McpSamplingResponder`      | Server asks the host LLM to generate a completion  |
-| `elicitation/create`       | `McpElicitationResponder`   | Server asks the user for input                     |
-| `roots/list`               | `McpRootsProvider`          | Server enumerates workspace roots in scope         |
+| Server request           | Trait                     | Use                                               |
+| ------------------------ | ------------------------- | ------------------------------------------------- |
+| `sampling/createMessage` | `McpSamplingResponder`    | Server asks the host LLM to generate a completion |
+| `elicitation/create`     | `McpElicitationResponder` | Server asks the user for input                    |
+| `roots/list`             | `McpRootsProvider`        | Server enumerates workspace roots in scope        |
 
 ```rust,ignore
-let manager = McpServerManager::new()
-    .with_sampling_responder(Arc::new(host_sampling))
-    .with_elicitation_responder(Arc::new(prompt_user))
-    .with_roots_provider(Arc::new(workspace_roots));
+let manager = McpServerManager::new().with_handler_config(
+    McpHandlerConfig::new()
+        .with_sampling_responder(Arc::new(host_sampling))
+        .with_elicitation_responder(Arc::new(prompt_user))
+        .with_roots_provider(Arc::new(workspace_roots)),
+);
 ```
 
 ## Server-pushed events
@@ -121,7 +132,7 @@ while let Ok(event) = events.recv().await {
 
 `set_logging_level(LoggingLevel::Info)` negotiates the minimum severity the server emits. `subscribe_resource` / `unsubscribe_resource` toggle per-URI watch on resources that support it.
 
-List-changed events are *also* delivered through the legacy `McpServerNotification` mpsc receiver that `McpServerManager::refresh_changed_catalogs` drains to re-run discovery — the two channels coexist: events for live UI/observability, mpsc for catalog re-sync.
+List-changed events are _also_ delivered through the legacy `McpServerNotification` mpsc receiver that `McpServerManager::refresh_changed_catalogs` drains to re-run discovery — the two channels coexist: events for live UI/observability, mpsc for catalog re-sync.
 
 ## Auth as interruption
 
@@ -139,10 +150,10 @@ To rotate credentials at runtime — e.g. a Streamable HTTP bearer that expires 
 
 ## Transports
 
-| Transport       | Connection                              | Use case                   |
-| --------------- | --------------------------------------- | -------------------------- |
-| stdio           | Spawn child process, pipe stdin/stdout  | Local tool servers         |
-| Streamable HTTP | HTTP POST with JSON or SSE responses    | Modern remote tool servers |
+| Transport       | Connection                             | Use case                   |
+| --------------- | -------------------------------------- | -------------------------- |
+| stdio           | Spawn child process, pipe stdin/stdout | Local tool servers         |
+| Streamable HTTP | HTTP POST with JSON or SSE responses   | Modern remote tool servers |
 
 The rest of agentkit doesn't know whether a server is reached via stdio, HTTP, or in-memory pipes. Transport is configured in `McpServerConfig` and the MCP manager handles the connection lifecycle.
 
@@ -170,7 +181,7 @@ If an SSE response stream is interrupted before the matching response arrives, t
 
 ### Custom transports
 
-When you need a transport rmcp supports but `McpTransportBinding` does not (in-memory pipes for tests, websockets, custom IO), build the rmcp `RunningService` yourself and adopt it through `McpConnection::from_running_service_with_events`. Pair the service with the channels returned by `McpClientHandler::builder().build()` so list-change notifications and `McpServerEvent` subscribers stay observable.
+When you need a transport rmcp supports but `McpTransportBinding` does not (in-memory pipes for tests, websockets, custom IO), build the rmcp `RunningService` yourself and adopt it through `McpConnection::from_running_service_with_events`. Pair the service with the channels returned by `McpHandlerConfig::new().build()` so list-change notifications and `McpServerEvent` subscribers stay observable.
 
 ## The full picture
 

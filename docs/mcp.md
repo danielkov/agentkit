@@ -69,7 +69,7 @@ The rest of `agentkit` does not care whether an MCP server is reached via stdio,
 - **stdio** (rmcp `TokioChildProcess`)
 - **Streamable HTTP** (rmcp `StreamableHttpClientTransport`)
 
-For transports rmcp supports but the built-in `McpTransportBinding` enum does not (in-memory pipes for tests, websockets, custom IO), hosts construct the rmcp `RunningService` themselves and adopt it through `McpConnection::from_running_service_with_events`. Pair the service with the channels returned by `McpClientHandler::builder().build()` so list-change notifications and `McpServerEvent` subscribers stay observable.
+For transports rmcp supports but the built-in `McpTransportBinding` enum does not (in-memory pipes for tests, websockets, custom IO), hosts construct the rmcp `RunningService` themselves and adopt it through `McpConnection::from_running_service_with_events`. Pair the service with the channels returned by `McpHandlerConfig::new().build()` so list-change notifications and `McpServerEvent` subscribers stay observable.
 
 ### 5. Discovery is explicit and cacheable
 
@@ -91,7 +91,7 @@ MCP server capabilities may change over time, but hosts should not be forced to 
 
 MCP is bidirectional — servers can issue `sampling/createMessage`, `elicitation/create`, and `roots/list` requests back into the client. The host installs `McpSamplingResponder` / `McpElicitationResponder` / `McpRootsProvider` implementations and the client only advertises the matching `ClientCapabilities` entry when a responder is wired in.
 
-Server-pushed notifications (progress, logging, resource updates, list-changed, cancellation) are delivered as `McpServerEvent` over a `tokio::sync::broadcast` channel obtained via `McpConnection::subscribe_events`. List-changed events are *also* delivered through the legacy `McpServerNotification` mpsc receiver consumed by `refresh_changed_catalogs` — the two channels coexist: events for live UI/observability, mpsc for catalog re-sync.
+Server-pushed notifications (progress, logging, resource updates, list-changed, cancellation) are delivered as `McpServerEvent` over a `tokio::sync::broadcast` channel obtained via `McpConnection::subscribe_events`. List-changed events are _also_ delivered through the legacy `McpServerNotification` mpsc receiver consumed by `refresh_changed_catalogs` — the two channels coexist: events for live UI/observability, mpsc for catalog re-sync.
 
 ## Main boundary
 
@@ -137,9 +137,12 @@ let manager = McpServerManager::new()
     .with_server(config_a)
     .with_server(config_b)
     .with_namespace(McpToolNamespace::Default)
-    .with_sampling_responder(Arc::new(host_sampling))
-    .with_elicitation_responder(Arc::new(prompt_user))
-    .with_roots_provider(Arc::new(workspace_roots));
+    .with_handler_config(
+        McpHandlerConfig::new()
+            .with_sampling_responder(Arc::new(host_sampling))
+            .with_elicitation_responder(Arc::new(prompt_user))
+            .with_roots_provider(Arc::new(workspace_roots)),
+    );
 
 manager.connect_all().await?;
 let registry = manager.tool_registry();

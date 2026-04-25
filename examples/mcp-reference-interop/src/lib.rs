@@ -145,9 +145,8 @@ async fn probe_server(
             .call_tool(FIXTURE_TOOL_NAME, json!({ "text": PROBE_TEXT }))
             .await?,
     )?;
-    let resource_text = decode_resource_text(
-        connection.read_resource(FIXTURE_RESOURCE_URI).await?,
-    )?;
+    let resource_text =
+        decode_resource_text(connection.read_resource(FIXTURE_RESOURCE_URI).await?)?;
     let prompt = connection
         .get_prompt(FIXTURE_PROMPT_NAME, json!({ "name": "Ada" }))
         .await?;

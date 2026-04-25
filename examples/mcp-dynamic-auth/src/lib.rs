@@ -1,13 +1,10 @@
 //! In-memory token registry shared between the mock MCP server and the
 //! agentkit-mcp client used by the binary.
 //!
-//! After Phase 1 of the rmcp migration this crate no longer wires a
-//! `reqwest_middleware` layer into the agentkit-mcp transport — rmcp's
-//! Streamable HTTP transport accepts a static bearer at construction time
-//! only. The binary demonstrates rotation by triggering an
-//! [`agentkit_mcp::McpConnection::resolve_auth`], which currently rebuilds
-//! the underlying rmcp service against the new credentials. Live header
-//! rotation lands in Phase 4.
+//! rmcp's Streamable HTTP transport accepts a static bearer at construction
+//! time only, so this example rotates credentials by triggering
+//! [`agentkit_mcp::McpConnection::resolve_auth`], which rebuilds the
+//! underlying rmcp service against the new bearer.
 
 use std::sync::Arc;
 

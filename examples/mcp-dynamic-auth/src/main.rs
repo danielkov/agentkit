@@ -71,8 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     *mock.expected_token.lock().await = "token-v2".into();
 
     // Trigger a reconnect that picks up the rotated token via stored auth
-    // credentials. (Phase-4 work will replace this reconnect with a live
-    // header rotation on the rmcp transport.)
+    // credentials.
     let mut credentials = MetadataMap::new();
     credentials.insert(
         "bearer_token".into(),

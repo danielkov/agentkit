@@ -13,6 +13,15 @@ This crate covers:
 
 The wire-protocol types — `CallToolResult`, `ReadResourceResult`, `GetPromptResult`, `Content`, `RawContent`, `ToolAnnotations`, `Prompt`, etc. — are re-exported from `rmcp` directly. There is no parallel agentkit-side type vocabulary to maintain.
 
+## Why this matters
+
+Re-exporting [`rmcp::model`](https://docs.rs/rmcp/latest/rmcp/model/index.html) keeps agentkit-mcp in lockstep with the MCP spec — new fields, content variants, capability flags, server-initiated requests, and notification payloads land in agentkit the moment `rmcp` ships them. No second source of truth to drift.
+
+- **Spec:** [modelcontextprotocol.io](https://modelcontextprotocol.io)
+- **Rust SDK:** [`rmcp` on crates.io](https://crates.io/crates/rmcp)
+
+The same applies to transports: any future rmcp transport is reachable through `McpConnection::from_running_service_with_events` without touching the built-in `McpTransportBinding` enum.
+
 ## Configuring and connecting MCP servers
 
 Register one or more MCP server configurations with `McpServerManager`, then connect them. Each connected server is represented by an `McpServerHandle` that holds the live connection and the discovery snapshot.
@@ -141,14 +150,14 @@ To rotate the bearer at runtime, drive an `AuthResolution::Provided { credential
 
 ## Sampling, elicitation, and roots
 
-Servers can issue requests *back* into the client: `sampling/createMessage` (ask the host LLM to generate), `elicitation/create` (ask the user for input), `roots/list` (enumerate workspace roots in scope). Wire in trait implementations to handle each:
+Servers can issue requests _back_ into the client: `sampling/createMessage` (ask the host LLM to generate), `elicitation/create` (ask the user for input), `roots/list` (enumerate workspace roots in scope). Wire in trait implementations to handle each:
 
 ```rust,no_run
 use std::sync::Arc;
 use async_trait::async_trait;
 use agentkit_mcp::{
-    McpCreateMessageRequestParams, McpCreateMessageResult, McpError, McpRoot, McpRootsProvider,
-    McpSamplingMessage, McpSamplingResponder, McpServerManager,
+    McpCreateMessageRequestParams, McpCreateMessageResult, McpError, McpHandlerConfig, McpRoot,
+    McpRootsProvider, McpSamplingMessage, McpSamplingResponder, McpServerManager,
 };
 
 struct HostSampling;
@@ -173,9 +182,11 @@ impl McpRootsProvider for StaticRoots {
     }
 }
 
-let manager = McpServerManager::new()
-    .with_sampling_responder(Arc::new(HostSampling))
-    .with_roots_provider(Arc::new(StaticRoots));
+let manager = McpServerManager::new().with_handler_config(
+    McpHandlerConfig::new()
+        .with_sampling_responder(Arc::new(HostSampling))
+        .with_roots_provider(Arc::new(StaticRoots)),
+);
 ```
 
 `McpElicitationResponder` follows the same shape. The handler advertises the corresponding `ClientCapabilities` entry only when a responder is installed — servers that probe `client.capabilities.sampling` will see the host opt in.
@@ -208,7 +219,7 @@ while let Ok(event) = events.recv().await {
 # }
 ```
 
-Catalog list-changed events are *also* delivered through the legacy `McpServerNotification` mpsc receiver consumed by `McpServerManager::refresh_changed_catalogs`. The two channels coexist: events for live UI/observability, mpsc for re-discovery.
+Catalog list-changed events are _also_ delivered through the legacy `McpServerNotification` mpsc receiver consumed by `McpServerManager::refresh_changed_catalogs`. The two channels coexist: events for live UI/observability, mpsc for re-discovery.
 
 ## Lifecycle management
 
@@ -242,11 +253,11 @@ manager.disconnect_server(&server_id).await?;
 When you need a transport rmcp supports but `McpTransportBinding` does not (in-memory pipes, websockets, custom IO), build the rmcp `RunningService` directly and adopt it:
 
 ```rust,no_run
-use agentkit_mcp::{McpClientHandler, McpConnection, McpServerId};
+use agentkit_mcp::{McpConnection, McpHandlerConfig, McpServerId};
 use rmcp::ServiceExt;
 
 # async fn adopt(client_io: tokio::io::DuplexStream) -> Result<(), Box<dyn std::error::Error>> {
-let (handler, channels) = McpClientHandler::builder().build();
+let (handler, channels) = McpHandlerConfig::new().build();
 let service = handler.serve(client_io).await?;
 let connection = McpConnection::from_running_service_with_events(
     McpServerId::new("in-memory"),

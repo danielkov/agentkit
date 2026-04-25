@@ -57,15 +57,16 @@ use agentkit_core::{
     TextPart, ToolCallId, ToolCallPart, ToolOutput, ToolResultPart, TurnCancellation, Usage,
 };
 use agentkit_task_manager::{
-    PendingLoopUpdates, SimpleTaskManager, TaskApproval, TaskAuth, TaskLaunchRequest, TaskManager,
-    TaskResolution, TaskStartContext, TaskStartOutcome, TurnTaskUpdate,
+    PendingLoopUpdates, SimpleTaskManager, TaskApproval, TaskAuth, TaskLaunchKind,
+    TaskLaunchRequest, TaskManager, TaskResolution, TaskStartContext, TaskStartOutcome,
+    TurnTaskUpdate,
 };
 #[cfg(test)]
 use agentkit_tools_core::ToolContext;
 use agentkit_tools_core::{
-    ApprovalDecision, ApprovalRequest, AuthOperation, AuthRequest, AuthResolution,
-    BasicToolExecutor, OwnedToolContext, PermissionChecker, ToolCatalogEvent, ToolError,
-    ToolExecutor, ToolRegistry, ToolRequest, ToolResources, ToolSpec,
+    AllowAllPermissions, ApprovalDecision, ApprovalRequest, AuthOperation, AuthRequest,
+    AuthResolution, BasicToolExecutor, OwnedToolContext, PermissionChecker, ToolCatalogEvent,
+    ToolError, ToolExecutor, ToolRegistry, ToolRequest, ToolResources, ToolSpec,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -592,16 +593,7 @@ pub enum AgentEvent {
     /// An authentication interrupt has been resolved.
     AuthResolved { provided: bool },
     /// The available tool catalog changed and will be reflected on the next model request.
-    ToolCatalogChanged {
-        /// Stable source identifier for the catalog that changed.
-        source: String,
-        /// Tool names that became available.
-        added: Vec<String>,
-        /// Tool names that are no longer available.
-        removed: Vec<String>,
-        /// Tool names whose schema, description, or metadata changed.
-        changed: Vec<String>,
-    },
+    ToolCatalogChanged(ToolCatalogEvent),
     /// Transcript compaction is about to begin.
     CompactionStarted {
         session_id: SessionId,
@@ -1143,15 +1135,12 @@ where
     /// Set a dynamic tool executor.
     ///
     /// When this is provided, the agent uses it instead of wrapping the static
-    /// [`ToolRegistry`] in a [`BasicToolExecutor`].
+    /// [`ToolRegistry`] in a [`BasicToolExecutor`]. Pass an owned `impl
+    /// ToolExecutor + 'static` or an existing `Arc<dyn ToolExecutor>` — the
+    /// blanket [`ToolExecutor`] impl on [`Arc`] makes both work without
+    /// double-wrapping.
     pub fn tool_executor(mut self, executor: impl ToolExecutor + 'static) -> Self {
         self.tool_executor = Some(Arc::new(executor));
-        self
-    }
-
-    /// Set a shared dynamic tool executor.
-    pub fn tool_executor_arc(mut self, executor: Arc<dyn ToolExecutor>) -> Self {
-        self.tool_executor = Some(executor);
         self
     }
 
@@ -1307,8 +1296,7 @@ where
         &self,
         task_id: Option<TaskId>,
         tool_request: ToolRequest,
-        approved_request: Option<ApprovalRequest>,
-        auth_resolution: Option<AuthResolution>,
+        kind: TaskLaunchKind,
         cancellation: Option<TurnCancellation>,
     ) -> impl std::future::Future<Output = Result<TaskStartOutcome, LoopError>> + Send + 'static
     {
@@ -1326,8 +1314,7 @@ where
                     TaskLaunchRequest {
                         task_id,
                         request: tool_request.clone(),
-                        approved_request,
-                        auth_resolution,
+                        kind,
                     },
                     TaskStartContext {
                         executor: tool_executor,
@@ -1352,12 +1339,7 @@ where
 
     fn emit_tool_catalog_events(&mut self, events: Vec<ToolCatalogEvent>) {
         for event in events {
-            self.emit(AgentEvent::ToolCatalogChanged {
-                source: event.source,
-                added: event.added,
-                removed: event.removed,
-                changed: event.changed,
-            });
+            self.emit(AgentEvent::ToolCatalogChanged(event));
         }
     }
 
@@ -1606,8 +1588,7 @@ where
                     .start_task_via_manager(
                         None,
                         tool_request.clone(),
-                        None,
-                        None,
+                        TaskLaunchKind::Plain,
                         cancellation.clone(),
                     )
                     .await?
@@ -1898,8 +1879,7 @@ where
                 .start_task_via_manager(
                     Some(pending.task_id.clone()),
                     pending.tool_request.clone(),
-                    None,
-                    Some(resolution.clone()),
+                    TaskLaunchKind::AfterAuth(resolution.clone()),
                     self.cancellation
                         .as_ref()
                         .map(CancellationHandle::checkpoint),
@@ -1958,8 +1938,7 @@ where
                 .start_task_via_manager(
                     Some(pending.task_id.clone()),
                     pending.tool_request.clone(),
-                    Some(pending.request.clone()),
-                    None,
+                    TaskLaunchKind::Approved(pending.request.clone()),
                     self.cancellation
                         .as_ref()
                         .map(CancellationHandle::checkpoint),
@@ -2331,17 +2310,6 @@ fn upgrade_auth_request(
         metadata,
     };
     request
-}
-
-struct AllowAllPermissions;
-
-impl PermissionChecker for AllowAllPermissions {
-    fn evaluate(
-        &self,
-        _request: &dyn agentkit_tools_core::PermissionRequest,
-    ) -> agentkit_tools_core::PermissionDecision {
-        agentkit_tools_core::PermissionDecision::Allow
-    }
 }
 
 /// Errors that can occur while driving the agent loop.
@@ -3990,7 +3958,7 @@ mod tests {
                 seen_descriptions: seen_descriptions.clone(),
                 seen_caches: StdArc::new(StdMutex::new(Vec::new())),
             })
-            .tool_executor_arc(executor_for_agent)
+            .tool_executor(executor_for_agent)
             .permissions(AllowAllPermissions)
             .observer(RecordingObserver {
                 events: events.clone(),
@@ -4035,12 +4003,12 @@ mod tests {
         let events = events.lock().unwrap();
         assert!(events.iter().any(|event| matches!(
             event,
-            AgentEvent::ToolCatalogChanged {
+            AgentEvent::ToolCatalogChanged(ToolCatalogEvent {
                 source,
                 added,
                 removed,
                 changed,
-            } if source == "mcp:mock"
+            }) if source == "mcp:mock"
                 && added == &vec!["dynamic".to_string()]
                 && removed.is_empty()
                 && changed.is_empty()
