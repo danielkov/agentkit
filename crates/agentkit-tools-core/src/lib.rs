@@ -802,6 +802,19 @@ pub trait PermissionChecker: Send + Sync {
     fn evaluate(&self, request: &dyn PermissionRequest) -> PermissionDecision;
 }
 
+/// A [`PermissionChecker`] that unconditionally allows every operation.
+///
+/// Useful in tests, examples, and embedding scenarios where the host has
+/// already gated tool access elsewhere.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct AllowAllPermissions;
+
+impl PermissionChecker for AllowAllPermissions {
+    fn evaluate(&self, _request: &dyn PermissionRequest) -> PermissionDecision {
+        PermissionDecision::Allow
+    }
+}
+
 /// The result of a single [`PermissionPolicy`] evaluation.
 ///
 /// Unlike [`PermissionDecision`], a policy can return [`PolicyMatch::NoOpinion`]
@@ -2093,66 +2106,17 @@ pub trait ToolExecutor: Send + Sync {
     }
 }
 
-/// A [`ToolExecutor`] that routes requests across multiple executors.
-///
-/// This is intended for hosts that combine static local tools with one or
-/// more dynamic catalogs, such as MCP servers.
-pub struct CompositeToolExecutor {
-    executors: Vec<Arc<dyn ToolExecutor>>,
-}
-
-impl CompositeToolExecutor {
-    /// Builds an empty composite executor.
-    pub fn new() -> Self {
-        Self {
-            executors: Vec::new(),
-        }
-    }
-
-    /// Builds a composite executor from existing executor instances.
-    pub fn from_executors(executors: Vec<Arc<dyn ToolExecutor>>) -> Self {
-        Self { executors }
-    }
-
-    /// Appends an executor.
-    pub fn push(mut self, executor: impl ToolExecutor + 'static) -> Self {
-        self.executors.push(Arc::new(executor));
-        self
-    }
-
-    /// Appends a shared executor.
-    pub fn push_arc(mut self, executor: Arc<dyn ToolExecutor>) -> Self {
-        self.executors.push(executor);
-        self
-    }
-
-    fn executor_for(&self, name: &ToolName) -> Option<&Arc<dyn ToolExecutor>> {
-        self.executors
-            .iter()
-            .find(|executor| executor.specs().iter().any(|spec| &spec.name == name))
-    }
-}
-
-impl Default for CompositeToolExecutor {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[async_trait]
-impl ToolExecutor for CompositeToolExecutor {
+impl<T> ToolExecutor for Arc<T>
+where
+    T: ToolExecutor + ?Sized,
+{
     fn specs(&self) -> Vec<ToolSpec> {
-        self.executors
-            .iter()
-            .flat_map(|executor| executor.specs())
-            .collect()
+        (**self).specs()
     }
 
     fn drain_catalog_events(&self) -> Vec<ToolCatalogEvent> {
-        self.executors
-            .iter()
-            .flat_map(|executor| executor.drain_catalog_events())
-            .collect()
+        (**self).drain_catalog_events()
     }
 
     async fn execute(
@@ -2160,10 +2124,7 @@ impl ToolExecutor for CompositeToolExecutor {
         request: ToolRequest,
         ctx: &mut ToolContext<'_>,
     ) -> ToolExecutionOutcome {
-        let Some(executor) = self.executor_for(&request.tool_name) else {
-            return ToolExecutionOutcome::Failed(ToolError::NotFound(request.tool_name));
-        };
-        executor.execute(request, ctx).await
+        (**self).execute(request, ctx).await
     }
 
     async fn execute_approved(
@@ -2172,10 +2133,7 @@ impl ToolExecutor for CompositeToolExecutor {
         approved_request: &ApprovalRequest,
         ctx: &mut ToolContext<'_>,
     ) -> ToolExecutionOutcome {
-        let Some(executor) = self.executor_for(&request.tool_name) else {
-            return ToolExecutionOutcome::Failed(ToolError::NotFound(request.tool_name));
-        };
-        executor
+        (**self)
             .execute_approved(request, approved_request, ctx)
             .await
     }
@@ -2186,10 +2144,7 @@ impl ToolExecutor for CompositeToolExecutor {
         auth_resolution: &AuthResolution,
         ctx: &mut ToolContext<'_>,
     ) -> ToolExecutionOutcome {
-        let Some(executor) = self.executor_for(&request.tool_name) else {
-            return ToolExecutionOutcome::Failed(ToolError::NotFound(request.tool_name));
-        };
-        executor
+        (**self)
             .execute_after_auth(request, auth_resolution, ctx)
             .await
     }

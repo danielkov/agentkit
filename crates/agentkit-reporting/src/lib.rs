@@ -578,18 +578,14 @@ where
         AgentEvent::AuthResolved { provided } => {
             writeln!(writer, "[auth] resolved provided={provided}")?;
         }
-        AgentEvent::ToolCatalogChanged {
-            source,
-            added,
-            removed,
-            changed,
-        } => {
+        AgentEvent::ToolCatalogChanged(event) => {
             writeln!(
                 writer,
-                "[tools] catalog changed source={source} added={} removed={} changed={}",
-                added.len(),
-                removed.len(),
-                changed.len()
+                "[tools] catalog changed source={} added={} removed={} changed={}",
+                event.source,
+                event.added.len(),
+                event.removed.len(),
+                event.changed.len()
             )?;
         }
         AgentEvent::CompactionStarted {

@@ -178,7 +178,7 @@ async fn rust_sdk_stateless_transport_skips_session_and_delete() {
 }
 
 #[tokio::test]
-async fn streamable_http_accepts_sse_responses_from_common_stream() {
+async fn streamable_http_resumes_interrupted_sse_response() {
     let (base_url, requests, shutdown) = spawn_resume_server().await;
     let url = format!("{base_url}/mcp");
 
@@ -192,8 +192,18 @@ async fn streamable_http_accepts_sse_responses_from_common_stream() {
     let tools = connection.list_tools().await.unwrap();
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0].name, "echo");
-    connection.close().await.unwrap();
 
+    let second_get = wait_for_second_get(&requests, std::time::Duration::from_secs(5))
+        .await
+        .expect("rmcp client should reopen the common SSE GET stream after it closes");
+    assert_eq!(
+        second_get.headers.get("last-event-id").map(String::as_str),
+        Some("evt-1"),
+        "reconnect must carry Last-Event-Id from the previous stream so the server can resume",
+    );
+    assert!(second_get.headers.contains_key("mcp-session-id"));
+
+    connection.close().await.unwrap();
     shutdown.cancel();
 
     let requests = requests.lock().await.clone();
@@ -206,12 +216,30 @@ async fn streamable_http_accepts_sse_responses_from_common_stream() {
             .map(String::as_str),
         Some("2025-11-25")
     );
+}
 
-    let common_stream_get = requests
-        .iter()
-        .find(|request| request.method == "GET" && request.path == "/mcp")
-        .expect("expected RMCP Streamable HTTP client to open the common SSE GET stream");
-    assert!(common_stream_get.headers.contains_key("mcp-session-id"));
+async fn wait_for_second_get(
+    requests: &Arc<Mutex<Vec<RecordedRequest>>>,
+    timeout: std::time::Duration,
+) -> Option<RecordedRequest> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        {
+            let guard = requests.lock().await;
+            let mut gets = guard
+                .iter()
+                .filter(|request| request.method == "GET" && request.path == "/mcp");
+            if gets.next().is_some() {
+                if let Some(second) = gets.next() {
+                    return Some(second.clone());
+                }
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }
 
 fn find_jsonrpc_request<'a>(requests: &'a [RecordedRequest], method: &str) -> &'a RecordedRequest {
@@ -224,6 +252,7 @@ fn find_jsonrpc_request<'a>(requests: &'a [RecordedRequest], method: &str) -> &'
 #[derive(Clone, Default)]
 struct ResumeState {
     requests: Arc<Mutex<Vec<RecordedRequest>>>,
+    get_count: Arc<Mutex<u32>>,
 }
 
 async fn spawn_resume_server() -> (String, Arc<Mutex<Vec<RecordedRequest>>>, CancellationToken) {
@@ -266,7 +295,10 @@ async fn resume_post(
     match request.get("method").and_then(Value::as_str) {
         Some("initialize") => response_with_headers(
             StatusCode::OK,
-            &[("content-type", "application/json"), ("mcp-session-id", "resume-session")],
+            &[
+                ("content-type", "application/json"),
+                ("mcp-session-id", "resume-session"),
+            ],
             json!({
                 "jsonrpc": "2.0",
                 "id": request["id"],
@@ -278,15 +310,23 @@ async fn resume_post(
             })
             .to_string(),
         ),
-        Some("notifications/initialized") => response_with_headers(StatusCode::ACCEPTED, &[], String::new()),
+        Some("notifications/initialized") => {
+            response_with_headers(StatusCode::ACCEPTED, &[], String::new())
+        }
         Some("tools/list") => response_with_headers(
             StatusCode::OK,
-            &[("content-type", "text/event-stream")],
-            concat!(
-                "id: evt-1\n",
-                "event: message\n",
-                "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{\"phase\":\"stream-start\"}}\n\n"
-            )
+            &[("content-type", "application/json")],
+            json!({
+                "jsonrpc": "2.0",
+                "id": request["id"],
+                "result": {
+                    "tools": [{
+                        "name": "echo",
+                        "description": "Echo",
+                        "inputSchema": { "type": "object" }
+                    }]
+                }
+            })
             .to_string(),
         ),
         other => panic!("unexpected POST method: {other:?}"),
@@ -295,15 +335,30 @@ async fn resume_post(
 
 async fn resume_get(State(state): State<ResumeState>, headers: HeaderMap) -> Response {
     record_request(&state, "GET", "/mcp", &headers, "").await;
+    let count = {
+        let mut counter = state.get_count.lock().await;
+        *counter += 1;
+        *counter
+    };
+    let body = if count == 1 {
+        // First common GET delivers one SSE frame with an event id, then ends.
+        // Per SEP-1699, the rmcp client treats the graceful close as resumable
+        // and reconnects with `Last-Event-Id: evt-1` — that is what the test
+        // asserts.
+        concat!(
+            "id: evt-1\n",
+            "event: message\n",
+            "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",",
+            "\"params\":{\"progressToken\":\"resume-token\",\"progress\":1,\"total\":1}}\n\n"
+        )
+        .to_string()
+    } else {
+        String::new()
+    };
     response_with_headers(
         StatusCode::OK,
         &[("content-type", "text/event-stream")],
-        concat!(
-            "id: evt-2\n",
-            "event: message\n",
-            "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"echo\",\"description\":\"Echo\",\"inputSchema\":{\"type\":\"object\"}}]}}\n\n"
-        )
-        .to_string(),
+        body,
     )
 }
 

@@ -539,7 +539,7 @@ struct CliArgs {
 }
 
 enum CliOutcome {
-    Run(CliArgs),
+    Run(Box<CliArgs>),
     Help,
 }
 
@@ -695,7 +695,7 @@ impl CliArgs {
             }
         }
 
-        Ok(CliOutcome::Run(cli))
+        Ok(CliOutcome::Run(Box::new(cli)))
     }
 }
 

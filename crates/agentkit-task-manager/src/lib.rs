@@ -91,12 +91,61 @@ pub struct PendingLoopUpdates {
     pub resolutions: VecDeque<TaskResolution>,
 }
 
+/// How a task should be invoked. Mutually exclusive between plain execution,
+/// resuming after approval, and resuming after auth.
+#[derive(Clone, Debug, Default)]
+pub enum TaskLaunchKind {
+    /// Execute the tool with the active permission policy.
+    #[default]
+    Plain,
+    /// Re-execute a previously-interrupted call after the user approved it.
+    Approved(ApprovalRequest),
+    /// Re-execute a previously-interrupted call after auth was resolved.
+    AfterAuth(AuthResolution),
+}
+
 #[derive(Clone, Debug)]
 pub struct TaskLaunchRequest {
     pub task_id: Option<TaskId>,
     pub request: ToolRequest,
-    pub approved_request: Option<ApprovalRequest>,
-    pub auth_resolution: Option<AuthResolution>,
+    pub kind: TaskLaunchKind,
+}
+
+impl TaskLaunchRequest {
+    /// Plain launch (no prior approval / auth).
+    pub fn plain(task_id: Option<TaskId>, request: ToolRequest) -> Self {
+        Self {
+            task_id,
+            request,
+            kind: TaskLaunchKind::Plain,
+        }
+    }
+
+    /// Resume after the user approved the call.
+    pub fn approved(
+        task_id: Option<TaskId>,
+        request: ToolRequest,
+        approval: ApprovalRequest,
+    ) -> Self {
+        Self {
+            task_id,
+            request,
+            kind: TaskLaunchKind::Approved(approval),
+        }
+    }
+
+    /// Resume after auth was resolved.
+    pub fn after_auth(
+        task_id: Option<TaskId>,
+        request: ToolRequest,
+        resolution: AuthResolution,
+    ) -> Self {
+        Self {
+            task_id,
+            request,
+            kind: TaskLaunchKind::AfterAuth(resolution),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -259,11 +308,8 @@ impl TaskManager for SimpleTaskManager {
             .task_id
             .clone()
             .unwrap_or_else(|| self.state.next_task_id());
-        let outcome = match (
-            request.auth_resolution.as_ref(),
-            request.approved_request.as_ref(),
-        ) {
-            (Some(auth_resolution), _) => {
+        let outcome = match &request.kind {
+            TaskLaunchKind::AfterAuth(auth_resolution) => {
                 ctx.executor
                     .execute_after_auth_owned(
                         request.request.clone(),
@@ -272,12 +318,12 @@ impl TaskManager for SimpleTaskManager {
                     )
                     .await
             }
-            (None, Some(approved)) => {
+            TaskLaunchKind::Approved(approved) => {
                 ctx.executor
                     .execute_approved_owned(request.request.clone(), approved, ctx.tool_context)
                     .await
             }
-            (None, None) => {
+            TaskLaunchKind::Plain => {
                 ctx.executor
                     .execute_owned(request.request.clone(), ctx.tool_context)
                     .await
@@ -487,8 +533,7 @@ impl TaskManager for AsyncTaskManager {
         let inner = self.inner.clone();
         let task_id_for_future = task_id.clone();
         let turn_id = snapshot.turn_id.clone();
-        let approved = request.approved_request.clone();
-        let auth_resolution = request.auth_resolution.clone();
+        let kind = request.kind.clone();
         let exec_request = request.request.clone();
         let owned_ctx = ctx.tool_context.clone();
         let executor = ctx.executor.clone();
@@ -529,18 +574,18 @@ impl TaskManager for AsyncTaskManager {
                 });
             }
 
-            let outcome = match (auth_resolution.as_ref(), approved.as_ref()) {
-                (Some(auth_resolution), _) => {
+            let outcome = match &kind {
+                TaskLaunchKind::AfterAuth(auth_resolution) => {
                     executor
                         .execute_after_auth_owned(exec_request.clone(), auth_resolution, owned_ctx)
                         .await
                 }
-                (None, Some(approval)) => {
+                TaskLaunchKind::Approved(approval) => {
                     executor
                         .execute_approved_owned(exec_request.clone(), approval, owned_ctx)
                         .await
                 }
-                (None, None) => {
+                TaskLaunchKind::Plain => {
                     executor
                         .execute_owned(exec_request.clone(), owned_ctx)
                         .await
@@ -1054,8 +1099,7 @@ mod tests {
                 TaskLaunchRequest {
                     task_id: None,
                     request: request.clone(),
-                    approved_request: None,
-                    auth_resolution: None,
+                    kind: TaskLaunchKind::Plain,
                 },
                 make_context(executor, &request.turn_id, None),
             )
@@ -1113,8 +1157,7 @@ mod tests {
                 TaskLaunchRequest {
                     task_id: None,
                     request: make_request("foreground", "turn-1", "call-fg"),
-                    approved_request: None,
-                    auth_resolution: None,
+                    kind: TaskLaunchKind::Plain,
                 },
                 make_context(executor.clone(), &turn_id, None),
             )
@@ -1125,8 +1168,7 @@ mod tests {
                 TaskLaunchRequest {
                     task_id: None,
                     request: make_request("background", "turn-1", "call-bg"),
-                    approved_request: None,
-                    auth_resolution: None,
+                    kind: TaskLaunchKind::Plain,
                 },
                 make_context(executor.clone(), &turn_id, None),
             )
@@ -1199,8 +1241,7 @@ mod tests {
                 TaskLaunchRequest {
                     task_id: None,
                     request: request.clone(),
-                    approved_request: None,
-                    auth_resolution: None,
+                    kind: TaskLaunchKind::Plain,
                 },
                 make_context(executor, &request.turn_id, None),
             )
@@ -1247,8 +1288,7 @@ mod tests {
                 TaskLaunchRequest {
                     task_id: None,
                     request: request.clone(),
-                    approved_request: None,
-                    auth_resolution: None,
+                    kind: TaskLaunchKind::Plain,
                 },
                 make_context(executor, &request.turn_id, None),
             )
@@ -1327,8 +1367,7 @@ mod tests {
                 TaskLaunchRequest {
                     task_id: None,
                     request: request.clone(),
-                    approved_request: None,
-                    auth_resolution: None,
+                    kind: TaskLaunchKind::Plain,
                 },
                 make_context(
                     executor,
@@ -1393,8 +1432,7 @@ mod tests {
                 TaskLaunchRequest {
                     task_id: None,
                     request: request.clone(),
-                    approved_request: None,
-                    auth_resolution: None,
+                    kind: TaskLaunchKind::Plain,
                 },
                 make_context(executor, &request.turn_id, None),
             )
