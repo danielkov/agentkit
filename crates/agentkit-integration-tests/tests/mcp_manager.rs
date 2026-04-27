@@ -17,6 +17,7 @@ use agentkit_integration_tests::snapshot::{
 };
 use agentkit_loop::{Agent, LoopInterrupt, LoopStep, SessionConfig};
 use agentkit_mcp::{McpCatalogEvent, McpServerConfig, McpServerId, McpServerManager};
+use agentkit_tools_core::ToolSource;
 
 #[tokio::test]
 async fn connect_server_populates_catalog() {
@@ -204,6 +205,33 @@ async fn refresh_server_picks_up_removed_tool() {
 }
 
 #[tokio::test]
+async fn reconnect_server_removes_stale_tools() {
+    let server = spawn_http_mcp(vec![
+        simple_tool("keeper", "Stays."),
+        simple_tool("stale", "Removed before reconnect."),
+    ])
+    .await;
+
+    let mut manager =
+        McpServerManager::new().with_server(McpServerConfig::streamable_http("dyn", &server.url));
+    let source = manager.source();
+
+    manager
+        .connect_server(&McpServerId::new("dyn"))
+        .await
+        .expect("initial connect succeeds");
+    assert_tool_names(&source, &["mcp_dyn_keeper", "mcp_dyn_stale"]);
+
+    assert!(server.remove_tool("stale"));
+    manager
+        .connect_server(&McpServerId::new("dyn"))
+        .await
+        .expect("reconnect succeeds");
+
+    assert_tool_names(&source, &["mcp_dyn_keeper"]);
+}
+
+#[tokio::test]
 async fn refresh_changed_catalogs_reacts_to_list_changed_notification() {
     let server = spawn_http_mcp(vec![simple_tool("orig", "Initial tool.")]).await;
 
@@ -271,6 +299,16 @@ async fn refresh_changed_catalogs_reacts_to_list_changed_notification() {
 
     let observed = adapter.into_recording(&recording, driver.snapshot().transcript.clone());
     assert_recording(&observed, &path);
+}
+
+fn assert_tool_names(source: &impl ToolSource, expected: &[&str]) {
+    let mut actual = source
+        .specs()
+        .into_iter()
+        .map(|spec| spec.name.0)
+        .collect::<Vec<_>>();
+    actual.sort();
+    assert_eq!(actual, expected);
 }
 
 async fn drive_until_finished<S>(driver: &mut agentkit_loop::LoopDriver<S>)
