@@ -1920,10 +1920,7 @@ impl ToolSource for CatalogReader {
         // way this Mutex poisons is if a panic somehow originates outside the
         // try_recv loop while held — recover defensively, the receiver state
         // is independent of this lock.
-        let mut rx = self
-            .events_rx
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut rx = self.events_rx.lock().unwrap_or_else(|e| e.into_inner());
         let mut out = Vec::new();
         loop {
             match rx.try_recv() {
@@ -2649,7 +2646,9 @@ mod tests {
         // NOT happened yet at this point (the diff runs before the
         // `*guard = new_map`), so the catalog state is still consistent.
         let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            writer.replace_all(vec![Arc::new(PanickingSpecTool::new("boom")) as Arc<dyn Tool>]);
+            writer.replace_all(vec![
+                Arc::new(PanickingSpecTool::new("boom")) as Arc<dyn Tool>
+            ]);
         }));
         assert!(
             panic_result.is_err(),

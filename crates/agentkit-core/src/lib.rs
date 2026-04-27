@@ -393,6 +393,14 @@ impl Item {
         Self::new(kind, vec![Part::Text(TextPart::new(text))])
     }
 
+    /// Builds a [`ItemKind::Notification`] item carrying free-form text.
+    /// Adapters wrap the content in `<system-reminder>` and deliver it as
+    /// a user-role message so the model can react to the notification on
+    /// its next turn without violating tool_use/tool_result pairing.
+    pub fn notification(text: impl Into<String>) -> Self {
+        Self::text(ItemKind::Notification, text)
+    }
+
     /// Sets the item identifier.
     pub fn with_id(mut self, id: impl Into<MessageId>) -> Self {
         self.id = Some(id.into());
@@ -414,7 +422,8 @@ impl Item {
 
 /// The role of an [`Item`] in the transcript.
 ///
-/// Variants are ordered so that `System < Developer < User < Assistant < Tool < Context`,
+/// Variants are ordered so that
+/// `System < Developer < User < Assistant < Tool < Context < Notification`,
 /// which is useful for sorting items by priority during compaction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum ItemKind {
@@ -430,6 +439,20 @@ pub enum ItemKind {
     Tool,
     /// Ambient context injected by context loaders (e.g. project files, docs).
     Context,
+    /// Out-of-band side-channel signal injected mid-conversation:
+    /// background-task completions, environment changes, system reminders.
+    /// Adapters render it as a user-role message wrapped in
+    /// `<system-reminder>` so the model interprets it as a notification
+    /// rather than user input. Distinct from [`ItemKind::Context`] in two
+    /// ways: (1) temporal placement is preserved (Anthropic adapter does
+    /// NOT hoist it to the top-level `system` field), (2) UI hosts can
+    /// filter or render notifications differently from user turns.
+    ///
+    /// Use this when a tool runs in the background and its result
+    /// arrives after the original `tool_use` was already paired and
+    /// closed — emitting another `tool_result` for the same call_id
+    /// would violate the provider schema.
+    Notification,
 }
 
 /// A content part within an [`Item`].

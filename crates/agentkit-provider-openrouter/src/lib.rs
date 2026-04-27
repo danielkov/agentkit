@@ -78,6 +78,10 @@ pub struct OpenRouterConfig {
     pub max_completion_tokens: Option<u32>,
     /// Sampling temperature (0.0 = deterministic, higher = more creative).
     pub temperature: Option<f32>,
+    /// Whether the model is allowed to emit multiple tool calls in a
+    /// single turn. Omitted from the request when `None` so the
+    /// upstream's per-model default applies.
+    pub parallel_tool_calls: Option<bool>,
     /// Arbitrary extra fields merged into the request body.
     pub extra_body: MetadataMap,
 }
@@ -93,6 +97,7 @@ impl OpenRouterConfig {
             site_url: None,
             max_completion_tokens: None,
             temperature: None,
+            parallel_tool_calls: None,
             extra_body: MetadataMap::new(),
         }
     }
@@ -124,6 +129,12 @@ impl OpenRouterConfig {
     /// Sets the sampling temperature (0.0 for deterministic output).
     pub fn with_temperature(mut self, temperature: f32) -> Self {
         self.temperature = Some(temperature);
+        self
+    }
+
+    /// Sets whether the model may emit multiple tool calls in a single turn.
+    pub fn with_parallel_tool_calls(mut self, flag: bool) -> Self {
+        self.parallel_tool_calls = Some(flag);
         self
     }
 
@@ -196,6 +207,9 @@ pub struct OpenRouterRequestConfig {
     /// Maximum completion tokens.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_completion_tokens: Option<u32>,
+    /// Parallel tool calls toggle (omitted when `None`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
     /// Extra fields merged into the body.
     #[serde(flatten)]
     pub extra: MetadataMap,
@@ -224,6 +238,7 @@ impl From<OpenRouterConfig> for OpenRouterProvider {
                 model: config.model,
                 temperature: config.temperature,
                 max_completion_tokens: config.max_completion_tokens,
+                parallel_tool_calls: config.parallel_tool_calls,
                 extra: config.extra_body,
             },
         }
@@ -698,6 +713,10 @@ fn cacheable_content_part_indices(item: &Item) -> Vec<usize> {
             ItemKind::User => match part {
                 Part::Text(_) | Part::Structured(_) | Part::Media(_) | Part::File(_) => Some(index),
                 Part::Reasoning(reasoning) if reasoning.summary.is_some() => Some(index),
+                _ => None,
+            },
+            ItemKind::Notification => match part {
+                Part::Text(_) | Part::Structured(_) => Some(index),
                 _ => None,
             },
             ItemKind::Assistant => match part {

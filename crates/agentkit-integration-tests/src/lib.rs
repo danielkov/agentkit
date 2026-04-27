@@ -17,3 +17,4 @@ pub mod http_mcp_server;
 pub mod mcp_server;
 pub mod mock_model;
 pub mod mock_tool;
+pub mod snapshot;

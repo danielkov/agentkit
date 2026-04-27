@@ -34,6 +34,11 @@ pub enum CompletionsError {
     #[error("protocol error: {0}")]
     Protocol(String),
 
+    /// A tool name does not match the regex `^[a-zA-Z0-9_-]{{1,64}}$`
+    /// required by OpenAI-compatible chat completions APIs.
+    #[error("tool name {0:?} does not match ^[a-zA-Z0-9_-]{{1,64}}$")]
+    InvalidToolName(String),
+
     /// A value could not be serialized to JSON for the request body.
     #[error("failed to serialize request data: {0}")]
     Serialize(serde_json::Error),

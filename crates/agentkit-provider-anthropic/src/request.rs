@@ -63,11 +63,26 @@ pub(crate) fn build_request_body(
             }
             ItemKind::Assistant => {
                 let content = build_assistant_content(&item.parts)?;
-                messages.push(Message::Assistant { content });
+                // Anthropic rejects assistant messages with an empty
+                // content array (`messages.X.content: minimum 1 item`).
+                // Skip when every part filtered out (blank text, summary-
+                // less reasoning, etc.) rather than emitting `[]`.
+                if !content.is_empty() {
+                    messages.push(Message::Assistant { content });
+                }
             }
             ItemKind::Tool => {
                 let blocks = build_tool_result_blocks(&item.parts)?;
                 append_user_message(&mut messages, blocks);
+            }
+            ItemKind::Notification => {
+                // Out-of-band signal: emit as a user-role message with
+                // the content wrapped in <system-reminder> so the model
+                // reads it as a notification, not a user turn. Crucially
+                // this stays in the messages stream — DO NOT hoist into
+                // system_blocks — so its temporal position is preserved.
+                let block = build_notification_block(&item.parts)?;
+                append_user_message(&mut messages, vec![block]);
             }
         }
     }
@@ -200,6 +215,35 @@ fn extend_system_blocks(blocks: &mut Vec<Value>, item: &Item) -> Result<(), Buil
         }
     }
     Ok(())
+}
+
+// --- Notification (out-of-band side-channel) ---
+
+fn build_notification_block(parts: &[Part]) -> Result<Value, BuildError> {
+    let mut buf = String::new();
+    for part in parts {
+        match part {
+            Part::Text(text) => buf.push_str(&text.text),
+            Part::Structured(structured) => {
+                buf.push_str(&serde_json::to_string_pretty(&structured.value)?);
+            }
+            Part::Reasoning(reasoning) => {
+                if let Some(summary) = &reasoning.summary {
+                    buf.push_str(summary);
+                }
+            }
+            _ => {
+                return Err(BuildError::UnsupportedPart {
+                    role: ItemKind::Notification,
+                    part_kind: part_kind(part),
+                });
+            }
+        }
+    }
+    Ok(json!({
+        "type": "text",
+        "text": format!("<system-reminder>\n{buf}\n</system-reminder>"),
+    }))
 }
 
 // --- User / tool-result message content ---
@@ -661,6 +705,51 @@ mod tests {
     }
 
     #[test]
+    fn notification_emits_user_message_with_system_reminder_wrap() {
+        // A notification mid-conversation: must land in the messages
+        // stream (not hoisted to system_blocks), wrapped in
+        // <system-reminder>. Adjacent user content can merge with it
+        // since both carry the user role.
+        let transcript = vec![
+            Item::new(
+                ItemKind::Assistant,
+                vec![Part::ToolCall(ToolCallPart::new(
+                    "call-1",
+                    "mcp_install",
+                    json!({}),
+                ))],
+            ),
+            Item::new(
+                ItemKind::Tool,
+                vec![Part::ToolResult(ToolResultPart::success(
+                    "call-1",
+                    ToolOutput::text("running in background"),
+                ))],
+            ),
+            Item::text(ItemKind::Assistant, "ok, kicked it off"),
+            Item::notification("Slack install completed: ok"),
+        ];
+        let body = build_request_body(&cfg(), &base_request(transcript)).unwrap();
+        let messages = body["messages"].as_array().unwrap();
+        // assistant -> tool_result-as-user -> assistant -> notification-as-user
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[3]["role"], "user");
+        let text = messages[3]["content"][0]["text"].as_str().unwrap();
+        assert!(text.starts_with("<system-reminder>"));
+        assert!(text.contains("Slack install completed: ok"));
+        assert!(text.ends_with("</system-reminder>"));
+        // Critical: must NOT leak into top-level system blocks.
+        let no_leak = body
+            .get("system")
+            .and_then(|s| s.as_array())
+            .map_or(true, |arr| {
+                arr.iter()
+                    .all(|b| !b["text"].as_str().unwrap_or("").contains("Slack install"))
+            });
+        assert!(no_leak, "notification leaked into system blocks");
+    }
+
+    #[test]
     fn automatic_cache_places_single_breakpoint() {
         let transcript = vec![Item::text(ItemKind::User, "hi")];
         let mut req = base_request(transcript);
@@ -776,6 +865,43 @@ mod tests {
         let body =
             build_request_body(&cfg().with_streaming(false), &base_request(transcript)).unwrap();
         assert_eq!(body["stream"], false);
+    }
+
+    #[test]
+    fn empty_assistant_item_is_skipped() {
+        // An assistant Item where every part filters away (blank text,
+        // reasoning without summary) would emit `content: []`, which
+        // Anthropic rejects. Skip the message.
+        use agentkit_core::ReasoningPart;
+
+        let blank_text = TextPart {
+            text: String::new(),
+            metadata: MetadataMap::new(),
+        };
+        let summaryless = ReasoningPart {
+            summary: None,
+            data: None,
+            redacted: false,
+            metadata: MetadataMap::new(),
+        };
+        let transcript = vec![
+            Item::text(ItemKind::User, "hi"),
+            Item::new(
+                ItemKind::Assistant,
+                vec![Part::Text(blank_text), Part::Reasoning(summaryless)],
+            ),
+            Item::text(ItemKind::User, "still there?"),
+        ];
+        let body = build_request_body(&cfg(), &base_request(transcript)).unwrap();
+        let messages = body["messages"].as_array().unwrap();
+        // Empty assistant collapsed; the two user messages merge into one
+        // (consecutive user-role turns share a message).
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "user");
+        let parts = messages[0]["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["text"], "hi");
+        assert_eq!(parts[1]["text"], "still there?");
     }
 
     #[test]

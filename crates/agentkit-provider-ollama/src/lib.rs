@@ -70,6 +70,14 @@ pub struct OllamaConfig {
     pub top_k: Option<u32>,
     /// Nucleus sampling parameter.
     pub top_p: Option<f32>,
+    /// Whether the model is allowed to emit multiple tool calls in a
+    /// single turn. Omitted from the request when `None`.
+    pub parallel_tool_calls: Option<bool>,
+    /// Whether the loaded chat template enforces strict
+    /// `user`/`assistant` role alternation. Set to `true` when running
+    /// Mistral-/Mixtral-/Llama-template models locally; the adapter then
+    /// merges adjacent user messages before sending.
+    pub strict_alternating_roles: bool,
 }
 
 impl OllamaConfig {
@@ -82,6 +90,8 @@ impl OllamaConfig {
             num_predict: None,
             top_k: None,
             top_p: None,
+            parallel_tool_calls: None,
+            strict_alternating_roles: false,
         }
     }
 
@@ -112,6 +122,22 @@ impl OllamaConfig {
     /// Sets the nucleus sampling parameter.
     pub fn with_top_p(mut self, v: f32) -> Self {
         self.top_p = Some(v);
+        self
+    }
+
+    /// Sets whether the model may emit multiple tool calls in a single turn.
+    pub fn with_parallel_tool_calls(mut self, flag: bool) -> Self {
+        self.parallel_tool_calls = Some(flag);
+        self
+    }
+
+    /// Enable strict `user`/`assistant` role alternation for chat
+    /// templates that require it (notably Mistral, Mixtral, Llama). The
+    /// adapter merges adjacent user-role messages before sending. Same
+    /// rejection mode as vLLM-served Mistral; see
+    /// <https://github.com/vllm-project/vllm/issues/6862>.
+    pub fn with_strict_alternating_roles(mut self, flag: bool) -> Self {
+        self.strict_alternating_roles = flag;
         self
     }
 
@@ -147,12 +173,15 @@ pub struct OllamaRequestConfig {
     pub top_k: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
 }
 
 /// The Ollama provider, implementing [`CompletionsProvider`].
 #[derive(Clone, Debug)]
 pub struct OllamaProvider {
     base_url: String,
+    strict_alternating_roles: bool,
     request_config: OllamaRequestConfig,
 }
 
@@ -160,12 +189,14 @@ impl From<OllamaConfig> for OllamaProvider {
     fn from(config: OllamaConfig) -> Self {
         Self {
             base_url: config.base_url,
+            strict_alternating_roles: config.strict_alternating_roles,
             request_config: OllamaRequestConfig {
                 model: config.model,
                 temperature: config.temperature,
                 num_predict: config.num_predict,
                 top_k: config.top_k,
                 top_p: config.top_p,
+                parallel_tool_calls: config.parallel_tool_calls,
             },
         }
     }
@@ -192,6 +223,10 @@ impl CompletionsProvider for OllamaProvider {
             "User-Agent",
             concat!("agentkit-provider-ollama/", env!("CARGO_PKG_VERSION")),
         )
+    }
+
+    fn requires_alternating_roles(&self) -> bool {
+        self.strict_alternating_roles
     }
 }
 

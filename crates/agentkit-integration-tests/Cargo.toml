@@ -16,10 +16,13 @@ agentkit-capabilities = { version = "0.4.0", path = "../agentkit-capabilities" }
 agentkit-core = { version = "0.4.0", path = "../agentkit-core" }
 agentkit-loop = { version = "0.4.0", path = "../agentkit-loop" }
 agentkit-mcp = { version = "0.4.0", path = "../agentkit-mcp" }
+agentkit-task-manager = { version = "0.4.0", path = "../agentkit-task-manager" }
 agentkit-tools-core = { version = "0.4.0", path = "../agentkit-tools-core" }
 async-trait.workspace = true
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+pretty_assertions = "1.4"
 rmcp = { version = "1.5.0", default-features = false, features = ["client", "server", "transport-async-rw", "transport-streamable-http-server", "macros"] }
+ron = "0.8"
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["sync", "io-util", "net"] }
