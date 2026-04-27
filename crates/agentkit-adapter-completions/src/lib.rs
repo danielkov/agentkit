@@ -99,6 +99,21 @@ pub trait CompletionsProvider: Send + Sync + Clone {
         Ok(())
     }
 
+    /// Whether the upstream chat template enforces strict
+    /// `user`/`assistant` role alternation.
+    ///
+    /// When `true`, the adapter merges adjacent `user`-role messages
+    /// (including notifications and tool-result follow-ups that come back
+    /// as user messages) into a single message before sending. Required
+    /// for vLLM-served Mistral templates and the Mistral hosted API; see
+    /// <https://github.com/vllm-project/vllm/issues/6862>.
+    ///
+    /// Defaults to `false`. Providers that target strictly-alternating
+    /// upstreams should override.
+    fn requires_alternating_roles(&self) -> bool {
+        false
+    }
+
     /// Hook to inspect the raw HTTP response before deserialisation.
     ///
     /// Called after the response body is read but before it is parsed into

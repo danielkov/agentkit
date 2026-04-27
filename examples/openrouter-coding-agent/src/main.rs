@@ -596,10 +596,7 @@ where
                 let _ = evt_tx.send(UiEvent::Idle);
                 match cmd_rx.recv().await {
                     Some(AgentCommand::UserMessage(text)) => {
-                        input.submit(
-                            &mut driver,
-                            vec![Item::text(ItemKind::User, text)],
-                        )?;
+                        input.submit(&mut driver, vec![Item::text(ItemKind::User, text)])?;
                         let _ = evt_tx.send(UiEvent::Busy);
                         Mode::Driving {
                             buffered: Vec::new(),
@@ -790,9 +787,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ))
         .build()?;
 
-    let session_config = SessionConfig::new("openrouter-coding-agent").with_cache(
-        PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
-    );
+    let session_config = SessionConfig::new("openrouter-coding-agent")
+        .with_cache(PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short));
 
     print_banner(&model_name, &workspace_root, max_ctx);
 

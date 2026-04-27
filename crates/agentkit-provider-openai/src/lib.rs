@@ -74,6 +74,10 @@ pub struct OpenAIConfig {
     pub frequency_penalty: Option<f32>,
     /// Penalizes tokens based on whether they have appeared at all.
     pub presence_penalty: Option<f32>,
+    /// Whether the model is allowed to emit multiple tool calls in a
+    /// single turn. Omitted from the request when `None` so OpenAI's
+    /// per-model default applies.
+    pub parallel_tool_calls: Option<bool>,
 }
 
 impl OpenAIConfig {
@@ -88,6 +92,7 @@ impl OpenAIConfig {
             top_p: None,
             frequency_penalty: None,
             presence_penalty: None,
+            parallel_tool_calls: None,
         }
     }
 
@@ -124,6 +129,12 @@ impl OpenAIConfig {
     /// Sets the presence penalty (penalizes tokens that have already appeared).
     pub fn with_presence_penalty(mut self, v: f32) -> Self {
         self.presence_penalty = Some(v);
+        self
+    }
+
+    /// Sets whether the model may emit multiple tool calls in a single turn.
+    pub fn with_parallel_tool_calls(mut self, flag: bool) -> Self {
+        self.parallel_tool_calls = Some(flag);
         self
     }
 
@@ -165,6 +176,8 @@ pub struct OpenAIRequestConfig {
     pub frequency_penalty: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub presence_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
 }
 
 /// The OpenAI provider, implementing [`CompletionsProvider`].
@@ -187,6 +200,7 @@ impl From<OpenAIConfig> for OpenAIProvider {
                 top_p: config.top_p,
                 frequency_penalty: config.frequency_penalty,
                 presence_penalty: config.presence_penalty,
+                parallel_tool_calls: config.parallel_tool_calls,
             },
         }
     }

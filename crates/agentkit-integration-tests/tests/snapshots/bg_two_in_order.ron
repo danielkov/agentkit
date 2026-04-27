@@ -1,0 +1,694 @@
+SessionRecording(
+    session_id: "two-in-order",
+    initial_items: [
+        Item(
+            id: None,
+            kind: System,
+            parts: [
+                Text(TextPart(
+                    text: "You are an assistant. Long-running tools may detach and finish later — react to each notification as it arrives.",
+                    metadata: {},
+                )),
+            ],
+            metadata: {},
+        ),
+        Item(
+            id: None,
+            kind: User,
+            parts: [
+                Text(TextPart(
+                    text: "Kick off both tool-a and tool-b.",
+                    metadata: {},
+                )),
+            ],
+            metadata: {},
+        ),
+    ],
+    turns: [
+        TurnRecord(
+            input: [
+                Item(
+                    id: None,
+                    kind: System,
+                    parts: [
+                        Text(TextPart(
+                            text: "You are an assistant. Long-running tools may detach and finish later — react to each notification as it arrives.",
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                ),
+                Item(
+                    id: None,
+                    kind: User,
+                    parts: [
+                        Text(TextPart(
+                            text: "Kick off both tool-a and tool-b.",
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                ),
+            ],
+            tools: [
+                ToolSpec(
+                    name: ToolName("tool-a"),
+                    description: "blocking tool used by deferred-result tests",
+                    input_schema: {
+                        "additionalProperties": true,
+                        "type": "object",
+                    },
+                    annotations: ToolAnnotations(
+                        read_only_hint: false,
+                        destructive_hint: false,
+                        idempotent_hint: false,
+                        needs_approval_hint: false,
+                        supports_streaming_hint: false,
+                    ),
+                    metadata: {},
+                ),
+                ToolSpec(
+                    name: ToolName("tool-b"),
+                    description: "blocking tool used by deferred-result tests",
+                    input_schema: {
+                        "additionalProperties": true,
+                        "type": "object",
+                    },
+                    annotations: ToolAnnotations(
+                        read_only_hint: false,
+                        destructive_hint: false,
+                        idempotent_hint: false,
+                        needs_approval_hint: false,
+                        supports_streaming_hint: false,
+                    ),
+                    metadata: {},
+                ),
+            ],
+            events: [
+                ToolCall(ToolCallPart(
+                    id: ToolCallId("call-a"),
+                    name: "tool-a",
+                    input: {},
+                    metadata: {},
+                )),
+                ToolCall(ToolCallPart(
+                    id: ToolCallId("call-b"),
+                    name: "tool-b",
+                    input: {},
+                    metadata: {},
+                )),
+                Finished(ModelTurnResult(
+                    finish_reason: ToolCall,
+                    output_items: [
+                        Item(
+                            id: None,
+                            kind: Assistant,
+                            parts: [
+                                ToolCall(ToolCallPart(
+                                    id: ToolCallId("call-a"),
+                                    name: "tool-a",
+                                    input: {},
+                                    metadata: {},
+                                )),
+                                ToolCall(ToolCallPart(
+                                    id: ToolCallId("call-b"),
+                                    name: "tool-b",
+                                    input: {},
+                                    metadata: {},
+                                )),
+                            ],
+                            metadata: {},
+                        ),
+                    ],
+                    usage: None,
+                    metadata: {},
+                )),
+            ],
+        ),
+        TurnRecord(
+            input: [
+                Item(
+                    id: None,
+                    kind: System,
+                    parts: [
+                        Text(TextPart(
+                            text: "You are an assistant. Long-running tools may detach and finish later — react to each notification as it arrives.",
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                ),
+                Item(
+                    id: None,
+                    kind: User,
+                    parts: [
+                        Text(TextPart(
+                            text: "Kick off both tool-a and tool-b.",
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                ),
+                Item(
+                    id: None,
+                    kind: Assistant,
+                    parts: [
+                        ToolCall(ToolCallPart(
+                            id: ToolCallId("call-a"),
+                            name: "tool-a",
+                            input: {},
+                            metadata: {},
+                        )),
+                        ToolCall(ToolCallPart(
+                            id: ToolCallId("call-b"),
+                            name: "tool-b",
+                            input: {},
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                ),
+                Item(
+                    id: None,
+                    kind: Tool,
+                    parts: [
+                        ToolResult(ToolResultPart(
+                            call_id: ToolCallId("call-a"),
+                            output: Text("Tool tool-a is now running in the background. The result will be delivered when it completes."),
+                            is_error: false,
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                ),
+                Item(
+                    id: None,
+                    kind: Tool,
+                    parts: [
+                        ToolResult(ToolResultPart(
+                            call_id: ToolCallId("call-b"),
+                            output: Text("Tool tool-b is now running in the background. The result will be delivered when it completes."),
+                            is_error: false,
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                ),
+            ],
+            tools: [
+                ToolSpec(
+                    name: ToolName("tool-a"),
+                    description: "blocking tool used by deferred-result tests",
+                    input_schema: {
+                        "additionalProperties": true,
+                        "type": "object",
+                    },
+                    annotations: ToolAnnotations(
+                        read_only_hint: false,
+                        destructive_hint: false,
+                        idempotent_hint: false,
+                        needs_approval_hint: false,
+                        supports_streaming_hint: false,
+                    ),
+                    metadata: {},
+                ),
+                ToolSpec(
+                    name: ToolName("tool-b"),
+                    description: "blocking tool used by deferred-result tests",
+                    input_schema: {
+                        "additionalProperties": true,
+                        "type": "object",
+                    },
+                    annotations: ToolAnnotations(
+                        read_only_hint: false,
+                        destructive_hint: false,
+                        idempotent_hint: false,
+                        needs_approval_hint: false,
+                        supports_streaming_hint: false,
+                    ),
+                    metadata: {},
+                ),
+            ],
+            events: [
+                Finished(ModelTurnResult(
+                    finish_reason: Completed,
+                    output_items: [
+                        Item(
+                            id: None,
+                            kind: Assistant,
+                            parts: [
+                                Text(TextPart(
+                                    text: "Two tools kicked off.",
+                                    metadata: {},
+                                )),
+                            ],
+                            metadata: {},
+                        ),
+                    ],
+                    usage: None,
+                    metadata: {},
+                )),
+            ],
+        ),
+        TurnRecord(
+            input: [
+                Item(
+                    id: None,
+                    kind: System,
+                    parts: [
+                        Text(TextPart(
+                            text: "You are an assistant. Long-running tools may detach and finish later — react to each notification as it arrives.",
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                ),
+                Item(
+                    id: None,
+                    kind: User,
+                    parts: [
+                        Text(TextPart(
+                            text: "Kick off both tool-a and tool-b.",
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                ),
+                Item(
+                    id: None,
+                    kind: Assistant,
+                    parts: [
+                        ToolCall(ToolCallPart(
+                            id: ToolCallId("call-a"),
+                            name: "tool-a",
+                            input: {},
+                            metadata: {},
+                        )),
+                        ToolCall(ToolCallPart(
+                            id: ToolCallId("call-b"),
+                            name: "tool-b",
+                            input: {},
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                ),
+                Item(
+                    id: None,
+                    kind: Tool,
+                    parts: [
+                        ToolResult(ToolResultPart(
+                            call_id: ToolCallId("call-a"),
+                            output: Text("Tool tool-a is now running in the background. The result will be delivered when it completes."),
+                            is_error: false,
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                ),
+                Item(
+                    id: None,
+                    kind: Tool,
+                    parts: [
+                        ToolResult(ToolResultPart(
+                            call_id: ToolCallId("call-b"),
+                            output: Text("Tool tool-b is now running in the background. The result will be delivered when it completes."),
+                            is_error: false,
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                ),
+                Item(
+                    id: None,
+                    kind: Assistant,
+                    parts: [
+                        Text(TextPart(
+                            text: "Two tools kicked off.",
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                ),
+                Item(
+                    id: None,
+                    kind: Notification,
+                    parts: [
+                        Text(TextPart(
+                            text: "Background tool call call-a completed: out-a",
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                ),
+            ],
+            tools: [
+                ToolSpec(
+                    name: ToolName("tool-a"),
+                    description: "blocking tool used by deferred-result tests",
+                    input_schema: {
+                        "additionalProperties": true,
+                        "type": "object",
+                    },
+                    annotations: ToolAnnotations(
+                        read_only_hint: false,
+                        destructive_hint: false,
+                        idempotent_hint: false,
+                        needs_approval_hint: false,
+                        supports_streaming_hint: false,
+                    ),
+                    metadata: {},
+                ),
+                ToolSpec(
+                    name: ToolName("tool-b"),
+                    description: "blocking tool used by deferred-result tests",
+                    input_schema: {
+                        "additionalProperties": true,
+                        "type": "object",
+                    },
+                    annotations: ToolAnnotations(
+                        read_only_hint: false,
+                        destructive_hint: false,
+                        idempotent_hint: false,
+                        needs_approval_hint: false,
+                        supports_streaming_hint: false,
+                    ),
+                    metadata: {},
+                ),
+            ],
+            events: [
+                Finished(ModelTurnResult(
+                    finish_reason: Completed,
+                    output_items: [
+                        Item(
+                            id: None,
+                            kind: Assistant,
+                            parts: [
+                                Text(TextPart(
+                                    text: "tool-a done.",
+                                    metadata: {},
+                                )),
+                            ],
+                            metadata: {},
+                        ),
+                    ],
+                    usage: None,
+                    metadata: {},
+                )),
+            ],
+        ),
+        TurnRecord(
+            input: [
+                Item(
+                    id: None,
+                    kind: System,
+                    parts: [
+                        Text(TextPart(
+                            text: "You are an assistant. Long-running tools may detach and finish later — react to each notification as it arrives.",
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                ),
+                Item(
+                    id: None,
+                    kind: User,
+                    parts: [
+                        Text(TextPart(
+                            text: "Kick off both tool-a and tool-b.",
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                ),
+                Item(
+                    id: None,
+                    kind: Assistant,
+                    parts: [
+                        ToolCall(ToolCallPart(
+                            id: ToolCallId("call-a"),
+                            name: "tool-a",
+                            input: {},
+                            metadata: {},
+                        )),
+                        ToolCall(ToolCallPart(
+                            id: ToolCallId("call-b"),
+                            name: "tool-b",
+                            input: {},
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                ),
+                Item(
+                    id: None,
+                    kind: Tool,
+                    parts: [
+                        ToolResult(ToolResultPart(
+                            call_id: ToolCallId("call-a"),
+                            output: Text("Tool tool-a is now running in the background. The result will be delivered when it completes."),
+                            is_error: false,
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                ),
+                Item(
+                    id: None,
+                    kind: Tool,
+                    parts: [
+                        ToolResult(ToolResultPart(
+                            call_id: ToolCallId("call-b"),
+                            output: Text("Tool tool-b is now running in the background. The result will be delivered when it completes."),
+                            is_error: false,
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                ),
+                Item(
+                    id: None,
+                    kind: Assistant,
+                    parts: [
+                        Text(TextPart(
+                            text: "Two tools kicked off.",
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                ),
+                Item(
+                    id: None,
+                    kind: Notification,
+                    parts: [
+                        Text(TextPart(
+                            text: "Background tool call call-a completed: out-a",
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                ),
+                Item(
+                    id: None,
+                    kind: Assistant,
+                    parts: [
+                        Text(TextPart(
+                            text: "tool-a done.",
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                ),
+                Item(
+                    id: None,
+                    kind: Notification,
+                    parts: [
+                        Text(TextPart(
+                            text: "Background tool call call-b completed: out-b",
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                ),
+            ],
+            tools: [
+                ToolSpec(
+                    name: ToolName("tool-a"),
+                    description: "blocking tool used by deferred-result tests",
+                    input_schema: {
+                        "additionalProperties": true,
+                        "type": "object",
+                    },
+                    annotations: ToolAnnotations(
+                        read_only_hint: false,
+                        destructive_hint: false,
+                        idempotent_hint: false,
+                        needs_approval_hint: false,
+                        supports_streaming_hint: false,
+                    ),
+                    metadata: {},
+                ),
+                ToolSpec(
+                    name: ToolName("tool-b"),
+                    description: "blocking tool used by deferred-result tests",
+                    input_schema: {
+                        "additionalProperties": true,
+                        "type": "object",
+                    },
+                    annotations: ToolAnnotations(
+                        read_only_hint: false,
+                        destructive_hint: false,
+                        idempotent_hint: false,
+                        needs_approval_hint: false,
+                        supports_streaming_hint: false,
+                    ),
+                    metadata: {},
+                ),
+            ],
+            events: [
+                Finished(ModelTurnResult(
+                    finish_reason: Completed,
+                    output_items: [
+                        Item(
+                            id: None,
+                            kind: Assistant,
+                            parts: [
+                                Text(TextPart(
+                                    text: "tool-b done.",
+                                    metadata: {},
+                                )),
+                            ],
+                            metadata: {},
+                        ),
+                    ],
+                    usage: None,
+                    metadata: {},
+                )),
+            ],
+        ),
+    ],
+    final_transcript: [
+        Item(
+            id: None,
+            kind: System,
+            parts: [
+                Text(TextPart(
+                    text: "You are an assistant. Long-running tools may detach and finish later — react to each notification as it arrives.",
+                    metadata: {},
+                )),
+            ],
+            metadata: {},
+        ),
+        Item(
+            id: None,
+            kind: User,
+            parts: [
+                Text(TextPart(
+                    text: "Kick off both tool-a and tool-b.",
+                    metadata: {},
+                )),
+            ],
+            metadata: {},
+        ),
+        Item(
+            id: None,
+            kind: Assistant,
+            parts: [
+                ToolCall(ToolCallPart(
+                    id: ToolCallId("call-a"),
+                    name: "tool-a",
+                    input: {},
+                    metadata: {},
+                )),
+                ToolCall(ToolCallPart(
+                    id: ToolCallId("call-b"),
+                    name: "tool-b",
+                    input: {},
+                    metadata: {},
+                )),
+            ],
+            metadata: {},
+        ),
+        Item(
+            id: None,
+            kind: Tool,
+            parts: [
+                ToolResult(ToolResultPart(
+                    call_id: ToolCallId("call-a"),
+                    output: Text("Tool tool-a is now running in the background. The result will be delivered when it completes."),
+                    is_error: false,
+                    metadata: {},
+                )),
+            ],
+            metadata: {},
+        ),
+        Item(
+            id: None,
+            kind: Tool,
+            parts: [
+                ToolResult(ToolResultPart(
+                    call_id: ToolCallId("call-b"),
+                    output: Text("Tool tool-b is now running in the background. The result will be delivered when it completes."),
+                    is_error: false,
+                    metadata: {},
+                )),
+            ],
+            metadata: {},
+        ),
+        Item(
+            id: None,
+            kind: Assistant,
+            parts: [
+                Text(TextPart(
+                    text: "Two tools kicked off.",
+                    metadata: {},
+                )),
+            ],
+            metadata: {},
+        ),
+        Item(
+            id: None,
+            kind: Notification,
+            parts: [
+                Text(TextPart(
+                    text: "Background tool call call-a completed: out-a",
+                    metadata: {},
+                )),
+            ],
+            metadata: {},
+        ),
+        Item(
+            id: None,
+            kind: Assistant,
+            parts: [
+                Text(TextPart(
+                    text: "tool-a done.",
+                    metadata: {},
+                )),
+            ],
+            metadata: {},
+        ),
+        Item(
+            id: None,
+            kind: Notification,
+            parts: [
+                Text(TextPart(
+                    text: "Background tool call call-b completed: out-b",
+                    metadata: {},
+                )),
+            ],
+            metadata: {},
+        ),
+        Item(
+            id: None,
+            kind: Assistant,
+            parts: [
+                Text(TextPart(
+                    text: "tool-b done.",
+                    metadata: {},
+                )),
+            ],
+            metadata: {},
+        ),
+    ],
+)

@@ -65,6 +65,10 @@ pub struct GroqConfig {
     pub max_completion_tokens: Option<u32>,
     /// Nucleus sampling parameter.
     pub top_p: Option<f32>,
+    /// Whether the model is allowed to emit multiple tool calls in a
+    /// single turn. Omitted from the request when `None` so Groq's
+    /// per-model default applies.
+    pub parallel_tool_calls: Option<bool>,
 }
 
 impl GroqConfig {
@@ -77,6 +81,7 @@ impl GroqConfig {
             temperature: None,
             max_completion_tokens: None,
             top_p: None,
+            parallel_tool_calls: None,
         }
     }
 
@@ -101,6 +106,12 @@ impl GroqConfig {
     /// Sets the nucleus sampling parameter.
     pub fn with_top_p(mut self, v: f32) -> Self {
         self.top_p = Some(v);
+        self
+    }
+
+    /// Sets whether the model may emit multiple tool calls in a single turn.
+    pub fn with_parallel_tool_calls(mut self, flag: bool) -> Self {
+        self.parallel_tool_calls = Some(flag);
         self
     }
 
@@ -136,6 +147,8 @@ pub struct GroqRequestConfig {
     pub max_completion_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
 }
 
 /// The Groq provider, implementing [`CompletionsProvider`].
@@ -156,6 +169,7 @@ impl From<GroqConfig> for GroqProvider {
                 temperature: config.temperature,
                 max_completion_tokens: config.max_completion_tokens,
                 top_p: config.top_p,
+                parallel_tool_calls: config.parallel_tool_calls,
             },
         }
     }

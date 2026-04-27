@@ -1,0 +1,503 @@
+SessionRecording(
+    session_id: "mixed",
+    initial_items: [
+        Item(
+            id: None,
+            kind: System,
+            parts: [
+                Text(TextPart(
+                    text: "You are an assistant. Some tools resolve immediately, others detach and finish later.",
+                    metadata: {},
+                )),
+            ],
+            metadata: {},
+        ),
+        Item(
+            id: None,
+            kind: User,
+            parts: [
+                Text(TextPart(
+                    text: "Run fast and slow.",
+                    metadata: {},
+                )),
+            ],
+            metadata: {},
+        ),
+    ],
+    turns: [
+        TurnRecord(
+            input: [
+                Item(
+                    id: None,
+                    kind: System,
+                    parts: [
+                        Text(TextPart(
+                            text: "You are an assistant. Some tools resolve immediately, others detach and finish later.",
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                ),
+                Item(
+                    id: None,
+                    kind: User,
+                    parts: [
+                        Text(TextPart(
+                            text: "Run fast and slow.",
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                ),
+            ],
+            tools: [
+                ToolSpec(
+                    name: ToolName("fast"),
+                    description: "blocking tool used by deferred-result tests",
+                    input_schema: {
+                        "additionalProperties": true,
+                        "type": "object",
+                    },
+                    annotations: ToolAnnotations(
+                        read_only_hint: false,
+                        destructive_hint: false,
+                        idempotent_hint: false,
+                        needs_approval_hint: false,
+                        supports_streaming_hint: false,
+                    ),
+                    metadata: {},
+                ),
+                ToolSpec(
+                    name: ToolName("slow"),
+                    description: "blocking tool used by deferred-result tests",
+                    input_schema: {
+                        "additionalProperties": true,
+                        "type": "object",
+                    },
+                    annotations: ToolAnnotations(
+                        read_only_hint: false,
+                        destructive_hint: false,
+                        idempotent_hint: false,
+                        needs_approval_hint: false,
+                        supports_streaming_hint: false,
+                    ),
+                    metadata: {},
+                ),
+            ],
+            events: [
+                ToolCall(ToolCallPart(
+                    id: ToolCallId("call-fg"),
+                    name: "fast",
+                    input: {},
+                    metadata: {},
+                )),
+                ToolCall(ToolCallPart(
+                    id: ToolCallId("call-bg"),
+                    name: "slow",
+                    input: {},
+                    metadata: {},
+                )),
+                Finished(ModelTurnResult(
+                    finish_reason: ToolCall,
+                    output_items: [
+                        Item(
+                            id: None,
+                            kind: Assistant,
+                            parts: [
+                                ToolCall(ToolCallPart(
+                                    id: ToolCallId("call-fg"),
+                                    name: "fast",
+                                    input: {},
+                                    metadata: {},
+                                )),
+                                ToolCall(ToolCallPart(
+                                    id: ToolCallId("call-bg"),
+                                    name: "slow",
+                                    input: {},
+                                    metadata: {},
+                                )),
+                            ],
+                            metadata: {},
+                        ),
+                    ],
+                    usage: None,
+                    metadata: {},
+                )),
+            ],
+        ),
+        TurnRecord(
+            input: [
+                Item(
+                    id: None,
+                    kind: System,
+                    parts: [
+                        Text(TextPart(
+                            text: "You are an assistant. Some tools resolve immediately, others detach and finish later.",
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                ),
+                Item(
+                    id: None,
+                    kind: User,
+                    parts: [
+                        Text(TextPart(
+                            text: "Run fast and slow.",
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                ),
+                Item(
+                    id: None,
+                    kind: Assistant,
+                    parts: [
+                        ToolCall(ToolCallPart(
+                            id: ToolCallId("call-fg"),
+                            name: "fast",
+                            input: {},
+                            metadata: {},
+                        )),
+                        ToolCall(ToolCallPart(
+                            id: ToolCallId("call-bg"),
+                            name: "slow",
+                            input: {},
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                ),
+                Item(
+                    id: None,
+                    kind: Tool,
+                    parts: [
+                        ToolResult(ToolResultPart(
+                            call_id: ToolCallId("call-fg"),
+                            output: Text("fast-out"),
+                            is_error: false,
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                ),
+                Item(
+                    id: None,
+                    kind: Tool,
+                    parts: [
+                        ToolResult(ToolResultPart(
+                            call_id: ToolCallId("call-bg"),
+                            output: Text("Tool slow is now running in the background. The result will be delivered when it completes."),
+                            is_error: false,
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                ),
+            ],
+            tools: [
+                ToolSpec(
+                    name: ToolName("fast"),
+                    description: "blocking tool used by deferred-result tests",
+                    input_schema: {
+                        "additionalProperties": true,
+                        "type": "object",
+                    },
+                    annotations: ToolAnnotations(
+                        read_only_hint: false,
+                        destructive_hint: false,
+                        idempotent_hint: false,
+                        needs_approval_hint: false,
+                        supports_streaming_hint: false,
+                    ),
+                    metadata: {},
+                ),
+                ToolSpec(
+                    name: ToolName("slow"),
+                    description: "blocking tool used by deferred-result tests",
+                    input_schema: {
+                        "additionalProperties": true,
+                        "type": "object",
+                    },
+                    annotations: ToolAnnotations(
+                        read_only_hint: false,
+                        destructive_hint: false,
+                        idempotent_hint: false,
+                        needs_approval_hint: false,
+                        supports_streaming_hint: false,
+                    ),
+                    metadata: {},
+                ),
+            ],
+            events: [
+                Finished(ModelTurnResult(
+                    finish_reason: Completed,
+                    output_items: [
+                        Item(
+                            id: None,
+                            kind: Assistant,
+                            parts: [
+                                Text(TextPart(
+                                    text: "fast finished, slow detached.",
+                                    metadata: {},
+                                )),
+                            ],
+                            metadata: {},
+                        ),
+                    ],
+                    usage: None,
+                    metadata: {},
+                )),
+            ],
+        ),
+        TurnRecord(
+            input: [
+                Item(
+                    id: None,
+                    kind: System,
+                    parts: [
+                        Text(TextPart(
+                            text: "You are an assistant. Some tools resolve immediately, others detach and finish later.",
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                ),
+                Item(
+                    id: None,
+                    kind: User,
+                    parts: [
+                        Text(TextPart(
+                            text: "Run fast and slow.",
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                ),
+                Item(
+                    id: None,
+                    kind: Assistant,
+                    parts: [
+                        ToolCall(ToolCallPart(
+                            id: ToolCallId("call-fg"),
+                            name: "fast",
+                            input: {},
+                            metadata: {},
+                        )),
+                        ToolCall(ToolCallPart(
+                            id: ToolCallId("call-bg"),
+                            name: "slow",
+                            input: {},
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                ),
+                Item(
+                    id: None,
+                    kind: Tool,
+                    parts: [
+                        ToolResult(ToolResultPart(
+                            call_id: ToolCallId("call-fg"),
+                            output: Text("fast-out"),
+                            is_error: false,
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                ),
+                Item(
+                    id: None,
+                    kind: Tool,
+                    parts: [
+                        ToolResult(ToolResultPart(
+                            call_id: ToolCallId("call-bg"),
+                            output: Text("Tool slow is now running in the background. The result will be delivered when it completes."),
+                            is_error: false,
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                ),
+                Item(
+                    id: None,
+                    kind: Assistant,
+                    parts: [
+                        Text(TextPart(
+                            text: "fast finished, slow detached.",
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                ),
+                Item(
+                    id: None,
+                    kind: Notification,
+                    parts: [
+                        Text(TextPart(
+                            text: "Background tool call call-bg completed: slow-out",
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                ),
+            ],
+            tools: [
+                ToolSpec(
+                    name: ToolName("fast"),
+                    description: "blocking tool used by deferred-result tests",
+                    input_schema: {
+                        "additionalProperties": true,
+                        "type": "object",
+                    },
+                    annotations: ToolAnnotations(
+                        read_only_hint: false,
+                        destructive_hint: false,
+                        idempotent_hint: false,
+                        needs_approval_hint: false,
+                        supports_streaming_hint: false,
+                    ),
+                    metadata: {},
+                ),
+                ToolSpec(
+                    name: ToolName("slow"),
+                    description: "blocking tool used by deferred-result tests",
+                    input_schema: {
+                        "additionalProperties": true,
+                        "type": "object",
+                    },
+                    annotations: ToolAnnotations(
+                        read_only_hint: false,
+                        destructive_hint: false,
+                        idempotent_hint: false,
+                        needs_approval_hint: false,
+                        supports_streaming_hint: false,
+                    ),
+                    metadata: {},
+                ),
+            ],
+            events: [
+                Finished(ModelTurnResult(
+                    finish_reason: Completed,
+                    output_items: [
+                        Item(
+                            id: None,
+                            kind: Assistant,
+                            parts: [
+                                Text(TextPart(
+                                    text: "slow done.",
+                                    metadata: {},
+                                )),
+                            ],
+                            metadata: {},
+                        ),
+                    ],
+                    usage: None,
+                    metadata: {},
+                )),
+            ],
+        ),
+    ],
+    final_transcript: [
+        Item(
+            id: None,
+            kind: System,
+            parts: [
+                Text(TextPart(
+                    text: "You are an assistant. Some tools resolve immediately, others detach and finish later.",
+                    metadata: {},
+                )),
+            ],
+            metadata: {},
+        ),
+        Item(
+            id: None,
+            kind: User,
+            parts: [
+                Text(TextPart(
+                    text: "Run fast and slow.",
+                    metadata: {},
+                )),
+            ],
+            metadata: {},
+        ),
+        Item(
+            id: None,
+            kind: Assistant,
+            parts: [
+                ToolCall(ToolCallPart(
+                    id: ToolCallId("call-fg"),
+                    name: "fast",
+                    input: {},
+                    metadata: {},
+                )),
+                ToolCall(ToolCallPart(
+                    id: ToolCallId("call-bg"),
+                    name: "slow",
+                    input: {},
+                    metadata: {},
+                )),
+            ],
+            metadata: {},
+        ),
+        Item(
+            id: None,
+            kind: Tool,
+            parts: [
+                ToolResult(ToolResultPart(
+                    call_id: ToolCallId("call-fg"),
+                    output: Text("fast-out"),
+                    is_error: false,
+                    metadata: {},
+                )),
+            ],
+            metadata: {},
+        ),
+        Item(
+            id: None,
+            kind: Tool,
+            parts: [
+                ToolResult(ToolResultPart(
+                    call_id: ToolCallId("call-bg"),
+                    output: Text("Tool slow is now running in the background. The result will be delivered when it completes."),
+                    is_error: false,
+                    metadata: {},
+                )),
+            ],
+            metadata: {},
+        ),
+        Item(
+            id: None,
+            kind: Assistant,
+            parts: [
+                Text(TextPart(
+                    text: "fast finished, slow detached.",
+                    metadata: {},
+                )),
+            ],
+            metadata: {},
+        ),
+        Item(
+            id: None,
+            kind: Notification,
+            parts: [
+                Text(TextPart(
+                    text: "Background tool call call-bg completed: slow-out",
+                    metadata: {},
+                )),
+            ],
+            metadata: {},
+        ),
+        Item(
+            id: None,
+            kind: Assistant,
+            parts: [
+                Text(TextPart(
+                    text: "slow done.",
+                    metadata: {},
+                )),
+            ],
+            metadata: {},
+        ),
+    ],
+)

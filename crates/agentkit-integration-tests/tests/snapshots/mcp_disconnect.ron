@@ -1,0 +1,255 @@
+SessionRecording(
+    session_id: "mcp-disconnect",
+    initial_items: [
+        Item(
+            id: None,
+            kind: System,
+            parts: [
+                Text(TextPart(
+                    text: "You are an assistant. Report which remote tools are currently visible.",
+                    metadata: {},
+                )),
+            ],
+            metadata: {},
+        ),
+        Item(
+            id: None,
+            kind: User,
+            parts: [
+                Text(TextPart(
+                    text: "What tools are connected?",
+                    metadata: {},
+                )),
+            ],
+            metadata: {},
+        ),
+    ],
+    turns: [
+        TurnRecord(
+            input: [
+                Item(
+                    id: None,
+                    kind: System,
+                    parts: [
+                        Text(TextPart(
+                            text: "You are an assistant. Report which remote tools are currently visible.",
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                ),
+                Item(
+                    id: None,
+                    kind: User,
+                    parts: [
+                        Text(TextPart(
+                            text: "What tools are connected?",
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                ),
+            ],
+            tools: [
+                ToolSpec(
+                    name: ToolName("mcp_alpha_only_alpha"),
+                    description: "alpha-only tool.",
+                    input_schema: {
+                        "additionalProperties": true,
+                        "properties": {},
+                        "type": "object",
+                    },
+                    annotations: ToolAnnotations(
+                        read_only_hint: false,
+                        destructive_hint: false,
+                        idempotent_hint: false,
+                        needs_approval_hint: false,
+                        supports_streaming_hint: false,
+                    ),
+                    metadata: {},
+                ),
+                ToolSpec(
+                    name: ToolName("mcp_beta_only_beta"),
+                    description: "beta-only tool.",
+                    input_schema: {
+                        "additionalProperties": true,
+                        "properties": {},
+                        "type": "object",
+                    },
+                    annotations: ToolAnnotations(
+                        read_only_hint: false,
+                        destructive_hint: false,
+                        idempotent_hint: false,
+                        needs_approval_hint: false,
+                        supports_streaming_hint: false,
+                    ),
+                    metadata: {},
+                ),
+            ],
+            events: [
+                Finished(ModelTurnResult(
+                    finish_reason: Completed,
+                    output_items: [
+                        Item(
+                            id: None,
+                            kind: Assistant,
+                            parts: [
+                                Text(TextPart(
+                                    text: "I see only_alpha and only_beta.",
+                                    metadata: {},
+                                )),
+                            ],
+                            metadata: {},
+                        ),
+                    ],
+                    usage: None,
+                    metadata: {},
+                )),
+            ],
+        ),
+        TurnRecord(
+            input: [
+                Item(
+                    id: None,
+                    kind: System,
+                    parts: [
+                        Text(TextPart(
+                            text: "You are an assistant. Report which remote tools are currently visible.",
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                ),
+                Item(
+                    id: None,
+                    kind: User,
+                    parts: [
+                        Text(TextPart(
+                            text: "What tools are connected?",
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                ),
+                Item(
+                    id: None,
+                    kind: Assistant,
+                    parts: [
+                        Text(TextPart(
+                            text: "I see only_alpha and only_beta.",
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                ),
+                Item(
+                    id: None,
+                    kind: User,
+                    parts: [
+                        Text(TextPart(
+                            text: "anything else?",
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                ),
+            ],
+            tools: [
+                ToolSpec(
+                    name: ToolName("mcp_beta_only_beta"),
+                    description: "beta-only tool.",
+                    input_schema: {
+                        "additionalProperties": true,
+                        "properties": {},
+                        "type": "object",
+                    },
+                    annotations: ToolAnnotations(
+                        read_only_hint: false,
+                        destructive_hint: false,
+                        idempotent_hint: false,
+                        needs_approval_hint: false,
+                        supports_streaming_hint: false,
+                    ),
+                    metadata: {},
+                ),
+            ],
+            events: [
+                Finished(ModelTurnResult(
+                    finish_reason: Completed,
+                    output_items: [
+                        Item(
+                            id: None,
+                            kind: Assistant,
+                            parts: [
+                                Text(TextPart(
+                                    text: "Only only_beta is left now.",
+                                    metadata: {},
+                                )),
+                            ],
+                            metadata: {},
+                        ),
+                    ],
+                    usage: None,
+                    metadata: {},
+                )),
+            ],
+        ),
+    ],
+    final_transcript: [
+        Item(
+            id: None,
+            kind: System,
+            parts: [
+                Text(TextPart(
+                    text: "You are an assistant. Report which remote tools are currently visible.",
+                    metadata: {},
+                )),
+            ],
+            metadata: {},
+        ),
+        Item(
+            id: None,
+            kind: User,
+            parts: [
+                Text(TextPart(
+                    text: "What tools are connected?",
+                    metadata: {},
+                )),
+            ],
+            metadata: {},
+        ),
+        Item(
+            id: None,
+            kind: Assistant,
+            parts: [
+                Text(TextPart(
+                    text: "I see only_alpha and only_beta.",
+                    metadata: {},
+                )),
+            ],
+            metadata: {},
+        ),
+        Item(
+            id: None,
+            kind: User,
+            parts: [
+                Text(TextPart(
+                    text: "anything else?",
+                    metadata: {},
+                )),
+            ],
+            metadata: {},
+        ),
+        Item(
+            id: None,
+            kind: Assistant,
+            parts: [
+                Text(TextPart(
+                    text: "Only only_beta is left now.",
+                    metadata: {},
+                )),
+            ],
+            metadata: {},
+        ),
+    ],
+)

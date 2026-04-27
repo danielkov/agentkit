@@ -20,10 +20,7 @@ use rmcp::{
         StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
     },
 };
-use tokio::{
-    sync::oneshot,
-    task::JoinHandle,
-};
+use tokio::{sync::oneshot, task::JoinHandle};
 
 /// MCP server handler with a mutable tool list. Each tool returns a fixed
 /// "ok:<name>" response so call-side assertions can verify routing.
@@ -208,9 +205,8 @@ pub async fn spawn_http_mcp(initial_tools: Vec<Tool>) -> HttpServerHandle {
 /// Convenience for building an [`rmcp::model::Tool`] with a trivial
 /// `{"type":"object"}` input schema.
 pub fn simple_tool(name: &'static str, description: &'static str) -> Tool {
-    let schema: serde_json::Map<String, serde_json::Value> = serde_json::from_str(
-        r#"{"type":"object","properties":{},"additionalProperties":true}"#,
-    )
-    .expect("valid schema literal");
+    let schema: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(r#"{"type":"object","properties":{},"additionalProperties":true}"#)
+            .expect("valid schema literal");
     Tool::new(name, description, Arc::new(schema))
 }

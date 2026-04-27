@@ -63,6 +63,14 @@ impl LoopObserver for TracingReporter {
             AgentEvent::ToolCallRequested(call) => {
                 tracing::info!(target: "agentkit", tool = %call.name, "tool call requested");
             }
+            AgentEvent::ToolResultReceived(result) => {
+                tracing::info!(
+                    target: "agentkit",
+                    call_id = %result.call_id,
+                    is_error = result.is_error,
+                    "tool result received"
+                );
+            }
             AgentEvent::ApprovalRequired(request) => {
                 tracing::info!(target: "agentkit", summary = %request.summary, reason = ?request.reason, "approval required");
             }

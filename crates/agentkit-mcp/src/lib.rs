@@ -187,7 +187,10 @@ pub enum AuthResolution {
 impl AuthResolution {
     /// Builds a successful auth resolution.
     pub fn provided(request: AuthRequest, credentials: MetadataMap) -> Self {
-        Self::Provided { request, credentials }
+        Self::Provided {
+            request,
+            credentials,
+        }
     }
 
     /// Builds a cancelled auth resolution.
@@ -1397,7 +1400,6 @@ impl McpConnection {
             )
         })
     }
-
 }
 
 async fn connect_rmcp_stdio(
@@ -1879,7 +1881,8 @@ impl McpServerManager {
 
         let results = try_join_all(futures).await?;
         let mut handles = Vec::with_capacity(results.len());
-        let mut connected: Vec<(McpServerId, McpDiscoverySnapshot)> = Vec::with_capacity(results.len());
+        let mut connected: Vec<(McpServerId, McpDiscoverySnapshot)> =
+            Vec::with_capacity(results.len());
         for (server_id, handle) in results {
             connected.push((server_id.clone(), handle.snapshot.clone()));
             self.connections.insert(server_id, handle.clone());
@@ -2319,11 +2322,14 @@ impl Tool for McpToolAdapter {
         {
             Ok(result) => result,
             Err(McpError::AuthRequired(auth_request)) => {
-                let responder =
-                    self.connection.handler_config().auth.clone().ok_or_else(|| {
+                let responder = self
+                    .connection
+                    .handler_config()
+                    .auth
+                    .clone()
+                    .ok_or_else(|| {
                         ToolError::ExecutionFailed(
-                            "MCP server requires auth but no McpAuthResponder is registered"
-                                .into(),
+                            "MCP server requires auth but no McpAuthResponder is registered".into(),
                         )
                     })?;
                 let resolution = responder.resolve(*auth_request).await.map_err(|error| {

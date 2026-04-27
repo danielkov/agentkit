@@ -197,9 +197,42 @@ fn build_messages(transcript: &[Item]) -> Result<Vec<Value>, BuildError> {
             ItemKind::Tool => {
                 out.extend(build_tool_messages(item)?);
             }
+            ItemKind::Notification => {
+                // Side-channel signal — render as a user-role message
+                // wrapped in <system-reminder>. Stays in temporal order
+                // so the model sees it at the position it was emitted.
+                out.push(build_notification_message(item)?);
+            }
         }
     }
     Ok(out)
+}
+
+fn build_notification_message(item: &Item) -> Result<Value, BuildError> {
+    let mut buf = String::new();
+    for part in &item.parts {
+        match part {
+            Part::Text(t) => buf.push_str(&t.text),
+            Part::Structured(s) => {
+                buf.push_str(&serde_json::to_string(&s.value).map_err(BuildError::Serialize)?);
+            }
+            Part::Reasoning(r) => {
+                if let Some(summary) = &r.summary {
+                    buf.push_str(summary);
+                }
+            }
+            _ => {
+                return Err(BuildError::UnsupportedPart {
+                    role: ItemKind::Notification,
+                    part_kind: part_kind(part).into(),
+                });
+            }
+        }
+    }
+    Ok(json!({
+        "role": "user",
+        "content": format!("<system-reminder>\n{buf}\n</system-reminder>"),
+    }))
 }
 
 fn role_text(item: &Item, role: &'static str) -> Result<Value, BuildError> {

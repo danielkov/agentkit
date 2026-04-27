@@ -46,7 +46,7 @@
 //! # }
 //! ```
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use agentkit_compaction::{
@@ -1009,6 +1009,7 @@ where
             active_tool_round: None,
             pending_round_resume: None,
             next_turn_index: 1,
+            detached_call_ids: HashSet::new(),
         };
         driver.emit(AgentEvent::RunStarted { session_id });
         Ok(driver)
@@ -1230,6 +1231,14 @@ where
     active_tool_round: Option<ActiveToolRound>,
     pending_round_resume: Option<agentkit_core::TurnId>,
     next_turn_index: u64,
+    /// Call ids whose original tool_use was already paired with a
+    /// synthetic detach tool_result. When the real result eventually
+    /// arrives via the task manager, we MUST NOT emit a second
+    /// tool_result for the same id — the provider schema requires
+    /// exactly one tool_result per tool_use. Instead we route the
+    /// resolution into a [`ItemKind::Notification`] item that the model
+    /// can react to on the next turn.
+    detached_call_ids: HashSet<ToolCallId>,
 }
 
 impl<S> LoopDriver<S>
@@ -1545,12 +1554,27 @@ where
                 Some(TurnTaskUpdate::Detached(snapshot)) => {
                     // The task was promoted to background. Push a synthetic
                     // tool result so the model knows the call is still
-                    // running and can continue its turn.
+                    // running and can continue its turn. Track the
+                    // call_id so when the real result arrives later via
+                    // the task manager, we route it to a Notification
+                    // item instead of emitting a second tool_result for
+                    // the same call_id (which would violate the
+                    // provider schema — exactly one tool_result per
+                    // tool_use).
+                    // Order matters: append the synthetic placeholder FIRST as
+                    // a real Tool/ToolResult so the tool_use slot is filled
+                    // (provider schemas require exactly one tool_result per
+                    // tool_use). Only AFTER appending do we record the
+                    // call_id in `detached_call_ids` — so the *next* item
+                    // for this call_id (the real completion arriving later
+                    // via the task manager) is the one converted to a
+                    // Notification by `maybe_convert_detached`.
+                    let detached_call_id = snapshot.call_id.clone();
                     self.append_tool_result_item(Item {
                         id: None,
                         kind: ItemKind::Tool,
                         parts: vec![Part::ToolResult(ToolResultPart {
-                            call_id: snapshot.call_id,
+                            call_id: detached_call_id.clone(),
                             output: ToolOutput::Text(format!(
                                 "Tool {} is now running in the background. \
                                  The result will be delivered when it completes.",
@@ -1561,6 +1585,7 @@ where
                         })],
                         metadata: MetadataMap::new(),
                     });
+                    self.detached_call_ids.insert(detached_call_id);
                     if let Some(active) = self.active_tool_round.as_mut() {
                         active.background_pending = true;
                         active.foreground_progressed = true;
@@ -2022,13 +2047,62 @@ where
     /// Append a tool-result Item: emit one [`AgentEvent::ToolResultReceived`]
     /// per [`Part::ToolResult`] inside the Item, then funnel through
     /// [`Self::append_item`].
+    ///
+    /// If every `ToolResult` in the item references a `call_id` that was
+    /// already paired with a synthetic detach tool_result, the item is
+    /// converted to a [`ItemKind::Notification`] before appending.
+    /// Without this, we would emit a second `tool_result` for the same
+    /// `tool_use_id` — a provider-schema violation that
+    /// Anthropic/OpenRouter reject as an "orphaned tool_result".
+    /// Observers still see `ToolResultReceived` for each result so any
+    /// UI spinner or task tracker can close.
     fn append_tool_result_item(&mut self, item: Item) {
         for part in &item.parts {
             if let Part::ToolResult(result) = part {
                 self.emit(AgentEvent::ToolResultReceived(result.clone()));
             }
         }
+        let item = self.maybe_convert_detached(item);
         self.append_item(item);
+    }
+
+    fn maybe_convert_detached(&mut self, item: Item) -> Item {
+        if !matches!(item.kind, ItemKind::Tool) {
+            return item;
+        }
+        let results: Vec<&ToolResultPart> = item
+            .parts
+            .iter()
+            .filter_map(|p| match p {
+                Part::ToolResult(r) => Some(r),
+                _ => None,
+            })
+            .collect();
+        if results.is_empty()
+            || !results
+                .iter()
+                .all(|r| self.detached_call_ids.contains(&r.call_id))
+        {
+            return item;
+        }
+        let mut text = String::new();
+        for result in &results {
+            self.detached_call_ids.remove(&result.call_id);
+            if !text.is_empty() {
+                text.push_str("\n\n");
+            }
+            let label = if result.is_error {
+                "failed"
+            } else {
+                "completed"
+            };
+            let body = render_tool_output_brief(&result.output);
+            text.push_str(&format!(
+                "Background tool call {} {}: {body}",
+                result.call_id.0, label
+            ));
+        }
+        Item::notification(text)
     }
 
     /// Append several Items in order through [`Self::append_item`].
@@ -2036,6 +2110,15 @@ where
         for item in items {
             self.append_item(item);
         }
+    }
+}
+
+fn render_tool_output_brief(output: &ToolOutput) -> String {
+    match output {
+        ToolOutput::Text(t) => t.clone(),
+        ToolOutput::Structured(value) => value.to_string(),
+        ToolOutput::Parts(parts) => format!("[{} parts]", parts.len()),
+        ToolOutput::Files(files) => format!("[{} files]", files.len()),
     }
 }
 
@@ -2926,11 +3009,14 @@ mod tests {
             .unwrap();
 
         let mut driver = agent
-            .start(SessionConfig {
-                session_id: SessionId::new("session-1"),
-                metadata: MetadataMap::new(),
-                cache: None,
-            }, Vec::new())
+            .start(
+                SessionConfig {
+                    session_id: SessionId::new("session-1"),
+                    metadata: MetadataMap::new(),
+                    cache: None,
+                },
+                Vec::new(),
+            )
             .await
             .unwrap();
 
@@ -2984,11 +3070,14 @@ mod tests {
             .unwrap();
 
         let mut driver = agent
-            .start(SessionConfig {
-                session_id: SessionId::new("session-2"),
-                metadata: MetadataMap::new(),
-                cache: None,
-            }, Vec::new())
+            .start(
+                SessionConfig {
+                    session_id: SessionId::new("session-2"),
+                    metadata: MetadataMap::new(),
+                    cache: None,
+                },
+                Vec::new(),
+            )
             .await
             .unwrap();
 
@@ -3039,11 +3128,14 @@ mod tests {
             .unwrap();
 
         let mut driver = agent
-            .start(SessionConfig {
-                session_id: SessionId::new("session-background"),
-                metadata: MetadataMap::new(),
-                cache: None,
-            }, Vec::new())
+            .start(
+                SessionConfig {
+                    session_id: SessionId::new("session-background"),
+                    metadata: MetadataMap::new(),
+                    cache: None,
+                },
+                Vec::new(),
+            )
             .await
             .unwrap();
 
@@ -3102,11 +3194,14 @@ mod tests {
             .unwrap();
 
         let mut driver = agent
-            .start(SessionConfig {
-                session_id: SessionId::new("session-cancel"),
-                metadata: MetadataMap::new(),
-                cache: None,
-            }, Vec::new())
+            .start(
+                SessionConfig {
+                    session_id: SessionId::new("session-cancel"),
+                    metadata: MetadataMap::new(),
+                    cache: None,
+                },
+                Vec::new(),
+            )
             .await
             .unwrap();
 
@@ -3198,11 +3293,14 @@ mod tests {
             .unwrap();
 
         let mut driver = agent
-            .start(SessionConfig {
-                session_id: SessionId::new("session-mixed-cancel"),
-                metadata: MetadataMap::new(),
-                cache: None,
-            }, Vec::new())
+            .start(
+                SessionConfig {
+                    session_id: SessionId::new("session-mixed-cancel"),
+                    metadata: MetadataMap::new(),
+                    cache: None,
+                },
+                Vec::new(),
+            )
             .await
             .unwrap();
 
@@ -3263,11 +3361,14 @@ mod tests {
             .unwrap();
 
         let mut driver = agent
-            .start(SessionConfig {
-                session_id: SessionId::new("session-approval"),
-                metadata: MetadataMap::new(),
-                cache: None,
-            }, Vec::new())
+            .start(
+                SessionConfig {
+                    session_id: SessionId::new("session-approval"),
+                    metadata: MetadataMap::new(),
+                    cache: None,
+                },
+                Vec::new(),
+            )
             .await
             .unwrap();
 
@@ -3313,11 +3414,14 @@ mod tests {
             .unwrap();
 
         let mut driver = agent
-            .start(SessionConfig {
-                session_id: SessionId::new("session-dual-approval"),
-                metadata: MetadataMap::new(),
-                cache: None,
-            }, Vec::new())
+            .start(
+                SessionConfig {
+                    session_id: SessionId::new("session-dual-approval"),
+                    metadata: MetadataMap::new(),
+                    cache: None,
+                },
+                Vec::new(),
+            )
             .await
             .unwrap();
 
@@ -3395,11 +3499,14 @@ mod tests {
             .unwrap();
 
         let mut driver = agent
-            .start(SessionConfig {
-                session_id: SessionId::new("session-4"),
-                metadata: MetadataMap::new(),
-                cache: None,
-            }, Vec::new())
+            .start(
+                SessionConfig {
+                    session_id: SessionId::new("session-4"),
+                    metadata: MetadataMap::new(),
+                    cache: None,
+                },
+                Vec::new(),
+            )
             .await
             .unwrap();
 
@@ -3444,11 +3551,14 @@ mod tests {
             .unwrap();
 
         let mut driver = agent
-            .start(SessionConfig {
-                session_id: SessionId::new("session-dynamic-tools"),
-                metadata: MetadataMap::new(),
-                cache: None,
-            }, Vec::new())
+            .start(
+                SessionConfig {
+                    session_id: SessionId::new("session-dynamic-tools"),
+                    metadata: MetadataMap::new(),
+                    cache: None,
+                },
+                Vec::new(),
+            )
             .await
             .unwrap();
 
@@ -3497,11 +3607,14 @@ mod tests {
             .unwrap();
 
         let mut driver = agent
-            .start(SessionConfig {
-                session_id: SessionId::new("session-catalog-events"),
-                metadata: MetadataMap::new(),
-                cache: None,
-            }, Vec::new())
+            .start(
+                SessionConfig {
+                    session_id: SessionId::new("session-catalog-events"),
+                    metadata: MetadataMap::new(),
+                    cache: None,
+                },
+                Vec::new(),
+            )
             .await
             .unwrap();
 
@@ -3564,11 +3677,14 @@ mod tests {
         });
 
         let mut driver = agent
-            .start(SessionConfig {
-                session_id: SessionId::new("session-cache"),
-                metadata: MetadataMap::new(),
-                cache: Some(default_cache.clone()),
-            }, Vec::new())
+            .start(
+                SessionConfig {
+                    session_id: SessionId::new("session-cache"),
+                    metadata: MetadataMap::new(),
+                    cache: Some(default_cache.clone()),
+                },
+                Vec::new(),
+            )
             .await
             .unwrap();
 
@@ -3618,11 +3734,14 @@ mod tests {
             .unwrap();
 
         let mut driver = agent
-            .start(SessionConfig {
-                session_id: SessionId::new("yield-session"),
-                metadata: MetadataMap::new(),
-                cache: None,
-            }, Vec::new())
+            .start(
+                SessionConfig {
+                    session_id: SessionId::new("yield-session"),
+                    metadata: MetadataMap::new(),
+                    cache: None,
+                },
+                Vec::new(),
+            )
             .await
             .unwrap();
 
@@ -3709,11 +3828,14 @@ mod tests {
             .unwrap();
 
         let mut driver = agent
-            .start(SessionConfig {
-                session_id: SessionId::new("observer-session"),
-                metadata: MetadataMap::new(),
-                cache: None,
-            }, Vec::new())
+            .start(
+                SessionConfig {
+                    session_id: SessionId::new("observer-session"),
+                    metadata: MetadataMap::new(),
+                    cache: None,
+                },
+                Vec::new(),
+            )
             .await
             .unwrap();
 

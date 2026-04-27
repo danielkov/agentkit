@@ -185,6 +185,7 @@ impl ItemKindLabel for Item {
             ItemKind::Assistant => "assistant",
             ItemKind::Tool => "tool",
             ItemKind::Context => "context",
+            ItemKind::Notification => "notification",
         }
     }
 }

@@ -689,6 +689,7 @@ fn item_kind_name(kind: ItemKind) -> &'static str {
         ItemKind::Assistant => "assistant",
         ItemKind::Tool => "tool",
         ItemKind::Context => "context",
+        ItemKind::Notification => "notification",
     }
 }
 

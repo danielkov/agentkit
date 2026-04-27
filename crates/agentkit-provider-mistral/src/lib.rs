@@ -68,6 +68,17 @@ pub struct MistralConfig {
     pub max_tokens: Option<u32>,
     /// Nucleus sampling parameter.
     pub top_p: Option<f32>,
+    /// Whether the model is allowed to emit multiple tool calls in a
+    /// single turn. Omitted from the request when `None` so Mistral's
+    /// per-model default applies.
+    pub parallel_tool_calls: Option<bool>,
+    /// Whether to merge consecutive `user` messages before sending.
+    /// Defaults to `true` because Mistral's chat templates enforce
+    /// strict `user`/`assistant` alternation — the same behavior that
+    /// vLLM-served Mistral surfaces as
+    /// `Conversation roles must alternate user/assistant/user/assistant/...`.
+    /// See <https://github.com/vllm-project/vllm/issues/6862>.
+    pub strict_alternating_roles: bool,
 }
 
 impl MistralConfig {
@@ -80,6 +91,8 @@ impl MistralConfig {
             temperature: None,
             max_tokens: None,
             top_p: None,
+            parallel_tool_calls: None,
+            strict_alternating_roles: true,
         }
     }
 
@@ -104,6 +117,20 @@ impl MistralConfig {
     /// Sets the nucleus sampling parameter.
     pub fn with_top_p(mut self, v: f32) -> Self {
         self.top_p = Some(v);
+        self
+    }
+
+    /// Sets whether the model may emit multiple tool calls in a single turn.
+    pub fn with_parallel_tool_calls(mut self, flag: bool) -> Self {
+        self.parallel_tool_calls = Some(flag);
+        self
+    }
+
+    /// Toggle strict `user`/`assistant` alternation. Defaults to `true`
+    /// for Mistral. Override to `false` only if you've confirmed your
+    /// model deployment auto-merges adjacent user messages.
+    pub fn with_strict_alternating_roles(mut self, flag: bool) -> Self {
+        self.strict_alternating_roles = flag;
         self
     }
 
@@ -142,6 +169,8 @@ pub struct MistralRequestConfig {
     pub max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
 }
 
 /// The Mistral provider, implementing [`CompletionsProvider`].
@@ -149,6 +178,7 @@ pub struct MistralRequestConfig {
 pub struct MistralProvider {
     api_key: String,
     base_url: String,
+    strict_alternating_roles: bool,
     request_config: MistralRequestConfig,
 }
 
@@ -157,11 +187,13 @@ impl From<MistralConfig> for MistralProvider {
         Self {
             api_key: config.api_key,
             base_url: config.base_url,
+            strict_alternating_roles: config.strict_alternating_roles,
             request_config: MistralRequestConfig {
                 model: config.model,
                 temperature: config.temperature,
                 max_tokens: config.max_tokens,
                 top_p: config.top_p,
+                parallel_tool_calls: config.parallel_tool_calls,
             },
         }
     }
@@ -188,6 +220,10 @@ impl CompletionsProvider for MistralProvider {
             "User-Agent",
             concat!("agentkit-provider-mistral/", env!("CARGO_PKG_VERSION")),
         )
+    }
+
+    fn requires_alternating_roles(&self) -> bool {
+        self.strict_alternating_roles
     }
 }
 

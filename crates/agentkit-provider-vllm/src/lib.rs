@@ -69,6 +69,16 @@ pub struct VllmConfig {
     pub max_completion_tokens: Option<u32>,
     /// Nucleus sampling parameter.
     pub top_p: Option<f32>,
+    /// Whether the model is allowed to emit multiple tool calls in a
+    /// single turn. Omitted from the request when `None`.
+    pub parallel_tool_calls: Option<bool>,
+    /// Whether the loaded chat template enforces strict
+    /// `user`/`assistant` role alternation. Set to `true` for
+    /// Mistral-/Mixtral-/Llama-template models served via vLLM, which
+    /// otherwise return `Conversation roles must alternate
+    /// user/assistant/user/assistant/...`. See
+    /// <https://github.com/vllm-project/vllm/issues/6862>.
+    pub strict_alternating_roles: bool,
 }
 
 impl VllmConfig {
@@ -81,6 +91,8 @@ impl VllmConfig {
             temperature: None,
             max_completion_tokens: None,
             top_p: None,
+            parallel_tool_calls: None,
+            strict_alternating_roles: false,
         }
     }
 
@@ -111,6 +123,21 @@ impl VllmConfig {
     /// Sets the nucleus sampling parameter.
     pub fn with_top_p(mut self, v: f32) -> Self {
         self.top_p = Some(v);
+        self
+    }
+
+    /// Sets whether the model may emit multiple tool calls in a single turn.
+    pub fn with_parallel_tool_calls(mut self, flag: bool) -> Self {
+        self.parallel_tool_calls = Some(flag);
+        self
+    }
+
+    /// Enable strict `user`/`assistant` role alternation for chat
+    /// templates that require it (notably Mistral, Mixtral, Llama). The
+    /// adapter merges adjacent user-role messages before sending. See
+    /// <https://github.com/vllm-project/vllm/issues/6862>.
+    pub fn with_strict_alternating_roles(mut self, flag: bool) -> Self {
+        self.strict_alternating_roles = flag;
         self
     }
 
@@ -147,6 +174,8 @@ pub struct VllmRequestConfig {
     pub max_completion_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
 }
 
 /// The vLLM provider, implementing [`CompletionsProvider`].
@@ -154,6 +183,7 @@ pub struct VllmRequestConfig {
 pub struct VllmProvider {
     base_url: String,
     api_key: Option<String>,
+    strict_alternating_roles: bool,
     request_config: VllmRequestConfig,
 }
 
@@ -162,11 +192,13 @@ impl From<VllmConfig> for VllmProvider {
         Self {
             base_url: config.base_url,
             api_key: config.api_key,
+            strict_alternating_roles: config.strict_alternating_roles,
             request_config: VllmRequestConfig {
                 model: config.model,
                 temperature: config.temperature,
                 max_completion_tokens: config.max_completion_tokens,
                 top_p: config.top_p,
+                parallel_tool_calls: config.parallel_tool_calls,
             },
         }
     }
@@ -197,6 +229,10 @@ impl CompletionsProvider for VllmProvider {
             Some(key) => builder.bearer_auth(key),
             None => builder,
         }
+    }
+
+    fn requires_alternating_roles(&self) -> bool {
+        self.strict_alternating_roles
     }
 }
 
