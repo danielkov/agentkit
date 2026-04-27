@@ -23,6 +23,7 @@ members = [
     "crates/agentkit-tool-skills",
     "crates/agentkit-http",
     "crates/agentkit-mcp",
+    "crates/agentkit-integration-tests",
     "examples/anthropic-chat",
     "examples/cerebras-batch",
     "examples/cerebras-chat",

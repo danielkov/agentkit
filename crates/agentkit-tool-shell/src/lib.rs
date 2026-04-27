@@ -329,7 +329,7 @@ mod tests {
 
     #[tokio::test]
     async fn shell_tool_executes_and_captures_output() {
-        let executor = BasicToolExecutor::new(registry());
+        let executor = BasicToolExecutor::from_registry(registry());
         let metadata = MetadataMap::new();
         let mut ctx = ToolContext {
             capability: CapabilityContext {
@@ -374,7 +374,7 @@ mod tests {
 
     #[tokio::test]
     async fn shell_tool_respects_permission_denial() {
-        let executor = BasicToolExecutor::new(registry());
+        let executor = BasicToolExecutor::from_registry(registry());
         let metadata = MetadataMap::new();
         let mut ctx = ToolContext {
             capability: CapabilityContext {

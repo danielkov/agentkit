@@ -66,14 +66,8 @@ impl LoopObserver for TracingReporter {
             AgentEvent::ApprovalRequired(request) => {
                 tracing::info!(target: "agentkit", summary = %request.summary, reason = ?request.reason, "approval required");
             }
-            AgentEvent::AuthRequired(request) => {
-                tracing::info!(target: "agentkit", provider = %request.provider, "auth required");
-            }
             AgentEvent::ApprovalResolved { approved } => {
                 tracing::info!(target: "agentkit", approved, "approval resolved");
-            }
-            AgentEvent::AuthResolved { provided } => {
-                tracing::info!(target: "agentkit", provided, "auth resolved");
             }
             AgentEvent::ToolCatalogChanged(event) => {
                 tracing::info!(

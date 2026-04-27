@@ -2,32 +2,31 @@
 //!
 //! `agentkit-loop` is the central coordination layer in the agentkit workspace.  It
 //! drives a model through a multi-turn agentic loop, executing tool calls,
-//! respecting permission checks, surfacing approval and authentication interrupts
-//! to the host application, and optionally compacting the transcript when it grows
-//! too large.
+//! respecting permission checks, surfacing approval interrupts to the host
+//! application, and optionally compacting the transcript when it grows too large.
 //!
 //! # Architecture
 //!
 //! The main entry point is [`Agent`], constructed via [`AgentBuilder`].  After
-//! calling [`Agent::start`] you receive a [`LoopDriver`] that yields
-//! [`LoopStep`]s -- either a finished turn or an interrupt that requires host
-//! resolution before the loop can continue.
+//! calling [`Agent::start`] with the initial transcript you receive a
+//! [`LoopDriver`] that yields [`LoopStep`]s -- either a finished turn or an
+//! interrupt that requires host resolution before the loop can continue.
 //!
 //! ```text
 //! Agent::builder()
-//!     .model(adapter)        // ModelAdapter implementation
-//!     .tools(registry)       // ToolRegistry with registered tools
+//!     .model(adapter)              // ModelAdapter implementation
+//!     .add_tool_source(registry)   // ToolRegistry (or any ToolSource); call again to federate
 //!     .permissions(checker)  // PermissionChecker for gating tool use
 //!     .observer(obs)         // LoopObserver for streaming events
 //!     .build()?
-//!     .start(config).await?  -> LoopDriver
-//!         .submit_input(...)
+//!     .start(config, vec![system_item, user_item]).await?  -> LoopDriver
 //!         .next().await?     -> LoopStep::Finished | LoopStep::Interrupt
 //! ```
 //!
 //! # Example
 //!
 //! ```rust,no_run
+//! use agentkit_core::{Item, ItemKind};
 //! use agentkit_loop::{Agent, PromptCacheRequest, PromptCacheRetention, SessionConfig};
 //!
 //! # async fn example<M: agentkit_loop::ModelAdapter>(adapter: M) -> Result<(), agentkit_loop::LoopError> {
@@ -40,6 +39,7 @@
 //!         SessionConfig::new("demo").with_cache(
 //!             PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
 //!         ),
+//!         vec![Item::text(ItemKind::User, "Hello!")],
 //!     )
 //!     .await?;
 //! # Ok(())
@@ -57,16 +57,15 @@ use agentkit_core::{
     TextPart, ToolCallId, ToolCallPart, ToolOutput, ToolResultPart, TurnCancellation, Usage,
 };
 use agentkit_task_manager::{
-    PendingLoopUpdates, SimpleTaskManager, TaskApproval, TaskAuth, TaskLaunchKind,
-    TaskLaunchRequest, TaskManager, TaskResolution, TaskStartContext, TaskStartOutcome,
-    TurnTaskUpdate,
+    PendingLoopUpdates, SimpleTaskManager, TaskApproval, TaskLaunchKind, TaskLaunchRequest,
+    TaskManager, TaskResolution, TaskStartContext, TaskStartOutcome, TurnTaskUpdate,
 };
 #[cfg(test)]
 use agentkit_tools_core::ToolContext;
 use agentkit_tools_core::{
-    AllowAllPermissions, ApprovalDecision, ApprovalRequest, AuthOperation, AuthRequest,
-    AuthResolution, BasicToolExecutor, OwnedToolContext, PermissionChecker, ToolCatalogEvent,
-    ToolError, ToolExecutor, ToolRegistry, ToolRequest, ToolResources, ToolSpec,
+    AllowAllPermissions, ApprovalDecision, ApprovalRequest, BasicToolExecutor, OwnedToolContext,
+    PermissionChecker, ToolCatalogEvent, ToolError, ToolExecutor, ToolRequest, ToolResources,
+    ToolSource, ToolSpec,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -586,12 +585,8 @@ pub enum AgentEvent {
     ToolResultReceived(ToolResultPart),
     /// A tool call requires explicit user approval before execution.
     ApprovalRequired(ApprovalRequest),
-    /// A tool call requires authentication before execution.
-    AuthRequired(AuthRequest),
     /// An approval interrupt has been resolved.
     ApprovalResolved { approved: bool },
-    /// An authentication interrupt has been resolved.
-    AuthResolved { provided: bool },
     /// The available tool catalog changed and will be reflected on the next model request.
     ToolCatalogChanged(ToolCatalogEvent),
     /// Transcript compaction is about to begin.
@@ -690,60 +685,6 @@ impl PendingApproval {
     }
 }
 
-/// Handle for a pending authentication interrupt.
-///
-/// Wraps an [`AuthRequest`] and provides ergonomic resolution methods.
-///
-/// # Example
-///
-/// ```rust,no_run
-/// # use agentkit_loop::{LoopInterrupt, LoopStep, LoopDriver};
-/// # use agentkit_core::MetadataMap;
-/// # async fn handle<S: agentkit_loop::ModelSession>(driver: &mut LoopDriver<S>) -> Result<(), agentkit_loop::LoopError> {
-/// match driver.next().await? {
-///     LoopStep::Interrupt(LoopInterrupt::AuthRequest(pending)) => {
-///         println!("Auth required from: {}", pending.request.provider);
-///         pending.cancel(driver)?;
-///     }
-///     _ => {}
-/// }
-/// # Ok(())
-/// # }
-/// ```
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PendingAuth {
-    /// The underlying auth request details.
-    pub request: AuthRequest,
-}
-
-impl std::ops::Deref for PendingAuth {
-    type Target = AuthRequest;
-    fn deref(&self) -> &AuthRequest {
-        &self.request
-    }
-}
-
-impl PendingAuth {
-    /// Provide credentials to satisfy the auth request.
-    pub fn provide<S: ModelSession>(
-        self,
-        driver: &mut LoopDriver<S>,
-        credentials: MetadataMap,
-    ) -> Result<(), LoopError> {
-        driver.resolve_auth(AuthResolution::Provided {
-            request: self.request,
-            credentials,
-        })
-    }
-
-    /// Cancel the auth flow.
-    pub fn cancel<S: ModelSession>(self, driver: &mut LoopDriver<S>) -> Result<(), LoopError> {
-        driver.resolve_auth(AuthResolution::Cancelled {
-            request: self.request,
-        })
-    }
-}
-
 /// Descriptor for a [`LoopInterrupt::AwaitingInput`] interrupt.
 ///
 /// Returned when the driver has no pending input and needs the host to
@@ -819,10 +760,6 @@ pub struct TurnResult {
 ///         println!("Tool {} needs approval: {}", pending.request.request_kind, pending.request.summary);
 ///         pending.approve(driver)?;
 ///     }
-///     LoopStep::Interrupt(LoopInterrupt::AuthRequest(pending)) => {
-///         println!("Auth required from provider: {}", pending.request.provider);
-///         pending.cancel(driver)?;
-///     }
 ///     LoopStep::Interrupt(LoopInterrupt::AwaitingInput(pending)) => {
 ///         println!("Waiting for input: {}", pending.reason);
 ///         // ... call pending.submit(driver, items)
@@ -844,15 +781,13 @@ pub struct TurnResult {
 pub enum LoopInterrupt {
     /// A tool call requires explicit approval before it can execute.
     ApprovalRequest(PendingApproval),
-    /// A tool call requires authentication credentials.
-    AuthRequest(PendingAuth),
     /// The driver has no pending input and needs the host to supply some.
     AwaitingInput(InputRequest),
     /// A tool round finished: all tool calls from the previous assistant
     /// message now have results in the transcript, and the driver is about to
-    /// invoke the model again.  The host may call
-    /// [`LoopDriver::submit_input`] to interject user messages before the
-    /// next model turn, then call [`LoopDriver::next`] to resume.
+    /// invoke the model again. The host may interject user messages via the
+    /// [`ToolRoundInfo::submit`] handle before calling [`LoopDriver::next`]
+    /// to resume.
     ///
     /// This is a non-blocking interrupt: callers that do not care about
     /// mid-turn interjection can treat it as a no-op (`_ => continue`) and
@@ -862,15 +797,12 @@ pub enum LoopInterrupt {
 
 impl LoopInterrupt {
     /// Returns `true` if the interrupt must be explicitly resolved before
-    /// the loop can make progress.  Approvals and auth requests are
-    /// blocking; [`AwaitingInput`](LoopInterrupt::AwaitingInput) and
+    /// the loop can make progress. Approvals are blocking;
+    /// [`AwaitingInput`](LoopInterrupt::AwaitingInput) and
     /// [`AfterToolResult`](LoopInterrupt::AfterToolResult) are cooperative
     /// and can be ignored by calling [`LoopDriver::next`] again.
     pub fn is_blocking(&self) -> bool {
-        matches!(
-            self,
-            LoopInterrupt::ApprovalRequest(_) | LoopInterrupt::AuthRequest(_)
-        )
+        matches!(self, LoopInterrupt::ApprovalRequest(_))
     }
 }
 
@@ -887,9 +819,10 @@ pub struct ToolRoundInfo {
 }
 
 impl ToolRoundInfo {
-    /// Convenience: forwards to [`LoopDriver::submit_input`].
+    /// Interject user input between tool rounds. Consumes the
+    /// [`ToolRoundInfo`] handle so the same yield cannot accept input twice.
     pub fn submit<S: ModelSession>(
-        &self,
+        self,
         driver: &mut LoopDriver<S>,
         items: Vec<Item>,
     ) -> Result<(), LoopError> {
@@ -958,16 +891,6 @@ struct PendingApprovalToolCall {
     tool_request: ToolRequest,
 }
 
-#[derive(Clone, Debug)]
-struct PendingAuthToolCall {
-    request: AuthRequest,
-    resolution: Option<AuthResolution>,
-    turn_id: agentkit_core::TurnId,
-    task_id: TaskId,
-    call: ToolCallPart,
-    tool_request: ToolRequest,
-}
-
 #[derive(Clone, Debug, Default)]
 struct ActiveToolRound {
     turn_id: agentkit_core::TurnId,
@@ -993,7 +916,7 @@ struct ActiveToolRound {
 /// # async fn example<M: agentkit_loop::ModelAdapter>(adapter: M) -> Result<(), agentkit_loop::LoopError> {
 /// let agent = Agent::builder()
 ///     .model(adapter)
-///     .tools(ToolRegistry::new())
+///     .add_tool_source(ToolRegistry::new())
 ///     .build()?;
 ///
 /// let mut driver = agent
@@ -1001,10 +924,11 @@ struct ActiveToolRound {
 ///         SessionConfig::new("s1").with_cache(
 ///             PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
 ///         ),
+///         Vec::new(),
 ///     )
 ///     .await?;
 ///
-/// // Submit input and advance
+/// // Drive the loop; submit input via InputRequest::submit on AwaitingInput
 /// # Ok(())
 /// # }
 /// ```
@@ -1013,7 +937,7 @@ where
     M: ModelAdapter,
 {
     model: M,
-    tools: ToolRegistry,
+    tool_sources: Vec<Arc<dyn ToolSource>>,
     tool_executor: Option<Arc<dyn ToolExecutor>>,
     task_manager: Arc<dyn TaskManager>,
     permissions: Arc<dyn PermissionChecker>,
@@ -1033,7 +957,20 @@ where
         AgentBuilder::default()
     }
 
-    /// Consume the agent and start a new session, returning a [`LoopDriver`].
+    /// Consume the agent and start a session with the given initial
+    /// `transcript`, returning a [`LoopDriver`].
+    ///
+    /// `transcript` is the entire starting state of the conversation:
+    ///
+    /// - **New session:** `[system_prompt_item, first_user_input_item]`.
+    /// - **Resumed session:** the full transcript loaded from a database,
+    ///   file, or previous run.
+    ///
+    /// The first call to [`LoopDriver::next`] consumes the transcript directly
+    /// instead of waiting for input. Mid-session input is supplied through
+    /// [`InputRequest::submit`] (on `AwaitingInput`) or
+    /// [`ToolRoundInfo::submit`] (on `AfterToolResult`); there is no
+    /// out-of-turn submission entry point.
     ///
     /// This calls [`ModelAdapter::start_session`] and emits an
     /// [`AgentEvent::RunStarted`] event to all registered observers.
@@ -1041,13 +978,17 @@ where
     /// # Errors
     ///
     /// Returns [`LoopError`] if the model adapter fails to create a session.
-    pub async fn start(self, config: SessionConfig) -> Result<LoopDriver<M::Session>, LoopError> {
+    pub async fn start(
+        self,
+        config: SessionConfig,
+        transcript: Vec<Item>,
+    ) -> Result<LoopDriver<M::Session>, LoopError> {
         let session_id = config.session_id.clone();
         let default_cache = config.cache.clone();
         let session = self.model.start_session(config).await?;
         let tool_executor = self
             .tool_executor
-            .unwrap_or_else(|| Arc::new(BasicToolExecutor::new(self.tools.clone())));
+            .unwrap_or_else(|| Arc::new(BasicToolExecutor::new(self.tool_sources.clone())));
         let mut driver = LoopDriver {
             session_id: session_id.clone(),
             default_cache,
@@ -1062,10 +1003,9 @@ where
             observers: self.observers,
             transcript_observers: self.transcript_observers,
             transcript: Vec::new(),
-            pending_input: Vec::new(),
+            pending_input: transcript,
             pending_approvals: BTreeMap::new(),
             pending_approval_order: VecDeque::new(),
-            pending_auth: None,
             active_tool_round: None,
             pending_round_resume: None,
             next_turn_index: 1,
@@ -1085,7 +1025,7 @@ where
     M: ModelAdapter,
 {
     model: Option<M>,
-    tools: ToolRegistry,
+    tool_sources: Vec<Arc<dyn ToolSource>>,
     tool_executor: Option<Arc<dyn ToolExecutor>>,
     task_manager: Option<Arc<dyn TaskManager>>,
     permissions: Arc<dyn PermissionChecker>,
@@ -1103,7 +1043,7 @@ where
     fn default() -> Self {
         Self {
             model: None,
-            tools: ToolRegistry::new(),
+            tool_sources: Vec::new(),
             tool_executor: None,
             task_manager: None,
             permissions: Arc::new(AllowAllPermissions),
@@ -1126,19 +1066,28 @@ where
         self
     }
 
-    /// Set the tool registry.  Defaults to an empty [`ToolRegistry`].
-    pub fn tools(mut self, tools: ToolRegistry) -> Self {
-        self.tools = tools;
+    /// Adds a tool source to the agent. Call multiple times to compose
+    /// federated sources — for example a frozen native [`ToolRegistry`]
+    /// alongside an MCP manager's [`agentkit_tools_core::CatalogReader`]
+    /// and a skill-watcher reader. Sources are walked in registration
+    /// order; the default [`agentkit_tools_core::CollisionPolicy`] is
+    /// `FirstWins`.
+    ///
+    /// Accepts any sized [`ToolSource`]; the agent owns it for the
+    /// session. To share a dynamic source between the agent and the
+    /// subsystem mutating it, mint a [`agentkit_tools_core::CatalogReader`]
+    /// from a [`agentkit_tools_core::dynamic_catalog`] pair — the reader
+    /// is sized and owned, hosts never see the underlying `Arc`.
+    pub fn add_tool_source<S: ToolSource + 'static>(mut self, source: S) -> Self {
+        self.tool_sources.push(Arc::new(source));
         self
     }
 
-    /// Set a dynamic tool executor.
-    ///
-    /// When this is provided, the agent uses it instead of wrapping the static
-    /// [`ToolRegistry`] in a [`BasicToolExecutor`]. Pass an owned `impl
-    /// ToolExecutor + 'static` or an existing `Arc<dyn ToolExecutor>` — the
-    /// blanket [`ToolExecutor`] impl on [`Arc`] makes both work without
-    /// double-wrapping.
+    /// Set a custom [`ToolExecutor`]. When provided, the agent uses it
+    /// instead of building a [`BasicToolExecutor`] from the configured
+    /// sources. Most hosts should use [`add_tool_source`](Self::add_tool_source)
+    /// instead; this is for advanced cases (custom routing, instrumentation,
+    /// test fakes).
     pub fn tool_executor(mut self, executor: impl ToolExecutor + 'static) -> Self {
         self.tool_executor = Some(Arc::new(executor));
         self
@@ -1198,10 +1147,7 @@ where
     /// for persistence or replication) — [`LoopObserver`] alone is
     /// insufficient because it doesn't expose item boundaries for model
     /// output and historically did not surface tool results at all.
-    pub fn transcript_observer(
-        mut self,
-        observer: impl TranscriptObserver + 'static,
-    ) -> Self {
+    pub fn transcript_observer(mut self, observer: impl TranscriptObserver + 'static) -> Self {
         self.transcript_observers.push(Box::new(observer));
         self
     }
@@ -1217,7 +1163,7 @@ where
             .ok_or_else(|| LoopError::InvalidState("model adapter is required".into()))?;
         Ok(Agent {
             model,
-            tools: self.tools,
+            tool_sources: self.tool_sources,
             tool_executor: self.tool_executor,
             task_manager: self
                 .task_manager
@@ -1234,13 +1180,14 @@ where
 
 /// The runtime driver that advances the agent loop step by step.
 ///
-/// Obtained from [`Agent::start`].  The typical usage pattern is:
+/// Obtained from [`Agent::start`] with the initial transcript baked in.
+/// The typical usage pattern is:
 ///
-/// 1. Call [`submit_input`](LoopDriver::submit_input) to enqueue user messages.
-/// 2. Call [`next`](LoopDriver::next) to run the next turn.
-/// 3. Handle the returned [`LoopStep`]:
+/// 1. Call [`next`](LoopDriver::next) to advance the loop.
+/// 2. Handle the returned [`LoopStep`]:
 ///    - [`LoopStep::Finished`] -- the turn completed, inspect the result.
-///    - [`LoopStep::Interrupt`] -- resolve the interrupt and call `next` again.
+///    - [`LoopStep::Interrupt`] -- resolve the interrupt via the bound
+///      [`Pending*`](LoopInterrupt) handle, then call `next` again.
 ///
 /// # Example
 ///
@@ -1249,13 +1196,11 @@ where
 /// use agentkit_loop::{LoopDriver, LoopStep};
 ///
 /// # async fn drive<S: agentkit_loop::ModelSession>(driver: &mut LoopDriver<S>) -> Result<(), agentkit_loop::LoopError> {
-/// driver.submit_input(vec![Item::text(ItemKind::User, "Hello!")])?;
-///
 /// let step = driver.next().await?;
 /// match step {
 ///     LoopStep::Finished(result) => println!("Done: {:?}", result.finish_reason),
 ///     LoopStep::Interrupt(interrupt) => {
-///         // Resolve the interrupt (approval, auth, or input), then call next() again.
+///         // Resolve via the pending handle, then call next() again.
 ///         println!("Interrupted: {interrupt:?}");
 ///     }
 /// }
@@ -1282,7 +1227,6 @@ where
     pending_input: Vec<Item>,
     pending_approvals: BTreeMap<ToolCallId, PendingApprovalToolCall>,
     pending_approval_order: VecDeque<ToolCallId>,
-    pending_auth: Option<PendingAuthToolCall>,
     active_tool_round: Option<ActiveToolRound>,
     pending_round_resume: Option<agentkit_core::TurnId>,
     next_turn_index: u64,
@@ -1334,7 +1278,7 @@ where
     }
 
     fn has_pending_interrupts(&self) -> bool {
-        self.pending_auth.is_some() || !self.pending_approvals.is_empty()
+        !self.pending_approvals.is_empty()
     }
 
     fn emit_tool_catalog_events(&mut self, events: Vec<ToolCatalogEvent>) {
@@ -1408,40 +1352,6 @@ where
         self.pending_approvals.remove(&call_id)
     }
 
-    fn pending_auth_interrupt(&self) -> Option<LoopStep> {
-        self.pending_auth.as_ref().and_then(|pending| {
-            pending.resolution.is_none().then(|| {
-                LoopStep::Interrupt(LoopInterrupt::AuthRequest(PendingAuth {
-                    request: pending.request.clone(),
-                }))
-            })
-        })
-    }
-
-    fn queue_auth_interrupt(
-        &mut self,
-        turn_id: &agentkit_core::TurnId,
-        task: TaskAuth,
-    ) -> LoopStep {
-        let call = ToolCallPart {
-            id: task.tool_request.call_id.clone(),
-            name: task.tool_request.tool_name.to_string(),
-            input: task.tool_request.input.clone(),
-            metadata: task.tool_request.metadata.clone(),
-        };
-        let request = upgrade_auth_request(task.auth, &task.tool_request, &call);
-        self.pending_auth = Some(PendingAuthToolCall {
-            request: request.clone(),
-            resolution: None,
-            turn_id: turn_id.clone(),
-            task_id: task.task_id,
-            call,
-            tool_request: task.tool_request,
-        });
-        self.emit(AgentEvent::AuthRequired(request.clone()));
-        LoopStep::Interrupt(LoopInterrupt::AuthRequest(PendingAuth { request }))
-    }
-
     fn queue_resolution_interrupt(
         &mut self,
         turn_id: &agentkit_core::TurnId,
@@ -1456,7 +1366,6 @@ where
                 self.enqueue_pending_approval(turn_id, task);
                 self.take_next_unsurfaced_approval_interrupt()
             }
-            TaskResolution::Auth(task) => Some(self.queue_auth_interrupt(turn_id, task)),
         }
     }
 
@@ -1475,12 +1384,6 @@ where
                 }
                 TaskResolution::Approval(task) => {
                     self.enqueue_pending_approval(&task.tool_request.turn_id.clone(), task);
-                }
-                TaskResolution::Auth(task) => {
-                    return Ok((
-                        saw_items,
-                        Some(self.queue_auth_interrupt(&task.tool_request.turn_id.clone(), task)),
-                    ));
                 }
             }
         }
@@ -1605,9 +1508,6 @@ where
                             TaskResolution::Approval(task) => {
                                 self.enqueue_pending_approval(&turn_id, task);
                             }
-                            TaskResolution::Auth(task) => {
-                                return Ok(Some(self.queue_auth_interrupt(&turn_id, task)));
-                            }
                         }
                         continue;
                     }
@@ -1639,9 +1539,6 @@ where
                         }
                         TaskResolution::Approval(task) => {
                             self.enqueue_pending_approval(&turn_id, task);
-                        }
-                        TaskResolution::Auth(task) => {
-                            return Ok(Some(self.queue_auth_interrupt(&turn_id, task)));
                         }
                     }
                 }
@@ -1687,9 +1584,6 @@ where
                         LoopError::InvalidState("missing active tool round".into())
                     })?;
                     if let Some(step) = self.take_next_unsurfaced_approval_interrupt() {
-                        return Ok(Some(step));
-                    }
-                    if let Some(step) = self.pending_auth_interrupt() {
                         return Ok(Some(step));
                     }
                     if let Some(step) = self.next_unresolved_approval_interrupt() {
@@ -1866,64 +1760,6 @@ where
         Ok(LoopStep::Finished(turn_result))
     }
 
-    async fn resume_after_auth(
-        &mut self,
-        pending: PendingAuthToolCall,
-    ) -> Result<LoopStep, LoopError> {
-        let resolution = pending
-            .resolution
-            .clone()
-            .ok_or_else(|| LoopError::InvalidState("pending auth has no resolution".into()))?;
-        match resolution {
-            AuthResolution::Provided { .. } => match self
-                .start_task_via_manager(
-                    Some(pending.task_id.clone()),
-                    pending.tool_request.clone(),
-                    TaskLaunchKind::AfterAuth(resolution.clone()),
-                    self.cancellation
-                        .as_ref()
-                        .map(CancellationHandle::checkpoint),
-                )
-                .await?
-            {
-                TaskStartOutcome::Ready(resolution) => {
-                    let resolution = *resolution;
-                    if let Some(step) =
-                        self.queue_resolution_interrupt(&pending.turn_id, resolution)
-                    {
-                        return Ok(step);
-                    }
-                }
-                TaskStartOutcome::Pending { .. } => {}
-            },
-            AuthResolution::Cancelled { .. } => {
-                self.append_tool_result_item(Item {
-                    id: None,
-                    kind: ItemKind::Tool,
-                    parts: vec![Part::ToolResult(ToolResultPart {
-                        call_id: pending.call.id.clone(),
-                        output: ToolOutput::Text("auth cancelled".into()),
-                        is_error: true,
-                        metadata: pending.call.metadata.clone(),
-                    })],
-                    metadata: MetadataMap::new(),
-                });
-            }
-        }
-
-        if let Some(step) = self.continue_active_tool_round().await? {
-            Ok(step)
-        } else if let Some(step) = self.take_next_unsurfaced_approval_interrupt() {
-            Ok(step)
-        } else if let Some(step) = self.pending_auth_interrupt() {
-            Ok(step)
-        } else if let Some(step) = self.next_unresolved_approval_interrupt() {
-            Ok(step)
-        } else {
-            self.drive_turn(pending.turn_id, false).await
-        }
-    }
-
     async fn resume_after_approval(
         &mut self,
         pending: PendingApprovalToolCall,
@@ -1976,8 +1812,6 @@ where
             Ok(step)
         } else if let Some(step) = self.take_next_unsurfaced_approval_interrupt() {
             Ok(step)
-        } else if let Some(step) = self.pending_auth_interrupt() {
-            Ok(step)
         } else if let Some(step) = self.next_unresolved_approval_interrupt() {
             Ok(step)
         } else {
@@ -2002,15 +1836,12 @@ where
         Ok(LoopStep::Finished(turn_result))
     }
 
-    /// Enqueue user input items for the next turn.
-    ///
-    /// Items are buffered and consumed the next time [`next`](LoopDriver::next)
-    /// is called.  Must not be called while an interrupt is pending.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`LoopError::InvalidState`] if an interrupt is still unresolved.
-    pub fn submit_input(&mut self, input: Vec<Item>) -> Result<(), LoopError> {
+    /// Internal entry point for buffering user input. Reachable only via
+    /// [`InputRequest::submit`] (resolves an `AwaitingInput` interrupt) and
+    /// [`ToolRoundInfo::submit`] (interjects between tool rounds). Initial
+    /// transcript items are passed through [`Agent::start`] instead — there
+    /// is no out-of-turn submission API.
+    pub(crate) fn submit_input(&mut self, input: Vec<Item>) -> Result<(), LoopError> {
         if self.has_pending_interrupts() {
             return Err(LoopError::InvalidState(
                 "cannot submit input while an interrupt is pending".into(),
@@ -2038,9 +1869,8 @@ where
         Ok(())
     }
 
-    /// Enqueue user input and set a prompt cache override for the next model
-    /// turn in one call.
-    pub fn submit_input_with_cache(
+    #[cfg(test)]
+    pub(crate) fn submit_input_with_cache(
         &mut self,
         input: Vec<Item>,
         cache: PromptCacheRequest,
@@ -2101,32 +1931,6 @@ where
         self.resolve_approval_for(call_id, decision)
     }
 
-    /// Resolve a pending [`LoopInterrupt::AuthRequest`].
-    ///
-    /// The resolution must reference the same request id as the pending
-    /// [`AuthRequest`].  After calling this, invoke [`next`](LoopDriver::next)
-    /// to continue the loop.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`LoopError::InvalidState`] if no auth request is pending or
-    /// if the resolution's request id does not match.
-    pub fn resolve_auth(&mut self, resolution: AuthResolution) -> Result<(), LoopError> {
-        let Some(pending) = self.pending_auth.as_mut() else {
-            return Err(LoopError::InvalidState("no auth request is pending".into()));
-        };
-        if pending.request.id != resolution.request().id {
-            return Err(LoopError::InvalidState(
-                "auth resolution does not match the pending request".into(),
-            ));
-        }
-        pending.resolution = Some(resolution.clone());
-        self.emit(AgentEvent::AuthResolved {
-            provided: matches!(resolution, AuthResolution::Provided { .. }),
-        });
-        Ok(())
-    }
-
     /// Take a read-only snapshot of the driver's current transcript and input queue.
     pub fn snapshot(&self) -> LoopSnapshot {
         LoopSnapshot {
@@ -2151,27 +1955,11 @@ where
     /// Returns [`LoopError::InvalidState`] if called while an unresolved
     /// interrupt is pending, or propagates provider / tool / compaction errors.
     pub async fn next(&mut self) -> Result<LoopStep, LoopError> {
-        if self
-            .pending_auth
-            .as_ref()
-            .is_some_and(|pending| pending.resolution.is_some())
-        {
-            let pending = self
-                .pending_auth
-                .take()
-                .ok_or_else(|| LoopError::InvalidState("missing pending auth state".into()))?;
-            return self.resume_after_auth(pending).await;
-        }
-
         if let Some(pending) = self.take_next_resolved_approval() {
             return self.resume_after_approval(pending).await;
         }
 
         if let Some(step) = self.take_next_unsurfaced_approval_interrupt() {
-            return Ok(step);
-        }
-
-        if let Some(step) = self.pending_auth_interrupt() {
             return Ok(step);
         }
 
@@ -2287,31 +2075,6 @@ fn extract_tool_calls(items: &[Item]) -> Vec<ToolCallPart> {
     calls
 }
 
-fn upgrade_auth_request(
-    mut request: AuthRequest,
-    tool_request: &ToolRequest,
-    _call: &ToolCallPart,
-) -> AuthRequest {
-    if matches!(request.operation, AuthOperation::ToolCall { .. }) {
-        return request;
-    }
-
-    let prior_server_id = request.challenge.get("server_id").cloned();
-    let mut metadata = tool_request.metadata.clone();
-    if let Some(server_id) = prior_server_id {
-        metadata.entry("server_id".into()).or_insert(server_id);
-    }
-    request.operation = AuthOperation::ToolCall {
-        tool_name: tool_request.tool_name.0.clone(),
-        input: tool_request.input.clone(),
-        call_id: Some(tool_request.call_id.clone()),
-        session_id: Some(tool_request.session_id.clone()),
-        turn_id: Some(tool_request.turn_id.clone()),
-        metadata,
-    };
-    request
-}
-
 /// Errors that can occur while driving the agent loop.
 #[derive(Debug, Error)]
 pub enum LoopError {
@@ -2351,7 +2114,8 @@ mod tests {
     };
     use agentkit_tools_core::{
         FileSystemPermissionRequest, PermissionCode, PermissionDecision, PermissionDenial, Tool,
-        ToolAnnotations, ToolCatalogEvent, ToolExecutionOutcome, ToolName, ToolResult, ToolSpec,
+        ToolAnnotations, ToolCatalogEvent, ToolExecutionOutcome, ToolName, ToolRegistry,
+        ToolResult, ToolSpec,
     };
     use serde_json::{Value, json};
     use tokio::sync::Notify;
@@ -2992,63 +2756,6 @@ mod tests {
         }
     }
 
-    #[derive(Clone)]
-    struct AuthTool {
-        spec: ToolSpec,
-    }
-
-    impl Default for AuthTool {
-        fn default() -> Self {
-            Self {
-                spec: ToolSpec {
-                    name: ToolName::new("auth-tool"),
-                    description: "Always requires auth".into(),
-                    input_schema: json!({
-                        "type": "object",
-                        "properties": {},
-                        "additionalProperties": false
-                    }),
-                    annotations: ToolAnnotations::default(),
-                    metadata: MetadataMap::new(),
-                },
-            }
-        }
-    }
-
-    #[async_trait]
-    impl Tool for AuthTool {
-        fn spec(&self) -> &ToolSpec {
-            &self.spec
-        }
-
-        async fn invoke(
-            &self,
-            request: agentkit_tools_core::ToolRequest,
-            _ctx: &mut ToolContext<'_>,
-        ) -> Result<ToolResult, agentkit_tools_core::ToolError> {
-            let mut challenge = MetadataMap::new();
-            challenge.insert("server_id".into(), json!("mock"));
-            challenge.insert("scope".into(), json!("secret.read"));
-
-            Err(agentkit_tools_core::ToolError::AuthRequired(Box::new(
-                AuthRequest {
-                    task_id: None,
-                    id: "auth-1".into(),
-                    provider: "mcp.mock".into(),
-                    operation: AuthOperation::ToolCall {
-                        tool_name: request.tool_name.0,
-                        input: request.input,
-                        call_id: Some(request.call_id),
-                        session_id: Some(request.session_id),
-                        turn_id: Some(request.turn_id),
-                        metadata: request.metadata,
-                    },
-                    challenge,
-                },
-            )))
-        }
-    }
-
     struct CatalogExecutor {
         version: AtomicUsize,
         events: StdMutex<Vec<ToolCatalogEvent>>,
@@ -3097,82 +2804,6 @@ mod tests {
                 result: ToolResultPart {
                     call_id: request.call_id,
                     output: ToolOutput::Text("dynamic-ok".into()),
-                    is_error: false,
-                    metadata: MetadataMap::new(),
-                },
-                duration: None,
-                metadata: MetadataMap::new(),
-            })
-        }
-    }
-
-    struct AuthResumeExecutor {
-        credentials_seen: StdArc<StdMutex<Option<MetadataMap>>>,
-    }
-
-    impl AuthResumeExecutor {
-        fn new(credentials_seen: StdArc<StdMutex<Option<MetadataMap>>>) -> Self {
-            Self { credentials_seen }
-        }
-
-        fn auth_request(&self, request: &ToolRequest) -> AuthRequest {
-            AuthRequest {
-                task_id: None,
-                id: "auth-resume-1".into(),
-                provider: "mcp.mock".into(),
-                operation: AuthOperation::ToolCall {
-                    tool_name: request.tool_name.0.clone(),
-                    input: request.input.clone(),
-                    call_id: Some(request.call_id.clone()),
-                    session_id: Some(request.session_id.clone()),
-                    turn_id: Some(request.turn_id.clone()),
-                    metadata: request.metadata.clone(),
-                },
-                challenge: MetadataMap::new(),
-            }
-        }
-    }
-
-    #[async_trait]
-    impl ToolExecutor for AuthResumeExecutor {
-        fn specs(&self) -> Vec<ToolSpec> {
-            vec![ToolSpec {
-                name: ToolName::new("auth-tool"),
-                description: "Requires resumable auth".into(),
-                input_schema: json!({
-                    "type": "object",
-                    "properties": {},
-                    "additionalProperties": false
-                }),
-                annotations: ToolAnnotations::default(),
-                metadata: MetadataMap::new(),
-            }]
-        }
-
-        async fn execute(
-            &self,
-            request: ToolRequest,
-            _ctx: &mut ToolContext<'_>,
-        ) -> ToolExecutionOutcome {
-            ToolExecutionOutcome::Interrupted(agentkit_tools_core::ToolInterruption::AuthRequired(
-                self.auth_request(&request),
-            ))
-        }
-
-        async fn execute_after_auth(
-            &self,
-            request: ToolRequest,
-            auth_resolution: &AuthResolution,
-            _ctx: &mut ToolContext<'_>,
-        ) -> ToolExecutionOutcome {
-            if let AuthResolution::Provided { credentials, .. } = auth_resolution {
-                *self.credentials_seen.lock().unwrap() = Some(credentials.clone());
-            }
-
-            ToolExecutionOutcome::Completed(ToolResult {
-                result: ToolResultPart {
-                    call_id: request.call_id,
-                    output: ToolOutput::Text("auth-resumed".into()),
                     is_error: false,
                     metadata: MetadataMap::new(),
                 },
@@ -3289,7 +2920,7 @@ mod tests {
         let tools = ToolRegistry::new().with(EchoTool::default());
         let agent = Agent::builder()
             .model(FakeAdapter)
-            .tools(tools)
+            .add_tool_source(tools)
             .permissions(AllowAllPermissions)
             .build()
             .unwrap();
@@ -3299,7 +2930,7 @@ mod tests {
                 session_id: SessionId::new("session-1"),
                 metadata: MetadataMap::new(),
                 cache: None,
-            })
+            }, Vec::new())
             .await
             .unwrap();
 
@@ -3347,7 +2978,7 @@ mod tests {
         let tools = ToolRegistry::new().with(EchoTool::default());
         let agent = Agent::builder()
             .model(FakeAdapter)
-            .tools(tools)
+            .add_tool_source(tools)
             .permissions(DenyFsReads)
             .build()
             .unwrap();
@@ -3357,7 +2988,7 @@ mod tests {
                 session_id: SessionId::new("session-2"),
                 metadata: MetadataMap::new(),
                 cache: None,
-            })
+            }, Vec::new())
             .await
             .unwrap();
 
@@ -3385,107 +3016,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn loop_surfaces_auth_interruptions_from_tools() {
-        let tools = ToolRegistry::new().with(AuthTool::default());
-        let agent = Agent::builder()
-            .model(FakeAdapter)
-            .tools(tools)
-            .permissions(AllowAllPermissions)
-            .build()
-            .unwrap();
-
-        let mut driver = agent
-            .start(SessionConfig {
-                session_id: SessionId::new("session-3"),
-                metadata: MetadataMap::new(),
-                cache: None,
-            })
-            .await
-            .unwrap();
-
-        driver
-            .submit_input(vec![Item {
-                id: None,
-                kind: ItemKind::User,
-                parts: vec![Part::Text(TextPart {
-                    text: "ping".into(),
-                    metadata: MetadataMap::new(),
-                })],
-                metadata: MetadataMap::new(),
-            }])
-            .unwrap();
-
-        let result = driver.next().await.unwrap();
-
-        match result {
-            LoopStep::Interrupt(LoopInterrupt::AuthRequest(pending)) => {
-                let request = &pending.request;
-                assert!(request.task_id.is_some());
-                assert_eq!(request.provider, "mcp.mock");
-                assert_eq!(request.challenge.get("scope"), Some(&json!("secret.read")));
-                match &request.operation {
-                    AuthOperation::ToolCall { tool_name, .. } => {
-                        assert_eq!(tool_name, "auth-tool");
-                    }
-                    other => panic!("unexpected auth operation: {other:?}"),
-                }
-            }
-            other => panic!("unexpected loop step: {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn loop_passes_auth_resolution_to_executor_resume_path() {
-        let credentials_seen = StdArc::new(StdMutex::new(None));
-        let agent = Agent::builder()
-            .model(FakeAdapter)
-            .tool_executor(AuthResumeExecutor::new(credentials_seen.clone()))
-            .permissions(AllowAllPermissions)
-            .build()
-            .unwrap();
-
-        let mut driver = agent
-            .start(SessionConfig {
-                session_id: SessionId::new("session-auth-resume"),
-                metadata: MetadataMap::new(),
-                cache: None,
-            })
-            .await
-            .unwrap();
-
-        driver
-            .submit_input(vec![Item {
-                id: None,
-                kind: ItemKind::User,
-                parts: vec![Part::Text(TextPart {
-                    text: "ping".into(),
-                    metadata: MetadataMap::new(),
-                })],
-                metadata: MetadataMap::new(),
-            }])
-            .unwrap();
-
-        let pending = match driver.next().await.unwrap() {
-            LoopStep::Interrupt(LoopInterrupt::AuthRequest(pending)) => pending,
-            other => panic!("unexpected loop step: {other:?}"),
-        };
-        let mut credentials = MetadataMap::new();
-        credentials.insert("access_token".into(), json!("token-123"));
-        pending.provide(&mut driver, credentials.clone()).unwrap();
-
-        let result = run_until_finished(&mut driver).await;
-        match result {
-            LoopStep::Finished(turn) => match &turn.items[0].parts[0] {
-                Part::Text(text) => assert!(text.text.contains("auth-resumed")),
-                other => panic!("unexpected part: {other:?}"),
-            },
-            other => panic!("unexpected loop step: {other:?}"),
-        }
-
-        assert_eq!(*credentials_seen.lock().unwrap(), Some(credentials));
-    }
-
-    #[tokio::test]
     async fn async_task_manager_background_round_requires_explicit_continue() {
         let entered = StdArc::new(AtomicBool::new(false));
         let release = StdArc::new(Notify::new());
@@ -3502,7 +3032,7 @@ mod tests {
         ));
         let agent = Agent::builder()
             .model(FakeAdapter)
-            .tools(tools)
+            .add_tool_source(tools)
             .permissions(AllowAllPermissions)
             .task_manager(task_manager)
             .build()
@@ -3513,7 +3043,7 @@ mod tests {
                 session_id: SessionId::new("session-background"),
                 metadata: MetadataMap::new(),
                 cache: None,
-            })
+            }, Vec::new())
             .await
             .unwrap();
 
@@ -3576,7 +3106,7 @@ mod tests {
                 session_id: SessionId::new("session-cancel"),
                 metadata: MetadataMap::new(),
                 cache: None,
-            })
+            }, Vec::new())
             .await
             .unwrap();
 
@@ -3660,7 +3190,7 @@ mod tests {
             ));
         let agent = Agent::builder()
             .model(MultiToolAdapter)
-            .tools(tools)
+            .add_tool_source(tools)
             .permissions(AllowAllPermissions)
             .cancellation(controller.handle())
             .task_manager(task_manager)
@@ -3672,7 +3202,7 @@ mod tests {
                 session_id: SessionId::new("session-mixed-cancel"),
                 metadata: MetadataMap::new(),
                 cache: None,
-            })
+            }, Vec::new())
             .await
             .unwrap();
 
@@ -3727,7 +3257,7 @@ mod tests {
         let tools = ToolRegistry::new().with(EchoTool::default());
         let agent = Agent::builder()
             .model(FakeAdapter)
-            .tools(tools)
+            .add_tool_source(tools)
             .permissions(ApproveFsReads)
             .build()
             .unwrap();
@@ -3737,7 +3267,7 @@ mod tests {
                 session_id: SessionId::new("session-approval"),
                 metadata: MetadataMap::new(),
                 cache: None,
-            })
+            }, Vec::new())
             .await
             .unwrap();
 
@@ -3777,7 +3307,7 @@ mod tests {
         let tools = ToolRegistry::new().with(EchoTool::default());
         let agent = Agent::builder()
             .model(DualApprovalAdapter)
-            .tools(tools)
+            .add_tool_source(tools)
             .permissions(ApproveFsReads)
             .build()
             .unwrap();
@@ -3787,7 +3317,7 @@ mod tests {
                 session_id: SessionId::new("session-dual-approval"),
                 metadata: MetadataMap::new(),
                 cache: None,
-            })
+            }, Vec::new())
             .await
             .unwrap();
 
@@ -3869,7 +3399,7 @@ mod tests {
                 session_id: SessionId::new("session-4"),
                 metadata: MetadataMap::new(),
                 cache: None,
-            })
+            }, Vec::new())
             .await
             .unwrap();
 
@@ -3908,7 +3438,7 @@ mod tests {
                 seen_descriptions: seen_descriptions.clone(),
                 seen_caches: StdArc::new(StdMutex::new(Vec::new())),
             })
-            .tools(tools)
+            .add_tool_source(tools)
             .permissions(AllowAllPermissions)
             .build()
             .unwrap();
@@ -3918,7 +3448,7 @@ mod tests {
                 session_id: SessionId::new("session-dynamic-tools"),
                 metadata: MetadataMap::new(),
                 cache: None,
-            })
+            }, Vec::new())
             .await
             .unwrap();
 
@@ -3971,7 +3501,7 @@ mod tests {
                 session_id: SessionId::new("session-catalog-events"),
                 metadata: MetadataMap::new(),
                 cache: None,
-            })
+            }, Vec::new())
             .await
             .unwrap();
 
@@ -4038,7 +3568,7 @@ mod tests {
                 session_id: SessionId::new("session-cache"),
                 metadata: MetadataMap::new(),
                 cache: Some(default_cache.clone()),
-            })
+            }, Vec::new())
             .await
             .unwrap();
 
@@ -4082,7 +3612,7 @@ mod tests {
         let tools = ToolRegistry::new().with(EchoTool::default());
         let agent = Agent::builder()
             .model(FakeAdapter)
-            .tools(tools)
+            .add_tool_source(tools)
             .permissions(AllowAllPermissions)
             .build()
             .unwrap();
@@ -4092,7 +3622,7 @@ mod tests {
                 session_id: SessionId::new("yield-session"),
                 metadata: MetadataMap::new(),
                 cache: None,
-            })
+            }, Vec::new())
             .await
             .unwrap();
 
@@ -4167,7 +3697,7 @@ mod tests {
         let items = StdArc::new(StdMutex::new(Vec::<Item>::new()));
         let agent = Agent::builder()
             .model(FakeAdapter)
-            .tools(ToolRegistry::new().with(EchoTool::default()))
+            .add_tool_source(ToolRegistry::new().with(EchoTool::default()))
             .permissions(AllowAllPermissions)
             .observer(RecordingObserver {
                 events: events.clone(),
@@ -4183,7 +3713,7 @@ mod tests {
                 session_id: SessionId::new("observer-session"),
                 metadata: MetadataMap::new(),
                 cache: None,
-            })
+            }, Vec::new())
             .await
             .unwrap();
 
@@ -4227,12 +3757,19 @@ mod tests {
         assert_eq!(items.len(), 4, "items: {items:?}");
         assert_eq!(items[0].kind, ItemKind::User);
         assert_eq!(items[1].kind, ItemKind::Assistant);
-        assert!(items[1].parts.iter().any(|p| matches!(p, Part::ToolCall(_))));
+        assert!(
+            items[1]
+                .parts
+                .iter()
+                .any(|p| matches!(p, Part::ToolCall(_)))
+        );
         assert_eq!(items[2].kind, ItemKind::Tool);
-        assert!(items[2]
-            .parts
-            .iter()
-            .any(|p| matches!(p, Part::ToolResult(_))));
+        assert!(
+            items[2]
+                .parts
+                .iter()
+                .any(|p| matches!(p, Part::ToolResult(_)))
+        );
         assert_eq!(items[3].kind, ItemKind::Assistant);
     }
 

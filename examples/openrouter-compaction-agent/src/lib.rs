@@ -114,17 +114,17 @@ pub async fn run_mode(
         .observer(observer.clone())
         .build()?;
 
+    let prompt = prompt.unwrap_or(DEFAULT_PROMPT).to_owned();
+    let seed_transcript = build_seed_transcript(mode, &prompt);
+
     let mut driver = agent
         .start(
             SessionConfig::new(format!("openrouter-compaction-agent-{mode}")).with_cache(
                 PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
             ),
+            seed_transcript.clone(),
         )
         .await?;
-
-    let prompt = prompt.unwrap_or(DEFAULT_PROMPT).to_owned();
-    let seed_transcript = build_seed_transcript(mode, &prompt);
-    driver.submit_input(seed_transcript.clone())?;
 
     let output = run_to_completion(&mut driver).await?;
     let snapshot = driver.snapshot();
@@ -256,8 +256,8 @@ fn build_seed_transcript(mode: ShowcaseMode, prompt: &str) -> Vec<Item> {
 
     match mode {
         ShowcaseMode::Structural => vec![
-            text_item(ItemKind::System, ROOT_SYSTEM_PROMPT),
-            text_item(
+            Item::text(ItemKind::System, ROOT_SYSTEM_PROMPT),
+            Item::text(
                 ItemKind::User,
                 "Start a release prep notebook for the spring launch.",
             ),
@@ -266,11 +266,11 @@ fn build_seed_transcript(mode: ShowcaseMode, prompt: &str) -> Vec<Item> {
                 "Notebook started. We are targeting the spring launch.",
             ),
             failed_tool_item("git status timed out while checking the release branch."),
-            text_item(
+            Item::text(
                 ItemKind::User,
                 "Record the sealed release codename for the final checklist.",
             ),
-            text_item(
+            Item::text(
                 ItemKind::Assistant,
                 &format!("Recorded. The sealed release codename is {secret}."),
             ),
@@ -278,52 +278,52 @@ fn build_seed_transcript(mode: ShowcaseMode, prompt: &str) -> Vec<Item> {
                 "I can expand on the checklist if needed.",
                 "The checklist currently covers packaging, QA sign-off, and staged rollout.",
             ),
-            text_item(
+            Item::text(
                 ItemKind::User,
                 "Note that deploys happen from /srv/releases/spring.",
             ),
-            text_item(
+            Item::text(
                 ItemKind::Assistant,
                 "Noted. Deploys happen from /srv/releases/spring.",
             ),
             failed_tool_item(
                 "dry-run packaging failed because the artifact bucket was unavailable.",
             ),
-            text_item(ItemKind::User, prompt),
+            Item::text(ItemKind::User, prompt),
         ],
         ShowcaseMode::Semantic => vec![
-            text_item(ItemKind::System, ROOT_SYSTEM_PROMPT),
-            text_item(
+            Item::text(ItemKind::System, ROOT_SYSTEM_PROMPT),
+            Item::text(
                 ItemKind::User,
                 "For the spring launch: the sealed release codename is GOLDFINCH-17 and deploys happen from /srv/releases/spring.",
             ),
-            text_item(
+            Item::text(
                 ItemKind::Assistant,
                 "Stored. I will preserve the codename and deployment path for future turns.",
             ),
-            text_item(ItemKind::User, "Reminder: QA sign-off is owned by Marta."),
-            text_item(ItemKind::Assistant, "Stored. Marta owns QA sign-off."),
-            text_item(
+            Item::text(ItemKind::User, "Reminder: QA sign-off is owned by Marta."),
+            Item::text(ItemKind::Assistant, "Stored. Marta owns QA sign-off."),
+            Item::text(
                 ItemKind::User,
                 "Reminder: staged rollout begins on Tuesday.",
             ),
-            text_item(
+            Item::text(
                 ItemKind::Assistant,
                 "Stored. Staged rollout begins on Tuesday.",
             ),
-            text_item(
+            Item::text(
                 ItemKind::User,
                 "Reminder: customer comms go out after QA sign-off.",
             ),
-            text_item(
+            Item::text(
                 ItemKind::Assistant,
                 "Stored. Customer comms go out after QA sign-off.",
             ),
-            text_item(ItemKind::User, prompt),
+            Item::text(ItemKind::User, prompt),
         ],
         ShowcaseMode::Hybrid => vec![
-            text_item(ItemKind::System, ROOT_SYSTEM_PROMPT),
-            text_item(
+            Item::text(ItemKind::System, ROOT_SYSTEM_PROMPT),
+            Item::text(
                 ItemKind::User,
                 "Archive this release memory: the sealed release codename is GOLDFINCH-17 and the rollback script lives at scripts/rollback-spring.sh.",
             ),
@@ -332,22 +332,22 @@ fn build_seed_transcript(mode: ShowcaseMode, prompt: &str) -> Vec<Item> {
                 "Stored. The release codename is GOLDFINCH-17 and the rollback script lives at scripts/rollback-spring.sh.",
             ),
             failed_tool_item("grep failed because the release notes file was missing."),
-            text_item(ItemKind::User, "Reminder: QA sign-off is owned by Marta."),
-            text_item(ItemKind::Assistant, "Stored. Marta owns QA sign-off."),
+            Item::text(ItemKind::User, "Reminder: QA sign-off is owned by Marta."),
+            Item::text(ItemKind::Assistant, "Stored. Marta owns QA sign-off."),
             assistant_with_reasoning(
                 "I should note rollout sequencing.",
                 "The staged rollout begins on Tuesday and customer comms follow QA sign-off.",
             ),
             failed_tool_item("ls failed because the artifact directory was not mounted."),
-            text_item(
+            Item::text(
                 ItemKind::User,
                 "Reminder: deploys happen from /srv/releases/spring.",
             ),
-            text_item(
+            Item::text(
                 ItemKind::Assistant,
                 "Stored. Deploys happen from /srv/releases/spring.",
             ),
-            text_item(ItemKind::User, prompt),
+            Item::text(ItemKind::User, prompt),
         ],
     }
 }
@@ -387,6 +387,9 @@ impl CompactionBackend for NestedLoopCompactionBackend {
             .build()
             .map_err(|error| agentkit_compaction::CompactionError::Failed(error.to_string()))?;
 
+        let mut metadata = MetadataMap::new();
+        metadata.insert("compaction_agent".into(), "nested-loop".into());
+
         let mut driver = agent
             .start(
                 SessionConfig::new(format!(
@@ -397,22 +400,16 @@ impl CompactionBackend for NestedLoopCompactionBackend {
                 .with_cache(
                     PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
                 ),
+                vec![
+                    Item::text(ItemKind::System, COMPACTION_SYSTEM_PROMPT),
+                    context_item("compaction transcript", &render_items(&request.items)),
+                    Item::text(
+                        ItemKind::User,
+                        "Compress the supplied transcript into a context note for future turns. Preserve exact identifiers and actionable facts. Return only the compacted note.",
+                    ),
+                ],
             )
             .await
-            .map_err(|error| agentkit_compaction::CompactionError::Failed(error.to_string()))?;
-
-        let mut metadata = MetadataMap::new();
-        metadata.insert("compaction_agent".into(), "nested-loop".into());
-
-        driver
-            .submit_input(vec![
-                text_item(ItemKind::System, COMPACTION_SYSTEM_PROMPT),
-                context_item("compaction transcript", &render_items(&request.items)),
-                text_item(
-                    ItemKind::User,
-                    "Compress the supplied transcript into a context note for future turns. Preserve exact identifiers and actionable facts. Return only the compacted note.",
-                ),
-            ])
             .map_err(|error| agentkit_compaction::CompactionError::Failed(error.to_string()))?;
 
         let summary = run_to_completion(&mut driver)
@@ -496,10 +493,6 @@ impl PermissionChecker for AllowAll {
     }
 }
 
-fn text_item(kind: ItemKind, text: &str) -> Item {
-    Item::text(kind, text)
-}
-
 fn context_item(title: &str, text: &str) -> Item {
     let mut metadata = MetadataMap::new();
     metadata.insert("title".into(), title.into());
@@ -540,11 +533,10 @@ where
         match driver.next().await? {
             LoopStep::Finished(result) => return Ok(collect_assistant_output(&result.items)),
             LoopStep::Interrupt(LoopInterrupt::AfterToolResult(_)) => continue,
-            LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(request)) => {
-                return Err(format!("unexpected approval request: {}", request.summary).into());
-            }
-            LoopStep::Interrupt(LoopInterrupt::AuthRequest(request)) => {
-                return Err(format!("unexpected auth request from {}", request.provider).into());
+            LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(pending)) => {
+                return Err(
+                    format!("unexpected approval request: {}", pending.request.summary).into(),
+                );
             }
             LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_)) => {
                 return Err("loop requested more input before finishing".into());

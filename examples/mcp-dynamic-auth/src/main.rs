@@ -9,9 +9,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use agentkit_core::MetadataMap;
 use agentkit_mcp::{
-    McpConnection, McpServerConfig, McpTransportBinding, StreamableHttpTransportConfig,
+    AuthOperation, AuthRequest, AuthResolution, McpConnection, McpServerConfig,
+    McpTransportBinding, StreamableHttpTransportConfig,
 };
-use agentkit_tools_core::{AuthOperation, AuthRequest, AuthResolution};
 use axum::Router;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -79,14 +79,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     connection
         .resolve_auth(AuthResolution::Provided {
-            request: AuthRequest::new(
-                "rotate-token",
-                "mcp.dynamic-auth",
-                AuthOperation::McpConnect {
+            request: AuthRequest {
+                id: "rotate-token".into(),
+                provider: "mcp.dynamic-auth".into(),
+                operation: AuthOperation::McpConnect {
                     server_id: "dynamic-auth".into(),
                     metadata: MetadataMap::new(),
                 },
-            ),
+                challenge: MetadataMap::new(),
+            },
             credentials,
         })
         .await?;

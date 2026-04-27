@@ -47,21 +47,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Only add the skill tool if skills were discovered.
     if skill_registry.has_skills() {
-        builder = builder.tools(skill_registry.tool_registry());
+        builder = builder.add_tool_source(skill_registry.tool_registry());
     }
 
     let agent = builder.build()?;
 
-    let mut driver = agent
-        .start(SessionConfig::new("openrouter-context-agent").with_cache(
-            PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
-        ))
-        .await?;
-
     let mut input = vec![system_item()];
     input.extend(context_items);
     input.push(user_item(&args.prompt));
-    driver.submit_input(input)?;
+
+    let mut driver = agent
+        .start(
+            SessionConfig::new("openrouter-context-agent").with_cache(
+                PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
+            ),
+            input,
+        )
+        .await?;
 
     run_to_completion(&mut driver).await
 }
@@ -128,11 +130,10 @@ where
                 return Ok(());
             }
             LoopStep::Interrupt(LoopInterrupt::AfterToolResult(_)) => continue,
-            LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(req)) => {
-                return Err(format!("unexpected approval request: {}", req.summary).into());
-            }
-            LoopStep::Interrupt(LoopInterrupt::AuthRequest(req)) => {
-                return Err(format!("unexpected auth request from {}", req.provider).into());
+            LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(pending)) => {
+                return Err(
+                    format!("unexpected approval request: {}", pending.request.summary).into(),
+                );
             }
             LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_)) => {
                 return Err("loop requested more input before finishing".into());

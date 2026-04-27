@@ -31,7 +31,7 @@ use std::sync::{Arc, Mutex};
 
 use agentkit_core::{CancellationController, Delta, Item, ItemKind, Part, Usage};
 use agentkit_loop::{
-    Agent, AgentEvent, LoopInterrupt, LoopObserver, LoopStep, PromptCacheRequest,
+    Agent, AgentEvent, InputRequest, LoopInterrupt, LoopObserver, LoopStep, PromptCacheRequest,
     PromptCacheRetention, SessionConfig,
 };
 use agentkit_provider_anthropic::{
@@ -76,52 +76,70 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .observer(StreamPrinter::new(Arc::clone(&usage_slot)))
         .build()?;
 
-    let mut driver = agent
-        .start(SessionConfig::new("anthropic-chat").with_cache(
-            PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
-        ))
-        .await?;
-
-    // Seed a system prompt up front so it lives at the top of the transcript
-    // for every turn (Anthropic lifts system items into the top-level `system`
-    // field of the request body).
-    if let Some(system) = &cli.system {
-        driver.submit_input(vec![Item::text(ItemKind::System, system.clone())])?;
-    }
-
     println!(
         "Type a prompt and press enter. Use /exit or /quit to leave, Ctrl-C to cancel the current turn."
     );
 
+    // Anthropic (and most chat providers) reject a system-prompt-only call,
+    // so the system message must travel with the first user message in the
+    // initial transcript. Read that user message before starting the session.
+    let Some(first_prompt) = read_prompt()? else {
+        return Ok(());
+    };
+
+    let mut transcript = Vec::new();
+    if let Some(system) = &cli.system {
+        transcript.push(Item::text(ItemKind::System, system.clone()));
+    }
+    transcript.push(Item::text(ItemKind::User, first_prompt));
+
+    let mut driver = agent
+        .start(
+            SessionConfig::new("anthropic-chat").with_cache(
+                PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
+            ),
+            transcript,
+        )
+        .await?;
+
+    loop {
+        usage_slot.lock().expect("usage slot poisoned").take();
+        turn_active.store(true, Ordering::SeqCst);
+        let result = run_turn(&mut driver, &usage_slot).await;
+        turn_active.store(false, Ordering::SeqCst);
+        let pending_input = result?;
+
+        let Some(prompt) = read_prompt()? else {
+            break;
+        };
+        pending_input.submit(&mut driver, vec![Item::text(ItemKind::User, prompt)])?;
+    }
+
+    Ok(())
+}
+
+/// Reads one non-empty prompt from stdin. Returns `Ok(None)` on EOF or on
+/// `/exit` / `/quit`; loops on empty lines so the user can hit enter without
+/// ending the session.
+fn read_prompt() -> Result<Option<String>, Box<dyn std::error::Error>> {
     let mut line = String::new();
     loop {
         print!("you> ");
         io::stdout().flush()?;
         line.clear();
-
         if io::stdin().read_line(&mut line)? == 0 {
             println!();
-            break;
+            return Ok(None);
         }
-
         let prompt = line.trim();
         if prompt.is_empty() {
             continue;
         }
         if prompt == "/exit" || prompt == "/quit" {
-            break;
+            return Ok(None);
         }
-
-        driver.submit_input(vec![Item::text(ItemKind::User, prompt)])?;
-        usage_slot.lock().expect("usage slot poisoned").take();
-
-        turn_active.store(true, Ordering::SeqCst);
-        let result = run_turn(&mut driver, &usage_slot).await;
-        turn_active.store(false, Ordering::SeqCst);
-        result?;
+        return Ok(Some(prompt.to_string()));
     }
-
-    Ok(())
 }
 
 fn spawn_signal_router(cancellation: CancellationController, turn_active: Arc<AtomicBool>) {
@@ -143,7 +161,7 @@ fn spawn_signal_router(cancellation: CancellationController, turn_active: Arc<At
 async fn run_turn<S>(
     driver: &mut agentkit_loop::LoopDriver<S>,
     usage_slot: &Arc<Mutex<Option<Usage>>>,
-) -> Result<(), Box<dyn std::error::Error>>
+) -> Result<InputRequest, Box<dyn std::error::Error>>
 where
     S: agentkit_loop::ModelSession,
 {
@@ -165,17 +183,12 @@ where
                 {
                     print_usage_footer(&usage);
                 }
-                return Ok(());
             }
             LoopStep::Interrupt(LoopInterrupt::AfterToolResult(_)) => continue,
-            LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_)) => return Ok(()),
-            LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(request)) => {
-                eprintln!("\n[approval required] {}", request.summary);
-                return Ok(());
-            }
-            LoopStep::Interrupt(LoopInterrupt::AuthRequest(request)) => {
-                eprintln!("\n[auth required] {}", request.provider);
-                return Ok(());
+            LoopStep::Interrupt(LoopInterrupt::AwaitingInput(req)) => return Ok(req),
+            LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(pending)) => {
+                eprintln!("\n[approval required] {}", pending.request.summary);
+                return Err("approval interrupt unhandled in anthropic-chat".into());
             }
         }
     }

@@ -496,7 +496,7 @@ async fn run_agent(
 
     let agent = Agent::builder()
         .model(adapter)
-        .tools(tools)
+        .add_tool_source(tools)
         .cancellation(cancellation.handle())
         .build()?;
 
@@ -507,15 +507,12 @@ async fn run_agent(
                     .with_retention(PromptCacheRetention::Short)
                     .with_key(prompt_cache_key(&model, &prompt)),
             ),
+            vec![
+                Item::text(ItemKind::System, system_prompt()),
+                Item::text(ItemKind::User, prompt),
+            ],
         )
         .await?;
-
-    driver
-        .submit_input(vec![
-            Item::text(ItemKind::System, system_prompt()),
-            Item::text(ItemKind::User, prompt),
-        ])
-        .map_err(|e| AgentError::Other(e.into()))?;
 
     loop {
         let step = driver.next().await;
@@ -532,7 +529,6 @@ async fn run_agent(
             }
             LoopStep::Interrupt(LoopInterrupt::AfterToolResult(_)) => continue,
             LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_)) => break,
-            LoopStep::Interrupt(LoopInterrupt::AuthRequest(_)) => break,
         }
     }
 

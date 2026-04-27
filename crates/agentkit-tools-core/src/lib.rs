@@ -13,8 +13,8 @@
 //! - **Check permissions** before execution using composable policies
 //!   ([`PathPolicy`], [`CommandPolicy`], [`McpServerPolicy`],
 //!   [`CustomKindPolicy`]).
-//! - **Handle interruptions** (approval prompts, OAuth flows) via the
-//!   [`ToolInterruption`] / [`ApprovalRequest`] / [`AuthRequest`] types.
+//! - **Handle interruptions** (approval prompts) via the
+//!   [`ToolInterruption`] / [`ApprovalRequest`] types.
 //! - **Bridge to the capability layer** with [`ToolCapabilityProvider`],
 //!   which wraps every registered tool as an [`Invocable`].
 
@@ -592,175 +592,16 @@ pub enum ApprovalDecision {
     },
 }
 
-/// A request for authentication credentials before a tool can proceed.
-///
-/// Emitted as [`ToolInterruption::AuthRequired`] when a tool (typically an
-/// MCP integration) needs OAuth tokens, API keys, or other credentials that
-/// the user must supply interactively.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AuthRequest {
-    /// Runtime task identifier associated with this auth request, if any.
-    pub task_id: Option<TaskId>,
-    /// Unique identifier for this auth challenge.
-    pub id: String,
-    /// Name of the authentication provider (e.g. `"github"`, `"google"`).
-    pub provider: String,
-    /// The operation that triggered the auth requirement.
-    pub operation: AuthOperation,
-    /// Provider-specific challenge data (e.g. OAuth URLs, scopes).
-    pub challenge: MetadataMap,
-}
-
-impl AuthRequest {
-    /// Builds an auth request with no task id and empty challenge metadata.
-    pub fn new(
-        id: impl Into<String>,
-        provider: impl Into<String>,
-        operation: AuthOperation,
-    ) -> Self {
-        Self {
-            task_id: None,
-            id: id.into(),
-            provider: provider.into(),
-            operation,
-            challenge: MetadataMap::new(),
-        }
-    }
-
-    /// Sets the associated task id.
-    pub fn with_task_id(mut self, task_id: impl Into<TaskId>) -> Self {
-        self.task_id = Some(task_id.into());
-        self
-    }
-
-    /// Replaces the auth challenge payload.
-    pub fn with_challenge(mut self, challenge: MetadataMap) -> Self {
-        self.challenge = challenge;
-        self
-    }
-}
-
-/// Describes the operation that triggered an [`AuthRequest`].
-///
-/// The agent loop can inspect this to decide how to present the auth
-/// challenge and where to deliver the resulting credentials.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum AuthOperation {
-    /// A local tool call that requires auth.
-    ToolCall {
-        tool_name: String,
-        input: Value,
-        call_id: Option<ToolCallId>,
-        session_id: Option<SessionId>,
-        turn_id: Option<TurnId>,
-        metadata: MetadataMap,
-    },
-    /// Connecting to an MCP server that requires auth.
-    McpConnect {
-        server_id: String,
-        metadata: MetadataMap,
-    },
-    /// Invoking a tool on an MCP server that requires auth.
-    McpToolCall {
-        server_id: String,
-        tool_name: String,
-        input: Value,
-        metadata: MetadataMap,
-    },
-    /// Reading a resource from an MCP server that requires auth.
-    McpResourceRead {
-        server_id: String,
-        resource_id: String,
-        metadata: MetadataMap,
-    },
-    /// Fetching a prompt from an MCP server that requires auth.
-    McpPromptGet {
-        server_id: String,
-        prompt_id: String,
-        args: Value,
-        metadata: MetadataMap,
-    },
-    /// An application-defined operation that requires auth.
-    Custom {
-        kind: String,
-        payload: Value,
-        metadata: MetadataMap,
-    },
-}
-
-impl AuthOperation {
-    /// Returns the MCP server ID if this operation targets one, or looks it
-    /// up in metadata for `ToolCall` and `Custom` variants.
-    pub fn server_id(&self) -> Option<&str> {
-        match self {
-            Self::McpConnect { server_id, .. }
-            | Self::McpToolCall { server_id, .. }
-            | Self::McpResourceRead { server_id, .. }
-            | Self::McpPromptGet { server_id, .. } => Some(server_id.as_str()),
-            Self::ToolCall { metadata, .. } | Self::Custom { metadata, .. } => {
-                metadata.get("server_id").and_then(Value::as_str)
-            }
-        }
-    }
-}
-
-/// The outcome of an [`AuthRequest`] after the user interacts with the auth flow.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum AuthResolution {
-    /// The user completed authentication and supplied credentials.
-    Provided {
-        /// The original auth request.
-        request: AuthRequest,
-        /// Credentials the user provided (tokens, keys, etc.).
-        credentials: MetadataMap,
-    },
-    /// The user cancelled the authentication flow.
-    Cancelled {
-        /// The original auth request that was cancelled.
-        request: AuthRequest,
-    },
-}
-
-impl AuthResolution {
-    /// Builds a successful auth resolution.
-    pub fn provided(request: AuthRequest, credentials: MetadataMap) -> Self {
-        Self::Provided {
-            request,
-            credentials,
-        }
-    }
-
-    /// Builds a cancelled auth resolution.
-    pub fn cancelled(request: AuthRequest) -> Self {
-        Self::Cancelled { request }
-    }
-
-    /// Returns a reference to the underlying [`AuthRequest`] regardless of
-    /// the resolution variant.
-    pub fn request(&self) -> &AuthRequest {
-        match self {
-            Self::Provided { request, .. } | Self::Cancelled { request } => request,
-        }
-    }
-}
-
-impl AuthRequest {
-    /// Convenience accessor that delegates to [`AuthOperation::server_id`].
-    pub fn server_id(&self) -> Option<&str> {
-        self.operation.server_id()
-    }
-}
-
 /// A tool execution was paused because it needs external input.
 ///
-/// The agent loop should handle the interruption (show a prompt, open an
-/// OAuth flow, etc.) and then re-submit the tool call.
+/// The agent loop should handle the interruption (show a prompt, etc.) and
+/// then re-submit the tool call. Source-specific interruptions (e.g. MCP
+/// auth challenges) do not surface here — they are resolved by responders
+/// registered with the source.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToolInterruption {
     /// The operation requires human approval before it can proceed.
     ApprovalRequired(ApprovalRequest),
-    /// The operation requires authentication credentials.
-    AuthRequired(AuthRequest),
 }
 
 /// The verdict from a [`PermissionChecker`] for a single [`PermissionRequest`].
@@ -1708,10 +1549,10 @@ pub trait Tool: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Return an appropriate [`ToolError`] variant on failure. Returning
-    /// [`ToolError::AuthRequired`] causes the executor to emit a
-    /// [`ToolInterruption::AuthRequired`] instead of treating it as a
-    /// hard failure.
+    /// Return an appropriate [`ToolError`] variant on failure. Source-specific
+    /// concerns such as MCP authentication are resolved internally by the
+    /// source (via host-supplied responders) and are not surfaced as tool
+    /// errors.
     async fn invoke(
         &self,
         request: ToolRequest,
@@ -1813,6 +1654,286 @@ impl ToolRegistry {
             .values()
             .filter_map(|tool| tool.current_spec())
             .collect()
+    }
+}
+
+/// Read-side contract for a federated tool catalog.
+///
+/// A [`BasicToolExecutor`] composes one or more `ToolSource`s — typically a
+/// frozen [`ToolRegistry`] of native tools alongside one or more
+/// [`CatalogReader`]s owned by subsystems (MCP server manager, skill watcher,
+/// plugin loader). Each source manages its own lifecycle and concurrency
+/// story; the executor only reads.
+pub trait ToolSource: Send + Sync {
+    /// Returns the current spec for every tool in this source.
+    fn specs(&self) -> Vec<ToolSpec>;
+
+    /// Looks up a tool by name, returning `None` if not present.
+    fn get(&self, name: &ToolName) -> Option<Arc<dyn Tool>>;
+
+    /// Drains pending catalog change events. Static sources return an empty
+    /// list; dynamic sources surface added/removed/changed batches that the
+    /// loop forwards to the model on the next turn.
+    fn drain_catalog_events(&self) -> Vec<ToolCatalogEvent> {
+        Vec::new()
+    }
+}
+
+impl ToolSource for ToolRegistry {
+    fn specs(&self) -> Vec<ToolSpec> {
+        ToolRegistry::specs(self)
+    }
+
+    fn get(&self, name: &ToolName) -> Option<Arc<dyn Tool>> {
+        ToolRegistry::get(self, name)
+    }
+}
+
+/// Catalog storage with poison-recovery encoded in the type. The wrapped
+/// `RwLock` is private; only [`read`](Self::read) and [`write`](Self::write)
+/// are exposed, both infallible. Recovery is safe because every callsite
+/// honors the invariant below.
+///
+/// **Invariant for callers:** write critical sections must compute all
+/// derived state — diffs, comparisons, anything that may run user code
+/// (`Tool` impls in particular) — BEFORE mutating the map. If a panic fires
+/// between two mutations in the same critical section, recovery would hand
+/// the next caller a partially-updated map. The current callsites all hold
+/// this: `upsert`/`remove` perform a single op with no user code;
+/// `replace_all` completes its diff (which calls `Tool::current_spec`)
+/// before the swap.
+///
+/// The `catalog_recovers_from_panicked_writer` test exercises the recovery
+/// path; if you change a write critical section, re-check that it still
+/// computes-then-mutates.
+struct ToolMap {
+    inner: std::sync::RwLock<BTreeMap<ToolName, Arc<dyn Tool>>>,
+}
+
+impl ToolMap {
+    fn new() -> Self {
+        Self {
+            inner: std::sync::RwLock::new(BTreeMap::new()),
+        }
+    }
+
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, BTreeMap<ToolName, Arc<dyn Tool>>> {
+        self.inner.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, BTreeMap<ToolName, Arc<dyn Tool>>> {
+        self.inner.write().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// Shared inner state of a dynamic catalog. Held by both [`CatalogWriter`]
+/// (mutates) and [`CatalogReader`] (reads), behind `Arc`s that hosts never see.
+struct DynamicCatalogInner {
+    source_id: String,
+    tools: ToolMap,
+    events_tx: tokio::sync::broadcast::Sender<ToolCatalogEvent>,
+}
+
+/// Constructs a fresh dynamic tool catalog as a writer/reader pair.
+///
+/// The writer mutates the catalog; the reader implements [`ToolSource`] and
+/// is what gets handed to an `Agent`. Both sides share storage internally —
+/// callers see only sized, owned values. Modeled on
+/// `tokio::sync::watch::channel`.
+///
+/// `source_id` appears as the `source` field on every emitted
+/// [`ToolCatalogEvent`].
+///
+/// ```
+/// use agentkit_tools_core::dynamic_catalog;
+///
+/// let (writer, reader) = dynamic_catalog("plugins");
+/// assert_eq!(writer.source_id(), "plugins");
+/// assert_eq!(reader.source_id(), "plugins");
+/// ```
+pub fn dynamic_catalog(source_id: impl Into<String>) -> (CatalogWriter, CatalogReader) {
+    let (events_tx, events_rx) = tokio::sync::broadcast::channel(128);
+    let inner = Arc::new(DynamicCatalogInner {
+        source_id: source_id.into(),
+        tools: ToolMap::new(),
+        events_tx,
+    });
+    (
+        CatalogWriter {
+            inner: Arc::clone(&inner),
+        },
+        CatalogReader {
+            inner,
+            events_rx: std::sync::Mutex::new(events_rx),
+        },
+    )
+}
+
+/// Mutating side of a dynamic tool catalog. Owned by subsystems that
+/// discover or refresh tools at runtime (MCP server manager, skill watcher,
+/// plugin loader). Each [`upsert`](Self::upsert), [`remove`](Self::remove),
+/// or [`replace_all`](Self::replace_all) emits a [`ToolCatalogEvent`] that
+/// every [`CatalogReader`] minted from the same [`dynamic_catalog`] call
+/// (or its clones) observes via [`ToolSource::drain_catalog_events`].
+pub struct CatalogWriter {
+    inner: Arc<DynamicCatalogInner>,
+}
+
+impl CatalogWriter {
+    /// Stable source identifier appearing on emitted catalog events.
+    pub fn source_id(&self) -> &str {
+        &self.inner.source_id
+    }
+
+    /// Mints an additional [`CatalogReader`] over the same shared state.
+    /// The new reader subscribes from now forward — it does not see events
+    /// emitted before this call.
+    pub fn reader(&self) -> CatalogReader {
+        CatalogReader {
+            inner: Arc::clone(&self.inner),
+            events_rx: std::sync::Mutex::new(self.inner.events_tx.subscribe()),
+        }
+    }
+
+    /// Inserts or replaces a tool. Emits a single-entry catalog event with
+    /// the tool's name in `added` (new) or `changed` (replaced).
+    pub fn upsert(&self, tool: Arc<dyn Tool>) {
+        let name = tool.spec().name.clone();
+        let mut guard = self.inner.tools.write();
+        let existed = guard.insert(name.clone(), tool).is_some();
+        drop(guard);
+        let mut event = ToolCatalogEvent::new(self.inner.source_id.clone());
+        if existed {
+            event.changed.push(name.0);
+        } else {
+            event.added.push(name.0);
+        }
+        let _ = self.inner.events_tx.send(event);
+    }
+
+    /// Removes a tool by name. Emits a catalog event with the name in
+    /// `removed` if it existed.
+    pub fn remove(&self, name: &ToolName) -> bool {
+        let mut guard = self.inner.tools.write();
+        let removed = guard.remove(name).is_some();
+        drop(guard);
+        if removed {
+            let mut event = ToolCatalogEvent::new(self.inner.source_id.clone());
+            event.removed.push(name.0.clone());
+            let _ = self.inner.events_tx.send(event);
+        }
+        removed
+    }
+
+    /// Atomically replaces the entire tool set. Emits one catalog event
+    /// describing the diff against the previous contents.
+    pub fn replace_all(&self, tools: impl IntoIterator<Item = Arc<dyn Tool>>) {
+        let new_map: BTreeMap<ToolName, Arc<dyn Tool>> = tools
+            .into_iter()
+            .map(|tool| (tool.spec().name.clone(), tool))
+            .collect();
+
+        let mut guard = self.inner.tools.write();
+        let mut event = ToolCatalogEvent::new(self.inner.source_id.clone());
+
+        for (name, new_tool) in new_map.iter() {
+            match guard.get(name) {
+                None => event.added.push(name.0.clone()),
+                Some(existing)
+                    if !Arc::ptr_eq(existing, new_tool)
+                        && existing.current_spec() != new_tool.current_spec() =>
+                {
+                    event.changed.push(name.0.clone());
+                }
+                Some(_) => {}
+            }
+        }
+        for name in guard.keys() {
+            if !new_map.contains_key(name) {
+                event.removed.push(name.0.clone());
+            }
+        }
+
+        *guard = new_map;
+        drop(guard);
+
+        if !event.added.is_empty() || !event.removed.is_empty() || !event.changed.is_empty() {
+            let _ = self.inner.events_tx.send(event);
+        }
+    }
+
+    /// Subscribes a fresh broadcast receiver. Lower-level than
+    /// [`CatalogReader`] — for hosts that consume catalog events directly
+    /// rather than through the loop.
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<ToolCatalogEvent> {
+        self.inner.events_tx.subscribe()
+    }
+}
+
+/// Read side of a dynamic tool catalog. Implements [`ToolSource`] and is the
+/// value handed to [`agentkit_loop::AgentBuilder::tools`]. Cloning subscribes
+/// a fresh broadcast receiver, so independent observers don't compete for
+/// catalog events.
+pub struct CatalogReader {
+    inner: Arc<DynamicCatalogInner>,
+    events_rx: std::sync::Mutex<tokio::sync::broadcast::Receiver<ToolCatalogEvent>>,
+}
+
+impl CatalogReader {
+    /// Stable source identifier appearing on emitted catalog events.
+    pub fn source_id(&self) -> &str {
+        &self.inner.source_id
+    }
+
+    /// Subscribes a fresh broadcast receiver — equivalent to
+    /// [`CatalogWriter::subscribe`].
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<ToolCatalogEvent> {
+        self.inner.events_tx.subscribe()
+    }
+}
+
+impl Clone for CatalogReader {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            events_rx: std::sync::Mutex::new(self.inner.events_tx.subscribe()),
+        }
+    }
+}
+
+impl ToolSource for CatalogReader {
+    fn specs(&self) -> Vec<ToolSpec> {
+        self.inner
+            .tools
+            .read()
+            .values()
+            .filter_map(|tool| tool.current_spec())
+            .collect()
+    }
+
+    fn get(&self, name: &ToolName) -> Option<Arc<dyn Tool>> {
+        self.inner.tools.read().get(name).cloned()
+    }
+
+    fn drain_catalog_events(&self) -> Vec<ToolCatalogEvent> {
+        // try_recv on a broadcast::Receiver has no panic source, so the only
+        // way this Mutex poisons is if a panic somehow originates outside the
+        // try_recv loop while held — recover defensively, the receiver state
+        // is independent of this lock.
+        let mut rx = self
+            .events_rx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut out = Vec::new();
+        loop {
+            match rx.try_recv() {
+                Ok(event) => out.push(event),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+            }
+        }
+        out
     }
 }
 
@@ -2077,33 +2198,6 @@ pub trait ToolExecutor: Send + Sync {
         self.execute_approved(request, approved_request, &mut borrowed)
             .await
     }
-
-    /// Re-executes a tool call that was previously interrupted for auth.
-    ///
-    /// The default implementation ignores the resolution and delegates to
-    /// [`execute`](ToolExecutor::execute), preserving compatibility for
-    /// executors that do not implement resumable authentication.
-    async fn execute_after_auth(
-        &self,
-        request: ToolRequest,
-        auth_resolution: &AuthResolution,
-        ctx: &mut ToolContext<'_>,
-    ) -> ToolExecutionOutcome {
-        let _ = auth_resolution;
-        self.execute(request, ctx).await
-    }
-
-    /// Re-executes a tool call after auth using an owned execution context.
-    async fn execute_after_auth_owned(
-        &self,
-        request: ToolRequest,
-        auth_resolution: &AuthResolution,
-        ctx: OwnedToolContext,
-    ) -> ToolExecutionOutcome {
-        let mut borrowed = ctx.borrowed();
-        self.execute_after_auth(request, auth_resolution, &mut borrowed)
-            .await
-    }
 }
 
 #[async_trait]
@@ -2137,44 +2231,88 @@ where
             .execute_approved(request, approved_request, ctx)
             .await
     }
-
-    async fn execute_after_auth(
-        &self,
-        request: ToolRequest,
-        auth_resolution: &AuthResolution,
-        ctx: &mut ToolContext<'_>,
-    ) -> ToolExecutionOutcome {
-        (**self)
-            .execute_after_auth(request, auth_resolution, ctx)
-            .await
-    }
 }
 
-/// The default [`ToolExecutor`] that looks up tools in a [`ToolRegistry`],
+/// Policy applied when the same tool name appears in more than one
+/// [`ToolSource`] of a [`BasicToolExecutor`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum CollisionPolicy {
+    /// First source wins (in iteration order). Subsequent definitions of
+    /// the same name are ignored.
+    #[default]
+    FirstWins,
+    /// Later sources overwrite earlier ones at lookup time.
+    LastWins,
+}
+
+/// The default [`ToolExecutor`] that walks one or more [`ToolSource`]s,
 /// checks permissions via [`Tool::proposed_requests`], and invokes the tool.
+///
+/// Compose static native tools (a frozen [`ToolRegistry`]) alongside
+/// dynamic sources (a [`CatalogReader`] minted by [`dynamic_catalog`] and
+/// owned by an MCP manager, skill watcher, plugin loader, etc.) without
+/// merging into a single mutable registry.
 ///
 /// # Example
 ///
 /// ```rust,no_run
-/// use agentkit_tools_core::{BasicToolExecutor, ToolRegistry};
+/// use std::sync::Arc;
+/// use agentkit_tools_core::{BasicToolExecutor, ToolRegistry, ToolSource};
 ///
-/// let registry = ToolRegistry::new();
-/// let executor = BasicToolExecutor::new(registry);
+/// let static_registry: Arc<dyn ToolSource> = Arc::new(ToolRegistry::new());
+/// let executor = BasicToolExecutor::new([static_registry]);
 /// // Pass `executor` to the agent loop.
 /// ```
 pub struct BasicToolExecutor {
-    registry: ToolRegistry,
+    sources: Vec<Arc<dyn ToolSource>>,
+    collision: CollisionPolicy,
 }
 
 impl BasicToolExecutor {
-    /// Creates an executor backed by the given registry.
-    pub fn new(registry: ToolRegistry) -> Self {
-        Self { registry }
+    /// Creates an executor that walks `sources` in order on every lookup.
+    pub fn new(sources: impl IntoIterator<Item = Arc<dyn ToolSource>>) -> Self {
+        Self {
+            sources: sources.into_iter().collect(),
+            collision: CollisionPolicy::default(),
+        }
     }
 
-    /// Returns the [`ToolSpec`] for every tool in the underlying registry.
+    /// Back-compat shorthand: wrap a single [`ToolRegistry`] as the only source.
+    pub fn from_registry(registry: ToolRegistry) -> Self {
+        Self::new([Arc::new(registry) as Arc<dyn ToolSource>])
+    }
+
+    /// Sets the collision policy applied when the same tool name appears in
+    /// multiple sources.
+    pub fn with_collision_policy(mut self, policy: CollisionPolicy) -> Self {
+        self.collision = policy;
+        self
+    }
+
+    /// Returns the [`ToolSpec`] for every tool across all sources, deduped
+    /// by [`CollisionPolicy`].
     pub fn specs(&self) -> Vec<ToolSpec> {
-        self.registry.specs()
+        let mut seen = BTreeSet::new();
+        let mut out = Vec::new();
+        let iter: Box<dyn Iterator<Item = &Arc<dyn ToolSource>>> = match self.collision {
+            CollisionPolicy::FirstWins => Box::new(self.sources.iter()),
+            CollisionPolicy::LastWins => Box::new(self.sources.iter().rev()),
+        };
+        for source in iter {
+            for spec in source.specs() {
+                if seen.insert(spec.name.clone()) {
+                    out.push(spec);
+                }
+            }
+        }
+        out
+    }
+
+    fn lookup(&self, name: &ToolName) -> Option<Arc<dyn Tool>> {
+        match self.collision {
+            CollisionPolicy::FirstWins => self.sources.iter().find_map(|s| s.get(name)),
+            CollisionPolicy::LastWins => self.sources.iter().rev().find_map(|s| s.get(name)),
+        }
     }
 
     async fn execute_inner(
@@ -2183,7 +2321,7 @@ impl BasicToolExecutor {
         approved_request_id: Option<&ApprovalId>,
         ctx: &mut ToolContext<'_>,
     ) -> ToolExecutionOutcome {
-        let Some(tool) = self.registry.get(&request.tool_name) else {
+        let Some(tool) = self.lookup(&request.tool_name) else {
             return ToolExecutionOutcome::Failed(ToolError::NotFound(request.tool_name));
         };
 
@@ -2213,9 +2351,6 @@ impl BasicToolExecutor {
 
         match tool.invoke(request, ctx).await {
             Ok(result) => ToolExecutionOutcome::Completed(result),
-            Err(ToolError::AuthRequired(request)) => {
-                ToolExecutionOutcome::Interrupted(ToolInterruption::AuthRequired(*request))
-            }
             Err(error) => ToolExecutionOutcome::Failed(error),
         }
     }
@@ -2224,7 +2359,14 @@ impl BasicToolExecutor {
 #[async_trait]
 impl ToolExecutor for BasicToolExecutor {
     fn specs(&self) -> Vec<ToolSpec> {
-        self.registry.specs()
+        BasicToolExecutor::specs(self)
+    }
+
+    fn drain_catalog_events(&self) -> Vec<ToolCatalogEvent> {
+        self.sources
+            .iter()
+            .flat_map(|s| s.drain_catalog_events())
+            .collect()
     }
 
     async fn execute(
@@ -2264,11 +2406,6 @@ pub enum ToolError {
     /// The tool ran but encountered a runtime error.
     #[error("tool execution failed: {0}")]
     ExecutionFailed(String),
-    /// The tool needs authentication credentials to proceed.
-    ///
-    /// The executor converts this into [`ToolInterruption::AuthRequired`].
-    #[error("tool auth required: {0:?}")]
-    AuthRequired(Box<AuthRequest>),
     /// The tool is temporarily unavailable.
     #[error("tool unavailable: {0}")]
     Unavailable(String),
@@ -2436,5 +2573,108 @@ mod tests {
         fn evaluate(&self, _request: &dyn PermissionRequest) -> PermissionDecision {
             PermissionDecision::Allow
         }
+    }
+
+    /// Tool whose `current_spec()` panics — used to exercise the
+    /// catalog's poison-recovery guarantee.
+    #[derive(Clone)]
+    struct PanickingSpecTool {
+        spec: ToolSpec,
+    }
+
+    impl PanickingSpecTool {
+        fn new(name: &str) -> Self {
+            Self {
+                spec: ToolSpec {
+                    name: ToolName::new(name),
+                    description: "panics on current_spec".into(),
+                    input_schema: json!({"type": "object"}),
+                    annotations: ToolAnnotations::default(),
+                    metadata: MetadataMap::new(),
+                },
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Tool for PanickingSpecTool {
+        fn spec(&self) -> &ToolSpec {
+            &self.spec
+        }
+
+        fn current_spec(&self) -> Option<ToolSpec> {
+            panic!("PanickingSpecTool::current_spec");
+        }
+
+        async fn invoke(
+            &self,
+            request: ToolRequest,
+            _ctx: &mut ToolContext<'_>,
+        ) -> Result<ToolResult, ToolError> {
+            Ok(ToolResult {
+                result: ToolResultPart {
+                    call_id: request.call_id,
+                    output: ToolOutput::Text("never".into()),
+                    is_error: false,
+                    metadata: MetadataMap::new(),
+                },
+                duration: None,
+                metadata: MetadataMap::new(),
+            })
+        }
+    }
+
+    /// If a tool's `current_spec()` panics during `replace_all`'s diff phase,
+    /// the inner `RwLock` would normally poison and brick the catalog forever.
+    /// `ToolMap` recovers from poison; this test pins the behavior so a future
+    /// patch can't accidentally reintroduce the brick.
+    ///
+    /// The recovery is only safe because `replace_all` computes the diff
+    /// (running user code) BEFORE swapping the map. If you change a write
+    /// critical section to mutate before/between user-code calls, this test
+    /// will still pass — but the catalog WILL be in a half-mutated state
+    /// after a panic. Re-read `ToolMap`'s invariant before changing.
+    #[test]
+    fn catalog_recovers_from_panicked_writer() {
+        let (writer, reader) = dynamic_catalog("test");
+
+        // Pre-seed with a panicker so the next `replace_all` enters the
+        // diff branch that calls `existing.current_spec()`. `upsert`
+        // itself never calls `current_spec`, so this insertion is safe.
+        writer.upsert(Arc::new(PanickingSpecTool::new("boom")));
+        let _ = reader.drain_catalog_events();
+
+        // `replace_all` with a different Arc of the same name forces the
+        // diff to call `existing.current_spec()` → panics. The swap has
+        // NOT happened yet at this point (the diff runs before the
+        // `*guard = new_map`), so the catalog state is still consistent.
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            writer.replace_all(vec![Arc::new(PanickingSpecTool::new("boom")) as Arc<dyn Tool>]);
+        }));
+        assert!(
+            panic_result.is_err(),
+            "PanickingSpecTool::current_spec must propagate"
+        );
+
+        // Without recovery, every subsequent lock acquisition would panic
+        // with "dynamic catalog poisoned". `get` doesn't call `current_spec`,
+        // so it's a clean probe of whether the lock recovered.
+        assert!(
+            reader.get(&ToolName::new("boom")).is_some(),
+            "catalog still readable after poisoning panic"
+        );
+
+        // Writes also recover. Remove the panicker so subsequent `specs()`
+        // calls don't re-trigger its panic.
+        assert!(writer.remove(&ToolName::new("boom")));
+
+        // Add a well-behaved tool and round-trip through both sides.
+        // (HiddenTool::current_spec returns None, so it's intentionally
+        // filtered out of specs() — probe via get() instead.)
+        writer.upsert(Arc::new(HiddenTool::new()));
+        assert!(
+            reader.get(&ToolName::new("hidden")).is_some(),
+            "catalog usable for further writes + reads"
+        );
     }
 }

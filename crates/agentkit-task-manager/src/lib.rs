@@ -7,8 +7,7 @@ use agentkit_core::{
     Item, MetadataMap, TaskId, ToolCallId, ToolResultPart, TurnCancellation, TurnId,
 };
 use agentkit_tools_core::{
-    ApprovalRequest, AuthRequest, AuthResolution, OwnedToolContext, ToolError,
-    ToolExecutionOutcome, ToolExecutor, ToolRequest,
+    ApprovalRequest, OwnedToolContext, ToolError, ToolExecutionOutcome, ToolExecutor, ToolRequest,
 };
 use async_trait::async_trait;
 use thiserror::Error;
@@ -61,17 +60,9 @@ pub struct TaskApproval {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct TaskAuth {
-    pub task_id: TaskId,
-    pub tool_request: ToolRequest,
-    pub auth: AuthRequest,
-}
-
-#[derive(Clone, Debug, PartialEq)]
 pub enum TaskResolution {
     Item(Item),
     Approval(TaskApproval),
-    Auth(TaskAuth),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -91,8 +82,8 @@ pub struct PendingLoopUpdates {
     pub resolutions: VecDeque<TaskResolution>,
 }
 
-/// How a task should be invoked. Mutually exclusive between plain execution,
-/// resuming after approval, and resuming after auth.
+/// How a task should be invoked. Mutually exclusive between plain execution
+/// and resuming after approval.
 #[derive(Clone, Debug, Default)]
 pub enum TaskLaunchKind {
     /// Execute the tool with the active permission policy.
@@ -100,8 +91,6 @@ pub enum TaskLaunchKind {
     Plain,
     /// Re-execute a previously-interrupted call after the user approved it.
     Approved(ApprovalRequest),
-    /// Re-execute a previously-interrupted call after auth was resolved.
-    AfterAuth(AuthResolution),
 }
 
 #[derive(Clone, Debug)]
@@ -131,19 +120,6 @@ impl TaskLaunchRequest {
             task_id,
             request,
             kind: TaskLaunchKind::Approved(approval),
-        }
-    }
-
-    /// Resume after auth was resolved.
-    pub fn after_auth(
-        task_id: Option<TaskId>,
-        request: ToolRequest,
-        resolution: AuthResolution,
-    ) -> Self {
-        Self {
-            task_id,
-            request,
-            kind: TaskLaunchKind::AfterAuth(resolution),
         }
     }
 }
@@ -309,15 +285,6 @@ impl TaskManager for SimpleTaskManager {
             .clone()
             .unwrap_or_else(|| self.state.next_task_id());
         let outcome = match &request.kind {
-            TaskLaunchKind::AfterAuth(auth_resolution) => {
-                ctx.executor
-                    .execute_after_auth_owned(
-                        request.request.clone(),
-                        auth_resolution,
-                        ctx.tool_context,
-                    )
-                    .await
-            }
             TaskLaunchKind::Approved(approved) => {
                 ctx.executor
                     .execute_approved_owned(request.request.clone(), approved, ctx.tool_context)
@@ -575,11 +542,6 @@ impl TaskManager for AsyncTaskManager {
             }
 
             let outcome = match &kind {
-                TaskLaunchKind::AfterAuth(auth_resolution) => {
-                    executor
-                        .execute_after_auth_owned(exec_request.clone(), auth_resolution, owned_ctx)
-                        .await
-                }
                 TaskLaunchKind::Approved(approval) => {
                     executor
                         .execute_approved_owned(exec_request.clone(), approval, owned_ctx)
@@ -599,7 +561,7 @@ impl TaskManager for AsyncTaskManager {
                     agentkit_core::Part::ToolResult(result) => Some(result.clone()),
                     _ => None,
                 }),
-                TaskResolution::Approval(_) | TaskResolution::Auth(_) => None,
+                TaskResolution::Approval(_) => None,
             };
 
             let (snapshot, should_request_continue) = {
@@ -631,15 +593,13 @@ impl TaskManager for AsyncTaskManager {
                         TaskResolution::Item(_) if delivery_mode == DeliveryMode::ToLoop => {
                             state.pending_loop_updates.push_back(resolution.clone());
                         }
-                        TaskResolution::Approval(_) | TaskResolution::Auth(_)
-                            if delivery_mode == DeliveryMode::ToLoop =>
-                        {
+                        TaskResolution::Approval(_) if delivery_mode == DeliveryMode::ToLoop => {
                             state.pending_loop_updates.push_back(resolution.clone());
                         }
                         TaskResolution::Item(item) => {
                             state.manual_ready_items.push(item.clone());
                         }
-                        TaskResolution::Approval(_) | TaskResolution::Auth(_) => {}
+                        TaskResolution::Approval(_) => {}
                     }
                 }
 
@@ -871,17 +831,6 @@ fn map_outcome_to_resolution(
                 task_id,
                 tool_request: request,
                 approval,
-            })
-        }
-        ToolExecutionOutcome::Interrupted(agentkit_tools_core::ToolInterruption::AuthRequired(
-            mut auth,
-        )) => {
-            let task_id = task_id.unwrap_or_default();
-            auth.task_id = Some(task_id.clone());
-            TaskResolution::Auth(TaskAuth {
-                task_id,
-                tool_request: request,
-                auth,
             })
         }
         ToolExecutionOutcome::Failed(error) => TaskResolution::Item(Item {
