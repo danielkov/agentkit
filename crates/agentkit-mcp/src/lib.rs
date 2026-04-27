@@ -2081,6 +2081,7 @@ impl McpServerManager {
             Some(handle) => handle.connection.clone(),
             None => return,
         };
+        let previous = self.server_tools.remove(server_id).unwrap_or_default();
         let mut names = BTreeSet::new();
         for tool in &snapshot.tools {
             let adapter = McpToolAdapter::with_namespace(
@@ -2091,6 +2092,9 @@ impl McpServerManager {
             );
             names.insert(adapter.spec().name.clone());
             self.catalog_writer.upsert(Arc::new(adapter));
+        }
+        for stale in previous.difference(&names) {
+            self.catalog_writer.remove(stale);
         }
         self.server_tools.insert(server_id.clone(), names);
     }
