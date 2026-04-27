@@ -28,7 +28,9 @@ use agentkit_core::{
     CancellationController, Delta, FinishReason, Item, ItemKind, Part, ToolCallId, ToolOutput,
     ToolResultPart, Usage,
 };
-use agentkit_loop::{Agent, AgentEvent, LoopInterrupt, LoopObserver, LoopStep, SessionConfig};
+use agentkit_loop::{
+    Agent, AgentEvent, InputRequest, LoopInterrupt, LoopObserver, LoopStep, SessionConfig,
+};
 use agentkit_provider_cerebras::{
     CerebrasAdapter, CerebrasConfig, CompressionConfig, OutputFormat, Prediction, QueueThreshold,
     RateLimitSnapshot, ReasoningConfig, ReasoningEffort, ReasoningFormat, RequestEncoding,
@@ -67,72 +69,108 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let last_usage: Arc<Mutex<Option<Usage>>> = Arc::new(Mutex::new(None));
 
     let streaming = config.streaming;
-    let mut driver = start_session(
-        &adapter,
-        &registry,
-        &cancellation,
-        streaming,
-        &usage_slot,
-        &last_usage,
-        cli.system.as_deref(),
-    )
-    .await?;
 
     println!(
         "Type a prompt and press enter. Slash: /show /usage /ratelimit /headers /models /reset /new /quit. Ctrl-C cancels in-flight turn."
     );
 
+    // Outer loop: one iteration per session. /reset breaks back to here.
+    'session: loop {
+        // Read prompts until we have a real user message to seed the
+        // session with. Slash commands handled inline; /reset on an
+        // empty session is a no-op (already a fresh session).
+        let first = loop {
+            match read_input(&config, &adapter, &last_usage).await? {
+                ReadResult::Quit => return Ok(()),
+                ReadResult::Reset => continue,
+                ReadResult::Prompt(p) => break p,
+            }
+        };
+
+        // Cerebras (like other chat providers) rejects a system-prompt-only
+        // call. Bundle the system message with the first user message in the
+        // initial transcript so the first model call has both.
+        let mut transcript = Vec::new();
+        if let Some(system) = cli.system.as_deref() {
+            transcript.push(Item::text(ItemKind::System, system.to_string()));
+        }
+        transcript.push(Item::text(ItemKind::User, first));
+
+        let mut driver = start_session(
+            &adapter,
+            &registry,
+            &cancellation,
+            streaming,
+            &usage_slot,
+            &last_usage,
+            transcript,
+        )
+        .await?;
+
+        // Inner loop: run turns until /reset or /quit.
+        loop {
+            usage_slot.lock().expect("usage slot poisoned").take();
+            turn_active.store(true, Ordering::SeqCst);
+            let result = run_turn(&mut driver, &usage_slot, &last_usage).await;
+            turn_active.store(false, Ordering::SeqCst);
+            let pending_input = result?;
+
+            match read_input(&config, &adapter, &last_usage).await? {
+                ReadResult::Quit => return Ok(()),
+                ReadResult::Reset => {
+                    println!("[session reset]");
+                    continue 'session;
+                }
+                ReadResult::Prompt(p) => {
+                    pending_input.submit(&mut driver, vec![Item::text(ItemKind::User, p)])?;
+                }
+            }
+        }
+    }
+}
+
+enum ReadResult {
+    Prompt(String),
+    Reset,
+    Quit,
+}
+
+/// Reads from stdin, handling slash commands inline. Returns when the user
+/// has typed a real prompt, requested a reset, or asked to quit.
+async fn read_input(
+    config: &CerebrasConfig,
+    adapter: &CerebrasAdapter,
+    last_usage: &Arc<Mutex<Option<Usage>>>,
+) -> Result<ReadResult, Box<dyn std::error::Error>> {
     let stdin = io::stdin();
     let mut line = String::new();
-
     loop {
         print!("you> ");
         io::stdout().flush()?;
         line.clear();
         if stdin.read_line(&mut line)? == 0 {
             println!();
-            break;
+            return Ok(ReadResult::Quit);
         }
         let raw = line.trim();
         if raw.is_empty() {
             continue;
         }
         if raw == "/exit" || raw == "/quit" {
-            break;
+            return Ok(ReadResult::Quit);
         }
         if let Some(rest) = raw.strip_prefix('/') {
-            match handle_slash(rest, &config, &adapter, &last_usage).await {
+            match handle_slash(rest, config, adapter, last_usage).await {
                 SlashOutcome::Handled => continue,
                 SlashOutcome::Unknown => {
                     eprintln!("unknown command: /{rest}");
                     continue;
                 }
-                SlashOutcome::Reset => {
-                    driver = start_session(
-                        &adapter,
-                        &registry,
-                        &cancellation,
-                        streaming,
-                        &usage_slot,
-                        &last_usage,
-                        cli.system.as_deref(),
-                    )
-                    .await?;
-                    println!("[session reset]");
-                    continue;
-                }
+                SlashOutcome::Reset => return Ok(ReadResult::Reset),
             }
         }
-
-        driver.submit_input(vec![Item::text(ItemKind::User, raw)])?;
-        usage_slot.lock().expect("usage slot poisoned").take();
-        turn_active.store(true, Ordering::SeqCst);
-        let result = run_turn(&mut driver, &usage_slot, &last_usage).await;
-        turn_active.store(false, Ordering::SeqCst);
-        result?;
+        return Ok(ReadResult::Prompt(raw.to_string()));
     }
-
-    Ok(())
 }
 
 async fn start_session(
@@ -142,7 +180,7 @@ async fn start_session(
     streaming: bool,
     usage_slot: &Arc<Mutex<Option<Usage>>>,
     last_usage: &Arc<Mutex<Option<Usage>>>,
-    system: Option<&str>,
+    transcript: Vec<Item>,
 ) -> Result<
     agentkit_loop::LoopDriver<agentkit_provider_cerebras::CerebrasSession>,
     Box<dyn std::error::Error>,
@@ -150,17 +188,16 @@ async fn start_session(
     let agent = Agent::builder()
         .model(adapter.clone())
         .cancellation(cancellation.handle())
-        .tools(registry.clone())
+        .add_tool_source(registry.clone())
         .observer(StreamPrinter::new(
             streaming,
             Arc::clone(usage_slot),
             Arc::clone(last_usage),
         ))
         .build()?;
-    let mut driver = agent.start(SessionConfig::new("cerebras-chat")).await?;
-    if let Some(system) = system {
-        driver.submit_input(vec![Item::text(ItemKind::System, system.to_string())])?;
-    }
+    let driver = agent
+        .start(SessionConfig::new("cerebras-chat"), transcript)
+        .await?;
     Ok(driver)
 }
 
@@ -184,7 +221,7 @@ async fn run_turn<S>(
     driver: &mut agentkit_loop::LoopDriver<S>,
     usage_slot: &Arc<Mutex<Option<Usage>>>,
     last_usage: &Arc<Mutex<Option<Usage>>>,
-) -> Result<(), Box<dyn std::error::Error>>
+) -> Result<InputRequest, Box<dyn std::error::Error>>
 where
     S: agentkit_loop::ModelSession,
 {
@@ -206,17 +243,12 @@ where
                     print_usage_footer(&usage);
                     *last_usage.lock().expect("last usage poisoned") = Some(usage);
                 }
-                return Ok(());
             }
             LoopStep::Interrupt(LoopInterrupt::AfterToolResult(_)) => continue,
-            LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_)) => return Ok(()),
-            LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(request)) => {
-                eprintln!("\n[approval required] {}", request.summary);
-                return Ok(());
-            }
-            LoopStep::Interrupt(LoopInterrupt::AuthRequest(request)) => {
-                eprintln!("\n[auth required] {}", request.provider);
-                return Ok(());
+            LoopStep::Interrupt(LoopInterrupt::AwaitingInput(req)) => return Ok(req),
+            LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(pending)) => {
+                eprintln!("\n[approval required] {}", pending.request.summary);
+                return Err("approval interrupt unhandled in cerebras-chat".into());
             }
         }
     }

@@ -1328,7 +1328,7 @@ mod tests {
         let session_id = SessionId::new("session-1");
         let turn_id = TurnId::new("turn-1");
 
-        let executor = BasicToolExecutor::new(registry());
+        let executor = BasicToolExecutor::from_registry(registry());
         let metadata = MetadataMap::new();
         let mut ctx = tool_context(&session_id, &turn_id, &metadata, &());
 
@@ -1387,7 +1387,7 @@ mod tests {
         let session_id = SessionId::new("session-2");
         let turn_id = TurnId::new("turn-2");
         let metadata = MetadataMap::new();
-        let executor = BasicToolExecutor::new(registry());
+        let executor = BasicToolExecutor::from_registry(registry());
         let mut ctx = tool_context(&session_id, &turn_id, &metadata, &resources);
 
         let denied_edit = executor

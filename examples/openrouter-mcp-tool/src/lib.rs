@@ -59,20 +59,21 @@ pub async fn run_probe_with_command(
 
     let agent = Agent::builder()
         .model(adapter)
-        .tools(manager.tool_registry())
+        .add_tool_source(manager.source())
         .observer(observer.clone())
         .build()?;
 
     let mut driver = agent
-        .start(SessionConfig::new("openrouter-mcp-tool").with_cache(
-            PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
-        ))
+        .start(
+            SessionConfig::new("openrouter-mcp-tool").with_cache(
+                PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
+            ),
+            vec![
+                Item::text(ItemKind::System, ROOT_SYSTEM_PROMPT),
+                Item::text(ItemKind::User, prompt.unwrap_or(DEFAULT_PROMPT)),
+            ],
+        )
         .await?;
-
-    driver.submit_input(vec![
-        text_item(ItemKind::System, ROOT_SYSTEM_PROMPT),
-        text_item(ItemKind::User, prompt.unwrap_or(DEFAULT_PROMPT)),
-    ])?;
 
     let output = run_to_completion(&mut driver).await?;
     manager.disconnect_server(&McpServerId::new("mock")).await?;
@@ -239,10 +240,6 @@ impl LoopObserver for RecordingObserver {
     }
 }
 
-fn text_item(kind: ItemKind, text: &str) -> Item {
-    Item::text(kind, text)
-}
-
 async fn run_to_completion<S>(
     driver: &mut agentkit_loop::LoopDriver<S>,
 ) -> Result<String, Box<dyn Error>>
@@ -253,11 +250,10 @@ where
         match driver.next().await? {
             LoopStep::Finished(result) => return Ok(collect_assistant_output(&result.items)),
             LoopStep::Interrupt(LoopInterrupt::AfterToolResult(_)) => continue,
-            LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(request)) => {
-                return Err(format!("unexpected approval request: {}", request.summary).into());
-            }
-            LoopStep::Interrupt(LoopInterrupt::AuthRequest(request)) => {
-                return Err(format!("unexpected auth request from {}", request.provider).into());
+            LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(pending)) => {
+                return Err(
+                    format!("unexpected approval request: {}", pending.request.summary).into(),
+                );
             }
             LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_)) => {
                 return Err("loop requested more input before finishing".into());

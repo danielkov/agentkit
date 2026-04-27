@@ -43,21 +43,22 @@ pub async fn run_probe(secret: &str, prompt: Option<&str>) -> Result<ProbeRun, B
 
     let agent = Agent::builder()
         .model(adapter)
-        .tools(tools)
+        .add_tool_source(tools)
         .permissions(AllowAll)
         .observer(observer.clone())
         .build()?;
 
     let mut driver = agent
-        .start(SessionConfig::new("openrouter-subagent-tool").with_cache(
-            PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
-        ))
+        .start(
+            SessionConfig::new("openrouter-subagent-tool").with_cache(
+                PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
+            ),
+            vec![
+                Item::text(ItemKind::System, ROOT_SYSTEM_PROMPT),
+                Item::text(ItemKind::User, prompt.unwrap_or(DEFAULT_PROMPT)),
+            ],
+        )
         .await?;
-
-    driver.submit_input(vec![
-        text_item(ItemKind::System, ROOT_SYSTEM_PROMPT),
-        text_item(ItemKind::User, prompt.unwrap_or(DEFAULT_PROMPT)),
-    ])?;
 
     let output = run_to_completion(&mut driver).await?;
 
@@ -174,15 +175,12 @@ impl Tool for SubagentTool {
                 .with_cache(
                     PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
                 ),
+                vec![
+                    Item::text(ItemKind::System, &self.system_prompt_template),
+                    Item::text(ItemKind::User, &input.prompt),
+                ],
             )
             .await
-            .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
-
-        driver
-            .submit_input(vec![
-                text_item(ItemKind::System, &self.system_prompt_template),
-                text_item(ItemKind::User, &input.prompt),
-            ])
             .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
 
         let output = run_to_completion(&mut driver)
@@ -196,10 +194,6 @@ impl Tool for SubagentTool {
     }
 }
 
-fn text_item(kind: ItemKind, text: &str) -> Item {
-    Item::text(kind, text)
-}
-
 async fn run_to_completion<S>(
     driver: &mut agentkit_loop::LoopDriver<S>,
 ) -> Result<String, Box<dyn Error>>
@@ -210,11 +204,10 @@ where
         match driver.next().await? {
             LoopStep::Finished(result) => return Ok(collect_assistant_output(&result.items)),
             LoopStep::Interrupt(LoopInterrupt::AfterToolResult(_)) => continue,
-            LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(request)) => {
-                return Err(format!("unexpected approval request: {}", request.summary).into());
-            }
-            LoopStep::Interrupt(LoopInterrupt::AuthRequest(request)) => {
-                return Err(format!("unexpected auth request from {}", request.provider).into());
+            LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(pending)) => {
+                return Err(
+                    format!("unexpected approval request: {}", pending.request.summary).into(),
+                );
             }
             LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_)) => {
                 return Err("loop requested more input before finishing".into());

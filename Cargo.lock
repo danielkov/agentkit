@@ -114,6 +114,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentkit-integration-tests"
+version = "0.4.0"
+dependencies = [
+ "agentkit-capabilities",
+ "agentkit-core",
+ "agentkit-loop",
+ "agentkit-mcp",
+ "agentkit-tools-core",
+ "async-trait",
+ "axum",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "agentkit-loop"
 version = "0.4.0"
 dependencies = [
@@ -353,6 +370,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]

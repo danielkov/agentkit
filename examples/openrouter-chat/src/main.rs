@@ -2,7 +2,8 @@ use std::io::{self, Write};
 
 use agentkit_core::{CancellationController, Item, ItemKind, Part};
 use agentkit_loop::{
-    Agent, LoopInterrupt, LoopStep, PromptCacheRequest, PromptCacheRetention, SessionConfig,
+    Agent, InputRequest, LoopInterrupt, LoopStep, PromptCacheRequest, PromptCacheRetention,
+    SessionConfig,
 };
 use agentkit_provider_openrouter::{OpenRouterAdapter, OpenRouterConfig};
 
@@ -16,77 +17,78 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .model(adapter)
         .cancellation(cancellation.handle())
         .build()?;
-    let mut driver = agent
-        .start(SessionConfig::new("openrouter-chat").with_cache(
-            PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
-        ))
-        .await?;
 
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.is_empty() {
+
+    // Defer `start()` until we have a real first user message: most chat
+    // providers reject system-prompt-only calls, so the first user message
+    // travels with the initial transcript handed to `start()`.
+    let (first_prompt, run_repl) = if args.is_empty() {
         println!("openrouter-chat");
         println!(
             "Type a prompt and press enter. Use /exit to quit. Press Ctrl-C to cancel the current turn."
         );
-        repl(&mut driver, cancellation).await?;
+        let Some(prompt) = read_prompt()? else {
+            return Ok(());
+        };
+        (prompt, true)
     } else {
-        let prompt = args.join(" ");
-        submit_user_prompt(&mut driver, &prompt)?;
-        run_turn(&mut driver, &cancellation).await?;
+        (args.join(" "), false)
+    };
+
+    let mut driver = agent
+        .start(
+            SessionConfig::new("openrouter-chat").with_cache(
+                PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
+            ),
+            vec![Item::text(ItemKind::User, first_prompt)],
+        )
+        .await?;
+
+    let mut pending = run_turn(&mut driver, &cancellation).await?;
+
+    if !run_repl {
+        return Ok(());
+    }
+
+    loop {
+        let Some(prompt) = read_prompt()? else {
+            break;
+        };
+        pending.submit(&mut driver, vec![Item::text(ItemKind::User, prompt)])?;
+        pending = run_turn(&mut driver, &cancellation).await?;
     }
 
     Ok(())
 }
 
-async fn repl<S>(
-    driver: &mut agentkit_loop::LoopDriver<S>,
-    cancellation: CancellationController,
-) -> Result<(), Box<dyn std::error::Error>>
-where
-    S: agentkit_loop::ModelSession,
-{
+/// Reads one non-empty prompt from stdin. Returns `Ok(None)` on EOF or on
+/// `/exit` / `/quit`; loops on empty lines so the user can hit enter without
+/// ending the session.
+fn read_prompt() -> Result<Option<String>, Box<dyn std::error::Error>> {
     let mut line = String::new();
-
     loop {
         print!("you> ");
         io::stdout().flush()?;
         line.clear();
-
         if io::stdin().read_line(&mut line)? == 0 {
-            break;
+            return Ok(None);
         }
-
         let prompt = line.trim();
         if prompt.is_empty() {
             continue;
         }
         if prompt == "/exit" || prompt == "/quit" {
-            break;
+            return Ok(None);
         }
-
-        submit_user_prompt(driver, prompt)?;
-        run_turn(driver, &cancellation).await?;
+        return Ok(Some(prompt.to_string()));
     }
-
-    Ok(())
-}
-
-fn submit_user_prompt<S>(
-    driver: &mut agentkit_loop::LoopDriver<S>,
-    prompt: &str,
-) -> Result<(), Box<dyn std::error::Error>>
-where
-    S: agentkit_loop::ModelSession,
-{
-    driver.submit_input(vec![Item::text(ItemKind::User, prompt)])?;
-
-    Ok(())
 }
 
 async fn run_turn<S>(
     driver: &mut agentkit_loop::LoopDriver<S>,
     cancellation: &CancellationController,
-) -> Result<(), Box<dyn std::error::Error>>
+) -> Result<InputRequest, Box<dyn std::error::Error>>
 where
     S: agentkit_loop::ModelSession,
 {
@@ -96,39 +98,30 @@ where
         interrupt.interrupt();
     });
 
-    let result = loop {
-        match driver.next().await {
-            Ok(LoopStep::Interrupt(LoopInterrupt::AfterToolResult(_))) => continue,
-            step => break step,
+    let request = loop {
+        match driver.next().await? {
+            LoopStep::Finished(result) => {
+                if result.finish_reason == agentkit_core::FinishReason::Cancelled {
+                    eprintln!("turn cancelled");
+                }
+                for item in result.items {
+                    if item.kind != ItemKind::Assistant {
+                        continue;
+                    }
+                    render_assistant_item(item.parts);
+                }
+            }
+            LoopStep::Interrupt(LoopInterrupt::AfterToolResult(_)) => continue,
+            LoopStep::Interrupt(LoopInterrupt::AwaitingInput(req)) => break req,
+            LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(pending)) => {
+                ctrl_c.abort();
+                eprintln!("\n[approval required] {}", pending.request.summary);
+                return Err("approval interrupt unhandled in openrouter-chat".into());
+            }
         }
     };
     ctrl_c.abort();
-
-    match result? {
-        LoopStep::Finished(result) => {
-            if result.finish_reason == agentkit_core::FinishReason::Cancelled {
-                eprintln!("turn cancelled");
-            }
-            for item in result.items {
-                if item.kind != ItemKind::Assistant {
-                    continue;
-                }
-
-                render_assistant_item(item.parts);
-            }
-            Ok(())
-        }
-        LoopStep::Interrupt(LoopInterrupt::AfterToolResult(_)) => unreachable!(),
-        LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_)) => Ok(()),
-        LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(request)) => {
-            eprintln!("approval required: {}", request.summary);
-            Ok(())
-        }
-        LoopStep::Interrupt(LoopInterrupt::AuthRequest(request)) => {
-            eprintln!("auth required: {}", request.provider);
-            Ok(())
-        }
-    }
+    Ok(request)
 }
 
 fn render_assistant_item(parts: Vec<Part>) {

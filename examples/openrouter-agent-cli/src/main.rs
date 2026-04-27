@@ -20,7 +20,7 @@ use agentkit_reporting::{CompositeReporter, StdoutReporter};
 use agentkit_tool_skills::SkillRegistry;
 use agentkit_tools_core::{
     CommandPolicy, CompositePermissionChecker, PathPolicy, PermissionCode, PermissionDecision,
-    PermissionDenial, ToolRegistry,
+    PermissionDenial,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -70,10 +70,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let reporter =
         CompositeReporter::new().with_observer(StdoutReporter::new(io::stderr()).with_usage(false));
 
-    let mut tools = ToolRegistry::new();
-    merge_registry(&mut tools, agentkit_tool_fs::registry());
-    merge_registry(&mut tools, agentkit_tool_shell::registry());
-    skill_registry.register_tool(&mut tools);
+    let tools = agentkit_tool_fs::registry()
+        .merge(agentkit_tool_shell::registry())
+        .merge(skill_registry.tool_registry());
 
     let mut manager = if args.mcp_mock {
         let mut manager = McpServerManager::new().with_server(McpServerConfig::new(
@@ -85,7 +84,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
             ),
         ));
         manager.connect_server(&McpServerId::new("mock")).await?;
-        merge_registry(&mut tools, manager.tool_registry());
         Some(manager)
     } else {
         None
@@ -110,9 +108,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .require_approval_for_unknown(false),
     );
 
-    let agent = Agent::builder()
+    let mut builder = Agent::builder()
         .model(adapter)
-        .tools(tools)
+        .add_tool_source(tools)
         .permissions(permissions)
         .compaction(CompactionConfig::new(
             ItemCountTrigger::new(12),
@@ -125,19 +123,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         .preserve_kind(ItemKind::Context),
                 ),
         ))
-        .observer(reporter)
-        .build()?;
+        .observer(reporter);
+
+    if let Some(manager) = manager.as_ref() {
+        builder = builder.add_tool_source(manager.source());
+    }
+
+    let agent = builder.build()?;
+
+    let mut input = vec![Item::text(ItemKind::System, SYSTEM_PROMPT)];
+    input.extend(context_items);
+    input.push(Item::text(ItemKind::User, &args.prompt));
 
     let mut driver = agent
-        .start(SessionConfig::new("openrouter-agent-cli").with_cache(
-            PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
-        ))
+        .start(
+            SessionConfig::new("openrouter-agent-cli").with_cache(
+                PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
+            ),
+            input,
+        )
         .await?;
-
-    let mut input = vec![text_item(ItemKind::System, SYSTEM_PROMPT)];
-    input.extend(context_items);
-    input.push(text_item(ItemKind::User, &args.prompt));
-    driver.submit_input(input)?;
 
     let result = run_to_completion(&mut driver).await;
 
@@ -192,16 +197,6 @@ impl Args {
     }
 }
 
-fn merge_registry(target: &mut ToolRegistry, source: ToolRegistry) {
-    for tool in source.tools() {
-        target.register_arc(tool);
-    }
-}
-
-fn text_item(kind: ItemKind, text: &str) -> Item {
-    Item::text(kind, text)
-}
-
 async fn run_to_completion<S>(
     driver: &mut agentkit_loop::LoopDriver<S>,
 ) -> Result<(), Box<dyn Error>>
@@ -219,11 +214,10 @@ where
                 return Ok(());
             }
             LoopStep::Interrupt(LoopInterrupt::AfterToolResult(_)) => continue,
-            LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(request)) => {
-                return Err(format!("unexpected approval request: {}", request.summary).into());
-            }
-            LoopStep::Interrupt(LoopInterrupt::AuthRequest(request)) => {
-                return Err(format!("unexpected auth request from {}", request.provider).into());
+            LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(pending)) => {
+                return Err(
+                    format!("unexpected approval request: {}", pending.request.summary).into(),
+                );
             }
             LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_)) => {
                 return Err("loop requested more input before finishing".into());

@@ -79,8 +79,9 @@ use agentkit_core::{
     SessionId, TurnId,
 };
 use agentkit_loop::{
-    Agent, AgentEvent, LoopDriver, LoopError, LoopInterrupt, LoopObserver, LoopStep, ModelSession,
-    PendingApproval, PromptCacheRequest, PromptCacheRetention, SessionConfig,
+    Agent, AgentEvent, InputRequest, LoopDriver, LoopError, LoopInterrupt, LoopObserver, LoopStep,
+    ModelAdapter, ModelSession, PendingApproval, PromptCacheRequest, PromptCacheRetention,
+    SessionConfig,
 };
 use agentkit_provider_openrouter::{OpenRouterAdapter, OpenRouterConfig};
 use agentkit_tools_core::{
@@ -532,7 +533,9 @@ fn truncate(s: &str, max: usize) -> String {
 ///   the command channel for `ApprovalAnswer` (or fold stray user
 ///   messages into the preserved `buffered` list).
 enum Mode {
-    Idle,
+    Idle {
+        input: InputRequest,
+    },
     Driving {
         buffered: Vec<Item>,
     },
@@ -544,28 +547,59 @@ enum Mode {
 
 /// Agent task: owns the `LoopDriver` exclusively.  Every path that mutates
 /// the driver runs from here, so the `&mut` borrow rule is a local concern.
-async fn run_agent<S>(
-    mut driver: LoopDriver<S>,
+///
+/// The driver is started inside this task (rather than passed in already-
+/// started) so the system prompt can travel with the first user message in
+/// the initial transcript — most chat providers reject a system-prompt-only
+/// call. We wait for `cmd_rx` to deliver the first `UserMessage`, then
+/// `agent.start([system, user])` and enter the driving loop directly.
+async fn run_agent<M>(
+    agent: Agent<M>,
+    session_config: SessionConfig,
     cancellation: CancellationController,
     mut cmd_rx: mpsc::Receiver<AgentCommand>,
     evt_tx: mpsc::UnboundedSender<UiEvent>,
 ) -> Result<(), LoopError>
 where
-    S: ModelSession + Send,
+    M: ModelAdapter,
+    M::Session: ModelSession + Send,
 {
-    // Seed the system prompt before announcing idleness.
-    driver.submit_input(vec![Item::text(ItemKind::System, SYSTEM_PROMPT)])?;
+    let _ = evt_tx.send(UiEvent::Idle);
+    // Wait for the first real user message before paying for a session.
+    // Cancel/ApprovalAnswer at rest are stale UI state — drop them.
+    let first_text = loop {
+        match cmd_rx.recv().await {
+            Some(AgentCommand::UserMessage(text)) => break text,
+            Some(AgentCommand::Quit) | None => return Ok(()),
+            Some(AgentCommand::Cancel) | Some(AgentCommand::ApprovalAnswer(_)) => continue,
+        }
+    };
 
-    let mut mode = Mode::Idle;
+    let mut driver = agent
+        .start(
+            session_config,
+            vec![
+                Item::text(ItemKind::System, SYSTEM_PROMPT),
+                Item::text(ItemKind::User, first_text),
+            ],
+        )
+        .await?;
+    let _ = evt_tx.send(UiEvent::Busy);
+
+    let mut mode = Mode::Driving {
+        buffered: Vec::new(),
+    };
 
     loop {
         mode = match mode {
-            Mode::Idle => {
-                // Announce readiness so the UI renders the prompt.
+            Mode::Idle { input } => {
                 let _ = evt_tx.send(UiEvent::Idle);
                 match cmd_rx.recv().await {
                     Some(AgentCommand::UserMessage(text)) => {
-                        driver.submit_input(vec![Item::text(ItemKind::User, text)])?;
+                        input.submit(
+                            &mut driver,
+                            vec![Item::text(ItemKind::User, text)],
+                        )?;
                         let _ = evt_tx.send(UiEvent::Busy);
                         Mode::Driving {
                             buffered: Vec::new(),
@@ -575,7 +609,7 @@ where
                     // Cancel at rest: nothing to cancel.  Stray approval
                     // answer: the UI is out of sync — drop it.
                     Some(AgentCommand::Cancel) | Some(AgentCommand::ApprovalAnswer(_)) => {
-                        Mode::Idle
+                        Mode::Idle { input }
                     }
                 }
             }
@@ -585,37 +619,24 @@ where
                     biased;
 
                     step = driver.next() => match step? {
-                        LoopStep::Interrupt(LoopInterrupt::AfterToolResult(_)) => {
-                            // Mid-turn yield: flush any typed-ahead user
-                            // messages into the transcript so the next
-                            // model call sees them, then resume.
+                        LoopStep::Interrupt(LoopInterrupt::AfterToolResult(info)) => {
                             if !buffered.is_empty() {
-                                driver.submit_input(std::mem::take(&mut buffered))?;
+                                info.submit(&mut driver, std::mem::take(&mut buffered))?;
                             }
                             Mode::Driving { buffered }
                         }
-                        LoopStep::Finished(_)
-                        | LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_)) => {
-                            // End of turn.  If the user typed ahead after
-                            // the final round, auto-advance into a new
-                            // turn with their input; otherwise go idle.
+                        LoopStep::Finished(_) => Mode::Driving { buffered },
+                        LoopStep::Interrupt(LoopInterrupt::AwaitingInput(req)) => {
                             if !buffered.is_empty() {
-                                driver.submit_input(std::mem::take(&mut buffered))?;
+                                req.submit(&mut driver, std::mem::take(&mut buffered))?;
                                 Mode::Driving { buffered }
                             } else {
-                                Mode::Idle
+                                Mode::Idle { input: req }
                             }
                         }
                         LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(pending)) => {
                             let _ = evt_tx.send(UiEvent::ApprovalRequested(pending.request.clone()));
                             Mode::AwaitingApproval { pending, buffered }
-                        }
-                        LoopStep::Interrupt(LoopInterrupt::AuthRequest(req)) => {
-                            eprintln!(
-                                "✗ auth required for {} — interactive auth not wired in this example",
-                                req.provider,
-                            );
-                            break;
                         }
                     },
 
@@ -747,7 +768,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let agent = Agent::builder()
         .model(adapter)
-        .tools(tools)
+        .add_tool_source(tools)
         .permissions(permissions)
         .cancellation(cancellation.handle())
         .observer(MeterObserver {
@@ -769,11 +790,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ))
         .build()?;
 
-    let driver = agent
-        .start(SessionConfig::new("openrouter-coding-agent").with_cache(
-            PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
-        ))
-        .await?;
+    let session_config = SessionConfig::new("openrouter-coding-agent").with_cache(
+        PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
+    );
 
     print_banner(&model_name, &workspace_root, max_ctx);
 
@@ -795,7 +814,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Agent task runs in the background; UI task runs in the foreground so
     // that stdin / stdout see the same terminal as the user.
-    let agent_handle = tokio::spawn(run_agent(driver, cancellation, cmd_rx, evt_tx));
+    let agent_handle = tokio::spawn(run_agent(
+        agent,
+        session_config,
+        cancellation,
+        cmd_rx,
+        evt_tx,
+    ));
     run_ui(cmd_tx, evt_rx, meter).await;
 
     match agent_handle.await {

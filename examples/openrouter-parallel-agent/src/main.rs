@@ -86,7 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- build agent ---
     let agent = Agent::builder()
         .model(adapter)
-        .tools(tools)
+        .add_tool_source(tools)
         .task_manager(task_manager)
         .permissions(permissions)
         .observer(reporter)
@@ -130,12 +130,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- run ---
     let mut driver = agent
-        .start(SessionConfig::new("openrouter-parallel-agent").with_cache(
-            PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
-        ))
+        .start(
+            SessionConfig::new("openrouter-parallel-agent").with_cache(
+                PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
+            ),
+            vec![system_item(), user_item(&prompt)],
+        )
         .await?;
 
-    driver.submit_input(vec![system_item(), user_item(&prompt)])?;
     run_to_completion(&mut driver).await?;
 
     // If background tasks were detached, wait for them and feed their
@@ -172,10 +174,6 @@ where
             }
             LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(pending)) => {
                 let _ = pending.deny_with_reason(driver, "Tool call rejected, try something else.");
-                continue;
-            }
-            LoopStep::Interrupt(LoopInterrupt::AuthRequest(pending)) => {
-                let _ = pending.cancel(driver);
                 continue;
             }
             LoopStep::Interrupt(LoopInterrupt::AfterToolResult(_)) => continue,

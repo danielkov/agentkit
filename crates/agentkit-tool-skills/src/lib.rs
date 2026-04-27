@@ -25,9 +25,8 @@
 //! // Discover skills from default locations (.agents/skills/ at project and user level).
 //! let registry = SkillRegistry::discover(".").build().await;
 //!
-//! // Register the activate_skill tool with the agent's tool registry.
-//! let mut tools = agentkit_tools_core::ToolRegistry::new();
-//! registry.register_tool(&mut tools);
+//! // Compose with the agent's other tools.
+//! let tools = agentkit_tools_core::ToolRegistry::new().merge(registry.tool_registry());
 //! # Ok(())
 //! # }
 //! ```
@@ -163,9 +162,8 @@ where
 /// .discover_skills()
 /// .await;
 ///
-/// // Register the tool; it rediscovers available skills before each turn.
-/// let mut tools = agentkit_tools_core::ToolRegistry::new();
-/// registry.register_tool(&mut tools);
+/// // Compose with the agent's other tools; activate_skill rediscovers each turn.
+/// let tools = agentkit_tools_core::ToolRegistry::new().merge(registry.tool_registry());
 /// # Ok(())
 /// # }
 /// ```
@@ -249,26 +247,16 @@ impl SkillRegistry {
         self.skills.values().collect()
     }
 
-    /// Register the `activate_skill` tool into the given [`ToolRegistry`].
-    ///
-    /// The tool remains available even when discovery is currently empty so
-    /// future turns can surface newly added skills. If no roots are
-    /// configured, registration is skipped.
-    pub fn register_tool(&self, registry: &mut ToolRegistry) {
-        if self.roots.is_empty() {
-            return;
-        }
-        let tool = self.build_tool();
-        registry.register(tool);
-    }
-
     /// Build a [`ToolRegistry`] containing only the `activate_skill` tool.
     ///
     /// The tool remains registered even when discovery is currently empty so
-    /// future turns can surface newly added skills.
+    /// future turns can surface newly added skills. If no roots are
+    /// configured, returns an empty registry.
     pub fn tool_registry(&self) -> ToolRegistry {
         let mut registry = ToolRegistry::new();
-        self.register_tool(&mut registry);
+        if !self.roots.is_empty() {
+            registry.register(self.build_tool());
+        }
         registry
     }
 
