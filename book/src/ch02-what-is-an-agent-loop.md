@@ -69,7 +69,7 @@ pub enum LoopStep {
 ```text
 Host                          LoopDriver
  │                               │
- │  submit_input(items)          │
+ │  agent.start(cfg, transcript) │
  │──────────────────────────────▶│
  │                               │
  │  next().await                 │
@@ -88,7 +88,7 @@ Host                          LoopDriver
  │  LoopStep::Interrupt(...)     │
  │◀──────────────────────────────│  needs host decision
  │                               │
- │  resolve_approval(...)        │
+ │  pending.approve(driver)      │
  │──────────────────────────────▶│  host resolves, loop resumes
  │                               │
 ```
@@ -97,23 +97,25 @@ There is no polling, no callback registration, and no event queue the host must 
 
 ## Interrupts
 
-An interrupt pauses the loop and returns control to the host. agentkit defines four interrupt types, split into blocking (must be resolved before the loop continues) and cooperative (host may ignore the yield and call `next()` again):
+An interrupt pauses the loop and returns control to the host. agentkit defines three interrupt types, split into blocking (must be resolved before the loop continues) and cooperative (host may ignore the yield and call `next()` again):
 
 ```rust
 pub enum LoopInterrupt {
     ApprovalRequest(PendingApproval),     // blocking
-    AuthRequest(PendingAuth),             // blocking
     AwaitingInput(InputRequest),          // cooperative
     AfterToolResult(ToolRoundInfo),       // cooperative
 }
 ```
 
-| Interrupt         | Trigger                                                   | Resolution                                                               |
-| ----------------- | --------------------------------------------------------- | ------------------------------------------------------------------------ |
-| `ApprovalRequest` | A tool call requires explicit permission                  | Host calls `approve()` or `deny()` on the `PendingApproval` handle       |
-| `AuthRequest`     | A tool needs credentials the loop doesn't have            | Host provides credentials or cancels                                     |
-| `AwaitingInput`   | The model finished and the loop has no pending input      | Host calls `submit_input()` with new items                               |
-| `AfterToolResult` | A tool round completed, model is about to be called again | Optional — host may `submit_input()` to interject, or just call `next()` |
+| Interrupt         | Trigger                                                   | Resolution                                                                        |
+| ----------------- | --------------------------------------------------------- | --------------------------------------------------------------------------------- |
+| `ApprovalRequest` | A tool call requires explicit permission                  | Host calls `approve()` or `deny()` on the `PendingApproval` handle                |
+| `AwaitingInput`   | The model finished and the loop has no pending input      | Host calls `req.submit(&mut driver, items)` on the `InputRequest` handle          |
+| `AfterToolResult` | A tool round completed, model is about to be called again | Optional — host calls `info.submit(&mut driver, items)` to interject, or `next()` |
+
+> **MCP auth.** Earlier versions of agentkit surfaced `AuthRequest` as a fourth loop interrupt. Auth is now an MCP-only concept: the manager raises `McpError::AuthRequired(AuthRequest)` from non-tool operations and `ToolError::AuthRequired(_)` from tool calls, and the host resolves them out-of-band via [`McpServerManager::resolve_auth`](./ch17-mcp.md). The loop never blocks on auth.
+>
+> This pattern generalises. Userland and third-party tools can define their own strongly-typed pause-and-resume protocols (think payment confirmations, hardware key taps, multi-step wizards) by surfacing a tool-specific error variant and exposing a resolver on the tool handle. The host catches the typed error, drives the resolution through the tool's own API, and retries. The loop interrupt enum stays closed: there is no need to plumb every new interaction shape through `LoopInterrupt`, and no need for a catch-all `Custom(Box<dyn Any>)` variant that would erase the type at the boundary.
 
 Interrupts are the mechanism for user cancellation and external preemption. A user who wants to abort a loop heading in the wrong direction triggers a cancellation (via `CancellationController::interrupt()`), which causes the current turn to end with `FinishReason::Cancelled`. The host sees this in the `TurnResult` and can decide how to proceed — submit corrected input, adjust the system prompt, or stop entirely.
 
@@ -129,14 +131,21 @@ pub trait LoopObserver: Send {
 
 Observers are informational — they cannot stall the loop or alter its control flow. This keeps the driver's state machine simple: `next()` either returns a `LoopStep` or doesn't return yet. There is no interleaving of observer handling with loop logic.
 
-| Control flow (`LoopStep`) | Observation (`AgentEvent`)       |
-| ------------------------- | -------------------------------- |
-| `ApprovalRequest`         | `ContentDelta`                   |
-| `AuthRequest`             | `ToolCallRequested`              |
-| `AwaitingInput`           | `UsageUpdated`                   |
-| `AfterToolResult`         | `CompactionStarted` / `Finished` |
-| `Finished(TurnResult)`    | `TurnStarted` / `TurnFinished`   |
-|                           | `Warning`                        |
+| Control flow (`LoopStep`) | Observation (`AgentEvent`)                 |
+| ------------------------- | ------------------------------------------ |
+| `ApprovalRequest`         | `ContentDelta`                             |
+| `AwaitingInput`           | `ToolCallRequested` / `ToolResultReceived` |
+| `AfterToolResult`         | `ToolCatalogChanged`                       |
+| `Finished(TurnResult)`    | `UsageUpdated`                             |
+|                           | `CompactionStarted` / `CompactionFinished` |
+|                           | `TurnStarted` / `TurnFinished` / `Warning` |
+
+For loss-free transcript reconstruction (persistence, replication, audit), register a `TranscriptObserver` alongside the operational `LoopObserver`. The two observe different things:
+
+- **`LoopObserver`** sees a stream of `AgentEvent`s. Content arrives as deltas — partial fragments that don't carry their parent-`Item` identity — interleaved with lifecycle and telemetry events. Useful for UIs and logging, but a consumer cannot reassemble the canonical transcript from this stream alone.
+- **`TranscriptObserver`** fires exactly once per `Item` appended, with the fully-formed `Item` ready to persist. Calls happen synchronously from the driver, in transcript order, at the single mutation point that owns the transcript — so what the observer sees is what the loop will send to the model on the next turn.
+
+Compaction rewrites the transcript without firing `on_item_appended`; those rewrites are signalled separately by `AgentEvent::CompactionFinished`, which a persistence layer can use to snapshot the post-compaction state.
 
 ## The three-layer model
 
@@ -172,7 +181,7 @@ This separation means: configure once, run many sessions. Or run multiple concur
 
 The [`openrouter-chat`](https://github.com/danielkov/agentkit/tree/main/examples/openrouter-chat) example demonstrates the simplest possible host loop. The key parts:
 
-**Setup** — build an `Agent` with just a model adapter, start a session:
+**Setup** — build an `Agent` with just a model adapter and start a session with the initial transcript:
 
 ```rust
 let agent = Agent::builder()
@@ -181,34 +190,18 @@ let agent = Agent::builder()
     .build()?;
 
 let mut driver = agent
-    .start(SessionConfig {
-        session_id: SessionId::new("openrouter-chat"),
-        metadata: MetadataMap::new(),
-        cache: Some(PromptCacheRequest {
-            mode: PromptCacheMode::BestEffort,
-            strategy: PromptCacheStrategy::Automatic,
-            retention: Some(PromptCacheRetention::Short),
-            key: None,
-        }),
-    })
+    .start(
+        SessionConfig::new("openrouter-chat").with_cache(
+            PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
+        ),
+        vec![Item::text(ItemKind::User, prompt)],
+    )
     .await?;
 ```
 
-The `cache` field configures prompt caching for the session. It is optional, but most long-running agents benefit from setting it. See [Chapter 15](./ch15-caching.md) for the full cache request shape.
+`Agent::start` takes the full starting transcript — typically `[system_item, user_item]` for a fresh session, or a transcript loaded from a database / file when resuming. The first `next()` call consumes that transcript directly; there is no separate `submit_input` step at the start.
 
-**Submit input** — construct an `Item` with `ItemKind::User` and a `TextPart`:
-
-```rust
-driver.submit_input(vec![Item {
-    id: None,
-    kind: ItemKind::User,
-    parts: vec![Part::Text(TextPart {
-        text: prompt.into(),
-        metadata: MetadataMap::new(),
-    })],
-    metadata: MetadataMap::new(),
-}])?;
-```
+The session-level `cache` configures prompt caching for the session. It is optional, but most long-running agents benefit from setting it. See [Chapter 15](./ch15-caching.md) for the full cache request shape.
 
 **Drive the loop** — call `next().await` and match on the result:
 
@@ -217,19 +210,18 @@ match driver.next().await? {
     LoopStep::Finished(result) => {
         // Render assistant items from result.items
     }
-    LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_)) => {
-        // Model finished, prompt user for more input
+    LoopStep::Interrupt(LoopInterrupt::AwaitingInput(req)) => {
+        // Model finished — call req.submit(&mut driver, more_items)? to
+        // continue the conversation, or drop the handle to stop.
     }
-    LoopStep::Interrupt(LoopInterrupt::AfterToolResult(_)) => {
-        // Tool round done.  Non-interactive callers just loop back; an
-        // interactive host may call driver.submit_input(...) here to
-        // interject a user message before the next model call.
+    LoopStep::Interrupt(LoopInterrupt::AfterToolResult(info)) => {
+        // Tool round done. Non-interactive callers just loop back; an
+        // interactive host may call info.submit(&mut driver, items)?
+        // to interject a user message before the next model call.
     }
     LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(pending)) => {
-        // A tool needs permission — approve or deny
-    }
-    LoopStep::Interrupt(LoopInterrupt::AuthRequest(request)) => {
-        // A tool needs credentials
+        // A tool needs permission — pending.approve(&mut driver)? /
+        // pending.deny(&mut driver)?
     }
 }
 ```

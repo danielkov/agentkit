@@ -12,21 +12,21 @@ pub enum LoopStep {
 
 pub enum LoopInterrupt {
     ApprovalRequest(PendingApproval),
-    AuthRequest(PendingAuth),
     AwaitingInput(InputRequest),
     AfterToolResult(ToolRoundInfo),
 }
 
 impl LoopInterrupt {
     /// `true` for variants that must be resolved before the loop can
-    /// make progress: `ApprovalRequest`, `AuthRequest`.  `false` for
-    /// cooperative yields the host may ignore: `AwaitingInput`,
-    /// `AfterToolResult`.
+    /// make progress: `ApprovalRequest`.  `false` for cooperative
+    /// yields the host may ignore: `AwaitingInput`, `AfterToolResult`.
     pub fn is_blocking(&self) -> bool { /* ... */ }
 }
 ```
 
-Each variant represents a different reason control returned to the host. `ApprovalRequest` / `AuthRequest` / `AwaitingInput` carry handle types (`PendingApproval`, `PendingAuth`, `InputRequest`) with ergonomic resolution methods. `AfterToolResult` carries a `ToolRoundInfo` snapshot (`session_id`, `turn_id`, `transcript_len`) but needs no resolution — the host either calls `submit_input(..)` to interject or just calls `next()` again to continue the turn.
+Each variant represents a different reason control returned to the host. `ApprovalRequest` and `AwaitingInput` carry handle types (`PendingApproval`, `InputRequest`) with ergonomic resolution methods. `AfterToolResult` carries a `ToolRoundInfo` snapshot (`session_id`, `turn_id`, `transcript_len`) and exposes the same `submit(...)` shape as `InputRequest`, so the host can interject a user message without cancelling the turn — or just call `next()` again to continue.
+
+> **MCP auth is not an interrupt.** Earlier versions of agentkit included a fourth `AuthRequest(PendingAuth)` variant. Auth is now handled outside the loop: tool adapters return `ToolError::AuthRequired(AuthRequest)` and the host completes the flow via [`McpServerManager::resolve_auth`](./ch17-mcp.md). The next tool call reconnects with the resolved credentials. Keeping auth out of the loop's interrupt set keeps the state machine small and lets non-MCP hosts ignore the concept entirely.
 
 ```text
 Loop autonomy boundary:
@@ -47,7 +47,6 @@ Loop autonomy boundary:
   │                Host decision zone                    │
   │                                                      │
   │   blocking:    "Approve this shell command?"         │
-  │   blocking:    "Enter your GitHub OAuth token"       │
   │   cooperative: "Type your next message"              │
   │   cooperative: "Tool round done — interject?"        │
   │                                                      │
@@ -173,51 +172,21 @@ Interrupt model (adopted):
   └── Host owns the stack. Host does whatever it needs. Calls next() when ready.
 ```
 
-## Auth interrupts
+## Auth — handled outside the loop
 
-MCP servers and external tools may require authentication. Auth interrupts follow the same pattern:
+MCP servers and external tools may require authentication. agentkit does **not** model auth as a loop interrupt. The flow:
 
-```rust
-pub struct AuthRequest {
-    pub task_id: Option<TaskId>,
-    pub id: String,
-    pub provider: String,           // e.g. "github", "google"
-    pub operation: AuthOperation,   // what triggered the auth
-    pub challenge: MetadataMap,     // OAuth URLs, scopes, etc.
-}
-```
-
-The `AuthOperation` enum describes what triggered the auth requirement:
+1. A tool call surfaces `ToolError::AuthRequired(AuthRequest)`. The driver writes the failure to the transcript as a tool error and continues — the model sees that the call could not be completed.
+2. The host (which owns the `McpServerManager`) reads the `AuthRequest` either from the tool error metadata or from `manager.resolve_auth_and_resume(...)`-style entry points, runs whatever auth flow it needs (OAuth, API key prompt, secret-store fetch), and submits the resolution.
+3. Subsequent calls reconnect with the new credentials transparently.
 
 ```rust
-pub enum AuthOperation {
-    ToolCall { tool_name, input, ... },
-    McpConnect { server_id, ... },
-    McpToolCall { server_id, tool_name, input, ... },
-    McpResourceRead { server_id, resource_id, ... },
-    McpPromptGet { server_id, prompt_id, args, ... },
-    Custom { kind, payload, ... },
-}
+manager
+    .resolve_auth(AuthResolution::provided(request, credentials))
+    .await?;
 ```
 
-The host resolves using the `PendingAuth` handle:
-
-```rust
-match driver.next().await? {
-    LoopStep::Interrupt(LoopInterrupt::AuthRequest(pending)) => {
-        println!("Auth required from: {}", pending.request.provider);
-
-        // Option 1: provide credentials
-        let mut creds = MetadataMap::new();
-        creds.insert("token".into(), json!("ghp_..."));
-        pending.provide(&mut driver, creds)?;
-
-        // Option 2: cancel
-        pending.cancel(&mut driver)?;
-    }
-    ...
-}
-```
+This keeps the loop state machine to three interrupts and lets hosts that don't use MCP ignore auth entirely. See [Chapter 17](./ch17-mcp.md) for the manager-side surface (`AuthRequest`, `AuthOperation`, `AuthResolution`, `McpAuthResponder`).
 
 ## Input interrupts
 
@@ -253,7 +222,7 @@ pub struct ToolRoundInfo {
 }
 ```
 
-Unlike approval or auth, this yield requires no resolution. The host has three choices:
+Unlike approval, this yield requires no resolution. The host has three choices:
 
 ```rust
 LoopStep::Interrupt(LoopInterrupt::AfterToolResult(info)) => {
@@ -261,7 +230,7 @@ LoopStep::Interrupt(LoopInterrupt::AfterToolResult(info)) => {
     //    existing transcript into the next model call.
     // 2. Interject: submit a user message that the next model call will
     //    see as part of the transcript.
-    driver.submit_input(vec![Item::text(ItemKind::User, "also: be concise")])?;
+    info.submit(&mut driver, vec![Item::text(ItemKind::User, "also: be concise")])?;
     // 3. Cancel: call cancellation.interrupt() and then drain the turn.
 }
 ```
@@ -274,9 +243,9 @@ Interactive agents frequently need to let the user type ahead during a slow turn
 
 - cancel the whole turn and restart with the combined message — loses progress and burns tokens;
 - inject into the next `TurnRequest.transcript` via a `ModelAdapter` wrapper — works, but requires a parallel buffer and post-turn reconciliation with the driver's own transcript;
-- hold the driver under a mutex and call `submit_input` from another task — violates the `&mut self` invariant and requires `unsafe` or a lock wrapper.
+- hold the driver under a mutex and submit input from another task — violates the `&mut self` invariant and requires `unsafe` or a lock wrapper.
 
-`AfterToolResult` solves this natively: the driver is not mid-`next()` at the yield, so `submit_input` is callable in the normal way, and the transcript the model sees is always the single canonical one owned by the driver.
+`AfterToolResult` solves this natively: the driver is not mid-`next()` at the yield, so `info.submit(&mut driver, items)` is callable in the normal way, and the transcript the model sees is always the single canonical one owned by the driver. The handle is consumed when used, so the same yield cannot accept input twice.
 
 ### Hosts that don't care about interjection
 
@@ -299,12 +268,11 @@ The driver enforces strict state transitions:
 ```text
 Valid transitions:
 
-  submit_input() ──▶ next() ──▶ Finished
-                               ──▶ Interrupt(Approval)        ──▶ resolve_approval()    ──▶ next()
-                               ──▶ Interrupt(Auth)            ──▶ resolve_auth()        ──▶ next()
-                               ──▶ Interrupt(Awaiting)        ──▶ submit_input()        ──▶ next()
-                               ──▶ Interrupt(AfterToolResult) ──▶ [submit_input()]      ──▶ next()
-                                                                  (submit_input is optional)
+  agent.start(cfg, transcript) ──▶ next() ──▶ Finished
+                                            ──▶ Interrupt(Approval)        ──▶ pending.approve/deny()  ──▶ next()
+                                            ──▶ Interrupt(Awaiting)        ──▶ req.submit(driver, …)   ──▶ next()
+                                            ──▶ Interrupt(AfterToolResult) ──▶ [info.submit(driver, …)] ──▶ next()
+                                                                              (submit is optional)
 
 Invalid (state errors):
 
@@ -313,7 +281,7 @@ Invalid (state errors):
   resolve_approval() for a ToolCallId that doesn't exist → LoopError::InvalidState
 ```
 
-Blocking interrupts (`ApprovalRequest`, `AuthRequest`) must be resolved before `next()` can run again; calling `next()` with an unresolved approval returns `LoopError::InvalidState`. Cooperative interrupts (`AwaitingInput`, `AfterToolResult`) impose no such constraint — the host calls `next()` when ready, with or without an intervening `submit_input()`. These constraints prevent subtle bugs where the host accidentally skips or duplicates a resolution that actually matters.
+Blocking interrupts (`ApprovalRequest`) must be resolved before `next()` can run again; calling `next()` with an unresolved approval returns `LoopError::InvalidState`. Cooperative interrupts (`AwaitingInput`, `AfterToolResult`) impose no such constraint — the host calls `next()` when ready, with or without an intervening `submit`. These constraints prevent subtle bugs where the host accidentally skips or duplicates a resolution that actually matters.
 
 ## The event/interrupt duality
 
@@ -322,7 +290,6 @@ Some actions are reported both as non-blocking observations _and_ as blocking in
 | Observer receives                   | Host receives                                   |
 | ----------------------------------- | ----------------------------------------------- |
 | `AgentEvent::ApprovalRequired(req)` | `LoopStep::Interrupt(ApprovalRequest(pending))` |
-| `AgentEvent::AuthRequired(req)`     | `LoopStep::Interrupt(AuthRequest(pending))`     |
 | `AgentEvent::TurnFinished(result)`  | `LoopStep::Finished(result)`                    |
 
 This duplication is intentional. The event is for observability — a reporter logs it, a UI updates a status indicator. The interrupt is for control flow — the host must answer it before the loop can continue. These are different concerns served by different mechanisms.
@@ -367,4 +334,4 @@ The approval system still runs — it's just that the policy answers "yes" to ev
 
 > **Example:** [`openrouter-coding-agent`](https://github.com/danielkov/agentkit/tree/main/examples/openrouter-coding-agent) handles approval interrupts for filesystem writes in its main loop.
 >
-> **Crate:** [`agentkit-loop`](https://github.com/danielkov/agentkit/tree/main/crates/agentkit-loop) — `LoopStep`, `LoopInterrupt`, `PendingApproval`, `PendingAuth`, `InputRequest`, `ToolRoundInfo`. Approval types come from [`agentkit-tools-core`](https://github.com/danielkov/agentkit/tree/main/crates/agentkit-tools-core).
+> **Crate:** [`agentkit-loop`](https://github.com/danielkov/agentkit/tree/main/crates/agentkit-loop) — `LoopStep`, `LoopInterrupt`, `PendingApproval`, `InputRequest`, `ToolRoundInfo`. Approval types come from [`agentkit-tools-core`](https://github.com/danielkov/agentkit/tree/main/crates/agentkit-tools-core); MCP `AuthRequest` / `AuthResolution` live in [`agentkit-mcp`](https://github.com/danielkov/agentkit/tree/main/crates/agentkit-mcp).

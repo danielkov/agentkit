@@ -134,22 +134,25 @@ This is the right default for shell commands in a coding agent:
 
 ### How background results re-enter the loop
 
-When the driver starts a new turn, it calls `task_manager.take_pending_loop_updates()`. Any completed background tasks have their results injected into the transcript before the model sees it:
+When the driver starts a new turn, it calls `task_manager.take_pending_loop_updates()`. Any completed background tasks have their results injected into the transcript before the model sees it. The driver also fires `AgentEvent::ToolResultReceived(_)` for the placeholder _and_ the eventual result, so observers can render the bg-tool transition in the UI:
 
 ```text
 Turn N:
   Model: ToolCall(shell_exec, "cargo test")
   Task manager: starts foreground, detaches after 5s
-  Model receives: "task detached"
+  Driver appends a placeholder tool result ("task detached")
+  AgentEvent::ToolResultReceived(call_id=42, is_error=false)
   Model: ToolCall(fs_read_file, "src/test_results.rs")  ← continues working
   Turn ends
 
 Turn N+1:
   take_pending_loop_updates() → cargo test finished: "3 tests passed"
-  Result injected into transcript
-  Model sees: tool result from cargo test + new user message
+  Driver appends the real result and re-fires
+  AgentEvent::ToolResultReceived(call_id=42, …)         ← same call_id
   Model: "All 3 tests pass. Here's what I changed..."
 ```
+
+Correlate the two events by `call_id`. Hosts that need a fully reconstructable transcript (persistence, audit) should also register a `TranscriptObserver` — it fires once per `Item` appended, so the placeholder and the real result both appear in transcript order.
 
 ## Task lifecycle
 

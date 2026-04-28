@@ -75,7 +75,7 @@ let context_items = ContextLoader::new()
 // 7. Assemble the agent
 let agent = Agent::builder()
     .model(OpenRouterAdapter::new(OpenRouterConfig::new(api_key, model))?)
-    .tools(tools)
+    .add_tool_source(tools)
     .permissions(permissions)
     .compaction(compaction)
     .task_manager(task_manager)
@@ -85,44 +85,56 @@ let agent = Agent::builder()
 
 ## The host loop
 
-The host application drives the interaction:
+The host application drives the interaction. The first user message travels with the system prompt and context as the initial transcript handed to `start`; subsequent messages flow through the `InputRequest` handle exposed on `AwaitingInput`:
 
 ```rust
-let mut driver = agent.start(session_config).await?;
+// Block until we have a real first user message — most providers reject
+// system-prompt-only calls.
+let first_user = read_line()?;
 
-// Submit system prompt and context
-driver.submit_input(system_items)?;
-driver.submit_input(context_items)?;
+let mut transcript = Vec::new();
+transcript.extend(system_items);
+transcript.extend(context_items);
+transcript.push(user_item(first_user));
+
+let mut driver = agent.start(session_config, transcript).await?;
+let mut pending_input: Option<InputRequest> = None;
 
 loop {
-    // Get user input
-    let user_input = read_line()?;
-    driver.submit_input(vec![user_item(user_input)])?;
+    if let Some(req) = pending_input.take() {
+        let user_input = read_line()?;
+        req.submit(&mut driver, vec![user_item(user_input)])?;
+    }
 
     // Run the agent turn
     loop {
         match driver.next().await? {
-            LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(req)) => {
-                let decision = prompt_user_approval(&req)?;
+            LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(pending)) => {
+                let decision = prompt_user_approval(&pending.request)?;
                 driver.resolve_approval(decision)?;
             }
-            LoopStep::Interrupt(LoopInterrupt::AuthRequest(req)) => {
-                let resolution = handle_auth(&req)?;
-                driver.resolve_auth(resolution)?;
-            }
-            // Cooperative yield between tool rounds.  A headless coding
-            // agent just resumes; an interactive host can `submit_input`
+            // Cooperative yield between tool rounds. A headless coding
+            // agent just resumes; an interactive host can `info.submit(...)`
             // here to interject a user message before the next model call.
             LoopStep::Interrupt(LoopInterrupt::AfterToolResult(_)) => continue,
-            LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_)) => break,
+            LoopStep::Interrupt(LoopInterrupt::AwaitingInput(req)) => {
+                pending_input = Some(req);
+                break;
+            }
             LoopStep::Finished(result) => {
                 print_usage(&result);
                 break;
             }
         }
     }
+
+    if pending_input.is_none() {
+        break;
+    }
 }
 ```
+
+MCP-tool auth challenges surface as `ToolError::AuthRequired(_)` rather than a loop interrupt — handle them on the manager via `manager.resolve_auth(...)` (see [Chapter 17](./ch17-mcp.md)).
 
 ## Crate dependency graph
 

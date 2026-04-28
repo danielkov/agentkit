@@ -165,33 +165,17 @@ This matters for providers that expose explicit cache boundaries on tools or mes
 Session defaults are often enough, but the loop also supports per-turn overrides:
 
 ```rust
-driver.set_next_turn_cache(PromptCacheRequest {
-    mode: PromptCacheMode::Required,
-    strategy: PromptCacheStrategy::Explicit {
-        breakpoints: vec![PromptCacheBreakpoint::ToolsEnd],
-    },
-    retention: Some(PromptCacheRetention::Extended),
-    key: Some("release-planning".into()),
-})?;
-
-driver.submit_input(vec![user_item])?;
-```
-
-Or in one call:
-
-```rust
-driver.submit_input_with_cache(
-    vec![user_item],
-    PromptCacheRequest {
-        mode: PromptCacheMode::BestEffort,
-        strategy: PromptCacheStrategy::Automatic,
-        retention: Some(PromptCacheRetention::Short),
-        key: None,
-    },
+driver.set_next_turn_cache(
+    PromptCacheRequest::explicit_required([PromptCacheBreakpoint::tools_end()])
+        .with_retention(PromptCacheRetention::Extended)
+        .with_key("release-planning"),
 )?;
+
+// then submit the user message via the next cooperative interrupt:
+input_request.submit(&mut driver, vec![user_item])?;
 ```
 
-The override applies to the next model turn only. Later turns fall back to the session default.
+The override applies to the next model turn only. Later turns fall back to the session default. The `set_next_turn_cache` call is independent of input submission, so it composes with whichever `InputRequest` / `ToolRoundInfo` handle is in scope.
 
 ## How adapters use it
 

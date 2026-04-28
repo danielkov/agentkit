@@ -9,14 +9,16 @@ The project is intentionally split into small crates behind feature flags so hos
 `agentkit` is past the design-only stage. The repo currently includes working implementations for:
 
 - normalized transcript, content-part, and delta types with fluent builders
-- a runtime-agnostic loop driver with blocking interrupts for approval and auth, plus cooperative yields for end-of-turn input and between-tool-round interjection
-- trait-based tools, permissions, approvals, and auth handoff
+- a runtime-agnostic loop driver with blocking approval interrupts plus cooperative yields for end-of-turn input and between-tool-round interjection
+- federated tool sources behind a single `ToolSource` trait — frozen `ToolRegistry`s, dynamic catalogs, and MCP-backed sources compose by registration order, with collision policies and live `ToolCatalogChanged` events
+- trait-based tools, permissions, and approval handoff
+- a `TranscriptObserver` channel for loss-free transcript reconstruction (persistence, replication, audit) alongside the operational `LoopObserver` event stream
 - built-in filesystem, shell, and skills tools
 - context loading for `AGENTS.md` and skills directories
-- MCP integration on top of [`rmcp`](https://crates.io/crates/rmcp): stdio + Streamable HTTP transports, discovery, tool/resource/prompt adapters, auth replay, lifecycle management, pluggable sampling/elicitation/roots responders, and a broadcast subscription for server-pushed progress, logging, resource updates, list-changed, and cancellation events
+- MCP integration on top of [`rmcp`](https://crates.io/crates/rmcp): stdio + Streamable HTTP transports, discovery, tool/resource/prompt adapters, auth replay, lifecycle management (connect / disconnect / refresh), pluggable sampling/elicitation/roots responders, and a broadcast subscription for server-pushed progress, logging, resource updates, list-changed, and cancellation events
 - reporting observers
 - compaction triggers, strategy pipelines, and backend-driven semantic compaction
-- async task management with foreground/background scheduling, routing policies, and detach-after-timeout
+- async task management with foreground/background scheduling, routing policies, detach-after-timeout, and notification of background-tool completion through the loop event stream
 - optional turn cancellation with resumable sessions
 - prompt caching with automatic and explicit strategies, retention hints, and cache keys
 - a generic completions adapter base for building provider crates
@@ -153,11 +155,13 @@ cargo run -p openrouter-agent-cli -- --mcp-mock \
 
 ### Minimal chat
 
-Build an agent with a provider adapter, start a session with prompt caching, and drive the loop:
+Build an agent with a provider adapter, hand the initial transcript to `start`, and drive the loop:
 
 ```rust
 use agentkit_core::{Item, ItemKind};
-use agentkit_loop::{Agent, LoopStep, PromptCacheRequest, PromptCacheRetention, SessionConfig};
+use agentkit_loop::{
+    Agent, LoopInterrupt, LoopStep, PromptCacheRequest, PromptCacheRetention, SessionConfig,
+};
 use agentkit_provider_openrouter::{OpenRouterAdapter, OpenRouterConfig};
 
 let adapter = OpenRouterAdapter::new(
@@ -168,25 +172,31 @@ let adapter = OpenRouterAdapter::new(
 let agent = Agent::builder().model(adapter).build()?;
 
 let mut driver = agent
-    .start(SessionConfig::new("chat").with_cache(
-        PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
-    ))
+    .start(
+        SessionConfig::new("chat").with_cache(
+            PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
+        ),
+        vec![Item::text(ItemKind::User, "Hello!")],
+    )
     .await?;
-
-driver.submit_input(vec![Item::text(ItemKind::User, "Hello!")])?;
 
 match driver.next().await? {
     LoopStep::Finished(result) => { /* render result.items */ }
-    LoopStep::Interrupt(interrupt) if interrupt.is_blocking() => {
-        /* resolve approval or auth */
+    LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(pending)) => {
+        /* blocking: approve or deny via the PendingApproval handle */
     }
-    LoopStep::Interrupt(_) => { /* cooperative yield: submit input or call next() again */ }
+    LoopStep::Interrupt(LoopInterrupt::AwaitingInput(req)) => {
+        /* cooperative: req.submit(&mut driver, more_items)? then call next() */
+    }
+    LoopStep::Interrupt(LoopInterrupt::AfterToolResult(_)) => { /* call next() to resume */ }
 }
 ```
 
+`Agent::start` takes the full starting transcript — typically `[system_item, user_item]` for a fresh session, or a transcript loaded from disk when resuming. Mid-session input is supplied through the `InputRequest` / `ToolRoundInfo` handles surfaced on the cooperative interrupts; there is no out-of-turn `submit_input` entry point.
+
 ### Tools and permissions
 
-Register filesystem tools with a path-scoped permission policy:
+Register filesystem tools with a path-scoped permission policy. Tool sources federate — call `add_tool_source` once per source (registry, MCP catalog reader, skill watcher, …) and the agent walks them in registration order:
 
 ```rust
 use agentkit_core::MetadataMap;
@@ -208,7 +218,7 @@ let permissions = CompositePermissionChecker::new(PermissionDecision::Deny(Permi
 
 let agent = Agent::builder()
     .model(adapter)
-    .tools(agentkit_tool_fs::registry())
+    .add_tool_source(agentkit_tool_fs::registry())
     .permissions(permissions)
     .build()?;
 ```
@@ -278,7 +288,7 @@ let task_manager = AsyncTaskManager::new().routing(|req: &agentkit_tools_core::T
 
 let agent = Agent::builder()
     .model(adapter)
-    .tools(tools)
+    .add_tool_source(tools)
     .task_manager(task_manager)
     .build()?;
 ```

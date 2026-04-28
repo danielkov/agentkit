@@ -14,14 +14,10 @@ The agent is configured with filesystem tools, shell tools, a `PathPolicy` for t
 
 ### 1. Input submission
 
-The CLI reads the user's message and submits it as a `User` item:
+The CLI reads the user's message. For the first turn it travels with the system prompt and any context items in the initial transcript handed to `Agent::start`; for subsequent turns it goes through the `InputRequest` handle the driver yielded on the previous `AwaitingInput` interrupt:
 
 ```rust
-driver.submit_input(vec![Item {
-    kind: ItemKind::User,
-    parts: vec![Part::Text(TextPart { text: user_input, .. })],
-    ..
-}])?;
+input_request.submit(&mut driver, vec![Item::text(ItemKind::User, user_input)])?;
 ```
 
 ### 2. Compaction check

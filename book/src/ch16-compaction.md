@@ -255,7 +255,7 @@ When compaction fires:
 ```text
 Turn lifecycle with compaction:
 
-  submit_input()
+  next() → merge pending input
        │
        ▼
   ┌── compaction check ──┐
