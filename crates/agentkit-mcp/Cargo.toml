@@ -23,9 +23,11 @@ reqwest.workspace = true
 rmcp = { version = "1.5.0", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest", "auth"] }
 serde.workspace = true
 serde_json.workspace = true
+sse-stream = "0.2"
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 
 [dev-dependencies]
+axum = "0.8"
 rmcp = { version = "1.5.0", default-features = false, features = ["client", "server", "transport-async-rw", "macros", "elicitation"] }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util", "time"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util", "time", "net"] }
