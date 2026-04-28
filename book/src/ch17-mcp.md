@@ -134,19 +134,56 @@ while let Ok(event) = events.recv().await {
 
 List-changed events are _also_ delivered through the legacy `McpServerNotification` mpsc receiver that `McpServerManager::refresh_changed_catalogs` drains to re-run discovery — the two channels coexist: events for live UI/observability, mpsc for catalog re-sync.
 
-## Auth as interruption
+## Auth handled outside the loop
 
-MCP auth follows the same interrupt pattern as tool approvals:
+MCP auth challenges are explicit, but they are **not** a loop interrupt. The loop's interrupt set is intentionally narrow (approval + cooperative yields); auth is an MCP concern and lives on the manager.
 
-1. Tool invocation triggers an auth requirement
-2. The tool adapter returns `ToolError::AuthRequired(AuthRequest)`
-3. The loop surfaces it as `LoopStep::Interrupt(...)`
-4. The host performs the auth flow (OAuth, API key entry, etc.)
-5. The host resolves the interrupt with `manager.resolve_auth(...)` and the operation resumes
+1. A tool invocation triggers an auth requirement.
+2. The tool adapter returns `ToolError::AuthRequired(AuthRequest)`.
+3. The driver records the failure on the transcript as a tool error so the model can see the call did not complete.
+4. The host (which holds the `McpServerManager`) reads the `AuthRequest` — either from the tool error or from a non-tool operation that returned `McpError::AuthRequired(_)` — runs whatever flow it needs (OAuth, API key entry, secret store fetch), and submits an `AuthResolution`.
+5. `manager.resolve_auth(resolution).await?` stores the credentials and reconnects the affected server. The next tool call uses the fresh credentials.
 
-Auth is never hidden retry logic. The host always knows when auth is happening and controls the flow. For non-tool MCP operations (connecting, reading resources, fetching prompts), auth follows the same pattern but through the MCP manager API rather than the loop interrupt system.
+```rust,ignore
+manager
+    .resolve_auth(AuthResolution::provided(request, credentials))
+    .await?;
+```
 
-To rotate credentials at runtime — e.g. a Streamable HTTP bearer that expires every hour — drive an `AuthResolution::Provided { credentials, .. }` through `McpServerManager::resolve_auth`. The next operation reconnects with the new credentials.
+For non-tool MCP operations (connecting, reading resources, fetching prompts), `manager.resolve_auth_and_resume(resolution)` resolves credentials and replays the original operation in one call. The connection-level `McpConnection::replay_auth_operation(operation)` is exposed for hosts that drive auth without going through the manager.
+
+Auth is never hidden retry logic. The host always knows when auth is happening and controls the flow. To rotate credentials at runtime — e.g. a Streamable HTTP bearer that expires every hour — drive an `AuthResolution::Provided { credentials, .. }` through `McpServerManager::resolve_auth`; the manager reconnects with the new credentials. Plug an `McpAuthResponder` into `McpHandlerConfig` to handle challenges automatically without surfacing them to the host loop at all.
+
+## Lifecycle
+
+The manager owns server lifecycle:
+
+| Method                                 | Purpose                                                                                                                                 |
+| -------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `connect_server(id)` / `connect_all()` | Open a connection and run discovery                                                                                                     |
+| `refresh_server(id)`                   | Re-run discovery and emit per-tool/resource/prompt diff events                                                                          |
+| `refresh_changed_catalogs()`           | Drain pending `*list_changed` notifications and refresh affected catalogs                                                               |
+| `disconnect_server(id)`                | Close the connection, drop tools from the federated catalog, emit `ServerDisconnected`                                                  |
+| `subscribe_catalog_events()`           | Broadcast receiver for `McpCatalogEvent` (server connect / disconnect / tool added / removed / changed / refresh failed / auth changed) |
+
+## Federating MCP into the agent
+
+`McpServerManager::source()` returns a sized `CatalogReader` that the agent can take ownership of through `add_tool_source`. Connect, disconnect, and catalog refresh events feed straight into the loop — every `next()` re-snapshots the source and emits `AgentEvent::ToolCatalogChanged` before invoking the model again, so the model sees the current tool list every turn:
+
+```rust,ignore
+let mut manager = McpServerManager::new()
+    .with_server(github_config)
+    .with_server(database_config);
+manager.connect_all().await?;
+
+let agent = Agent::builder()
+    .model(adapter)
+    .add_tool_source(native_registry)   // built-ins
+    .add_tool_source(manager.source())  // MCP-backed
+    .build()?;
+```
+
+`tool_registry()` is still available for one-shot snapshots, but for long-running hosts `source()` is the right entry point — it stays correlated with the manager's catalog state through reconnects, refreshes, and `disconnect_server` calls.
 
 ## Transports
 

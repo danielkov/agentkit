@@ -10,19 +10,20 @@ The `LoopDriver` is generic over the model session type:
 pub struct LoopDriver<S: ModelSession> {
     session_id: SessionId,
     session: Option<S>,
-    tool_executor: Arc<BasicToolExecutor>,
+    tool_executor: Arc<dyn ToolExecutor>,
     task_manager: Arc<dyn TaskManager>,
     permissions: Arc<dyn PermissionChecker>,
     resources: Arc<dyn ToolResources>,
     cancellation: Option<CancellationHandle>,
     compaction: Option<CompactionConfig>,
     observers: Vec<Box<dyn LoopObserver>>,
+    transcript_observers: Vec<Box<dyn TranscriptObserver>>,
     transcript: Vec<Item>,
     pending_input: Vec<Item>,
     pending_approvals: BTreeMap<ToolCallId, PendingApprovalToolCall>,
-    pending_auth: Option<PendingAuthToolCall>,
     active_tool_round: Option<ActiveToolRound>,
     next_turn_index: u64,
+    /* … */
 }
 ```
 
@@ -30,19 +31,20 @@ The public API is narrow:
 
 ```rust
 impl<S: ModelSession> LoopDriver<S> {
-    pub fn submit_input(&mut self, input: Vec<Item>) -> Result<(), LoopError>;
+    pub async fn next(&mut self) -> Result<LoopStep, LoopError>;
     pub fn resolve_approval_for(&mut self, call_id: ToolCallId, decision: ApprovalDecision)
         -> Result<(), LoopError>;
-    pub fn resolve_auth(&mut self, resolution: AuthResolution) -> Result<(), LoopError>;
-    pub async fn next(&mut self) -> Result<LoopStep, LoopError>;
+    pub fn set_next_turn_cache(&mut self, cache: PromptCacheRequest) -> Result<(), LoopError>;
     pub fn snapshot(&self) -> LoopSnapshot;
 }
 ```
 
+There is no `submit_input` on the driver. The initial transcript is handed to `Agent::start`; mid-session input is supplied through the `InputRequest` and `ToolRoundInfo` handles surfaced on cooperative interrupts. Funnelling every transcript mutation through the driver itself preserves the `&mut LoopDriver` invariant — no other task or thread can race with `next()`.
+
 The host code is a simple loop:
 
 ```rust
-driver.submit_input(vec![system_item, user_item])?;
+let mut driver = agent.start(session_config, vec![system_item, user_item]).await?;
 
 loop {
     match driver.next().await? {
@@ -59,15 +61,15 @@ loop {
 ```text
 Driver state machine:
 
-                submit_input()
+           agent.start(cfg, transcript)
                       │
                       ▼
   ┌─────────────────────────────────┐
   │         Has pending input?      │
   │                                 │
   │  yes ──▶ merge into transcript  │
-  │  no  ──▶ AwaitingInput         ─┼──▶ Interrupt
-  └─────────────┬───────────────────┘
+  │  no  ──▶ AwaitingInput         ─┼──▶ Interrupt (cooperative)
+  └─────────────┬───────────────────┘     host: req.submit(...) or drop
                 │
                 ▼
   ┌─────────────────────────────────┐
@@ -98,7 +100,7 @@ Driver state machine:
   ┌─────────────────────────────────┐
   │    Any require approval?        │
   │                                 │
-  │  yes ──▶ ApprovalRequest       ─┼──▶ Interrupt
+  │  yes ──▶ ApprovalRequest       ─┼──▶ Interrupt (blocking)
   │  no  ──▶ execute tools          │
   └─────────────┬───────────────────┘
                 │
@@ -108,7 +110,7 @@ Driver state machine:
                 ▼
   ┌─────────────────────────────────┐
   │   AfterToolResult              ─┼──▶ Interrupt (cooperative)
-  │                                 │    host may submit_input() to
+  │                                 │    host: info.submit(...) to
   │   host calls next() to resume  ◀┼─── interject, then next() to
   └─────────────┬───────────────────┘    resume into the next model turn
                 │
@@ -116,7 +118,7 @@ Driver state machine:
        go to "Model turn" ◀─── automatic tool roundtrip
 ```
 
-The host cannot call `next()` twice without resolving an outstanding _blocking_ interrupt (`ApprovalRequest`, `AuthRequest`) — that's a state error. Cooperative interrupts (`AwaitingInput`, `AfterToolResult`) require no resolution; calling `next()` again resumes the loop as described in the diagram. The driver forces the host to deal with blocking interrupts before proceeding so an approval request can never be silently skipped.
+The host cannot call `next()` twice without resolving an outstanding _blocking_ interrupt (`ApprovalRequest`) — that's a state error. Cooperative interrupts (`AwaitingInput`, `AfterToolResult`) require no resolution; calling `next()` again resumes the loop as described in the diagram. The driver forces the host to deal with blocking interrupts before proceeding so an approval request can never be silently skipped.
 
 ## Anatomy of a turn
 
@@ -124,7 +126,7 @@ Here's what happens inside `next()`, step by step:
 
 ### 1. Merge input
 
-Pending items (submitted via `submit_input()`) are appended to the working transcript. The driver emits `AgentEvent::InputAccepted` to observers.
+Pending items — the initial transcript on the first call, or items submitted through an `InputRequest` / `ToolRoundInfo` handle on subsequent calls — are appended to the working transcript. The driver emits `AgentEvent::InputAccepted` to observers.
 
 ```text
 Before:
@@ -194,12 +196,13 @@ If the model requested tool calls (indicated by `FinishReason::ToolCall`):
 3. The task manager routes each tool call (foreground, background, or foreground-then-detach)
 4. The executor runs permission preflight on each tool
 5. If any tool requires approval → the driver surfaces `LoopStep::Interrupt(ApprovalRequest)`
-6. If any tool requires auth → the driver surfaces `LoopStep::Interrupt(AuthRequest)`
-7. Otherwise → tools execute and results are appended to the transcript as `ToolResultPart`s
+6. Otherwise → tools execute and results are appended to the transcript as `ToolResultPart`s
+
+Auth challenges from MCP-backed tools are not loop interrupts. They surface as `ToolError::AuthRequired(AuthRequest)` from the tool, the driver records the failure on the transcript, and the host completes the auth flow out-of-band via [`McpServerManager::resolve_auth`](./ch17-mcp.md). The next tool call reconnects with the new credentials.
 
 ### 7. Tool roundtrip
 
-If tools were executed, the driver yields `LoopStep::Interrupt(AfterToolResult(_))` before invoking the model again. The host has a chance to call `submit_input(..)` to interject a user message at this boundary — the resulting transcript `[..., tool_call, tool_result, user]` is valid for the next model call. Calling `next()` again resumes the turn into the next model call (back to step 3). The model sees the tool results (and any injected message) and may request more tools or produce a final response.
+If tools were executed, the driver yields `LoopStep::Interrupt(AfterToolResult(info))` before invoking the model again. The host has a chance to call `info.submit(&mut driver, items)?` to interject a user message at this boundary — the resulting transcript `[..., tool_call, tool_result, user]` is valid for the next model call. Calling `next()` again resumes the turn into the next model call (back to step 3). The model sees the tool results (and any injected message) and may request more tools or produce a final response.
 
 ### 8. Return result
 
@@ -225,7 +228,7 @@ User: "Add error handling to src/parser.rs"
   Model call 1: ToolCall(fs_read_file)
                 execute → result appended
   ──▶ next() returns Interrupt(AfterToolResult)
-      (host may submit_input or just call next())
+      (host may info.submit(...) or just call next())
 
   Model call 2: ToolCall(fs_replace_in_file)
                 execute → result appended
@@ -256,25 +259,27 @@ pub trait LoopObserver: Send {
 
 The full event taxonomy:
 
-| Event                      | When it fires                                |
-| -------------------------- | -------------------------------------------- |
-| `RunStarted`               | `Agent::start()` completes                   |
-| `TurnStarted`              | Before each model turn begins                |
-| `InputAccepted`            | `submit_input()` is called                   |
-| `ContentDelta(Delta)`      | Model streams a delta                        |
-| `ToolCallRequested`        | Model requests a tool call                   |
-| `ApprovalRequired`         | A tool requires approval                     |
-| `AuthRequired`             | A tool requires auth                         |
-| `ApprovalResolved`         | An approval interrupt is resolved            |
-| `AuthResolved`             | An auth interrupt is resolved                |
-| `CompactionStarted`        | Compaction trigger fires                     |
-| `CompactionFinished`       | Compaction pipeline completes                |
-| `UsageUpdated(Usage)`      | Token usage reported                         |
-| `Warning(String)`          | Non-fatal issue (recovered tool error, etc.) |
-| `RunFailed(String)`        | Unrecoverable error                          |
-| `TurnFinished(TurnResult)` | A turn completes                             |
+| Event                      | When it fires                                                                          |
+| -------------------------- | -------------------------------------------------------------------------------------- |
+| `RunStarted`               | `Agent::start()` completes                                                             |
+| `TurnStarted`              | Before each model turn begins                                                          |
+| `InputAccepted`            | The driver merges pending input into the transcript                                    |
+| `ContentDelta(Delta)`      | Model streams a delta                                                                  |
+| `ToolCallRequested`        | Model requests a tool call                                                             |
+| `ToolResultReceived`       | A tool result lands in the transcript (foreground or background)                       |
+| `ApprovalRequired`         | A tool requires approval                                                               |
+| `ApprovalResolved`         | An approval interrupt is resolved                                                      |
+| `ToolCatalogChanged`       | A federated tool source's catalog changed; the next request will see the new tool list |
+| `CompactionStarted`        | Compaction trigger fires                                                               |
+| `CompactionFinished`       | Compaction pipeline completes                                                          |
+| `UsageUpdated(Usage)`      | Token usage reported                                                                   |
+| `Warning(String)`          | Non-fatal issue (recovered tool error, etc.)                                           |
+| `RunFailed(String)`        | Unrecoverable error                                                                    |
+| `TurnFinished(TurnResult)` | A turn completes                                                                       |
 
 Observers are called inline, synchronously, in registration order. The loop task blocks briefly for each observer call. This is acceptable because observers should be fast — write to stderr, increment a counter, append to a buffer. Expensive processing should happen asynchronously behind a channel adapter.
+
+For loss-free transcript reconstruction (persistence, replication, audit), the driver also fans out to a separate `TranscriptObserver` channel that fires once per `Item` appended, in transcript order. `LoopObserver` alone is not sufficient for this — content deltas span partial parts and historically tool results were appended without an event at all. Compaction-driven rewrites do **not** fire `on_item_appended`; those are signaled by `AgentEvent::CompactionFinished`. Register via `AgentBuilder::transcript_observer`.
 
 ## Building the agent
 
@@ -283,31 +288,48 @@ The `Agent` is built with a builder:
 ```rust
 let agent = Agent::builder()
     .model(adapter)                          // required
-    .tools(registry)                         // default: empty
+    .add_tool_source(registry)               // optional; call again to federate
     .permissions(checker)                    // default: allow all
     .resources(resources)                    // default: ()
     .task_manager(manager)                   // default: SimpleTaskManager
     .cancellation(cancellation_handle)       // default: none
     .compaction(config)                      // default: none
     .observer(reporter)                      // default: none
+    .transcript_observer(persistence)        // default: none
     .build()?;
 
-let mut driver = agent.start(session_config).await?;
+let mut driver = agent.start(session_config, vec![system_item, user_item]).await?;
 ```
 
 The builder validates that a model adapter is set. Everything else has sensible defaults:
 
-| Field          | Default               | Effect                            |
-| -------------- | --------------------- | --------------------------------- |
-| `tools`        | empty `ToolRegistry`  | Model can't call any tools        |
-| `permissions`  | `AllowAllPermissions` | Every tool call is auto-approved  |
-| `resources`    | `()`                  | No shared resources               |
-| `task_manager` | `SimpleTaskManager`   | Sequential, inline tool execution |
-| `cancellation` | `None`                | No cancellation support           |
-| `compaction`   | `None`                | Transcript grows without bounds   |
-| `observers`    | `[]`                  | No event reporting                |
+| Field                  | Default               | Effect                            |
+| ---------------------- | --------------------- | --------------------------------- |
+| `tool_sources`         | `[]`                  | Model can't call any tools        |
+| `permissions`          | `AllowAllPermissions` | Every tool call is auto-approved  |
+| `resources`            | `()`                  | No shared resources               |
+| `task_manager`         | `SimpleTaskManager`   | Sequential, inline tool execution |
+| `cancellation`         | `None`                | No cancellation support           |
+| `compaction`           | `None`                | Transcript grows without bounds   |
+| `observers`            | `[]`                  | No event reporting                |
+| `transcript_observers` | `[]`                  | No transcript persistence hook    |
 
-`Agent::start()` consumes the agent and returns a `LoopDriver`. The agent's immutable configuration (adapter, tools, permissions) is moved into the driver. Multiple drivers can be created from the same `Agent` type by cloning it first.
+`Agent::start()` consumes the agent and returns a `LoopDriver` with the supplied transcript loaded as pending input. The agent's immutable configuration (adapter, tool sources, permissions) is moved into the driver. Multiple drivers can be created from the same `Agent` type by cloning it first.
+
+### Tool sources federate
+
+`add_tool_source` accepts any `ToolSource`. Sources are walked in registration order; the default `CollisionPolicy` is `FirstWins`. A typical interactive agent stitches three together:
+
+```rust
+let agent = Agent::builder()
+    .model(adapter)
+    .add_tool_source(native_registry)             // frozen built-ins
+    .add_tool_source(mcp_manager.source())        // CatalogReader from McpServerManager
+    .add_tool_source(skill_watcher.reader())      // dynamic_catalog reader
+    .build()?;
+```
+
+Dynamic sources publish `ToolCatalogEvent`s; the driver re-snapshots the available tools at each model call boundary and emits `AgentEvent::ToolCatalogChanged` so observers can log what changed.
 
 ## Snapshots
 

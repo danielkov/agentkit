@@ -130,17 +130,18 @@ impl LoopObserver for AuditLogger {
 
 ## AgentEvent categories
 
-| Category   | Events                                                   |
-| ---------- | -------------------------------------------------------- |
-| Lifecycle  | `RunStarted`, `TurnStarted`, `TurnFinished`, `RunFailed` |
-| Input      | `InputAccepted`                                          |
-| Streaming  | `ContentDelta`                                           |
-| Tools      | `ToolCallRequested`                                      |
-| Approval   | `ApprovalRequired`, `ApprovalResolved`                   |
-| Auth       | `AuthRequired`, `AuthResolved`                           |
-| Compaction | `CompactionStarted`, `CompactionFinished`                |
-| Usage      | `UsageUpdated`                                           |
-| Diagnostic | `Warning`                                                |
+| Category   | Events                                                          |
+| ---------- | --------------------------------------------------------------- |
+| Lifecycle  | `RunStarted`, `TurnStarted`, `TurnFinished`, `RunFailed`        |
+| Input      | `InputAccepted`                                                 |
+| Streaming  | `ContentDelta`                                                  |
+| Tools      | `ToolCallRequested`, `ToolResultReceived`, `ToolCatalogChanged` |
+| Approval   | `ApprovalRequired`, `ApprovalResolved`                          |
+| Compaction | `CompactionStarted`, `CompactionFinished`                       |
+| Usage      | `UsageUpdated`                                                  |
+| Diagnostic | `Warning`                                                       |
+
+For loss-free transcript reconstruction, register a `TranscriptObserver` alongside `LoopObserver`. It fires once per `Item` appended, in transcript order — including the synthetic placeholder and the eventual real result for background-detached tools, both correlated through the matching `ToolResultReceived` events by `call_id`.
 
 ### Event timeline for a typical turn
 

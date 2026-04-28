@@ -700,31 +700,17 @@ let agent = Agent::builder()
     .build()?;
 ```
 
-Without tools or a loop, an agent can be used for a single one-shot inference call — send a message, get a response:
+Without tools or a loop, an agent can be used for a single one-shot inference call — send a message, get a response. The starting transcript is handed to `start` directly:
 
 ```rust
 let mut driver = agent
-    .start(SessionConfig {
-        session_id: SessionId::new("one-shot"),
-        metadata: MetadataMap::new(),
-        cache: Some(PromptCacheRequest {
-            mode: PromptCacheMode::BestEffort,
-            strategy: PromptCacheStrategy::Automatic,
-            retention: Some(PromptCacheRetention::Short),
-            key: None,
-        }),
-    })
+    .start(
+        SessionConfig::new("one-shot").with_cache(
+            PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
+        ),
+        vec![Item::text(ItemKind::User, "Explain quicksort in one sentence.")],
+    )
     .await?;
-
-driver.submit_input(vec![Item {
-    id: None,
-    kind: ItemKind::User,
-    parts: vec![Part::Text(TextPart {
-        text: "Explain quicksort in one sentence.".into(),
-        metadata: MetadataMap::new(),
-    })],
-    metadata: MetadataMap::new(),
-}])?;
 
 if let LoopStep::Finished(result) = driver.next().await? {
     for item in result.items {

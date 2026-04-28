@@ -50,7 +50,7 @@ enum UiEvent {
 
 Why this shape:
 
-- **The `&mut LoopDriver` invariant stays intact.** Every driver mutation happens inside the agent task. The UI task cannot accidentally call `submit_input` while `next()` is awaiting.
+- **The `&mut LoopDriver` invariant stays intact.** Every driver mutation happens inside the agent task. The UI task cannot accidentally submit input while `next()` is awaiting.
 - **The approval race disappears.** With one string channel both typed-ahead user messages and approval answers arrive as `AgentCommand`, and a heuristic must decide which is which. With two typed variants and a UI-owned `UiMode`, the UI classifies at the source — no race.
 - **The front-end is pluggable.** Swap the UI task for an HTTP handler, a test harness, or a GUI without touching the agent code.
 - **State transitions read top-to-bottom.** The agent task is a self-contained `loop { mode = match mode { … } }` state machine.
@@ -61,48 +61,51 @@ The `openrouter-coding-agent` example implements this pattern end-to-end.
 
 ```rust
 enum Mode {
-    Idle,
+    Idle { input: InputRequest },
     Driving { buffered: Vec<Item> },
     AwaitingApproval { pending: PendingApproval, buffered: Vec<Item> },
 }
 
+// agent.start(...) was called with the first user message in the initial
+// transcript, so the agent task starts in `Mode::Driving`.
+
 loop {
     mode = match mode {
-        Mode::Idle => {
+        Mode::Idle { input } => {
             evt_tx.send(UiEvent::Idle).ok();
             match cmd_rx.recv().await {
                 Some(AgentCommand::UserMessage(text)) => {
-                    driver.submit_input(vec![Item::text(ItemKind::User, text)])?;
+                    input.submit(&mut driver, vec![Item::text(ItemKind::User, text)])?;
                     evt_tx.send(UiEvent::Busy).ok();
                     Mode::Driving { buffered: Vec::new() }
                 }
                 Some(AgentCommand::Quit) | None => break,
-                _ => Mode::Idle,  // stray commands at rest: drop
+                _ => Mode::Idle { input },  // stray commands at rest: drop
             }
         }
 
         Mode::Driving { mut buffered } => tokio::select! {
             step = driver.next() => match step? {
-                LoopStep::Interrupt(LoopInterrupt::AfterToolResult(_)) => {
+                LoopStep::Interrupt(LoopInterrupt::AfterToolResult(info)) => {
                     // Flush typed-ahead messages so the next model call sees them.
                     if !buffered.is_empty() {
-                        driver.submit_input(std::mem::take(&mut buffered))?;
+                        info.submit(&mut driver, std::mem::take(&mut buffered))?;
                     }
                     Mode::Driving { buffered }
                 }
-                LoopStep::Finished(_) | LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_)) => {
+                LoopStep::Finished(_) => Mode::Driving { buffered },
+                LoopStep::Interrupt(LoopInterrupt::AwaitingInput(req)) => {
                     if !buffered.is_empty() {
-                        driver.submit_input(std::mem::take(&mut buffered))?;
+                        req.submit(&mut driver, std::mem::take(&mut buffered))?;
                         Mode::Driving { buffered }  // auto-advance
                     } else {
-                        Mode::Idle
+                        Mode::Idle { input: req }
                     }
                 }
                 LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(pending)) => {
                     evt_tx.send(UiEvent::ApprovalRequested(pending.request.clone())).ok();
                     Mode::AwaitingApproval { pending, buffered }
                 }
-                LoopStep::Interrupt(LoopInterrupt::AuthRequest(_)) => break,
             },
             Some(cmd) = cmd_rx.recv() => match cmd {
                 AgentCommand::UserMessage(text) => {
@@ -139,6 +142,8 @@ loop {
 }
 ```
 
+`InputRequest` and `ToolRoundInfo` both consume themselves on `submit`, so the typed handle in scope at each yield point is the only way to push input — there is no alternative entry point that could race with `next()`.
+
 The three modes correspond to the three reasons a host might be waiting: waiting for the user to speak, waiting for the driver to finish work, waiting for the user to answer an approval.
 
 ## The UI-task classifier
@@ -168,14 +173,16 @@ The UI flips to `ApprovalInput` on `UiEvent::ApprovalRequested` and back to `Mes
 For simple CLIs or prototypes, a single-task skeleton with cooperative-yield passthrough is still fine:
 
 ```rust
-driver.submit_input(vec![user_item(&input)])?;
+let mut driver = agent
+    .start(session_config, vec![system_item, user_item(&input)])
+    .await?;
+
 loop {
     match driver.next().await? {
         LoopStep::Finished(_) => break,
         LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_)) => break,
         LoopStep::Interrupt(LoopInterrupt::AfterToolResult(_)) => continue,
         LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(p)) => handle_approval(p, &mut driver)?,
-        LoopStep::Interrupt(LoopInterrupt::AuthRequest(p))     => handle_auth(p, &mut driver)?,
     }
 }
 ```

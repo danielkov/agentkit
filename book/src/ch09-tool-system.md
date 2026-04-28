@@ -141,11 +141,10 @@ pub enum ToolExecutionOutcome {
 
 pub enum ToolInterruption {
     ApprovalRequired(ApprovalRequest),
-    AuthRequired(AuthRequest),
 }
 ```
 
-Not every execution failure is an error. An approval-required outcome means the tool is valid but needs human confirmation. The loop translates this into an interrupt.
+Not every execution failure is an error. An approval-required outcome means the tool is valid but needs human confirmation. The loop translates this into a `LoopStep::Interrupt(ApprovalRequest(...))`. Auth challenges are not modelled as a `ToolInterruption` — MCP-backed tools surface them as `ToolError::AuthRequired(AuthRequest)` and the host completes the flow out-of-band via `McpServerManager::resolve_auth`.
 
 ## Preflight permission requests
 
