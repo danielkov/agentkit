@@ -19,7 +19,7 @@
 //! agentkit-side vocabulary. As `rmcp` tracks new MCP spec revisions, those
 //! types and their fields propagate into agentkit unchanged.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::sync::{Arc, RwLock};
 
@@ -39,6 +39,7 @@ use agentkit_tools_core::{
 };
 use async_trait::async_trait;
 use futures_util::future::try_join_all;
+use futures_util::stream::BoxStream;
 use http::{HeaderName, HeaderValue};
 use rmcp::ServiceExt;
 use rmcp::handler::client::ClientHandler;
@@ -46,9 +47,11 @@ use rmcp::model as rmcp_model;
 use rmcp::service::{ClientInitializeError, Peer, RoleClient, RunningService, ServiceError};
 use rmcp::transport::streamable_http_client::{
     AuthRequiredError, InsufficientScopeError,
+    StreamableHttpClient as RmcpStreamableHttpClient,
     StreamableHttpClientTransportConfig as RmcpStreamableHttpClientTransportConfig,
-    StreamableHttpError,
+    StreamableHttpError, StreamableHttpPostResponse,
 };
+use sse_stream::{Error as SseError, Sse};
 use rmcp::transport::{
     ConfigureCommandExt, DynamicTransportError, StreamableHttpClientTransport, TokioChildProcess,
 };
@@ -84,6 +87,20 @@ pub use rmcp::model::{
     TextContent, Tool as McpTool, ToolAnnotations as McpToolAnnotations,
     UrlElicitationCapability as McpUrlElicitationCapability,
 };
+
+/// Re-export of the JSON-RPC client→server envelope handed to
+/// [`McpHttpClient::post_message`].
+pub use rmcp::model::ClientJsonRpcMessage;
+
+/// Re-exports of the rmcp Streamable HTTP transport types used by
+/// [`McpHttpClient`] implementations.
+pub use rmcp::transport::streamable_http_client::{
+    StreamableHttpError as McpStreamableHttpError,
+    StreamableHttpPostResponse as McpStreamableHttpPostResponse,
+};
+
+/// Re-export of the SSE event/error types referenced by [`McpHttpClient::get_stream`].
+pub use sse_stream::{Error as McpSseError, Sse as McpSse};
 
 /// Alias for [`McpTool`].
 pub type McpToolDescriptor = McpTool;
@@ -289,14 +306,40 @@ impl StdioTransportConfig {
 }
 
 /// Configuration for an MCP server that communicates over the MCP Streamable HTTP transport.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct StreamableHttpTransportConfig {
     /// The MCP endpoint URL to connect to.
     pub url: String,
     /// Static bearer token sent as an HTTP `Authorization: Bearer ...` header.
+    ///
+    /// Ignored when [`Self::http_client`] is set, since the custom client owns
+    /// authorization for every request.
     pub bearer_token: Option<String>,
     /// Static custom HTTP headers sent with every Streamable HTTP request.
+    ///
+    /// Ignored when [`Self::http_client`] is set.
     pub headers: Vec<(HeaderName, HeaderValue)>,
+    /// Optional caller-supplied HTTP client.
+    ///
+    /// When `Some`, agentkit-mcp routes every Streamable HTTP request through
+    /// the provided implementation instead of rmcp's default reqwest client.
+    /// This is the seam to inject dynamic bearers, request signing, retry
+    /// middleware, custom TLS, and so on. See [`McpHttpClient`].
+    pub http_client: Option<Arc<dyn McpHttpClient>>,
+}
+
+impl fmt::Debug for StreamableHttpTransportConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StreamableHttpTransportConfig")
+            .field("url", &self.url)
+            .field("bearer_token", &self.bearer_token.as_deref().map(|_| "<redacted>"))
+            .field("headers", &self.headers)
+            .field(
+                "http_client",
+                &self.http_client.as_ref().map(|_| "<custom>"),
+            )
+            .finish()
+    }
 }
 
 impl StreamableHttpTransportConfig {
@@ -306,18 +349,36 @@ impl StreamableHttpTransportConfig {
             url: url.into(),
             bearer_token: None,
             headers: Vec::new(),
+            http_client: None,
         }
     }
 
     /// Sets a static bearer token for Streamable HTTP authorization.
+    ///
+    /// Ignored when a custom [`McpHttpClient`] is installed via
+    /// [`Self::with_http_client`].
     pub fn with_bearer_token(mut self, token: impl Into<String>) -> Self {
         self.bearer_token = Some(token.into());
+        self
+    }
+
+    /// Installs a caller-supplied HTTP client for every Streamable HTTP
+    /// request issued by this transport.
+    ///
+    /// This is the only seam capable of producing per-request dynamic state
+    /// (rotating bearers, request signing, distributed-tracing headers).
+    /// rmcp's default reqwest path is bypassed entirely when this is set, so
+    /// implementations are responsible for forwarding `auth_header` /
+    /// `custom_headers` if they want the static config to keep applying.
+    pub fn with_http_client(mut self, client: Arc<dyn McpHttpClient>) -> Self {
+        self.http_client = Some(client);
         self
     }
 
     /// Adds a static HTTP header for every Streamable HTTP request.
     ///
     /// Reserved MCP session and protocol headers are still managed by RMCP.
+    /// Ignored when a custom [`McpHttpClient`] is installed.
     pub fn with_header<N, V>(mut self, name: N, value: V) -> Result<Self, McpError>
     where
         N: TryInto<HeaderName>,
@@ -333,6 +394,115 @@ impl StreamableHttpTransportConfig {
             .map_err(|error| McpError::Transport(format!("invalid HTTP header value: {error}")))?;
         self.headers.push((name, value));
         Ok(self)
+    }
+}
+
+/// Type alias for the SSE stream returned by [`McpHttpClient::get_stream`].
+pub type McpSseStream = BoxStream<'static, Result<Sse, SseError>>;
+
+/// Pluggable HTTP transport for the MCP Streamable HTTP client.
+///
+/// Mirrors [`rmcp::transport::streamable_http_client::StreamableHttpClient`]
+/// but is dyn-compatible (boxed via `async_trait`) so the configuration can
+/// store an `Arc<dyn McpHttpClient>` without genericizing every type that
+/// flows through [`McpServerConfig`] / [`McpTransportBinding`].
+///
+/// The associated error type is fixed to [`reqwest::Error`] so that
+/// agentkit-mcp's auth-challenge detection (which downcasts to
+/// [`StreamableHttpError<reqwest::Error>`]) keeps working — implementations
+/// that wrap a non-reqwest backend should map their failures into a
+/// `reqwest::Error` before returning.
+///
+/// All three methods are invoked by rmcp's worker on every protocol op.
+/// `auth_header` and `custom_headers` carry the values resolved from
+/// [`StreamableHttpTransportConfig`] at connection time; implementations are
+/// free to ignore them and inject their own per-call values (e.g. a fresh
+/// bearer pulled from a runtime registry).
+#[async_trait]
+pub trait McpHttpClient: Send + Sync + 'static {
+    /// POSTs a single client→server JSON-RPC message. The response carries
+    /// either a JSON body or an SSE stream depending on what the server
+    /// negotiates.
+    async fn post_message(
+        &self,
+        uri: Arc<str>,
+        message: ClientJsonRpcMessage,
+        session_id: Option<Arc<str>>,
+        auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+    ) -> Result<StreamableHttpPostResponse, StreamableHttpError<reqwest::Error>>;
+
+    /// Tears down a server-issued session (HTTP DELETE).
+    async fn delete_session(
+        &self,
+        uri: Arc<str>,
+        session_id: Arc<str>,
+        auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+    ) -> Result<(), StreamableHttpError<reqwest::Error>>;
+
+    /// Opens a server→client SSE stream (HTTP GET) for push notifications and
+    /// reconnect resumes.
+    async fn get_stream(
+        &self,
+        uri: Arc<str>,
+        session_id: Arc<str>,
+        last_event_id: Option<String>,
+        auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+    ) -> Result<McpSseStream, StreamableHttpError<reqwest::Error>>;
+}
+
+/// Internal newtype that adapts an `Arc<dyn McpHttpClient>` to rmcp's
+/// generic, non-dyn-compatible [`RmcpStreamableHttpClient`] trait.
+#[derive(Clone)]
+struct DynHttpClient(Arc<dyn McpHttpClient>);
+
+impl RmcpStreamableHttpClient for DynHttpClient {
+    type Error = reqwest::Error;
+
+    async fn post_message(
+        &self,
+        uri: Arc<str>,
+        message: ClientJsonRpcMessage,
+        session_id: Option<Arc<str>>,
+        auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+    ) -> Result<StreamableHttpPostResponse, StreamableHttpError<reqwest::Error>> {
+        self.0
+            .post_message(uri, message, session_id, auth_header, custom_headers)
+            .await
+    }
+
+    async fn delete_session(
+        &self,
+        uri: Arc<str>,
+        session_id: Arc<str>,
+        auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+    ) -> Result<(), StreamableHttpError<reqwest::Error>> {
+        self.0
+            .delete_session(uri, session_id, auth_header, custom_headers)
+            .await
+    }
+
+    async fn get_stream(
+        &self,
+        uri: Arc<str>,
+        session_id: Arc<str>,
+        last_event_id: Option<String>,
+        auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+    ) -> Result<McpSseStream, StreamableHttpError<reqwest::Error>> {
+        self.0
+            .get_stream(
+                uri,
+                session_id,
+                last_event_id,
+                auth_header,
+                custom_headers,
+            )
+            .await
     }
 }
 
@@ -1446,12 +1616,21 @@ async fn connect_rmcp_streamable_http(
         rmcp_config = rmcp_config.auth_header(auth_header);
     }
     rmcp_config = rmcp_config.custom_headers(binding.headers.iter().cloned().collect());
-    let transport = StreamableHttpClientTransport::from_config(rmcp_config);
 
-    let service = handler
-        .serve(transport)
-        .await
-        .map_err(|error| rmcp_initialize_error(config, error))?;
+    let result = match binding.http_client.as_ref() {
+        Some(client) => {
+            let transport = StreamableHttpClientTransport::with_client(
+                DynHttpClient(client.clone()),
+                rmcp_config,
+            );
+            handler.serve(transport).await
+        }
+        None => {
+            let transport = StreamableHttpClientTransport::from_config(rmcp_config);
+            handler.serve(transport).await
+        }
+    };
+    let service = result.map_err(|error| rmcp_initialize_error(config, error))?;
     let capabilities = service
         .peer_info()
         .map(|info| rmcp_server_capabilities_to_agentkit(&info.capabilities))

@@ -1,39 +1,40 @@
-//! End-to-end demo: spins up a tiny in-process mock MCP endpoint that
-//! validates `Authorization: Bearer <token>` against an expected value, then
-//! drives it through an MCP client whose HTTP layer picks the token up fresh
-//! from an in-memory registry on every request.
+//! End-to-end demo of [`agentkit_mcp::McpHttpClient`].
+//!
+//! Spins up a tiny in-process mock MCP endpoint that only accepts
+//! `Authorization: Bearer token-N` where `N` is the next sequential request
+//! counter, then drives it through an MCP client whose HTTP layer mints a
+//! fresh token on every request from a shared atomic counter — no reconnect,
+//! no auth-resolver round trip.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use agentkit_core::MetadataMap;
 use agentkit_mcp::{
-    AuthOperation, AuthRequest, AuthResolution, McpConnection, McpServerConfig,
-    McpTransportBinding, StreamableHttpTransportConfig,
+    ClientJsonRpcMessage, McpConnection, McpHttpClient, McpServerConfig, McpSseStream,
+    McpStreamableHttpError, McpStreamableHttpPostResponse, McpTransportBinding,
+    StreamableHttpTransportConfig,
 };
+use async_trait::async_trait;
 use axum::Router;
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
-use mcp_dynamic_auth::TokenRegistry;
+use rmcp::transport::streamable_http_client::StreamableHttpClient as RmcpStreamableHttpClient;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
 
 #[derive(Clone, Default)]
 struct MockState {
-    expected_token: Arc<Mutex<String>>,
-    observed_tokens: Arc<Mutex<Vec<String>>>,
-    request_count: Arc<AtomicU64>,
+    expected: Arc<AtomicU64>,
+    observed: Arc<tokio::sync::Mutex<Vec<String>>>,
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mock = MockState::default();
-    *mock.expected_token.lock().await = "token-v1".into();
-
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr: SocketAddr = listener.local_addr()?;
     let server = {
@@ -45,101 +46,147 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
     };
 
-    let registry = TokenRegistry::new("token-v1");
+    let counter = Arc::new(AtomicU64::new(0));
+    let dynamic_client = Arc::new(SequentialBearerClient {
+        inner: reqwest::Client::new(),
+        counter: counter.clone(),
+    });
 
     let connection = McpConnection::connect(&McpServerConfig::new(
         "dynamic-auth",
         McpTransportBinding::StreamableHttp(
             StreamableHttpTransportConfig::new(format!("http://{addr}/mcp"))
-                .with_bearer_token(registry.current().await),
+                .with_http_client(dynamic_client),
         ),
     ))
     .await?;
 
+    println!("[client] connected — counter is at {}", counter.load(Ordering::SeqCst));
+
     let first = connection.discover().await?;
     println!(
-        "[first discover] tools={:?} (registry = {})",
-        first
-            .tools
-            .iter()
-            .map(|t| t.name.as_ref())
-            .collect::<Vec<_>>(),
-        registry.current().await,
+        "[first discover] tools={:?} (counter = {})",
+        first.tools.iter().map(|t| t.name.as_ref()).collect::<Vec<_>>(),
+        counter.load(Ordering::SeqCst)
     );
-
-    registry.rotate("token-v2").await;
-    *mock.expected_token.lock().await = "token-v2".into();
-
-    // Trigger a reconnect that picks up the rotated token via stored auth
-    // credentials.
-    let mut credentials = MetadataMap::new();
-    credentials.insert(
-        "bearer_token".into(),
-        Value::String(registry.current().await),
-    );
-    connection
-        .resolve_auth(AuthResolution::Provided {
-            request: AuthRequest {
-                id: "rotate-token".into(),
-                provider: "mcp.dynamic-auth".into(),
-                operation: AuthOperation::McpConnect {
-                    server_id: "dynamic-auth".into(),
-                    metadata: MetadataMap::new(),
-                },
-                challenge: MetadataMap::new(),
-            },
-            credentials,
-        })
-        .await?;
 
     let second = connection.discover().await?;
     println!(
-        "[second discover] tools={:?} (registry = {})",
-        second
-            .tools
-            .iter()
-            .map(|t| t.name.as_ref())
-            .collect::<Vec<_>>(),
-        registry.current().await,
+        "[second discover] tools={:?} (counter = {})",
+        second.tools.iter().map(|t| t.name.as_ref()).collect::<Vec<_>>(),
+        counter.load(Ordering::SeqCst)
     );
 
     connection.close().await?;
     server.abort();
 
-    let observed = mock.observed_tokens.lock().await.clone();
-    println!(
-        "[server] total requests = {}",
-        mock.request_count.load(Ordering::SeqCst)
-    );
-    println!("[server] unique tokens seen = {:?}", unique(observed));
+    let observed = mock.observed.lock().await.clone();
+    println!("[server] tokens accepted in order: {observed:?}");
 
     Ok(())
 }
 
-async fn handle_mcp(State(state): State<MockState>, headers: HeaderMap, body: String) -> Response {
-    state.request_count.fetch_add(1, Ordering::SeqCst);
+/// A minimal [`McpHttpClient`] that prepends `token-N` to every request,
+/// where `N` is pulled from a shared atomic and incremented per HTTP op.
+struct SequentialBearerClient {
+    inner: reqwest::Client,
+    counter: Arc<AtomicU64>,
+}
 
+impl SequentialBearerClient {
+    fn next_token(&self) -> String {
+        let n = self.counter.fetch_add(1, Ordering::SeqCst);
+        format!("token-{n}")
+    }
+}
+
+#[async_trait]
+impl McpHttpClient for SequentialBearerClient {
+    async fn post_message(
+        &self,
+        uri: Arc<str>,
+        message: ClientJsonRpcMessage,
+        session_id: Option<Arc<str>>,
+        _auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+    ) -> Result<McpStreamableHttpPostResponse, McpStreamableHttpError<reqwest::Error>> {
+        let token = self.next_token();
+        RmcpStreamableHttpClient::post_message(
+            &self.inner,
+            uri,
+            message,
+            session_id,
+            Some(token),
+            custom_headers,
+        )
+        .await
+    }
+
+    async fn delete_session(
+        &self,
+        uri: Arc<str>,
+        session_id: Arc<str>,
+        _auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+    ) -> Result<(), McpStreamableHttpError<reqwest::Error>> {
+        let token = self.next_token();
+        RmcpStreamableHttpClient::delete_session(
+            &self.inner,
+            uri,
+            session_id,
+            Some(token),
+            custom_headers,
+        )
+        .await
+    }
+
+    async fn get_stream(
+        &self,
+        uri: Arc<str>,
+        session_id: Arc<str>,
+        last_event_id: Option<String>,
+        _auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+    ) -> Result<McpSseStream, McpStreamableHttpError<reqwest::Error>> {
+        let token = self.next_token();
+        RmcpStreamableHttpClient::get_stream(
+            &self.inner,
+            uri,
+            session_id,
+            last_event_id,
+            Some(token),
+            custom_headers,
+        )
+        .await
+    }
+}
+
+async fn handle_mcp(State(state): State<MockState>, headers: HeaderMap, body: String) -> Response {
     let presented = headers
-        .get(http::header::AUTHORIZATION)
+        .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
         .map(str::to_owned);
 
-    match &presented {
-        Some(token) => state.observed_tokens.lock().await.push(token.clone()),
-        None => return (StatusCode::UNAUTHORIZED, "missing bearer token").into_response(),
-    }
+    let Some(token) = presented else {
+        return (StatusCode::UNAUTHORIZED, "missing bearer token").into_response();
+    };
 
-    let expected = state.expected_token.lock().await.clone();
-    if presented.as_deref() != Some(expected.as_str()) {
-        return (StatusCode::UNAUTHORIZED, "stale token").into_response();
+    let expected = state.expected.fetch_add(1, Ordering::SeqCst);
+    let want = format!("token-{expected}");
+    if token != want {
+        return (
+            StatusCode::UNAUTHORIZED,
+            format!("expected {want}, got {token}"),
+        )
+            .into_response();
     }
+    state.observed.lock().await.push(token);
 
     let message: Value = match serde_json::from_str(&body) {
         Ok(value) => value,
         Err(_) => return (StatusCode::BAD_REQUEST, "invalid json").into_response(),
     };
-
     let id = message.get("id").cloned().unwrap_or(Value::Null);
     let method = message.get("method").and_then(Value::as_str).unwrap_or("");
 
@@ -160,12 +207,11 @@ async fn handle_mcp(State(state): State<MockState>, headers: HeaderMap, body: St
         "resources/list" => json!({ "resources": [] }),
         "prompts/list" => json!({ "prompts": [] }),
         _ => {
-            let payload = json!({
+            return json_ok(json!({
                 "jsonrpc": "2.0",
                 "id": id,
                 "error": { "code": -32601, "message": format!("unknown method: {method}") }
-            });
-            return json_ok(payload);
+            }));
         }
     };
 
@@ -175,14 +221,11 @@ async fn handle_mcp(State(state): State<MockState>, headers: HeaderMap, body: St
 fn json_ok(value: Value) -> Response {
     (
         StatusCode::OK,
-        [(http::header::CONTENT_TYPE, "application/json")],
+        [(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        )],
         serde_json::to_string(&value).unwrap(),
     )
         .into_response()
-}
-
-fn unique(mut values: Vec<String>) -> Vec<String> {
-    values.sort();
-    values.dedup();
-    values
 }
