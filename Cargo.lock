@@ -1844,6 +1844,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "openrouter-context-window-compaction"
+version = "0.5.0"
+dependencies = [
+ "agentkit-compaction",
+ "agentkit-core",
+ "agentkit-http",
+ "agentkit-loop",
+ "agentkit-provider-openrouter",
+ "agentkit-tools-core",
+ "async-trait",
+ "dotenvy",
+ "reqwest",
+ "serde",
+ "tokio",
+]
+
+[[package]]
 name = "openrouter-mcp-tool"
 version = "0.5.0"
 dependencies = [

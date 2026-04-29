@@ -46,17 +46,16 @@ use rmcp::handler::client::ClientHandler;
 use rmcp::model as rmcp_model;
 use rmcp::service::{ClientInitializeError, Peer, RoleClient, RunningService, ServiceError};
 use rmcp::transport::streamable_http_client::{
-    AuthRequiredError, InsufficientScopeError,
-    StreamableHttpClient as RmcpStreamableHttpClient,
+    AuthRequiredError, InsufficientScopeError, StreamableHttpClient as RmcpStreamableHttpClient,
     StreamableHttpClientTransportConfig as RmcpStreamableHttpClientTransportConfig,
     StreamableHttpError, StreamableHttpPostResponse,
 };
-use sse_stream::{Error as SseError, Sse};
 use rmcp::transport::{
     ConfigureCommandExt, DynamicTransportError, StreamableHttpClientTransport, TokioChildProcess,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sse_stream::{Error as SseError, Sse};
 use thiserror::Error;
 use tokio::sync::{Mutex, broadcast, mpsc};
 
@@ -332,7 +331,10 @@ impl fmt::Debug for StreamableHttpTransportConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("StreamableHttpTransportConfig")
             .field("url", &self.url)
-            .field("bearer_token", &self.bearer_token.as_deref().map(|_| "<redacted>"))
+            .field(
+                "bearer_token",
+                &self.bearer_token.as_deref().map(|_| "<redacted>"),
+            )
             .field("headers", &self.headers)
             .field(
                 "http_client",
@@ -495,13 +497,7 @@ impl RmcpStreamableHttpClient for DynHttpClient {
         custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> Result<McpSseStream, StreamableHttpError<reqwest::Error>> {
         self.0
-            .get_stream(
-                uri,
-                session_id,
-                last_event_id,
-                auth_header,
-                custom_headers,
-            )
+            .get_stream(uri, session_id, last_event_id, auth_header, custom_headers)
             .await
     }
 }
