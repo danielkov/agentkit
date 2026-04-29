@@ -61,19 +61,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ))
     .await?;
 
-    println!("[client] connected — counter is at {}", counter.load(Ordering::SeqCst));
+    println!(
+        "[client] connected — counter is at {}",
+        counter.load(Ordering::SeqCst)
+    );
 
     let first = connection.discover().await?;
     println!(
         "[first discover] tools={:?} (counter = {})",
-        first.tools.iter().map(|t| t.name.as_ref()).collect::<Vec<_>>(),
+        first
+            .tools
+            .iter()
+            .map(|t| t.name.as_ref())
+            .collect::<Vec<_>>(),
         counter.load(Ordering::SeqCst)
     );
 
     let second = connection.discover().await?;
     println!(
         "[second discover] tools={:?} (counter = {})",
-        second.tools.iter().map(|t| t.name.as_ref()).collect::<Vec<_>>(),
+        second
+            .tools
+            .iter()
+            .map(|t| t.name.as_ref())
+            .collect::<Vec<_>>(),
         counter.load(Ordering::SeqCst)
     );
 
