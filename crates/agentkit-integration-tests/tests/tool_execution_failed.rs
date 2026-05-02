@@ -82,13 +82,12 @@ async fn tool_execution_failure_lands_as_synthetic_error_result() {
         .build()
         .unwrap();
 
-    let mut driver = agent
-        .start(
-            SessionConfig::new(recording.session_id.clone()),
-            recording.initial_items.clone(),
-        )
-        .await
-        .unwrap();
+    let mut driver = agentkit_integration_tests::start_with_initial_input(
+        agent,
+        SessionConfig::new(recording.session_id.clone()),
+        recording.initial_items.clone(),
+    )
+    .await;
 
     loop {
         match driver.next().await.unwrap() {

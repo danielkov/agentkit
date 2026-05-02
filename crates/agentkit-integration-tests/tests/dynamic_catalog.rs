@@ -37,13 +37,12 @@ async fn dynamic_registry_mutations_flow_to_next_turn() {
         .build()
         .unwrap();
 
-    let mut driver = agent
-        .start(
-            SessionConfig::new(recording.session_id.clone()),
-            recording.initial_items.clone(),
-        )
-        .await
-        .unwrap();
+    let mut driver = agentkit_integration_tests::start_with_initial_input(
+        agent,
+        SessionConfig::new(recording.session_id.clone()),
+        recording.initial_items.clone(),
+    )
+    .await;
 
     // Turn 1 — sees [alpha].
     drive_until_finished(&mut driver).await;

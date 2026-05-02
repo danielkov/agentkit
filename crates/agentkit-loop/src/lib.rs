@@ -7,41 +7,56 @@
 //!
 //! # Architecture
 //!
-//! The main entry point is [`Agent`], constructed via [`AgentBuilder`].  After
-//! calling [`Agent::start`] with the initial transcript you receive a
-//! [`LoopDriver`] that yields [`LoopStep`]s -- either a finished turn or an
-//! interrupt that requires host resolution before the loop can continue.
+//! The main entry point is [`Agent`], constructed via [`AgentBuilder`]. The
+//! builder optionally accepts the prior conversation transcript via
+//! [`AgentBuilder::transcript`] and the next user turn via
+//! [`AgentBuilder::input`] — both default to empty. Calling
+//! [`Agent::start`] with a [`SessionConfig`] returns a [`LoopDriver`] that
+//! yields [`LoopStep`]s — either a finished turn or an interrupt that
+//! requires host resolution before the loop can continue.
+//!
+//! If no input was preloaded, the first call to [`LoopDriver::next`] yields
+//! [`LoopInterrupt::AwaitingInput`] and the host supplies the first user
+//! turn via [`InputRequest::submit`]. If input was preloaded, the first
+//! `next()` dispatches the model directly — convenient for one-shot calls.
 //!
 //! ```text
 //! Agent::builder()
 //!     .model(adapter)              // ModelAdapter implementation
 //!     .add_tool_source(registry)   // ToolRegistry (or any ToolSource); call again to federate
-//!     .permissions(checker)  // PermissionChecker for gating tool use
-//!     .observer(obs)         // LoopObserver for streaming events
+//!     .permissions(checker)        // PermissionChecker for gating tool use
+//!     .observer(obs)               // LoopObserver for streaming events
+//!     .transcript(prior)           // optional: passive prior transcript (system prompt, resumed session)
+//!     .input(first_user_turn)      // optional: preload next user turn so first next() drives a turn
 //!     .build()?
-//!     .start(config, vec![system_item, user_item]).await?  -> LoopDriver
-//!         .next().await?     -> LoopStep::Finished | LoopStep::Interrupt
+//!     .start(config).await?  -> LoopDriver
+//!         .next().await?     -> LoopStep::Finished | LoopStep::Interrupt(...)
 //! ```
 //!
 //! # Example
 //!
 //! ```rust,no_run
 //! use agentkit_core::{Item, ItemKind};
-//! use agentkit_loop::{Agent, PromptCacheRequest, PromptCacheRetention, SessionConfig};
+//! use agentkit_loop::{
+//!     Agent, PromptCacheRequest, PromptCacheRetention, SessionConfig,
+//! };
 //!
 //! # async fn example<M: agentkit_loop::ModelAdapter>(adapter: M) -> Result<(), agentkit_loop::LoopError> {
+//! // One-shot: preload system prompt and first user message; first next()
+//! // drives the model directly.
 //! let agent = Agent::builder()
 //!     .model(adapter)
+//!     .transcript(vec![Item::text(ItemKind::System, "You are a helpful assistant.")])
+//!     .input(vec![Item::text(ItemKind::User, "Hello!")])
 //!     .build()?;
 //!
 //! let mut driver = agent
-//!     .start(
-//!         SessionConfig::new("demo").with_cache(
-//!             PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
-//!         ),
-//!         vec![Item::text(ItemKind::User, "Hello!")],
-//!     )
+//!     .start(SessionConfig::new("demo").with_cache(
+//!         PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
+//!     ))
 //!     .await?;
+//!
+//! let _ = driver.next().await?;
 //! # Ok(())
 //! # }
 //! ```
@@ -688,7 +703,11 @@ impl PendingApproval {
 /// Descriptor for a [`LoopInterrupt::AwaitingInput`] interrupt.
 ///
 /// Returned when the driver has no pending input and needs the host to
-/// supply items before advancing.
+/// supply items before advancing. This is the entry point for every user
+/// turn that wasn't preloaded via [`AgentBuilder::input`]. Transcript items
+/// loaded via [`AgentBuilder::transcript`] are passive, so when no input is
+/// preloaded the first [`LoopDriver::next`] call surfaces `AwaitingInput`
+/// and the host injects the first user message via [`InputRequest::submit`].
 ///
 /// # Example
 ///
@@ -902,14 +921,22 @@ struct ActiveToolRound {
 /// A configured agent ready to start a session.
 ///
 /// Build one with [`Agent::builder`], supplying at minimum a [`ModelAdapter`].
-/// Then call [`Agent::start`] with a [`SessionConfig`] to obtain a
-/// [`LoopDriver`] that drives the agentic loop.
+/// Optionally preload prior conversation state via
+/// [`AgentBuilder::transcript`] and the next user turn via
+/// [`AgentBuilder::input`]. Then call [`Agent::start`] with a
+/// [`SessionConfig`] to obtain a [`LoopDriver`] that drives the agentic loop.
+///
+/// If no input is preloaded, the first call to [`LoopDriver::next`] yields
+/// [`LoopInterrupt::AwaitingInput`] so the host can supply the first user
+/// message via [`InputRequest::submit`]. If input was preloaded, the first
+/// `next()` dispatches the model directly.
 ///
 /// # Example
 ///
 /// ```rust,no_run
+/// use agentkit_core::{Item, ItemKind};
 /// use agentkit_loop::{
-///     Agent, LoopStep, PromptCacheRequest, PromptCacheRetention, SessionConfig,
+///     Agent, PromptCacheRequest, PromptCacheRetention, SessionConfig,
 /// };
 /// use agentkit_tools_core::ToolRegistry;
 ///
@@ -917,18 +944,18 @@ struct ActiveToolRound {
 /// let agent = Agent::builder()
 ///     .model(adapter)
 ///     .add_tool_source(ToolRegistry::new())
+///     .transcript(vec![Item::text(ItemKind::System, "You are a helpful assistant.")])
+///     .input(vec![Item::text(ItemKind::User, "Hello!")])
 ///     .build()?;
 ///
 /// let mut driver = agent
-///     .start(
-///         SessionConfig::new("s1").with_cache(
-///             PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
-///         ),
-///         Vec::new(),
-///     )
+///     .start(SessionConfig::new("s1").with_cache(
+///         PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
+///     ))
 ///     .await?;
 ///
-/// // Drive the loop; submit input via InputRequest::submit on AwaitingInput
+/// // First next() drives the model since input was preloaded.
+/// let _ = driver.next().await?;
 /// # Ok(())
 /// # }
 /// ```
@@ -946,6 +973,8 @@ where
     compaction: Option<CompactionConfig>,
     observers: Vec<Box<dyn LoopObserver>>,
     transcript_observers: Vec<Box<dyn TranscriptObserver>>,
+    transcript: Vec<Item>,
+    input: Vec<Item>,
 }
 
 impl<M> Agent<M>
@@ -957,20 +986,10 @@ where
         AgentBuilder::default()
     }
 
-    /// Consume the agent and start a session with the given initial
-    /// `transcript`, returning a [`LoopDriver`].
-    ///
-    /// `transcript` is the entire starting state of the conversation:
-    ///
-    /// - **New session:** `[system_prompt_item, first_user_input_item]`.
-    /// - **Resumed session:** the full transcript loaded from a database,
-    ///   file, or previous run.
-    ///
-    /// The first call to [`LoopDriver::next`] consumes the transcript directly
-    /// instead of waiting for input. Mid-session input is supplied through
-    /// [`InputRequest::submit`] (on `AwaitingInput`) or
-    /// [`ToolRoundInfo::submit`] (on `AfterToolResult`); there is no
-    /// out-of-turn submission entry point.
+    /// Consume the agent and start a session, returning a [`LoopDriver`]
+    /// preloaded with whatever transcript and input were configured on the
+    /// builder. See [`AgentBuilder::transcript`] and [`AgentBuilder::input`]
+    /// for what each one does and when to use them.
     ///
     /// This calls [`ModelAdapter::start_session`] and emits an
     /// [`AgentEvent::RunStarted`] event to all registered observers.
@@ -978,11 +997,7 @@ where
     /// # Errors
     ///
     /// Returns [`LoopError`] if the model adapter fails to create a session.
-    pub async fn start(
-        self,
-        config: SessionConfig,
-        transcript: Vec<Item>,
-    ) -> Result<LoopDriver<M::Session>, LoopError> {
+    pub async fn start(self, config: SessionConfig) -> Result<LoopDriver<M::Session>, LoopError> {
         let session_id = config.session_id.clone();
         let default_cache = config.cache.clone();
         let session = self.model.start_session(config).await?;
@@ -1002,8 +1017,8 @@ where
             compaction: self.compaction,
             observers: self.observers,
             transcript_observers: self.transcript_observers,
-            transcript: Vec::new(),
-            pending_input: transcript,
+            transcript: self.transcript,
+            pending_input: self.input,
             pending_approvals: BTreeMap::new(),
             pending_approval_order: VecDeque::new(),
             active_tool_round: None,
@@ -1035,6 +1050,8 @@ where
     compaction: Option<CompactionConfig>,
     observers: Vec<Box<dyn LoopObserver>>,
     transcript_observers: Vec<Box<dyn TranscriptObserver>>,
+    transcript: Vec<Item>,
+    input: Vec<Item>,
 }
 
 impl<M> Default for AgentBuilder<M>
@@ -1053,6 +1070,8 @@ where
             compaction: None,
             observers: Vec::new(),
             transcript_observers: Vec::new(),
+            transcript: Vec::new(),
+            input: Vec::new(),
         }
     }
 }
@@ -1153,6 +1172,31 @@ where
         self
     }
 
+    /// Preload the driver's transcript with prior conversation state
+    /// (defaults to empty).
+    ///
+    /// Items pass straight into the driver's transcript without firing
+    /// [`TranscriptObserver::on_item_appended`] — the host is expected to
+    /// already know about (and have persisted) anything it preloads. Use
+    /// this for resumed sessions or to seed a system prompt.
+    pub fn transcript(mut self, transcript: Vec<Item>) -> Self {
+        self.transcript = transcript;
+        self
+    }
+
+    /// Preload the driver's pending-input queue with the next user turn
+    /// (defaults to empty).
+    ///
+    /// When non-empty, the first [`LoopDriver::next`] dispatches the model
+    /// directly instead of yielding [`LoopInterrupt::AwaitingInput`]. Use
+    /// this for one-shot calls and scripts where the first user turn is
+    /// known up front. Items move to the transcript on turn dispatch the
+    /// same way submitted input does, firing transcript observers.
+    pub fn input(mut self, input: Vec<Item>) -> Self {
+        self.input = input;
+        self
+    }
+
     /// Consume the builder and produce an [`Agent`].
     ///
     /// # Errors
@@ -1175,13 +1219,16 @@ where
             compaction: self.compaction,
             observers: self.observers,
             transcript_observers: self.transcript_observers,
+            transcript: self.transcript,
+            input: self.input,
         })
     }
 }
 
 /// The runtime driver that advances the agent loop step by step.
 ///
-/// Obtained from [`Agent::start`] with the initial transcript baked in.
+/// Obtained from [`Agent::start`] with the builder's preloaded transcript
+/// and pending-input queue baked in.
 /// The typical usage pattern is:
 ///
 /// 1. Call [`next`](LoopDriver::next) to advance the loop.
@@ -1862,10 +1909,14 @@ where
     }
 
     /// Internal entry point for buffering user input. Reachable only via
-    /// [`InputRequest::submit`] (resolves an `AwaitingInput` interrupt) and
-    /// [`ToolRoundInfo::submit`] (interjects between tool rounds). Initial
-    /// transcript items are passed through [`Agent::start`] instead — there
-    /// is no out-of-turn submission API.
+    /// [`InputRequest::submit`] (resolves an `AwaitingInput` interrupt,
+    /// including the very first one after [`Agent::start`]) and
+    /// [`ToolRoundInfo::submit`] (interjects between tool rounds). Prior
+    /// transcript items — the passive starting state of a session — are
+    /// preloaded via [`AgentBuilder::transcript`]; an opening user turn for
+    /// one-shot calls is preloaded via [`AgentBuilder::input`]. New input
+    /// after start-up always flows through one of the typed `submit`
+    /// handles.
     pub(crate) fn submit_input(&mut self, input: Vec<Item>) -> Result<(), LoopError> {
         if self.has_pending_interrupts() {
             return Err(LoopError::InvalidState(
@@ -1974,6 +2025,12 @@ where
     ///
     /// If no input is queued and no interrupt is pending, returns
     /// [`LoopStep::Interrupt(LoopInterrupt::AwaitingInput(..))`](LoopInterrupt::AwaitingInput).
+    /// This is the steady state after [`Agent::start`] when no input was
+    /// preloaded via [`AgentBuilder::input`]: the prior transcript loaded
+    /// via [`AgentBuilder::transcript`] is passive, so the first call
+    /// surfaces `AwaitingInput` and waits for the host to supply input via
+    /// [`InputRequest::submit`] before any model turn is dispatched. If
+    /// input was preloaded, the first call dispatches the model directly.
     ///
     /// # Errors
     ///
@@ -3009,14 +3066,11 @@ mod tests {
             .unwrap();
 
         let mut driver = agent
-            .start(
-                SessionConfig {
-                    session_id: SessionId::new("session-1"),
-                    metadata: MetadataMap::new(),
-                    cache: None,
-                },
-                Vec::new(),
-            )
+            .start(SessionConfig {
+                session_id: SessionId::new("session-1"),
+                metadata: MetadataMap::new(),
+                cache: None,
+            })
             .await
             .unwrap();
 
@@ -3070,14 +3124,11 @@ mod tests {
             .unwrap();
 
         let mut driver = agent
-            .start(
-                SessionConfig {
-                    session_id: SessionId::new("session-2"),
-                    metadata: MetadataMap::new(),
-                    cache: None,
-                },
-                Vec::new(),
-            )
+            .start(SessionConfig {
+                session_id: SessionId::new("session-2"),
+                metadata: MetadataMap::new(),
+                cache: None,
+            })
             .await
             .unwrap();
 
@@ -3128,14 +3179,11 @@ mod tests {
             .unwrap();
 
         let mut driver = agent
-            .start(
-                SessionConfig {
-                    session_id: SessionId::new("session-background"),
-                    metadata: MetadataMap::new(),
-                    cache: None,
-                },
-                Vec::new(),
-            )
+            .start(SessionConfig {
+                session_id: SessionId::new("session-background"),
+                metadata: MetadataMap::new(),
+                cache: None,
+            })
             .await
             .unwrap();
 
@@ -3194,14 +3242,11 @@ mod tests {
             .unwrap();
 
         let mut driver = agent
-            .start(
-                SessionConfig {
-                    session_id: SessionId::new("session-cancel"),
-                    metadata: MetadataMap::new(),
-                    cache: None,
-                },
-                Vec::new(),
-            )
+            .start(SessionConfig {
+                session_id: SessionId::new("session-cancel"),
+                metadata: MetadataMap::new(),
+                cache: None,
+            })
             .await
             .unwrap();
 
@@ -3293,14 +3338,11 @@ mod tests {
             .unwrap();
 
         let mut driver = agent
-            .start(
-                SessionConfig {
-                    session_id: SessionId::new("session-mixed-cancel"),
-                    metadata: MetadataMap::new(),
-                    cache: None,
-                },
-                Vec::new(),
-            )
+            .start(SessionConfig {
+                session_id: SessionId::new("session-mixed-cancel"),
+                metadata: MetadataMap::new(),
+                cache: None,
+            })
             .await
             .unwrap();
 
@@ -3361,14 +3403,11 @@ mod tests {
             .unwrap();
 
         let mut driver = agent
-            .start(
-                SessionConfig {
-                    session_id: SessionId::new("session-approval"),
-                    metadata: MetadataMap::new(),
-                    cache: None,
-                },
-                Vec::new(),
-            )
+            .start(SessionConfig {
+                session_id: SessionId::new("session-approval"),
+                metadata: MetadataMap::new(),
+                cache: None,
+            })
             .await
             .unwrap();
 
@@ -3414,14 +3453,11 @@ mod tests {
             .unwrap();
 
         let mut driver = agent
-            .start(
-                SessionConfig {
-                    session_id: SessionId::new("session-dual-approval"),
-                    metadata: MetadataMap::new(),
-                    cache: None,
-                },
-                Vec::new(),
-            )
+            .start(SessionConfig {
+                session_id: SessionId::new("session-dual-approval"),
+                metadata: MetadataMap::new(),
+                cache: None,
+            })
             .await
             .unwrap();
 
@@ -3499,14 +3535,11 @@ mod tests {
             .unwrap();
 
         let mut driver = agent
-            .start(
-                SessionConfig {
-                    session_id: SessionId::new("session-4"),
-                    metadata: MetadataMap::new(),
-                    cache: None,
-                },
-                Vec::new(),
-            )
+            .start(SessionConfig {
+                session_id: SessionId::new("session-4"),
+                metadata: MetadataMap::new(),
+                cache: None,
+            })
             .await
             .unwrap();
 
@@ -3551,14 +3584,11 @@ mod tests {
             .unwrap();
 
         let mut driver = agent
-            .start(
-                SessionConfig {
-                    session_id: SessionId::new("session-dynamic-tools"),
-                    metadata: MetadataMap::new(),
-                    cache: None,
-                },
-                Vec::new(),
-            )
+            .start(SessionConfig {
+                session_id: SessionId::new("session-dynamic-tools"),
+                metadata: MetadataMap::new(),
+                cache: None,
+            })
             .await
             .unwrap();
 
@@ -3607,14 +3637,11 @@ mod tests {
             .unwrap();
 
         let mut driver = agent
-            .start(
-                SessionConfig {
-                    session_id: SessionId::new("session-catalog-events"),
-                    metadata: MetadataMap::new(),
-                    cache: None,
-                },
-                Vec::new(),
-            )
+            .start(SessionConfig {
+                session_id: SessionId::new("session-catalog-events"),
+                metadata: MetadataMap::new(),
+                cache: None,
+            })
             .await
             .unwrap();
 
@@ -3677,14 +3704,11 @@ mod tests {
         });
 
         let mut driver = agent
-            .start(
-                SessionConfig {
-                    session_id: SessionId::new("session-cache"),
-                    metadata: MetadataMap::new(),
-                    cache: Some(default_cache.clone()),
-                },
-                Vec::new(),
-            )
+            .start(SessionConfig {
+                session_id: SessionId::new("session-cache"),
+                metadata: MetadataMap::new(),
+                cache: Some(default_cache.clone()),
+            })
             .await
             .unwrap();
 
@@ -3734,14 +3758,11 @@ mod tests {
             .unwrap();
 
         let mut driver = agent
-            .start(
-                SessionConfig {
-                    session_id: SessionId::new("yield-session"),
-                    metadata: MetadataMap::new(),
-                    cache: None,
-                },
-                Vec::new(),
-            )
+            .start(SessionConfig {
+                session_id: SessionId::new("yield-session"),
+                metadata: MetadataMap::new(),
+                cache: None,
+            })
             .await
             .unwrap();
 
@@ -3828,14 +3849,11 @@ mod tests {
             .unwrap();
 
         let mut driver = agent
-            .start(
-                SessionConfig {
-                    session_id: SessionId::new("observer-session"),
-                    metadata: MetadataMap::new(),
-                    cache: None,
-                },
-                Vec::new(),
-            )
+            .start(SessionConfig {
+                session_id: SessionId::new("observer-session"),
+                metadata: MetadataMap::new(),
+                cache: None,
+            })
             .await
             .unwrap();
 

@@ -129,19 +129,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
         builder = builder.add_tool_source(manager.source());
     }
 
-    let agent = builder.build()?;
+    let mut transcript = vec![Item::text(ItemKind::System, SYSTEM_PROMPT)];
+    transcript.extend(context_items);
 
-    let mut input = vec![Item::text(ItemKind::System, SYSTEM_PROMPT)];
-    input.extend(context_items);
-    input.push(Item::text(ItemKind::User, &args.prompt));
+    let agent = builder
+        .transcript(transcript)
+        .input(vec![Item::text(ItemKind::User, &args.prompt)])
+        .build()?;
 
     let mut driver = agent
-        .start(
-            SessionConfig::new("openrouter-agent-cli").with_cache(
-                PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
-            ),
-            input,
-        )
+        .start(SessionConfig::new("openrouter-agent-cli").with_cache(
+            PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
+        ))
         .await?;
 
     let result = run_to_completion(&mut driver).await;

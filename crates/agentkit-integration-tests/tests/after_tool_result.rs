@@ -79,13 +79,12 @@ async fn after_tool_result_submit_interjects_user_message_into_next_turn() {
         .build()
         .unwrap();
 
-    let mut driver = agent
-        .start(
-            SessionConfig::new(recording.session_id.clone()),
-            recording.initial_items.clone(),
-        )
-        .await
-        .unwrap();
+    let mut driver = agentkit_integration_tests::start_with_initial_input(
+        agent,
+        SessionConfig::new(recording.session_id.clone()),
+        recording.initial_items.clone(),
+    )
+    .await;
 
     let mut interjected = false;
     loop {

@@ -208,9 +208,18 @@ impl CompactionBackend for NestedLoopCompactionBackend {
             return Err(CompactionError::Cancelled);
         }
 
+        let rendered = render_items(&request.items);
         let mut builder = Agent::builder()
             .model(self.adapter.clone())
-            .permissions(AllowAll);
+            .permissions(AllowAll)
+            .transcript(vec![Item::text(ItemKind::System, COMPACTION_SYSTEM_PROMPT)])
+            .input(vec![Item::text(
+                ItemKind::User,
+                format!(
+                    "Compress the transcript below into a comprehensive context note. \
+                     Preserve every name, year, place, and event.\n\n{rendered}"
+                ),
+            )]);
         if let Some(c) = cancellation.as_ref() {
             builder = builder.cancellation(c.handle().clone());
         }
@@ -218,21 +227,11 @@ impl CompactionBackend for NestedLoopCompactionBackend {
             .build()
             .map_err(|e| CompactionError::Failed(e.to_string()))?;
 
-        let rendered = render_items(&request.items);
         let mut driver = agent
-            .start(
-                SessionConfig::new(format!("{}-compactor", request.session_id)),
-                vec![
-                    Item::text(ItemKind::System, COMPACTION_SYSTEM_PROMPT),
-                    Item::text(
-                        ItemKind::User,
-                        format!(
-                            "Compress the transcript below into a comprehensive context note. \
-                             Preserve every name, year, place, and event.\n\n{rendered}"
-                        ),
-                    ),
-                ],
-            )
+            .start(SessionConfig::new(format!(
+                "{}-compactor",
+                request.session_id
+            )))
             .await
             .map_err(|e| CompactionError::Failed(e.to_string()))?;
 
@@ -396,19 +395,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         adapter: adapter.clone(),
     };
 
-    let agent = Agent::builder()
-        .model(adapter)
-        .permissions(AllowAll)
-        .compaction(CompactionConfig::new(trigger.clone(), strategy).with_backend(backend))
-        .observer(trigger.clone())
-        .observer(DisplayObserver)
-        .build()?;
-
-    println!(
-        "[config] model={model} context_length={context_length} percentage={percentage}% threshold={}",
-        trigger.threshold()
-    );
-
     let prompts = [
         format!(
             "Below is a short story. Read it, then summarize it in 3 to 4 sentences. \
@@ -418,15 +404,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "Based on your summary, who is Holger Kvist?".to_owned(),
     ];
 
+    let agent = Agent::builder()
+        .model(adapter)
+        .permissions(AllowAll)
+        .compaction(CompactionConfig::new(trigger.clone(), strategy).with_backend(backend))
+        .observer(trigger.clone())
+        .observer(DisplayObserver)
+        .transcript(vec![Item::text(ItemKind::System, SYSTEM_PROMPT)])
+        .input(vec![Item::text(ItemKind::User, &prompts[0])])
+        .build()?;
+
+    println!(
+        "[config] model={model} context_length={context_length} percentage={percentage}% threshold={}",
+        trigger.threshold()
+    );
+
     let mut driver = agent
         .start(
             SessionConfig::new("openrouter-context-window-compaction").with_cache(
                 PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
             ),
-            vec![
-                Item::text(ItemKind::System, SYSTEM_PROMPT),
-                Item::text(ItemKind::User, &prompts[0]),
-            ],
         )
         .await?;
 

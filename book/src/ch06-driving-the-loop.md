@@ -39,15 +39,23 @@ impl<S: ModelSession> LoopDriver<S> {
 }
 ```
 
-There is no `submit_input` on the driver. The initial transcript is handed to `Agent::start`; mid-session input is supplied through the `InputRequest` and `ToolRoundInfo` handles surfaced on cooperative interrupts. Funnelling every transcript mutation through the driver itself preserves the `&mut LoopDriver` invariant — no other task or thread can race with `next()`.
+There is no `submit_input` on the driver. The prior transcript is preloaded via `AgentBuilder::transcript` as passive starting state, and an opening user turn for one-shot calls is preloaded via `AgentBuilder::input`. After that, every user turn is supplied through the `InputRequest` and `ToolRoundInfo` handles surfaced on cooperative interrupts. Funnelling every transcript mutation through the driver itself preserves the `&mut LoopDriver` invariant — no other task or thread can race with `next()`.
 
-The host code is a simple loop:
+The host code is a simple loop. With nothing preloaded as input, the first call to `next()` yields `AwaitingInput`:
 
 ```rust
-let mut driver = agent.start(session_config, vec![system_item, user_item]).await?;
+let agent = Agent::builder()
+    .model(adapter)
+    .transcript(vec![system_item])
+    .build()?;
+
+let mut driver = agent.start(session_config).await?;
 
 loop {
     match driver.next().await? {
+        LoopStep::Interrupt(LoopInterrupt::AwaitingInput(req)) => {
+            req.submit(&mut driver, read_user_input()?)?;
+        }
         LoopStep::Interrupt(interrupt) => handle_interrupt(interrupt),
         LoopStep::Finished(result) => break,
     }
@@ -61,9 +69,13 @@ loop {
 ```text
 Driver state machine:
 
-           agent.start(cfg, transcript)
+       Agent::builder()
+         .transcript(prior)        // passive, optional
+         .input(opening_turn)      // optional one-shot opener
+         .build()?
+         .start(cfg)
                       │
-                      ▼
+                      ▼  (transcript & pending input baked in)
   ┌─────────────────────────────────┐
   │         Has pending input?      │
   │                                 │
@@ -126,7 +138,7 @@ Here's what happens inside `next()`, step by step:
 
 ### 1. Merge input
 
-Pending items — the initial transcript on the first call, or items submitted through an `InputRequest` / `ToolRoundInfo` handle on subsequent calls — are appended to the working transcript. The driver emits `AgentEvent::InputAccepted` to observers.
+Pending items — submitted through an `InputRequest` / `ToolRoundInfo` handle — are appended to the working transcript. The driver emits `AgentEvent::InputAccepted` to observers. (The transcript handed to `Agent::start` is loaded passively at session creation and is not re-merged here.)
 
 ```text
 Before:
@@ -296,9 +308,11 @@ let agent = Agent::builder()
     .compaction(config)                      // default: none
     .observer(reporter)                      // default: none
     .transcript_observer(persistence)        // default: none
+    .transcript(vec![system_item])           // default: empty
+    .input(vec![first_user_turn])            // default: empty (one-shot opener)
     .build()?;
 
-let mut driver = agent.start(session_config, vec![system_item, user_item]).await?;
+let mut driver = agent.start(session_config).await?;
 ```
 
 The builder validates that a model adapter is set. Everything else has sensible defaults:
@@ -314,7 +328,7 @@ The builder validates that a model adapter is set. Everything else has sensible 
 | `observers`            | `[]`                  | No event reporting                |
 | `transcript_observers` | `[]`                  | No transcript persistence hook    |
 
-`Agent::start()` consumes the agent and returns a `LoopDriver` with the supplied transcript loaded as pending input. The agent's immutable configuration (adapter, tool sources, permissions) is moved into the driver. Multiple drivers can be created from the same `Agent` type by cloning it first.
+`Agent::start()` consumes the agent and returns a `LoopDriver` with the supplied transcript loaded passively. The first call to `next()` yields `AwaitingInput`; the host supplies the first user turn via `InputRequest::submit`, and the driver dispatches the model on the next `next()`. The agent's immutable configuration (adapter, tool sources, permissions) is moved into the driver. Multiple drivers can be created from the same `Agent` type by cloning it first.
 
 ### Tool sources federate
 

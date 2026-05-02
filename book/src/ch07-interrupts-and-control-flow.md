@@ -268,11 +268,15 @@ The driver enforces strict state transitions:
 ```text
 Valid transitions:
 
-  agent.start(cfg, transcript) ──▶ next() ──▶ Finished
-                                            ──▶ Interrupt(Approval)        ──▶ pending.approve/deny()  ──▶ next()
-                                            ──▶ Interrupt(Awaiting)        ──▶ req.submit(driver, …)   ──▶ next()
-                                            ──▶ Interrupt(AfterToolResult) ──▶ [info.submit(driver, …)] ──▶ next()
-                                                                              (submit is optional)
+  Agent::builder()
+    .transcript(prior)        // optional, default empty
+    .input(opening_turn)      // optional, default empty
+    .build()?
+    .start(cfg)         ──▶ next() ──▶ Interrupt(Awaiting)        ──▶ req.submit(driver, first_input)   ──▶ next()
+                                                  ──▶ Finished
+                                                  ──▶ Interrupt(Approval)        ──▶ pending.approve/deny()  ──▶ next()
+                                                  ──▶ Interrupt(AfterToolResult) ──▶ [info.submit(driver, …)] ──▶ next()
+                                                                                    (submit is optional)
 
 Invalid (state errors):
 

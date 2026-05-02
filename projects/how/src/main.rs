@@ -494,10 +494,14 @@ async fn run_agent(
     let adapter = OpenRouterAdapter::new(config).map_err(|e| AgentError::Other(e.into()))?;
     let tools = ToolRegistry::new().with(IsAvailableTool);
 
+    let cache_key = prompt_cache_key(&model, &prompt);
+
     let agent = Agent::builder()
         .model(adapter)
         .add_tool_source(tools)
         .cancellation(cancellation.handle())
+        .transcript(vec![Item::text(ItemKind::System, system_prompt())])
+        .input(vec![Item::text(ItemKind::User, prompt)])
         .build()?;
 
     let mut driver = agent
@@ -505,12 +509,8 @@ async fn run_agent(
             SessionConfig::new("how").with_cache(
                 PromptCacheRequest::automatic()
                     .with_retention(PromptCacheRetention::Short)
-                    .with_key(prompt_cache_key(&model, &prompt)),
+                    .with_key(cache_key),
             ),
-            vec![
-                Item::text(ItemKind::System, system_prompt()),
-                Item::text(ItemKind::User, prompt),
-            ],
         )
         .await?;
 

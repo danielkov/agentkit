@@ -77,13 +77,12 @@ async fn agent_drives_static_and_mcp_tools_in_one_session() {
         .build()
         .unwrap();
 
-    let mut driver = agent
-        .start(
-            SessionConfig::new(recording.session_id.clone()),
-            recording.initial_items.clone(),
-        )
-        .await
-        .unwrap();
+    let mut driver = agentkit_integration_tests::start_with_initial_input(
+        agent,
+        SessionConfig::new(recording.session_id.clone()),
+        recording.initial_items.clone(),
+    )
+    .await;
 
     loop {
         match driver.next().await.unwrap() {

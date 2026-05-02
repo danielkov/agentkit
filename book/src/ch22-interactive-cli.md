@@ -66,8 +66,10 @@ enum Mode {
     AwaitingApproval { pending: PendingApproval, buffered: Vec<Item> },
 }
 
-// agent.start(...) was called with the first user message in the initial
-// transcript, so the agent task starts in `Mode::Driving`.
+// The agent was built with `.transcript(system + context)` and
+// `.input(first_user_message)`, so the first `next()` dispatches the
+// model directly. After the opening turn, subsequent user messages flow
+// through the `InputRequest`/`ToolRoundInfo` handles below.
 
 loop {
     mode = match mode {
@@ -170,12 +172,16 @@ The UI flips to `ApprovalInput` on `UiEvent::ApprovalRequested` and back to `Mes
 
 ## Minimal skeleton
 
-For simple CLIs or prototypes, a single-task skeleton with cooperative-yield passthrough is still fine:
+For simple CLIs or prototypes, a single-task skeleton with cooperative-yield passthrough is still fine. Preload the system prompt and the user input on the builder so the first `next()` dispatches the model directly:
 
 ```rust
-let mut driver = agent
-    .start(session_config, vec![system_item, user_item(&input)])
-    .await?;
+let agent = Agent::builder()
+    .model(adapter)
+    .transcript(vec![system_item])
+    .input(vec![user_item(&input)])
+    .build()?;
+
+let mut driver = agent.start(session_config).await?;
 
 loop {
     match driver.next().await? {

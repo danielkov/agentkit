@@ -40,15 +40,20 @@ let items = ContextLoader::new()
     .await?;
 ```
 
-Sources are loaded in registration order and their results are concatenated. The resulting items are ordinary transcript entries — the loop and providers don't need a separate context path. They're handed to `Agent::start` alongside the system and user items as the initial transcript:
+Sources are loaded in registration order and their results are concatenated. The resulting items are ordinary transcript entries — the loop and providers don't need a separate context path. They're preloaded via `AgentBuilder::transcript` alongside the system items, and the first user message is preloaded via `AgentBuilder::input`:
 
 ```rust
 let mut transcript = Vec::new();
 transcript.extend(system_items);
 transcript.extend(context_items); // ← loaded by ContextLoader
-transcript.extend(user_items);
 
-let mut driver = agent.start(session_config, transcript).await?;
+let agent = Agent::builder()
+    .model(adapter)
+    .transcript(transcript)
+    .input(user_items)
+    .build()?;
+
+let mut driver = agent.start(session_config).await?;
 ```
 
 ## AgentsMd

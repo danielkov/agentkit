@@ -90,6 +90,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .task_manager(task_manager)
         .permissions(permissions)
         .observer(reporter)
+        .transcript(vec![system_item()])
+        .input(vec![user_item(&prompt)])
         .build()?;
 
     // --- spawn task-event printer ---
@@ -130,12 +132,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- run ---
     let mut driver = agent
-        .start(
-            SessionConfig::new("openrouter-parallel-agent").with_cache(
-                PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
-            ),
-            vec![system_item(), user_item(&prompt)],
-        )
+        .start(SessionConfig::new("openrouter-parallel-agent").with_cache(
+            PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
+        ))
         .await?;
 
     run_to_completion(&mut driver).await?;
@@ -177,12 +176,9 @@ where
                 continue;
             }
             LoopStep::Interrupt(LoopInterrupt::AfterToolResult(_)) => continue,
-            LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_)) => {
-                // No more input to process right now. Background tasks may
-                // still be running — the caller can wait for them and
-                // re-enter if needed.
-                return Ok(());
-            }
+            // Background tasks may still be running — the caller can wait
+            // for them and re-enter if needed.
+            LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_)) => return Ok(()),
         }
     }
 }

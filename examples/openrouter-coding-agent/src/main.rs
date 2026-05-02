@@ -549,12 +549,12 @@ enum Mode {
 /// the driver runs from here, so the `&mut` borrow rule is a local concern.
 ///
 /// The driver is started inside this task (rather than passed in already-
-/// started) so the system prompt can travel with the first user message in
-/// the initial transcript — most chat providers reject a system-prompt-only
-/// call. We wait for `cmd_rx` to deliver the first `UserMessage`, then
-/// `agent.start([system, user])` and enter the driving loop directly.
+/// started) so we don't pay for a session before the user has anything to
+/// say. We wait for `cmd_rx` to deliver the first `UserMessage`, preload it
+/// as the builder's `input`, then start the driver and enter the driving
+/// loop.
 async fn run_agent<M>(
-    agent: Agent<M>,
+    agent_builder: agentkit_loop::AgentBuilder<M>,
     session_config: SessionConfig,
     cancellation: CancellationController,
     mut cmd_rx: mpsc::Receiver<AgentCommand>,
@@ -575,15 +575,13 @@ where
         }
     };
 
-    let mut driver = agent
-        .start(
-            session_config,
-            vec![
-                Item::text(ItemKind::System, SYSTEM_PROMPT),
-                Item::text(ItemKind::User, first_text),
-            ],
-        )
-        .await?;
+    let agent = agent_builder
+        .transcript(vec![Item::text(ItemKind::System, SYSTEM_PROMPT)])
+        .input(vec![Item::text(ItemKind::User, first_text)])
+        .build()?;
+
+    let mut driver = agent.start(session_config).await?;
+
     let _ = evt_tx.send(UiEvent::Busy);
 
     let mut mode = Mode::Driving {
@@ -763,7 +761,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // if the agent falls behind, which it shouldn't).
     let (cmd_tx, cmd_rx) = mpsc::channel::<AgentCommand>(64);
 
-    let agent = Agent::builder()
+    let agent_builder = Agent::builder()
         .model(adapter)
         .add_tool_source(tools)
         .permissions(permissions)
@@ -784,8 +782,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .preserve_kind(ItemKind::System)
                         .preserve_kind(ItemKind::Context),
                 ),
-        ))
-        .build()?;
+        ));
 
     let session_config = SessionConfig::new("openrouter-coding-agent")
         .with_cache(PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short));
@@ -811,7 +808,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Agent task runs in the background; UI task runs in the foreground so
     // that stdin / stdout see the same terminal as the user.
     let agent_handle = tokio::spawn(run_agent(
-        agent,
+        agent_builder,
         session_config,
         cancellation,
         cmd_rx,

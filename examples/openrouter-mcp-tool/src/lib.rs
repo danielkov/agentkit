@@ -61,18 +61,17 @@ pub async fn run_probe_with_command(
         .model(adapter)
         .add_tool_source(manager.source())
         .observer(observer.clone())
+        .transcript(vec![Item::text(ItemKind::System, ROOT_SYSTEM_PROMPT)])
+        .input(vec![Item::text(
+            ItemKind::User,
+            prompt.unwrap_or(DEFAULT_PROMPT),
+        )])
         .build()?;
 
     let mut driver = agent
-        .start(
-            SessionConfig::new("openrouter-mcp-tool").with_cache(
-                PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
-            ),
-            vec![
-                Item::text(ItemKind::System, ROOT_SYSTEM_PROMPT),
-                Item::text(ItemKind::User, prompt.unwrap_or(DEFAULT_PROMPT)),
-            ],
-        )
+        .start(SessionConfig::new("openrouter-mcp-tool").with_cache(
+            PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
+        ))
         .await?;
 
     let output = run_to_completion(&mut driver).await?;

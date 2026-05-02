@@ -48,16 +48,15 @@ async fn cancellation_during_tool_call_finishes_with_cancelled_reason() {
         .build()
         .unwrap();
 
-    let mut driver = agent
-        .start(
-            SessionConfig::new("cancel-mid-tool"),
-            vec![agentkit_core::Item::text(
-                agentkit_core::ItemKind::User,
-                "park forever",
-            )],
-        )
-        .await
-        .unwrap();
+    let mut driver = agentkit_integration_tests::start_with_initial_input(
+        agent,
+        SessionConfig::new("cancel-mid-tool"),
+        vec![agentkit_core::Item::text(
+            agentkit_core::ItemKind::User,
+            "park forever",
+        )],
+    )
+    .await;
 
     // Tool stays parked: the loop must be the one to short-circuit via
     // cancellation, not the tool returning a real result.
