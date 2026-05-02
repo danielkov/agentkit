@@ -31,6 +31,7 @@
 - [Context loading](./ch14-context-loading.md)
 - [Prompt caching](./ch15-caching.md)
 - [Transcript compaction](./ch16-compaction.md)
+- [Session persistence](./session-persistence.md)
 
 # Part IV: Integration and extensibility
 

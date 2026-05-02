@@ -698,6 +698,27 @@ impl PendingApproval {
             },
         )
     }
+
+    /// Approve the pending tool call with a patched input.
+    ///
+    /// The model's original tool input is replaced with `input` before the
+    /// tool executes. The transcript still records the call as the model
+    /// emitted it; only the executor sees the patched payload. This mirrors
+    /// the `PermissionResultAllow(updated_input=...)` pattern from the
+    /// Anthropic Agent SDK and is intended for hosts that want to sanitise,
+    /// restrict, or augment arguments before tool execution without forcing
+    /// the model to re-issue the call.
+    pub fn approve_with_patched_input<S: ModelSession>(
+        self,
+        driver: &mut LoopDriver<S>,
+        input: serde_json::Value,
+    ) -> Result<(), LoopError> {
+        let call_id = self
+            .request
+            .call_id
+            .ok_or_else(|| LoopError::InvalidState("pending approval is missing call id".into()))?;
+        driver.resolve_approval_for_with_patched_input(call_id, input)
+    }
 }
 
 /// Descriptor for a [`LoopInterrupt::AwaitingInput`] interrupt.
@@ -1292,6 +1313,22 @@ impl<S> LoopDriver<S>
 where
     S: ModelSession,
 {
+    fn execute_tool_span(
+        &self,
+        request: &ToolRequest,
+        turn_id: &agentkit_core::TurnId,
+        launch_kind: &'static str,
+    ) -> tracing::Span {
+        tracing::info_span!(
+            "agent.execute_tool",
+            "gen_ai.tool.name" = %request.tool_name,
+            "gen_ai.tool.call.id" = %request.call_id,
+            session.id = %self.session_id,
+            turn.id = %turn_id,
+            launch_kind = launch_kind,
+        )
+    }
+
     fn start_task_via_manager(
         &self,
         task_id: Option<TaskId>,
@@ -1543,6 +1580,8 @@ where
                 .as_mut()
                 .and_then(|active| active.pending_calls.pop_front());
             if let Some((_call, tool_request)) = next_call {
+                use tracing::Instrument;
+                let dispatch_span = self.execute_tool_span(&tool_request, &turn_id, "plain");
                 match self
                     .start_task_via_manager(
                         None,
@@ -1550,6 +1589,7 @@ where
                         TaskLaunchKind::Plain,
                         cancellation.clone(),
                     )
+                    .instrument(dispatch_span)
                     .await?
                 {
                     TaskStartOutcome::Ready(resolution) => {
@@ -1684,6 +1724,17 @@ where
         }
     }
 
+    #[tracing::instrument(
+        name = "agent.turn",
+        skip_all,
+        fields(
+            session.id = %self.session_id,
+            turn.id = %turn_id,
+            transcript.len = self.transcript.len(),
+            saw_tool_call = tracing::field::Empty,
+            finish_reason = tracing::field::Empty,
+        ),
+    )]
     async fn drive_turn(
         &mut self,
         turn_id: agentkit_core::TurnId,
@@ -1787,6 +1838,11 @@ where
         let result = finished_result.ok_or_else(|| {
             LoopError::Provider("model turn ended without a Finished event".into())
         })?;
+        tracing::Span::current().record("saw_tool_call", saw_tool_call);
+        tracing::Span::current().record(
+            "finish_reason",
+            tracing::field::debug(&result.finish_reason),
+        );
         self.extend_transcript(result.output_items.clone());
 
         if saw_tool_call {
@@ -1842,27 +1898,33 @@ where
             .ok_or_else(|| LoopError::InvalidState("pending approval has no decision".into()))?;
 
         match decision {
-            ApprovalDecision::Approve => match self
-                .start_task_via_manager(
-                    Some(pending.task_id.clone()),
-                    pending.tool_request.clone(),
-                    TaskLaunchKind::Approved(pending.request.clone()),
-                    self.cancellation
-                        .as_ref()
-                        .map(CancellationHandle::checkpoint),
-                )
-                .await?
-            {
-                TaskStartOutcome::Ready(resolution) => {
-                    let resolution = *resolution;
-                    if let Some(step) =
-                        self.queue_resolution_interrupt(&pending.turn_id, resolution)
-                    {
-                        return Ok(step);
+            ApprovalDecision::Approve => {
+                use tracing::Instrument;
+                let dispatch_span =
+                    self.execute_tool_span(&pending.tool_request, &pending.turn_id, "approved");
+                match self
+                    .start_task_via_manager(
+                        Some(pending.task_id.clone()),
+                        pending.tool_request.clone(),
+                        TaskLaunchKind::Approved(pending.request.clone()),
+                        self.cancellation
+                            .as_ref()
+                            .map(CancellationHandle::checkpoint),
+                    )
+                    .instrument(dispatch_span)
+                    .await?
+                {
+                    TaskStartOutcome::Ready(resolution) => {
+                        let resolution = *resolution;
+                        if let Some(step) =
+                            self.queue_resolution_interrupt(&pending.turn_id, resolution)
+                        {
+                            return Ok(step);
+                        }
                     }
+                    TaskStartOutcome::Pending { .. } => {}
                 }
-                TaskStartOutcome::Pending { .. } => {}
-            },
+            }
             ApprovalDecision::Deny { reason } => {
                 self.append_tool_result_item(Item {
                     id: None,
@@ -1980,6 +2042,33 @@ where
             approved: matches!(decision, ApprovalDecision::Approve),
         });
         Ok(())
+    }
+
+    /// Resolve a pending [`LoopInterrupt::ApprovalRequest`] with a patched
+    /// input that replaces the model's original tool arguments.
+    ///
+    /// Equivalent to calling [`resolve_approval_for`] with
+    /// [`ApprovalDecision::Approve`] except the tool sees `input` instead of
+    /// what the model emitted. The transcript still records the model's
+    /// original call.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoopError::InvalidState`] if no approval is pending for
+    /// `call_id`.
+    pub fn resolve_approval_for_with_patched_input(
+        &mut self,
+        call_id: ToolCallId,
+        input: serde_json::Value,
+    ) -> Result<(), LoopError> {
+        let Some(pending) = self.pending_approvals.get_mut(&call_id) else {
+            return Err(LoopError::InvalidState(format!(
+                "no approval request is pending for call {}",
+                call_id.0
+            )));
+        };
+        pending.tool_request.input = input;
+        self.resolve_approval_for(call_id, ApprovalDecision::Approve)
     }
 
     /// Resolve a pending [`LoopInterrupt::ApprovalRequest`] when exactly one
@@ -3436,6 +3525,54 @@ mod tests {
         match second {
             LoopStep::Finished(turn) => match &turn.items[0].parts[0] {
                 Part::Text(text) => assert_eq!(text.text, "tool said: pong"),
+                other => panic!("unexpected part: {other:?}"),
+            },
+            other => panic!("unexpected loop step after approval: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn loop_resumes_with_patched_input_on_approval() {
+        let tools = ToolRegistry::new().with(EchoTool::default());
+        let agent = Agent::builder()
+            .model(FakeAdapter)
+            .add_tool_source(tools)
+            .permissions(ApproveFsReads)
+            .build()
+            .unwrap();
+
+        let mut driver = agent
+            .start(SessionConfig {
+                session_id: SessionId::new("session-approval-patched"),
+                metadata: MetadataMap::new(),
+                cache: None,
+            })
+            .await
+            .unwrap();
+
+        driver
+            .submit_input(vec![Item {
+                id: None,
+                kind: ItemKind::User,
+                parts: vec![Part::Text(TextPart {
+                    text: "ping".into(),
+                    metadata: MetadataMap::new(),
+                })],
+                metadata: MetadataMap::new(),
+            }])
+            .unwrap();
+
+        match driver.next().await.unwrap() {
+            LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(pending)) => {
+                pending
+                    .approve_with_patched_input(&mut driver, json!({ "value": "patched" }))
+                    .unwrap();
+            }
+            other => panic!("unexpected loop step: {other:?}"),
+        }
+        match driver.next().await.unwrap() {
+            LoopStep::Finished(turn) => match &turn.items[0].parts[0] {
+                Part::Text(text) => assert_eq!(text.text, "tool said: patched"),
                 other => panic!("unexpected part: {other:?}"),
             },
             other => panic!("unexpected loop step after approval: {other:?}"),

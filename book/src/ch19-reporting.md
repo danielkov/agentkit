@@ -75,6 +75,117 @@ For expensive or async reporting:
 
 These adapters wrap the synchronous observer contract without changing it.
 
+## Tracing and OpenTelemetry
+
+agentkit emits structured `tracing` data on **two independent layers** that you can filter and route separately.
+
+### Layer 1: internal `tracing::instrument` spans
+
+The loop, provider adapters, and tool dispatch sites are annotated with `#[tracing::instrument]` and ad-hoc `info_span!` macros. These spans cover what the framework is doing right now — they are not user events. You see them whenever `tracing` is enabled, whether or not you wire up a reporter.
+
+| Span name            | Source crate    | Fields                                                                            |
+| -------------------- | --------------- | --------------------------------------------------------------------------------- |
+| `agent.turn`         | `agentkit_loop` | `session.id`, `turn.id`, `transcript.len`, `saw_tool_call`, `finish_reason`       |
+| `agent.execute_tool` | `agentkit_loop` | `gen_ai.tool.name`, `gen_ai.tool.call.id`, `session.id`, `turn.id`, `launch_kind` |
+
+Field naming follows the [OpenTelemetry GenAI semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/) where applicable, so spans exported to an OTel backend slot directly into existing GenAI dashboards.
+
+`launch_kind` is `"plain"` for tool calls dispatched in a normal tool round, `"approved"` when the call resumes after a human-in-the-loop approval. Provider crates may add their own `chat` spans inside `agent.turn`; that is left to the adapter.
+
+### Layer 2: `TracingReporter`
+
+`TracingReporter` is a `LoopObserver` that converts each `AgentEvent` into a single `tracing` event:
+
+| Agent event                                                                                                                                          | Level   |
+| ---------------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
+| `RunStarted`, `TurnStarted`, `TurnFinished`, `ToolCallRequested`, `ToolResultReceived`, `ApprovalRequired`, `ApprovalResolved`, `ToolCatalogChanged` | `INFO`  |
+| `InputAccepted`, `UsageUpdated`, `CompactionStarted`, `CompactionFinished`                                                                           | `DEBUG` |
+| `ContentDelta`                                                                                                                                       | `TRACE` |
+| `Warning`                                                                                                                                            | `WARN`  |
+| `RunFailed`                                                                                                                                          | `ERROR` |
+
+Reporter events are emitted under the `agentkit_reporting` target so they filter independently of the internal spans:
+
+```bash
+# Internal spans + reporter events
+RUST_LOG=agentkit_loop=debug,agentkit_reporting=info cargo run
+
+# Reporter events only (treat agentkit as a black box)
+RUST_LOG=agentkit_reporting=info cargo run
+
+# One specific provider's HTTP traffic + everything else at info
+RUST_LOG=info,agentkit_provider_anthropic=trace cargo run
+```
+
+The `TracingReporter` target is fixed to `agentkit_reporting` because the underlying `tracing` macros require compile-time-constant targets. To route reporter output into your application's own log namespace, implement `LoopObserver` directly and call `tracing::*!` macros with your own `target:` literal.
+
+### Enabling the reporter
+
+The reporter is gated behind the `tracing` cargo feature on `agentkit-reporting`:
+
+```toml
+[dependencies]
+agentkit-reporting = { version = "...", features = ["tracing"] }
+```
+
+Then register it with the agent like any other observer:
+
+```rust,ignore
+use agentkit_reporting::TracingReporter;
+
+let agent = Agent::builder()
+    .model(adapter)
+    .observer(TracingReporter::new())
+    .build()?;
+```
+
+### Wiring a `tracing` subscriber
+
+For CLI applications, the standard `tracing-subscriber` setup with `EnvFilter` is enough:
+
+```rust,ignore
+use tracing_subscriber::{EnvFilter, fmt};
+
+fmt()
+    .with_env_filter(EnvFilter::from_default_env())  // honours RUST_LOG
+    .with_target(true)                                // show the target column
+    .init();
+```
+
+### Exporting to OpenTelemetry
+
+For OTLP export, layer `tracing-opentelemetry` on top of an OTLP exporter and add it to a `tracing-subscriber::Registry`:
+
+```rust,ignore
+use opentelemetry::global;
+use opentelemetry_otlp::WithExportConfig;
+use tracing_opentelemetry::OpenTelemetryLayer;
+use tracing_subscriber::{EnvFilter, Registry, layer::SubscriberExt};
+
+let tracer = opentelemetry_otlp::new_pipeline()
+    .tracing()
+    .with_exporter(opentelemetry_otlp::new_exporter().tonic().with_endpoint("http://localhost:4317"))
+    .install_batch(opentelemetry_sdk::runtime::Tokio)?;
+
+let subscriber = Registry::default()
+    .with(EnvFilter::from_default_env())
+    .with(OpenTelemetryLayer::new(tracer))
+    .with(tracing_subscriber::fmt::layer());
+
+tracing::subscriber::set_global_default(subscriber)?;
+```
+
+With this in place, the `agent.turn` and `agent.execute_tool` spans become OTel spans in your trace backend (Jaeger, Tempo, Honeycomb, Datadog, etc.) with the GenAI semantic-convention fields preserved as span attributes.
+
+### Two layers, one filter
+
+The split between internal spans and the reporter exists so the two concerns evolve independently:
+
+- **Internal spans** track _what the framework is doing right now_ — useful for performance investigations, deadlocks, and missing instrumentation. They emit unconditionally when `tracing` is enabled in your subscriber, with no host-side wiring.
+- **Reporter events** track _what the agent is reporting back to the host_ — useful for UX, audit, and product analytics. They only fire when you register a reporter, and they have stable categorical levels for log routing.
+
+A coding-agent CLI typically wants both. A library embedding agentkit may want only the reporter events to keep the framework's internal noise out of its own logs.
+
 ## Failure policy
 
 Reporter failures are non-fatal by default. A broken log writer shouldn't crash the agent. Hosts can configure stricter behavior:

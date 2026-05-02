@@ -2,6 +2,74 @@
 
 Custom tools are the primary extension mechanism in agentkit. This chapter shows how to implement tools from simple to sophisticated, including preflight actions, custom permission types, and shared resources.
 
+## Happy path: `#[tool]` macro
+
+For a stateless tool whose input is a serializable struct, the `#[tool]` attribute from `agentkit-tools-derive` generates the entire `Tool` impl from one async function:
+
+```rust,ignore
+use agentkit_core::{MetadataMap, ToolOutput, ToolResultPart};
+use agentkit_tools_core::{ToolError, ToolRegistry, ToolResult};
+use agentkit_tools_derive::tool;
+use schemars::JsonSchema;
+use serde::Deserialize;
+
+#[derive(JsonSchema, Deserialize)]
+struct WordCountInput {
+    /// The text whose words should be counted.
+    text: String,
+}
+
+/// Count the number of whitespace-separated words in a string.
+#[tool]
+async fn word_count(input: WordCountInput) -> Result<ToolResult, ToolError> {
+    let count = input.text.split_whitespace().count();
+    Ok(ToolResult {
+        result: ToolResultPart {
+            call_id: Default::default(),
+            output: ToolOutput::Text(format!("{count} word(s)")),
+            is_error: false,
+            metadata: MetadataMap::new(),
+        },
+        duration: None,
+        metadata: MetadataMap::new(),
+    })
+}
+
+let registry = ToolRegistry::new().with(word_count);
+```
+
+What the macro generates:
+
+- A unit struct named the same as the function (`word_count`), implementing `Tool`. Registering reads as `registry.with(word_count)`.
+- A `ToolSpec` whose `input_schema` is derived from the input type via `schemars::JsonSchema`. The schema is built once at first access and cached in a `OnceLock`.
+- `name` defaults to the function's identifier; override with `#[tool(name = "explicit_name")]`.
+- `description` defaults to the function's first doc comment line; override with `#[tool(description = "...")]`.
+- `invoke` decodes `request.input` into the input type using `serde_json` and calls the user body. Decode errors become `ToolError::InvalidInput`, which the loop surfaces as an error `ToolResult` so the model can correct itself on the next turn.
+
+Requirements for the input type:
+
+- Implements `schemars::JsonSchema` (for the `input_schema` field).
+- Implements `serde::Deserialize` (for decoding `request.input`).
+
+Requirements for the function:
+
+- `async fn`, with an explicit return type of `Result<ToolResult, ToolError>` (or any compatible alias).
+- Exactly one positional argument: the input struct. The argument name becomes a local binding inside the generated `invoke` body. `ToolContext` is not threaded into the macro shape — if your tool needs it, use the manual impl below.
+
+Enable the macro by adding the two crates to your `Cargo.toml`:
+
+```toml
+[dependencies]
+agentkit-tools-core = { version = "...", features = ["schemars"] }
+agentkit-tools-derive = "..."
+schemars = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+```
+
+The companion runnable example lives at `examples/openrouter-macro-tool/`.
+
+For tools that need access to `ToolContext`, hold per-instance state, propose preflight permission requests, or surface custom permission kinds, drop down to the manual `impl Tool` path described in the rest of this chapter.
+
 ## A minimal tool
 
 ```rust

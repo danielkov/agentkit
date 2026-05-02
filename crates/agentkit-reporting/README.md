@@ -136,7 +136,7 @@ use agentkit_reporting::TracingReporter;
 let reporter = TracingReporter::new();
 ```
 
-Events are emitted under the `"agentkit"` target at levels that match
+Events are emitted under the `"agentkit_reporting"` target at levels that match
 their severity (INFO for lifecycle, DEBUG for usage/compaction, TRACE for
 content deltas, WARN/ERROR for problems).
 
