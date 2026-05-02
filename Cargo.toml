@@ -5,6 +5,7 @@ members = [
     "crates/agentkit-context",
     "crates/agentkit-capabilities",
     "crates/agentkit-tools-core",
+    "crates/agentkit-tools-derive",
     "crates/agentkit-task-manager",
     "crates/agentkit-loop",
     "crates/agentkit",
@@ -34,7 +35,9 @@ members = [
     "examples/openrouter-compaction-agent",
     "examples/openrouter-context-window-compaction",
     "examples/openrouter-parallel-agent",
+    "examples/openrouter-macro-tool",
     "examples/openrouter-mcp-tool",
+    "examples/openrouter-session-persistence",
     "examples/openrouter-subagent-tool",
     "examples/mcp-reference-interop",
     "examples/mcp-dynamic-auth",
@@ -62,3 +65,4 @@ base64 = "0.22.1"
 futures-util = "0.3.31"
 futures-timer = "3.0.3"
 tracing = "0.1"
+schemars = { version = "1", default-features = false }

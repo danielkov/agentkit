@@ -40,6 +40,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+/// Re-exports used by the `#[tool]` proc macro so generated code does not
+/// require downstream crates to add `async-trait` as a direct dependency.
+/// Not part of the public API; the path may change at any time.
+#[doc(hidden)]
+pub mod __private_async_trait {
+    pub use async_trait::async_trait;
+}
+
 /// Unique name identifying a [`Tool`] within a [`ToolRegistry`].
 ///
 /// Tool names are used as registry keys and appear in [`ToolRequest`]s to
@@ -216,6 +224,23 @@ impl ToolCatalogEvent {
             removed: Vec::new(),
             changed: Vec::new(),
         }
+    }
+
+    /// Applies `f` to every tool name in `added`, `removed`, and `changed`.
+    pub fn for_each_name_mut(&mut self, mut f: impl FnMut(&mut String)) {
+        for vec in [&mut self.added, &mut self.removed, &mut self.changed] {
+            for name in vec.iter_mut() {
+                f(name);
+            }
+        }
+    }
+
+    /// Retains only tool names that pass `predicate` in `added`, `removed`,
+    /// and `changed`.
+    pub fn retain_names(&mut self, mut predicate: impl FnMut(&str) -> bool) {
+        self.added.retain(|n| predicate(n));
+        self.removed.retain(|n| predicate(n));
+        self.changed.retain(|n| predicate(n));
     }
 }
 
@@ -1677,6 +1702,49 @@ pub trait ToolSource: Send + Sync {
     fn drain_catalog_events(&self) -> Vec<ToolCatalogEvent> {
         Vec::new()
     }
+
+    /// Wraps this source so every advertised tool name is prefixed with
+    /// `<prefix>_`. Useful for mounting the same source under multiple
+    /// namespaces, or for avoiding collisions between MCP catalogs.
+    ///
+    /// Lookups strip the prefix before delegating, and the wrapped tool's
+    /// `spec()` reports the public (prefixed) name so the model and the
+    /// tool see consistent names.
+    ///
+    /// To wrap an `Arc<dyn ToolSource>` instead, use [`Prefixed::new`].
+    fn prefixed(self, prefix: impl Into<String>) -> Prefixed<Self>
+    where
+        Self: Sized,
+    {
+        Prefixed::new(self, prefix)
+    }
+
+    /// Wraps this source so only tools whose name passes `predicate` are
+    /// advertised and resolvable. Tools rejected by the predicate are
+    /// invisible to the model and return `None` on lookup.
+    ///
+    /// To wrap an `Arc<dyn ToolSource>` instead, use [`Filtered::new`].
+    fn filtered<F>(self, predicate: F) -> Filtered<Self, F>
+    where
+        Self: Sized,
+        F: Fn(&ToolName) -> bool + Send + Sync + 'static,
+    {
+        Filtered::new(self, predicate)
+    }
+
+    /// Wraps this source with a name remapping. Each `(original, new)` pair
+    /// in `mapping` causes the tool to be advertised as `new` and resolved
+    /// from `new` back to `original` on lookup. Tools not in the mapping
+    /// pass through unchanged.
+    ///
+    /// To wrap an `Arc<dyn ToolSource>` instead, use [`Renamed::new`].
+    fn renamed<I>(self, mapping: I) -> Renamed<Self>
+    where
+        Self: Sized,
+        I: IntoIterator<Item = (ToolName, ToolName)>,
+    {
+        Renamed::new(self, mapping)
+    }
 }
 
 impl ToolSource for ToolRegistry {
@@ -1686,6 +1754,321 @@ impl ToolSource for ToolRegistry {
 
     fn get(&self, name: &ToolName) -> Option<Arc<dyn Tool>> {
         ToolRegistry::get(self, name)
+    }
+}
+
+impl<S> ToolSource for Arc<S>
+where
+    S: ToolSource + ?Sized,
+{
+    fn specs(&self) -> Vec<ToolSpec> {
+        (**self).specs()
+    }
+
+    fn get(&self, name: &ToolName) -> Option<Arc<dyn Tool>> {
+        (**self).get(name)
+    }
+
+    fn drain_catalog_events(&self) -> Vec<ToolCatalogEvent> {
+        (**self).drain_catalog_events()
+    }
+}
+
+/// A [`ToolSource`] wrapper that prefixes every advertised tool name with
+/// `<prefix>_`. Constructed via [`ToolSource::prefixed`] or directly.
+pub struct Prefixed<S> {
+    inner: S,
+    prefix: String,
+}
+
+impl<S> Prefixed<S> {
+    /// Creates a new prefixed wrapper.
+    pub fn new(inner: S, prefix: impl Into<String>) -> Self {
+        Self {
+            inner,
+            prefix: prefix.into(),
+        }
+    }
+
+    fn rewrite(&self, name: &str) -> String {
+        format!("{}_{}", self.prefix, name)
+    }
+
+    fn strip<'a>(&self, name: &'a str) -> Option<&'a str> {
+        name.strip_prefix(self.prefix.as_str())
+            .and_then(|rest| rest.strip_prefix('_'))
+    }
+}
+
+impl<S> ToolSource for Prefixed<S>
+where
+    S: ToolSource,
+{
+    fn specs(&self) -> Vec<ToolSpec> {
+        self.inner
+            .specs()
+            .into_iter()
+            .map(|mut spec| {
+                spec.name = ToolName::new(self.rewrite(spec.name.0.as_str()));
+                spec
+            })
+            .collect()
+    }
+
+    fn get(&self, name: &ToolName) -> Option<Arc<dyn Tool>> {
+        let original = self.strip(name.0.as_str())?;
+        let inner_name = ToolName::new(original);
+        let inner_tool = self.inner.get(&inner_name)?;
+        let mut public_spec = inner_tool.spec().clone();
+        public_spec.name = name.clone();
+        Some(Arc::new(RewrittenTool {
+            inner: inner_tool,
+            inner_name,
+            public_spec,
+        }))
+    }
+
+    fn drain_catalog_events(&self) -> Vec<ToolCatalogEvent> {
+        self.inner
+            .drain_catalog_events()
+            .into_iter()
+            .map(|mut event| {
+                event.for_each_name_mut(|name| *name = self.rewrite(name.as_str()));
+                event
+            })
+            .collect()
+    }
+}
+
+/// A [`ToolSource`] wrapper that hides tools rejected by `predicate`.
+/// Constructed via [`ToolSource::filtered`] or directly.
+pub struct Filtered<S, F> {
+    inner: S,
+    predicate: F,
+}
+
+impl<S, F> Filtered<S, F> {
+    /// Creates a new filtered wrapper.
+    pub fn new(inner: S, predicate: F) -> Self {
+        Self { inner, predicate }
+    }
+}
+
+impl<S, F> ToolSource for Filtered<S, F>
+where
+    S: ToolSource,
+    F: Fn(&ToolName) -> bool + Send + Sync + 'static,
+{
+    fn specs(&self) -> Vec<ToolSpec> {
+        self.inner
+            .specs()
+            .into_iter()
+            .filter(|spec| (self.predicate)(&spec.name))
+            .collect()
+    }
+
+    fn get(&self, name: &ToolName) -> Option<Arc<dyn Tool>> {
+        if !(self.predicate)(name) {
+            return None;
+        }
+        self.inner.get(name)
+    }
+
+    fn drain_catalog_events(&self) -> Vec<ToolCatalogEvent> {
+        self.inner
+            .drain_catalog_events()
+            .into_iter()
+            .map(|mut event| {
+                event.retain_names(|n| (self.predicate)(&ToolName::new(n)));
+                event
+            })
+            .collect()
+    }
+}
+
+/// A [`ToolSource`] wrapper that renames specific tools. Tools whose
+/// original name appears in the forward mapping are advertised under the
+/// new name and resolved from the new name back to the original.
+/// Unmapped names pass through unchanged.
+///
+/// Constructed via [`ToolSource::renamed`] or directly.
+pub struct Renamed<S> {
+    inner: S,
+    forward: BTreeMap<ToolName, ToolName>,
+    backward: BTreeMap<ToolName, ToolName>,
+}
+
+impl<S> Renamed<S> {
+    /// Creates a new renaming wrapper from a `(original, new)` mapping.
+    pub fn new<I>(inner: S, mapping: I) -> Self
+    where
+        I: IntoIterator<Item = (ToolName, ToolName)>,
+    {
+        let forward: BTreeMap<ToolName, ToolName> = mapping.into_iter().collect();
+        let backward = forward
+            .iter()
+            .map(|(k, v)| (v.clone(), k.clone()))
+            .collect();
+        Self {
+            inner,
+            forward,
+            backward,
+        }
+    }
+}
+
+impl<S> ToolSource for Renamed<S>
+where
+    S: ToolSource,
+{
+    fn specs(&self) -> Vec<ToolSpec> {
+        self.inner
+            .specs()
+            .into_iter()
+            .map(|mut spec| {
+                if let Some(new_name) = self.forward.get(&spec.name) {
+                    spec.name = new_name.clone();
+                }
+                spec
+            })
+            .collect()
+    }
+
+    fn get(&self, name: &ToolName) -> Option<Arc<dyn Tool>> {
+        if let Some(original) = self.backward.get(name) {
+            let inner_tool = self.inner.get(original)?;
+            let mut public_spec = inner_tool.spec().clone();
+            public_spec.name = name.clone();
+            Some(Arc::new(RewrittenTool {
+                inner: inner_tool,
+                inner_name: original.clone(),
+                public_spec,
+            }))
+        } else if self.forward.contains_key(name) {
+            // Original name of a remapped tool — hidden under its new name.
+            None
+        } else {
+            self.inner.get(name)
+        }
+    }
+
+    fn drain_catalog_events(&self) -> Vec<ToolCatalogEvent> {
+        self.inner
+            .drain_catalog_events()
+            .into_iter()
+            .map(|mut event| {
+                event.for_each_name_mut(|name| {
+                    if let Some(new) = self.forward.get(&ToolName::new(name.as_str())) {
+                        *name = new.0.clone();
+                    }
+                });
+                event
+            })
+            .collect()
+    }
+}
+
+/// Builds a JSON Schema [`Value`] for the given input type. Requires the
+/// `schemars` feature.
+///
+/// This is the bridge between Rust types and the
+/// [`ToolSpec::input_schema`] field — instead of hand-writing JSON Schema,
+/// derive [`schemars::JsonSchema`] on your input struct and call this.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use agentkit_tools_core::schema_for;
+/// use schemars::JsonSchema;
+///
+/// #[derive(JsonSchema)]
+/// struct WeatherInput {
+///     /// City name to look up.
+///     location: String,
+///     /// Use celsius (default false).
+///     #[serde(default)]
+///     celsius: bool,
+/// }
+///
+/// let schema = schema_for::<WeatherInput>();
+/// assert!(schema.is_object());
+/// ```
+#[cfg(feature = "schemars")]
+pub fn schema_for<T: schemars::JsonSchema>() -> Value {
+    let schema = schemars::schema_for!(T);
+    serde_json::to_value(schema)
+        .expect("schemars produces valid JSON; this conversion is infallible")
+}
+
+/// Builds a [`ToolSpec`] from `T`'s derived JSON Schema. Requires the
+/// `schemars` feature. The generated schema is exactly what
+/// [`schema_for::<T>`] produces; this helper just wraps it with a name and
+/// description.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use agentkit_tools_core::tool_spec_for;
+/// use schemars::JsonSchema;
+///
+/// #[derive(JsonSchema)]
+/// struct WeatherInput { location: String }
+///
+/// let spec = tool_spec_for::<WeatherInput>("get_weather", "Fetch current weather");
+/// assert_eq!(spec.name.0, "get_weather");
+/// ```
+#[cfg(feature = "schemars")]
+pub fn tool_spec_for<T: schemars::JsonSchema>(
+    name: impl Into<ToolName>,
+    description: impl Into<String>,
+) -> ToolSpec {
+    ToolSpec::new(name, description, schema_for::<T>())
+}
+
+/// A [`Tool`] wrapper used by [`Prefixed`] and [`Renamed`] to bridge between
+/// the public (rewritten) tool name and the inner tool's own name. The
+/// wrapper reports the public spec but rewrites `request.tool_name` back to
+/// the inner name before delegating to the wrapped tool, so tools that
+/// inspect their own name (e.g. for logging or routing) see the original.
+struct RewrittenTool {
+    inner: Arc<dyn Tool>,
+    inner_name: ToolName,
+    public_spec: ToolSpec,
+}
+
+#[async_trait]
+impl Tool for RewrittenTool {
+    fn spec(&self) -> &ToolSpec {
+        &self.public_spec
+    }
+
+    fn current_spec(&self) -> Option<ToolSpec> {
+        let inner_current = self.inner.current_spec()?;
+        Some(ToolSpec {
+            name: self.public_spec.name.clone(),
+            description: inner_current.description,
+            input_schema: inner_current.input_schema,
+            annotations: inner_current.annotations,
+            metadata: inner_current.metadata,
+        })
+    }
+
+    fn proposed_requests(
+        &self,
+        request: &ToolRequest,
+    ) -> Result<Vec<Box<dyn PermissionRequest>>, ToolError> {
+        let mut inner_request = request.clone();
+        inner_request.tool_name = self.inner_name.clone();
+        self.inner.proposed_requests(&inner_request)
+    }
+
+    async fn invoke(
+        &self,
+        mut request: ToolRequest,
+        ctx: &mut ToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
+        request.tool_name = self.inner_name.clone();
+        self.inner.invoke(request, ctx).await
     }
 }
 
@@ -2675,5 +3058,174 @@ mod tests {
             reader.get(&ToolName::new("hidden")).is_some(),
             "catalog usable for further writes + reads"
         );
+    }
+
+    #[derive(Clone)]
+    struct EchoTool {
+        spec: ToolSpec,
+    }
+
+    impl EchoTool {
+        fn new(name: &str) -> Self {
+            Self {
+                spec: ToolSpec {
+                    name: ToolName::new(name),
+                    description: format!("echo {name}"),
+                    input_schema: json!({"type": "object"}),
+                    annotations: ToolAnnotations::default(),
+                    metadata: MetadataMap::new(),
+                },
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Tool for EchoTool {
+        fn spec(&self) -> &ToolSpec {
+            &self.spec
+        }
+
+        async fn invoke(
+            &self,
+            request: ToolRequest,
+            _ctx: &mut ToolContext<'_>,
+        ) -> Result<ToolResult, ToolError> {
+            Ok(ToolResult::new(ToolResultPart::success(
+                request.call_id,
+                ToolOutput::text(request.tool_name.0.clone()),
+            )))
+        }
+    }
+
+    fn registry_with(names: &[&str]) -> ToolRegistry {
+        names.iter().fold(ToolRegistry::new(), |reg, name| {
+            reg.with(EchoTool::new(name))
+        })
+    }
+
+    #[test]
+    fn prefixed_rewrites_specs_and_resolves_lookups() {
+        let source = registry_with(&["get_temp", "get_humidity"]).prefixed("weather");
+        let names: Vec<_> = source.specs().into_iter().map(|s| s.name.0).collect();
+        assert_eq!(names, vec!["weather_get_humidity", "weather_get_temp"]);
+
+        assert!(source.get(&ToolName::new("weather_get_temp")).is_some());
+        assert!(
+            source.get(&ToolName::new("get_temp")).is_none(),
+            "original name must not resolve when prefixed"
+        );
+        assert!(source.get(&ToolName::new("unknown")).is_none());
+    }
+
+    #[tokio::test]
+    async fn prefixed_invoke_sees_inner_name_on_request() {
+        let source = registry_with(&["get_temp"]).prefixed("weather");
+        let tool = source.get(&ToolName::new("weather_get_temp")).unwrap();
+
+        // The wrapper must report the public name on its spec...
+        assert_eq!(tool.spec().name.0, "weather_get_temp");
+
+        // ...but the inner tool must see its own name in the request.
+        let owned = OwnedToolContext {
+            session_id: SessionId::new("s"),
+            turn_id: TurnId::new("t"),
+            metadata: MetadataMap::new(),
+            permissions: Arc::new(AllowAllPermissions),
+            resources: Arc::new(()),
+            cancellation: None,
+        };
+        let mut ctx = owned.borrowed();
+        let request = ToolRequest {
+            call_id: ToolCallId::new("c"),
+            tool_name: ToolName::new("weather_get_temp"),
+            input: json!({}),
+            session_id: SessionId::new("s"),
+            turn_id: TurnId::new("t"),
+            metadata: MetadataMap::new(),
+        };
+        let result = tool.invoke(request, &mut ctx).await.unwrap();
+        match result.result.output {
+            ToolOutput::Text(text) => assert_eq!(text, "get_temp"),
+            other => panic!("unexpected output: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn filtered_hides_tools_rejected_by_predicate() {
+        let source = registry_with(&["safe", "danger_drop", "danger_delete"])
+            .filtered(|name| !name.0.starts_with("danger_"));
+        let names: Vec<_> = source.specs().into_iter().map(|s| s.name.0).collect();
+        assert_eq!(names, vec!["safe"]);
+
+        assert!(source.get(&ToolName::new("safe")).is_some());
+        assert!(source.get(&ToolName::new("danger_drop")).is_none());
+    }
+
+    #[test]
+    fn renamed_remaps_specs_and_lookups() {
+        let source = registry_with(&["legacy_name", "passthrough"])
+            .renamed([(ToolName::new("legacy_name"), ToolName::new("modern_name"))]);
+        let mut names: Vec<_> = source.specs().into_iter().map(|s| s.name.0).collect();
+        names.sort();
+        assert_eq!(names, vec!["modern_name", "passthrough"]);
+
+        assert!(source.get(&ToolName::new("modern_name")).is_some());
+        assert!(
+            source.get(&ToolName::new("legacy_name")).is_none(),
+            "original name is hidden after renaming"
+        );
+        assert!(source.get(&ToolName::new("passthrough")).is_some());
+    }
+
+    #[cfg(feature = "schemars")]
+    mod schemars_helpers {
+        use super::*;
+        use schemars::JsonSchema;
+        use serde::Deserialize;
+
+        #[derive(JsonSchema, Deserialize)]
+        #[allow(dead_code)]
+        struct WeatherInput {
+            /// City name to look up.
+            location: String,
+            /// Use celsius (default false).
+            #[serde(default)]
+            celsius: bool,
+        }
+
+        #[test]
+        fn schema_for_emits_object_schema_with_typed_fields() {
+            let schema = schema_for::<WeatherInput>();
+            let obj = schema.as_object().expect("schema is a JSON object");
+            assert_eq!(
+                obj.get("type").and_then(|v| v.as_str()),
+                Some("object"),
+                "root type should be object"
+            );
+            let properties = obj
+                .get("properties")
+                .and_then(|v| v.as_object())
+                .expect("properties block");
+            assert!(properties.contains_key("location"));
+            assert!(properties.contains_key("celsius"));
+        }
+
+        #[test]
+        fn tool_spec_for_carries_schema_name_and_description() {
+            let spec = tool_spec_for::<WeatherInput>("get_weather", "Fetch current weather");
+            assert_eq!(spec.name.0, "get_weather");
+            assert_eq!(spec.description, "Fetch current weather");
+            assert!(spec.input_schema.is_object());
+        }
+    }
+
+    #[test]
+    fn transforms_compose_via_chained_methods() {
+        let source = registry_with(&["read_file", "write_file", "delete_file"])
+            .filtered(|name| name.0 != "delete_file")
+            .prefixed("fs");
+        let mut names: Vec<_> = source.specs().into_iter().map(|s| s.name.0).collect();
+        names.sort();
+        assert_eq!(names, vec!["fs_read_file", "fs_write_file"]);
     }
 }
