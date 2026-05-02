@@ -46,18 +46,17 @@ pub async fn run_probe(secret: &str, prompt: Option<&str>) -> Result<ProbeRun, B
         .add_tool_source(tools)
         .permissions(AllowAll)
         .observer(observer.clone())
+        .transcript(vec![Item::text(ItemKind::System, ROOT_SYSTEM_PROMPT)])
+        .input(vec![Item::text(
+            ItemKind::User,
+            prompt.unwrap_or(DEFAULT_PROMPT),
+        )])
         .build()?;
 
     let mut driver = agent
-        .start(
-            SessionConfig::new("openrouter-subagent-tool").with_cache(
-                PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
-            ),
-            vec![
-                Item::text(ItemKind::System, ROOT_SYSTEM_PROMPT),
-                Item::text(ItemKind::User, prompt.unwrap_or(DEFAULT_PROMPT)),
-            ],
-        )
+        .start(SessionConfig::new("openrouter-subagent-tool").with_cache(
+            PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
+        ))
         .await?;
 
     let output = run_to_completion(&mut driver).await?;
@@ -163,6 +162,11 @@ impl Tool for SubagentTool {
         let agent = Agent::builder()
             .model(self.adapter.clone())
             .permissions(AllowAll)
+            .transcript(vec![Item::text(
+                ItemKind::System,
+                &self.system_prompt_template,
+            )])
+            .input(vec![Item::text(ItemKind::User, &input.prompt)])
             .build()
             .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
 
@@ -175,10 +179,6 @@ impl Tool for SubagentTool {
                 .with_cache(
                     PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
                 ),
-                vec![
-                    Item::text(ItemKind::System, &self.system_prompt_template),
-                    Item::text(ItemKind::User, &input.prompt),
-                ],
             )
             .await
             .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;

@@ -96,13 +96,12 @@ async fn server_progress_notification_reaches_subscriber_during_agent_run() {
         .build()
         .unwrap();
 
-    let mut driver = agent
-        .start(
-            SessionConfig::new(recording.session_id.clone()),
-            recording.initial_items.clone(),
-        )
-        .await
-        .unwrap();
+    let mut driver = agentkit_integration_tests::start_with_initial_input(
+        agent,
+        SessionConfig::new(recording.session_id.clone()),
+        recording.initial_items.clone(),
+    )
+    .await;
 
     // Fire the progress notification from the server side BEFORE driving
     // the loop, so a buggy "events bound only after first call" wiring

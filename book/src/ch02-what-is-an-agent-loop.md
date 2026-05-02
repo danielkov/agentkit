@@ -67,30 +67,43 @@ pub enum LoopStep {
 `Finished` means the model completed a turn — the host can inspect the results, submit new input, and call `next()` again. `Interrupt` means the loop cannot proceed without host action.
 
 ```text
-Host                          LoopDriver
- │                               │
- │  agent.start(cfg, transcript) │
- │──────────────────────────────▶│
- │                               │
- │  next().await                 │
- │──────────────────────────────▶│
- │                               ├── send transcript to model
- │                               ├── stream response
- │                               ├── execute tool calls
- │                               ├── (possibly loop internally)
- │                               │
- │  LoopStep::Finished(result)   │
- │◀──────────────────────────────│
- │                               │
- │  next().await                 │
- │──────────────────────────────▶│
- │                               │
- │  LoopStep::Interrupt(...)     │
- │◀──────────────────────────────│  needs host decision
- │                               │
- │  pending.approve(driver)      │
- │──────────────────────────────▶│  host resolves, loop resumes
- │                               │
+Host                                    LoopDriver
+ │                                         │
+ │  Agent::builder()                       │
+ │    .transcript(prior)                   │  passive, optional
+ │    .input([first_user_msg])             │  optional one-shot opener
+ │    .build()?                            │
+ │                                         │
+ │  agent.start(cfg)                       │
+ │────────────────────────────────────────▶│
+ │                                         │
+ │  next().await                           │
+ │────────────────────────────────────────▶│
+ │                                         │
+ │  if no input was preloaded:             │
+ │  LoopStep::Interrupt(AwaitingInput)     │
+ │◀────────────────────────────────────────│  no input queued yet
+ │  req.submit(driver, [first_user_msg])   │
+ │────────────────────────────────────────▶│
+ │  next().await                           │
+ │────────────────────────────────────────▶│
+ │                                         ├── send transcript to model
+ │                                         ├── stream response
+ │                                         ├── execute tool calls
+ │                                         ├── (possibly loop internally)
+ │                                         │
+ │  LoopStep::Finished(result)             │
+ │◀────────────────────────────────────────│
+ │                                         │
+ │  next().await                           │
+ │────────────────────────────────────────▶│
+ │                                         │
+ │  LoopStep::Interrupt(...)               │
+ │◀────────────────────────────────────────│  needs host decision
+ │                                         │
+ │  pending.approve(driver)                │
+ │────────────────────────────────────────▶│  host resolves, loop resumes
+ │                                         │
 ```
 
 There is no polling, no callback registration, and no event queue the host must drain. The `next()` call is the only synchronisation point.
@@ -181,25 +194,26 @@ This separation means: configure once, run many sessions. Or run multiple concur
 
 The [`openrouter-chat`](https://github.com/danielkov/agentkit/tree/main/examples/openrouter-chat) example demonstrates the simplest possible host loop. The key parts:
 
-**Setup** — build an `Agent` with just a model adapter and start a session with the initial transcript:
+**Setup** — build an `Agent` with just a model adapter and a preloaded first user message, then start the session:
 
 ```rust
 let agent = Agent::builder()
     .model(adapter)
     .cancellation(cancellation.handle())
+    // Optional — preload a prior transcript (system prompt or resumed
+    // session) and the next user turn so the first next() drives a turn
+    // directly. Both default to empty.
+    .input(vec![Item::text(ItemKind::User, prompt)])
     .build()?;
 
 let mut driver = agent
-    .start(
-        SessionConfig::new("openrouter-chat").with_cache(
-            PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
-        ),
-        vec![Item::text(ItemKind::User, prompt)],
-    )
+    .start(SessionConfig::new("openrouter-chat").with_cache(
+        PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
+    ))
     .await?;
 ```
 
-`Agent::start` takes the full starting transcript — typically `[system_item, user_item]` for a fresh session, or a transcript loaded from a database / file when resuming. The first `next()` call consumes that transcript directly; there is no separate `submit_input` step at the start.
+`AgentBuilder::transcript` takes the prior transcript — typically `[system_item]` for a fresh session, or a transcript loaded from a database / file when resuming. It is loaded passively. `AgentBuilder::input` preloads the next user turn into the driver's pending-input queue: when non-empty, the first `next()` dispatches the model directly; when left empty (the default for turn-based loops), the first `next()` yields `AwaitingInput` and the host supplies input via `InputRequest::submit`.
 
 The session-level `cache` configures prompt caching for the session. It is optional, but most long-running agents benefit from setting it. See [Chapter 15](./ch15-caching.md) for the full cache request shape.
 

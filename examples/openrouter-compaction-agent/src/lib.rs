@@ -107,22 +107,32 @@ pub async fn run_mode(
     let adapter = OpenRouterAdapter::new(config)?;
     let observer = RecordingObserver::default();
 
+    let prompt = prompt.unwrap_or(DEFAULT_PROMPT).to_owned();
+    let seed_transcript = build_seed_transcript(mode, &prompt);
+
+    // The seed transcript ends with the user prompt for the run. Split off
+    // that final user item so it lands in the builder's preloaded input;
+    // everything before it is the passive prior transcript.
+    let mut prior_transcript = seed_transcript.clone();
+    let first_input = prior_transcript
+        .pop()
+        .map(|item| vec![item])
+        .unwrap_or_default();
+
     let agent = Agent::builder()
         .model(adapter.clone())
         .permissions(AllowAll)
         .compaction(compaction_config(mode, adapter))
         .observer(observer.clone())
+        .transcript(prior_transcript)
+        .input(first_input)
         .build()?;
-
-    let prompt = prompt.unwrap_or(DEFAULT_PROMPT).to_owned();
-    let seed_transcript = build_seed_transcript(mode, &prompt);
 
     let mut driver = agent
         .start(
             SessionConfig::new(format!("openrouter-compaction-agent-{mode}")).with_cache(
                 PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
             ),
-            seed_transcript.clone(),
         )
         .await?;
 
@@ -380,7 +390,15 @@ impl CompactionBackend for NestedLoopCompactionBackend {
 
         let mut builder = Agent::builder()
             .model(self.adapter.clone())
-            .permissions(AllowAll);
+            .permissions(AllowAll)
+            .transcript(vec![
+                Item::text(ItemKind::System, COMPACTION_SYSTEM_PROMPT),
+                context_item("compaction transcript", &render_items(&request.items)),
+            ])
+            .input(vec![Item::text(
+                ItemKind::User,
+                "Compress the supplied transcript into a context note for future turns. Preserve exact identifiers and actionable facts. Return only the compacted note.",
+            )]);
         if let Some(cancellation) = cancellation.as_ref() {
             builder = builder.cancellation(cancellation.handle().clone());
         }
@@ -401,14 +419,6 @@ impl CompactionBackend for NestedLoopCompactionBackend {
                 .with_cache(
                     PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
                 ),
-                vec![
-                    Item::text(ItemKind::System, COMPACTION_SYSTEM_PROMPT),
-                    context_item("compaction transcript", &render_items(&request.items)),
-                    Item::text(
-                        ItemKind::User,
-                        "Compress the supplied transcript into a context note for future turns. Preserve exact identifiers and actionable facts. Return only the compacted note.",
-                    ),
-                ],
             )
             .await
             .map_err(|error| agentkit_compaction::CompactionError::Failed(error.to_string()))?;

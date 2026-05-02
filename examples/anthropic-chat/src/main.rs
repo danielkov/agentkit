@@ -70,36 +70,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `driver.next().await`, so a plain `Arc<Mutex<..>>` is sufficient.
     let usage_slot: Arc<Mutex<Option<Usage>>> = Arc::new(Mutex::new(None));
 
-    let agent = Agent::builder()
-        .model(adapter)
-        .cancellation(cancellation.handle())
-        .observer(StreamPrinter::new(Arc::clone(&usage_slot)))
-        .build()?;
-
     println!(
         "Type a prompt and press enter. Use /exit or /quit to leave, Ctrl-C to cancel the current turn."
     );
 
-    // Anthropic (and most chat providers) reject a system-prompt-only call,
-    // so the system message must travel with the first user message in the
-    // initial transcript. Read that user message before starting the session.
+    // Read the first user message before paying for a session.
     let Some(first_prompt) = read_prompt()? else {
         return Ok(());
     };
 
+    // Seed the system prompt (if any) as passive prior transcript and
+    // preload the first user message so the opening turn dispatches the
+    // model directly without an AwaitingInput hop.
     let mut transcript = Vec::new();
     if let Some(system) = &cli.system {
         transcript.push(Item::text(ItemKind::System, system.clone()));
     }
-    transcript.push(Item::text(ItemKind::User, first_prompt));
+
+    let agent = Agent::builder()
+        .model(adapter)
+        .cancellation(cancellation.handle())
+        .observer(StreamPrinter::new(Arc::clone(&usage_slot)))
+        .transcript(transcript)
+        .input(vec![Item::text(ItemKind::User, first_prompt)])
+        .build()?;
 
     let mut driver = agent
-        .start(
-            SessionConfig::new("anthropic-chat").with_cache(
-                PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
-            ),
-            transcript,
-        )
+        .start(SessionConfig::new("anthropic-chat").with_cache(
+            PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
+        ))
         .await?;
 
     loop {

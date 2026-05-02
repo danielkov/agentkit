@@ -14,7 +14,7 @@ The agent is configured with filesystem tools, shell tools, a `PathPolicy` for t
 
 ### 1. Input submission
 
-The CLI reads the user's message. For the first turn it travels with the system prompt and any context items in the initial transcript handed to `Agent::start`; for subsequent turns it goes through the `InputRequest` handle the driver yielded on the previous `AwaitingInput` interrupt:
+The CLI reads the user's message. The system prompt and any context items were preloaded via `AgentBuilder::transcript`; the very first user turn was preloaded via `AgentBuilder::input` so the opening `next()` dispatches the model directly. Subsequent user messages flow through the `InputRequest` handle the driver yields on each `AwaitingInput` interrupt:
 
 ```rust
 input_request.submit(&mut driver, vec![Item::text(ItemKind::User, user_input)])?;

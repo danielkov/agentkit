@@ -85,26 +85,40 @@ let agent = Agent::builder()
 
 ## The host loop
 
-The host application drives the interaction. The first user message travels with the system prompt and context as the initial transcript handed to `start`; subsequent messages flow through the `InputRequest` handle exposed on `AwaitingInput`:
+The host application drives the interaction. The system prompt and any preloaded context items are handed to `AgentBuilder::transcript` as the prior transcript; in this turn-based pattern no `input` is preloaded, so every user message flows through the `InputRequest` handle exposed on `AwaitingInput`:
 
 ```rust
-// Block until we have a real first user message — most providers reject
-// system-prompt-only calls.
-let first_user = read_line()?;
-
 let mut transcript = Vec::new();
 transcript.extend(system_items);
 transcript.extend(context_items);
-transcript.push(user_item(first_user));
 
-let mut driver = agent.start(session_config, transcript).await?;
+let agent = Agent::builder()
+    .model(adapter)
+    .transcript(transcript)
+    .build()?;
+
+let mut driver = agent.start(session_config).await?;
+// With no input preloaded, the first next() yields AwaitingInput — no
+// model call is dispatched until the host submits input via the
+// InputRequest handle.
 let mut pending_input: Option<InputRequest> = None;
 
 loop {
-    if let Some(req) = pending_input.take() {
-        let user_input = read_line()?;
-        req.submit(&mut driver, vec![user_item(user_input)])?;
-    }
+    let req = match pending_input.take() {
+        Some(req) => req,
+        None => match driver.next().await? {
+            LoopStep::Interrupt(LoopInterrupt::AwaitingInput(req)) => req,
+            // Drive any non-AwaitingInput step that surfaces before the
+            // first user input (rare; handled defensively).
+            other => {
+                handle_step(other);
+                continue;
+            }
+        },
+    };
+
+    let user_input = read_line()?;
+    req.submit(&mut driver, vec![user_item(user_input)])?;
 
     // Run the agent turn
     loop {

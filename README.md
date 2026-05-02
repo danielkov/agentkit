@@ -155,7 +155,7 @@ cargo run -p openrouter-agent-cli -- --mcp-mock \
 
 ### Minimal chat
 
-Build an agent with a provider adapter, hand the initial transcript to `start`, and drive the loop:
+Build an agent with a provider adapter and an opening user turn, then drive the loop:
 
 ```rust
 use agentkit_core::{Item, ItemKind};
@@ -169,17 +169,20 @@ let adapter = OpenRouterAdapter::new(
         .with_temperature(0.0),
 )?;
 
-let agent = Agent::builder().model(adapter).build()?;
+let agent = Agent::builder()
+    .model(adapter)
+    // Optional — preload a prior transcript (system prompt or resumed
+    // session) and the next user turn. Both default to empty.
+    .input(vec![Item::text(ItemKind::User, "Hello!")])
+    .build()?;
 
 let mut driver = agent
-    .start(
-        SessionConfig::new("chat").with_cache(
-            PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
-        ),
-        vec![Item::text(ItemKind::User, "Hello!")],
-    )
+    .start(SessionConfig::new("chat").with_cache(
+        PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
+    ))
     .await?;
 
+// First next() dispatches the model directly because we preloaded input.
 match driver.next().await? {
     LoopStep::Finished(result) => { /* render result.items */ }
     LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(pending)) => {
@@ -192,7 +195,7 @@ match driver.next().await? {
 }
 ```
 
-`Agent::start` takes the full starting transcript — typically `[system_item, user_item]` for a fresh session, or a transcript loaded from disk when resuming. Mid-session input is supplied through the `InputRequest` / `ToolRoundInfo` handles surfaced on the cooperative interrupts; there is no out-of-turn `submit_input` entry point.
+`AgentBuilder::transcript` preloads the prior transcript as passive starting state — typically `[system_item]` for a fresh session, or a transcript loaded from disk when resuming. `AgentBuilder::input` preloads the next user turn into the driver's pending-input queue: when non-empty, the first `next()` dispatches the model directly; when left empty (the default for turn-based loops), the first `next()` yields `AwaitingInput` and every user turn flows through the `InputRequest` / `ToolRoundInfo` handles surfaced on the cooperative interrupts. There is no out-of-turn `submit_input` entry point.
 
 ### Tools and permissions
 

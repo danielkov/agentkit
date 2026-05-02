@@ -87,14 +87,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
-        // Cerebras (like other chat providers) rejects a system-prompt-only
-        // call. Bundle the system message with the first user message in the
-        // initial transcript so the first model call has both.
         let mut transcript = Vec::new();
         if let Some(system) = cli.system.as_deref() {
             transcript.push(Item::text(ItemKind::System, system.to_string()));
         }
-        transcript.push(Item::text(ItemKind::User, first));
 
         let mut driver = start_session(
             &adapter,
@@ -104,6 +100,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &usage_slot,
             &last_usage,
             transcript,
+            vec![Item::text(ItemKind::User, first)],
         )
         .await?;
 
@@ -115,16 +112,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             turn_active.store(false, Ordering::SeqCst);
             let pending_input = result?;
 
-            match read_input(&config, &adapter, &last_usage).await? {
+            let prompt = match read_input(&config, &adapter, &last_usage).await? {
                 ReadResult::Quit => return Ok(()),
                 ReadResult::Reset => {
                     println!("[session reset]");
                     continue 'session;
                 }
-                ReadResult::Prompt(p) => {
-                    pending_input.submit(&mut driver, vec![Item::text(ItemKind::User, p)])?;
-                }
-            }
+                ReadResult::Prompt(p) => p,
+            };
+            pending_input.submit(&mut driver, vec![Item::text(ItemKind::User, prompt)])?;
         }
     }
 }
@@ -181,6 +177,7 @@ async fn start_session(
     usage_slot: &Arc<Mutex<Option<Usage>>>,
     last_usage: &Arc<Mutex<Option<Usage>>>,
     transcript: Vec<Item>,
+    input: Vec<Item>,
 ) -> Result<
     agentkit_loop::LoopDriver<agentkit_provider_cerebras::CerebrasSession>,
     Box<dyn std::error::Error>,
@@ -194,10 +191,10 @@ async fn start_session(
             Arc::clone(usage_slot),
             Arc::clone(last_usage),
         ))
+        .transcript(transcript)
+        .input(input)
         .build()?;
-    let driver = agent
-        .start(SessionConfig::new("cerebras-chat"), transcript)
-        .await?;
+    let driver = agent.start(SessionConfig::new("cerebras-chat")).await?;
     Ok(driver)
 }
 

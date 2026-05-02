@@ -50,19 +50,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         builder = builder.add_tool_source(skill_registry.tool_registry());
     }
 
-    let agent = builder.build()?;
+    let mut transcript = vec![system_item()];
+    transcript.extend(context_items);
 
-    let mut input = vec![system_item()];
-    input.extend(context_items);
-    input.push(user_item(&args.prompt));
+    let agent = builder
+        .transcript(transcript)
+        .input(vec![user_item(&args.prompt)])
+        .build()?;
 
     let mut driver = agent
-        .start(
-            SessionConfig::new("openrouter-context-agent").with_cache(
-                PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
-            ),
-            input,
-        )
+        .start(SessionConfig::new("openrouter-context-agent").with_cache(
+            PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
+        ))
         .await?;
 
     run_to_completion(&mut driver).await

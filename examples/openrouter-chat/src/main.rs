@@ -13,16 +13,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = OpenRouterConfig::from_env()?;
     let adapter = OpenRouterAdapter::new(config)?;
     let cancellation = CancellationController::new();
-    let agent = Agent::builder()
-        .model(adapter)
-        .cancellation(cancellation.handle())
-        .build()?;
 
     let args: Vec<String> = std::env::args().skip(1).collect();
 
-    // Defer `start()` until we have a real first user message: most chat
-    // providers reject system-prompt-only calls, so the first user message
-    // travels with the initial transcript handed to `start()`.
     let (first_prompt, run_repl) = if args.is_empty() {
         println!("openrouter-chat");
         println!(
@@ -36,13 +29,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         (args.join(" "), false)
     };
 
+    let agent = Agent::builder()
+        .model(adapter)
+        .cancellation(cancellation.handle())
+        .input(vec![Item::text(ItemKind::User, first_prompt)])
+        .build()?;
+
     let mut driver = agent
-        .start(
-            SessionConfig::new("openrouter-chat").with_cache(
-                PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
-            ),
-            vec![Item::text(ItemKind::User, first_prompt)],
-        )
+        .start(SessionConfig::new("openrouter-chat").with_cache(
+            PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
+        ))
         .await?;
 
     let mut pending = run_turn(&mut driver, &cancellation).await?;

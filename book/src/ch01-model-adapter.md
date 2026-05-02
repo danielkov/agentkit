@@ -697,19 +697,20 @@ let adapter = OpenRouterAdapter::new(
 
 let agent = Agent::builder()
     .model(adapter)
+    .input(vec![Item::text(
+        ItemKind::User,
+        "Explain quicksort in one sentence.",
+    )])
     .build()?;
 ```
 
-Without tools or a loop, an agent can be used for a single one-shot inference call — send a message, get a response. The starting transcript is handed to `start` directly:
+Without tools or a loop, an agent can be used for a single one-shot inference call — send a message, get a response. Preload the user message via `AgentBuilder::input` so the first `next()` dispatches the model directly:
 
 ```rust
 let mut driver = agent
-    .start(
-        SessionConfig::new("one-shot").with_cache(
-            PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
-        ),
-        vec![Item::text(ItemKind::User, "Explain quicksort in one sentence.")],
-    )
+    .start(SessionConfig::new("one-shot").with_cache(
+        PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
+    ))
     .await?;
 
 if let LoopStep::Finished(result) = driver.next().await? {
