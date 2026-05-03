@@ -22,7 +22,7 @@ use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -1109,9 +1109,9 @@ impl PermissionPolicy for CustomKindPolicy {
 ///     .require_approval_outside_allowed(true);
 /// ```
 pub struct PathPolicy {
-    allowed_roots: Vec<PathBuf>,
-    read_only_roots: Vec<PathBuf>,
-    protected_roots: Vec<PathBuf>,
+    allowed_roots: Vec<CanonicalRoot>,
+    read_only_roots: Vec<CanonicalRoot>,
+    protected_roots: Vec<CanonicalRoot>,
     require_approval_outside_allowed: bool,
 }
 
@@ -1129,19 +1129,19 @@ impl PathPolicy {
 
     /// Adds a directory tree that filesystem operations are allowed to target.
     pub fn allow_root(mut self, root: impl Into<PathBuf>) -> Self {
-        self.allowed_roots.push(root.into());
+        self.allowed_roots.push(CanonicalRoot::new(root.into()));
         self
     }
 
     /// Adds a directory tree that may be read or listed but not mutated.
     pub fn read_only_root(mut self, root: impl Into<PathBuf>) -> Self {
-        self.read_only_roots.push(root.into());
+        self.read_only_roots.push(CanonicalRoot::new(root.into()));
         self
     }
 
     /// Adds a directory tree that filesystem operations are never allowed to target.
     pub fn protect_root(mut self, root: impl Into<PathBuf>) -> Self {
-        self.protected_roots.push(root.into());
+        self.protected_roots.push(CanonicalRoot::new(root.into()));
         self
     }
 
@@ -1156,6 +1156,68 @@ impl PathPolicy {
 impl Default for PathPolicy {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Resolves `path` for symlink-safe containment checks; falls back to the
+/// lexically-absolute path so policy decisions stay deterministic when no
+/// component on disk yet exists.
+fn resolve_canonical(path: &Path) -> PathBuf {
+    let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    canonicalize_with_partial_fallback(&abs).unwrap_or(abs)
+}
+
+fn canonicalize_with_partial_fallback(abs: &Path) -> Option<PathBuf> {
+    if let Ok(canonical) = std::fs::canonicalize(abs) {
+        return Some(canonical);
+    }
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut current = abs.to_path_buf();
+    loop {
+        let name = current.file_name().map(|n| n.to_os_string())?;
+        tail.push(name);
+        if !current.pop() {
+            return None;
+        }
+        if let Ok(canonical) = std::fs::canonicalize(&current) {
+            let mut out = canonical;
+            for seg in tail.iter().rev() {
+                out.push(seg);
+            }
+            return Some(out);
+        }
+    }
+}
+
+/// A configured root with a lazily-cached canonical form.
+///
+/// Roots can be registered before they exist on disk; we only memoise once
+/// `fs::canonicalize` succeeds, so symlink changes to not-yet-existent
+/// components are still picked up on later evaluations.
+struct CanonicalRoot {
+    lexical: PathBuf,
+    canonical: OnceLock<PathBuf>,
+}
+
+impl CanonicalRoot {
+    fn new(lexical: PathBuf) -> Self {
+        Self {
+            lexical,
+            canonical: OnceLock::new(),
+        }
+    }
+
+    fn resolve(&self) -> std::borrow::Cow<'_, Path> {
+        if let Some(canonical) = self.canonical.get() {
+            return std::borrow::Cow::Borrowed(canonical);
+        }
+        let abs =
+            std::path::absolute(&self.lexical).unwrap_or_else(|_| self.lexical.clone());
+        if let Ok(canonical) = std::fs::canonicalize(&abs) {
+            let _ = self.canonical.set(canonical);
+            return std::borrow::Cow::Borrowed(self.canonical.get().unwrap());
+        }
+        std::borrow::Cow::Owned(canonicalize_with_partial_fallback(&abs).unwrap_or(abs))
     }
 }
 
@@ -1180,10 +1242,8 @@ impl PermissionPolicy for PathPolicy {
             | FileSystemPermissionRequest::CreateDir { path, .. } => vec![path.as_path()],
         };
 
-        let candidate_paths: Vec<PathBuf> = raw_paths
-            .iter()
-            .map(|p| std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf()))
-            .collect();
+        let candidate_paths: Vec<PathBuf> =
+            raw_paths.iter().map(|p| resolve_canonical(p)).collect();
 
         let mutates = matches!(
             fs,
@@ -1197,7 +1257,7 @@ impl PermissionPolicy for PathPolicy {
         if candidate_paths.iter().any(|path| {
             self.protected_roots
                 .iter()
-                .any(|root| path.starts_with(root))
+                .any(|root| path.starts_with(root.resolve().as_ref()))
         }) {
             return PolicyMatch::Deny(PermissionDenial {
                 code: PermissionCode::PathNotAllowed,
@@ -1210,7 +1270,7 @@ impl PermissionPolicy for PathPolicy {
             && candidate_paths.iter().any(|path| {
                 self.read_only_roots
                     .iter()
-                    .any(|root| path.starts_with(root))
+                    .any(|root| path.starts_with(root.resolve().as_ref()))
             })
         {
             return PolicyMatch::Deny(PermissionDenial {
@@ -1224,9 +1284,11 @@ impl PermissionPolicy for PathPolicy {
             return PolicyMatch::NoOpinion;
         }
 
-        let all_allowed = candidate_paths
-            .iter()
-            .all(|path| self.allowed_roots.iter().any(|root| path.starts_with(root)));
+        let all_allowed = candidate_paths.iter().all(|path| {
+            self.allowed_roots
+                .iter()
+                .any(|root| path.starts_with(root.resolve().as_ref()))
+        });
 
         if all_allowed {
             PolicyMatch::Allow
@@ -2884,6 +2946,154 @@ mod tests {
             }
             other => panic!("unexpected policy match: {other:?}"),
         }
+    }
+
+    #[cfg(unix)]
+    struct SymlinkTmpDir(PathBuf);
+
+    #[cfg(unix)]
+    impl SymlinkTmpDir {
+        fn new(label: &str) -> Self {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let dir = std::env::temp_dir().join(format!(
+                "agentkit-pathpolicy-{}-{}-{}",
+                label,
+                std::process::id(),
+                nanos
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            // Canonicalise so callers compare against the resolved tmp path
+            // (macOS `/tmp` is a symlink to `/private/tmp`, etc.).
+            Self(std::fs::canonicalize(&dir).unwrap())
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for SymlinkTmpDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_path_denied(
+        policy: &PathPolicy,
+        request: FileSystemPermissionRequest,
+    ) -> PermissionDenial {
+        match policy.evaluate(&request) {
+            PolicyMatch::Deny(denial) => denial,
+            other => panic!("expected deny, got: {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_policy_blocks_symlink_escape_from_allowed_root() {
+        let tmp = SymlinkTmpDir::new("allow-escape");
+        let allowed = tmp.path().join("workspace");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let secret = outside.join("secret.txt");
+        std::fs::write(&secret, b"top-secret").unwrap();
+        let escape = allowed.join("leak");
+        std::os::unix::fs::symlink(&secret, &escape).unwrap();
+
+        let policy = PathPolicy::new()
+            .allow_root(&allowed)
+            .require_approval_outside_allowed(false);
+        let denial = assert_path_denied(
+            &policy,
+            FileSystemPermissionRequest::Read {
+                path: escape,
+                metadata: MetadataMap::new(),
+            },
+        );
+        assert_eq!(denial.code, PermissionCode::PathNotAllowed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_policy_blocks_symlink_into_protected_root() {
+        let tmp = SymlinkTmpDir::new("protect-bypass");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let secret = workspace.join(".env");
+        std::fs::write(&secret, b"API_KEY=xxx").unwrap();
+        let alias = workspace.join("config");
+        std::os::unix::fs::symlink(&secret, &alias).unwrap();
+
+        let policy = PathPolicy::new()
+            .allow_root(&workspace)
+            .protect_root(&secret);
+        let denial = assert_path_denied(
+            &policy,
+            FileSystemPermissionRequest::Read {
+                path: alias,
+                metadata: MetadataMap::new(),
+            },
+        );
+        assert_eq!(denial.code, PermissionCode::PathNotAllowed);
+        assert!(denial.message.contains("denied"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_policy_blocks_symlink_write_into_read_only_root() {
+        let tmp = SymlinkTmpDir::new("readonly-bypass");
+        let workspace = tmp.path().join("workspace");
+        let vendor = workspace.join("vendor");
+        std::fs::create_dir_all(&vendor).unwrap();
+        let target = vendor.join("lib.rs");
+        std::fs::write(&target, b"// vendored").unwrap();
+        let writable_alias = workspace.join("writable");
+        std::os::unix::fs::symlink(&target, &writable_alias).unwrap();
+
+        let policy = PathPolicy::new()
+            .allow_root(&workspace)
+            .read_only_root(&vendor);
+        let denial = assert_path_denied(
+            &policy,
+            FileSystemPermissionRequest::Edit {
+                path: writable_alias,
+                metadata: MetadataMap::new(),
+            },
+        );
+        assert_eq!(denial.code, PermissionCode::PathNotAllowed);
+        assert!(denial.message.contains("read-only"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_policy_resolves_symlink_parent_for_nonexistent_leaf() {
+        let tmp = SymlinkTmpDir::new("create-escape");
+        let allowed = tmp.path().join("workspace");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let escape_dir = allowed.join("escape");
+        std::os::unix::fs::symlink(&outside, &escape_dir).unwrap();
+        let new_file = escape_dir.join("new.txt");
+
+        let policy = PathPolicy::new()
+            .allow_root(&allowed)
+            .require_approval_outside_allowed(false);
+        let denial = assert_path_denied(
+            &policy,
+            FileSystemPermissionRequest::Write {
+                path: new_file,
+                metadata: MetadataMap::new(),
+            },
+        );
+        assert_eq!(denial.code, PermissionCode::PathNotAllowed);
     }
 
     #[derive(Clone)]
