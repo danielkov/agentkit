@@ -33,6 +33,7 @@ CRATES=(
   agentkit-compaction
   agentkit-context
   agentkit-tools-core
+  agentkit-tools-derive
   agentkit-task-manager
   agentkit-loop
   agentkit-adapter-completions
