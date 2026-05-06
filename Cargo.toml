@@ -51,7 +51,7 @@ homepage = "https://github.com/danielkov/agentkit"
 license = "MIT"
 repository = "https://github.com/danielkov/agentkit"
 rust-version = "1.92"
-version = "0.5.0"
+version = "0.5.1"
 
 [workspace.dependencies]
 async-trait = "0.1.89"

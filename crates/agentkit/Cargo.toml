@@ -10,27 +10,27 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-agentkit-capabilities = { version = "0.5.0", path = "../agentkit-capabilities", optional = true }
-agentkit-compaction = { version = "0.5.0", path = "../agentkit-compaction", optional = true }
-agentkit-context = { version = "0.5.0", path = "../agentkit-context", optional = true }
-agentkit-core = { version = "0.5.0", path = "../agentkit-core", optional = true }
-agentkit-loop = { version = "0.5.0", path = "../agentkit-loop", optional = true }
-agentkit-mcp = { version = "0.5.0", path = "../agentkit-mcp", optional = true }
-agentkit-adapter-completions = { version = "0.5.0", path = "../agentkit-adapter-completions", optional = true }
-agentkit-provider-anthropic = { version = "0.5.0", path = "../agentkit-provider-anthropic", optional = true }
-agentkit-provider-cerebras = { version = "0.5.0", path = "../agentkit-provider-cerebras", optional = true }
-agentkit-provider-groq = { version = "0.5.0", path = "../agentkit-provider-groq", optional = true }
-agentkit-provider-mistral = { version = "0.5.0", path = "../agentkit-provider-mistral", optional = true }
-agentkit-provider-ollama = { version = "0.5.0", path = "../agentkit-provider-ollama", optional = true }
-agentkit-provider-openai = { version = "0.5.0", path = "../agentkit-provider-openai", optional = true }
-agentkit-provider-openrouter = { version = "0.5.0", path = "../agentkit-provider-openrouter", optional = true }
-agentkit-provider-vllm = { version = "0.5.0", path = "../agentkit-provider-vllm", optional = true }
-agentkit-reporting = { version = "0.5.0", path = "../agentkit-reporting", optional = true }
-agentkit-task-manager = { version = "0.5.0", path = "../agentkit-task-manager", optional = true }
-agentkit-tool-fs = { version = "0.5.0", path = "../agentkit-tool-fs", optional = true }
-agentkit-tool-shell = { version = "0.5.0", path = "../agentkit-tool-shell", optional = true }
-agentkit-tool-skills = { version = "0.5.0", path = "../agentkit-tool-skills", optional = true }
-agentkit-tools-core = { version = "0.5.0", path = "../agentkit-tools-core", optional = true }
+agentkit-capabilities = { version = "0.5.1", path = "../agentkit-capabilities", optional = true }
+agentkit-compaction = { version = "0.5.1", path = "../agentkit-compaction", optional = true }
+agentkit-context = { version = "0.5.1", path = "../agentkit-context", optional = true }
+agentkit-core = { version = "0.5.1", path = "../agentkit-core", optional = true }
+agentkit-loop = { version = "0.5.1", path = "../agentkit-loop", optional = true }
+agentkit-mcp = { version = "0.5.1", path = "../agentkit-mcp", optional = true }
+agentkit-adapter-completions = { version = "0.5.1", path = "../agentkit-adapter-completions", optional = true }
+agentkit-provider-anthropic = { version = "0.5.1", path = "../agentkit-provider-anthropic", optional = true }
+agentkit-provider-cerebras = { version = "0.5.1", path = "../agentkit-provider-cerebras", optional = true }
+agentkit-provider-groq = { version = "0.5.1", path = "../agentkit-provider-groq", optional = true }
+agentkit-provider-mistral = { version = "0.5.1", path = "../agentkit-provider-mistral", optional = true }
+agentkit-provider-ollama = { version = "0.5.1", path = "../agentkit-provider-ollama", optional = true }
+agentkit-provider-openai = { version = "0.5.1", path = "../agentkit-provider-openai", optional = true }
+agentkit-provider-openrouter = { version = "0.5.1", path = "../agentkit-provider-openrouter", optional = true }
+agentkit-provider-vllm = { version = "0.5.1", path = "../agentkit-provider-vllm", optional = true }
+agentkit-reporting = { version = "0.5.1", path = "../agentkit-reporting", optional = true }
+agentkit-task-manager = { version = "0.5.1", path = "../agentkit-task-manager", optional = true }
+agentkit-tool-fs = { version = "0.5.1", path = "../agentkit-tool-fs", optional = true }
+agentkit-tool-shell = { version = "0.5.1", path = "../agentkit-tool-shell", optional = true }
+agentkit-tool-skills = { version = "0.5.1", path = "../agentkit-tool-skills", optional = true }
+agentkit-tools-core = { version = "0.5.1", path = "../agentkit-tools-core", optional = true }
 
 [features]
 default = ["core", "capabilities", "tools", "loop", "reporting"]

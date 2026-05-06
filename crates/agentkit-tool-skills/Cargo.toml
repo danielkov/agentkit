@@ -10,8 +10,8 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-agentkit-core = { version = "0.5.0", path = "../agentkit-core" }
-agentkit-tools-core = { version = "0.5.0", path = "../agentkit-tools-core" }
+agentkit-core = { version = "0.5.1", path = "../agentkit-core" }
+agentkit-tools-core = { version = "0.5.1", path = "../agentkit-tools-core" }
 async-fs = "2.2.0"
 async-trait.workspace = true
 futures-lite = "2.6.1"
@@ -21,5 +21,5 @@ serde-saphyr = "0.0.23"
 thiserror.workspace = true
 
 [dev-dependencies]
-agentkit-capabilities = { version = "0.5.0", path = "../agentkit-capabilities" }
+agentkit-capabilities = { version = "0.5.1", path = "../agentkit-capabilities" }
 tokio.workspace = true
