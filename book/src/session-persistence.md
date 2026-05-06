@@ -4,11 +4,11 @@ The agent loop has no built-in storage backend. Persistence is intentionally a h
 
 ## The three primitives
 
-| Primitive | Purpose |
-|---|---|
-| `AgentBuilder::transcript(items)` | Restore prior transcript before the loop starts. |
-| `TranscriptObserver::on_item_appended(&item)` | Mirror every newly-appended item to durable storage as the loop runs. |
-| `LoopDriver::snapshot() -> LoopSnapshot` | Read-only point-in-time view of `transcript` and `pending_input` for ad-hoc dumps, audit, or full-state checkpoints. |
+| Primitive                                     | Purpose                                                                                                              |
+| --------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `AgentBuilder::transcript(items)`             | Restore prior transcript before the loop starts.                                                                     |
+| `TranscriptObserver::on_item_appended(&item)` | Mirror every newly-appended item to durable storage as the loop runs.                                                |
+| `LoopDriver::snapshot() -> LoopSnapshot`      | Read-only point-in-time view of `transcript` and `pending_input` for ad-hoc dumps, audit, or full-state checkpoints. |
 
 That is the whole protocol. Any storage backend — in-memory map, sqlite, Postgres, S3, Redis — implements the same shape:
 

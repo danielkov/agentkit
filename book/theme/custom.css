@@ -5,12 +5,6 @@
  */
 
 /* ──────────────────────────────────────────────
-   Google Fonts: Inter
-   ────────────────────────────────────────────── */
-
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
-
-/* ──────────────────────────────────────────────
    Root / global overrides
    ────────────────────────────────────────────── */
 
@@ -580,6 +574,74 @@ pre > .buttons :hover {
 
 .page-wrapper {
     background-color: #08090a;
+}
+
+/* ──────────────────────────────────────────────
+   Sidebar logo
+   ────────────────────────────────────────────── */
+
+.sidebar-logo {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 20px 22px 18px;
+    border-bottom: 1px solid var(--sidebar-spacer);
+    color: var(--fg);
+    text-decoration: none;
+    box-sizing: border-box;
+    height: 76px;
+    background: var(--sidebar-bg);
+    position: relative;
+    z-index: 1;
+}
+
+#mdbook-sidebar .sidebar-scrollbox,
+#mdbook-sidebar mdbook-sidebar-scrollbox {
+    top: 76px;
+}
+
+.sidebar-logo:hover {
+    color: var(--fg);
+    text-decoration: none;
+}
+
+.sidebar-logo img {
+    width: 36px;
+    height: 36px;
+    object-fit: contain;
+    flex-shrink: 0;
+}
+
+.sidebar-logo-text {
+    font-weight: 700;
+    font-size: 1.6rem;
+    letter-spacing: -0.02em;
+}
+
+/* ──────────────────────────────────────────────
+   Targeted heading anchor: replace » with link glyph
+   ────────────────────────────────────────────── */
+
+h1:target::before,
+h2:target::before,
+h3:target::before,
+h4:target::before,
+h5:target::before,
+h6:target::before,
+dt:target::before {
+    content: "#";
+    color: var(--accent-bright);
+    font-weight: 500;
+    opacity: 0.7;
+}
+
+/* ──────────────────────────────────────────────
+   Lock theme to ayu — hide theme picker
+   ────────────────────────────────────────────── */
+
+#mdbook-theme-toggle,
+#mdbook-theme-list {
+    display: none !important;
 }
 
 /* ──────────────────────────────────────────────

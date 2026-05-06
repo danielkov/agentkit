@@ -1,5 +1,12 @@
 # agentkit-mcp
 
+<p align="center">
+  <a href="https://crates.io/crates/agentkit-mcp"><img src="https://img.shields.io/crates/v/agentkit-mcp.svg?logo=rust" alt="Crates.io" /></a>
+  <a href="https://docs.rs/agentkit-mcp"><img src="https://img.shields.io/docsrs/agentkit-mcp?logo=docsdotrs" alt="Documentation" /></a>
+  <a href="https://github.com/danielkov/agentkit/blob/main/LICENSE"><img src="https://img.shields.io/crates/l/agentkit-mcp.svg" alt="License" /></a>
+  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/MSRV-1.92-blue?logo=rust" alt="MSRV" /></a>
+</p>
+
 Model Context Protocol integration for agentkit, built on top of the official [`rmcp`](https://crates.io/crates/rmcp) Rust SDK.
 
 This crate covers:

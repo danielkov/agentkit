@@ -1,5 +1,12 @@
 # agentkit-tools-core
 
+<p align="center">
+  <a href="https://crates.io/crates/agentkit-tools-core"><img src="https://img.shields.io/crates/v/agentkit-tools-core.svg?logo=rust" alt="Crates.io" /></a>
+  <a href="https://docs.rs/agentkit-tools-core"><img src="https://img.shields.io/docsrs/agentkit-tools-core?logo=docsdotrs" alt="Documentation" /></a>
+  <a href="https://github.com/danielkov/agentkit/blob/main/LICENSE"><img src="https://img.shields.io/crates/l/agentkit-tools-core.svg" alt="License" /></a>
+  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/MSRV-1.92-blue?logo=rust" alt="MSRV" /></a>
+</p>
+
 Core abstractions for defining, registering, executing, and governing tools in agentkit.
 
 This crate provides:
@@ -8,7 +15,7 @@ This crate provides:
 - **`ToolRegistry`** — a name-keyed collection of tools
 - **`BasicToolExecutor`** — looks up tools, checks permissions, invokes them
 - **Permission system** — composable policies (`PathPolicy`, `CommandPolicy`, `McpServerPolicy`, `CustomKindPolicy`) combined via `CompositePermissionChecker`
-- **Interruption types** — `ApprovalRequest` and `AuthRequest` for human-in-the-loop flows
+- **Interruption types** — `ApprovalRequest` and `ApprovalDecision` (wrapped by `ToolInterruption::ApprovalRequired`) for human-in-the-loop approval flows
 - **Capability bridge** — `ToolCapabilityProvider` adapts a registry into the agentkit capability layer
 
 ## Defining a tool
@@ -133,7 +140,7 @@ let registry = ToolRegistry::new().with(EchoTool {
     spec: ToolSpec::new("echo", "Return a fixed payload", json!({ "type": "object" })),
 });
 
-let executor = BasicToolExecutor::new(registry);
+let executor = BasicToolExecutor::from_registry(registry);
 let metadata = MetadataMap::new();
 let mut ctx = ToolContext {
     capability: CapabilityContext {

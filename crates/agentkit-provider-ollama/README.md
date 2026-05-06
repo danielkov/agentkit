@@ -1,5 +1,12 @@
 # agentkit-provider-ollama
 
+<p align="center">
+  <a href="https://crates.io/crates/agentkit-provider-ollama"><img src="https://img.shields.io/crates/v/agentkit-provider-ollama.svg?logo=rust" alt="Crates.io" /></a>
+  <a href="https://docs.rs/agentkit-provider-ollama"><img src="https://img.shields.io/docsrs/agentkit-provider-ollama?logo=docsdotrs" alt="Documentation" /></a>
+  <a href="https://github.com/danielkov/agentkit/blob/main/LICENSE"><img src="https://img.shields.io/crates/l/agentkit-provider-ollama.svg" alt="License" /></a>
+  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/MSRV-1.92-blue?logo=rust" alt="MSRV" /></a>
+</p>
+
 Ollama model adapter for the agentkit agent loop.
 
 This crate provides `OllamaAdapter` and `OllamaConfig` for connecting the

@@ -1,5 +1,12 @@
 # agentkit-core
 
+<p align="center">
+  <a href="https://crates.io/crates/agentkit-core"><img src="https://img.shields.io/crates/v/agentkit-core.svg?logo=rust" alt="Crates.io" /></a>
+  <a href="https://docs.rs/agentkit-core"><img src="https://img.shields.io/docsrs/agentkit-core?logo=docsdotrs" alt="Documentation" /></a>
+  <a href="https://github.com/danielkov/agentkit/blob/main/LICENSE"><img src="https://img.shields.io/crates/l/agentkit-core.svg" alt="License" /></a>
+  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/MSRV-1.92-blue?logo=rust" alt="MSRV" /></a>
+</p>
+
 Shared primitives for agentkit transcripts, content parts, usage accounting, identifiers, and cancellation.
 
 This crate defines the data model used across the rest of the workspace:
@@ -85,46 +92,26 @@ assert_eq!(tokens.input_tokens + tokens.output_tokens, 1550);
 
 ## Cancelling a running turn
 
-Wire a `CancellationController` into the agent and spawn a Ctrl-C listener
-that fires `interrupt()`. The loop checks the handle between steps and
-returns `FinishReason::Cancelled` when triggered.
+Create a `CancellationController` and hand its `handle()` to whatever drives
+the model — typically `AgentBuilder::cancellation` in `agentkit-loop`. Tools
+and adapters take a `TurnCancellation` checkpoint and observe its
+`is_cancelled()` flag (or `cancelled()` future) to bail out cooperatively.
+When the loop returns, a turn that was interrupted carries
+`FinishReason::Cancelled`.
 
-```rust,no_run
-use agentkit_core::CancellationController;
-use agentkit_loop::{Agent, LoopStep, SessionConfig};
-use agentkit_core::FinishReason;
-use agentkit_provider_openrouter::{OpenRouterAdapter, OpenRouterConfig};
+```rust
+use agentkit_core::{CancellationController, TurnCancellation};
 
-# async fn run() -> Result<(), Box<dyn std::error::Error>> {
-let cancellation = CancellationController::new();
-let agent = Agent::builder()
-    .model(OpenRouterAdapter::new(
-        OpenRouterConfig::new("sk-or-v1-...", "openrouter/auto"),
-    )?)
-    .cancellation(cancellation.handle())
-    .build()?;
+let controller = CancellationController::new();
+let handle = controller.handle();
 
-let mut driver = agent
-    .start(SessionConfig::new("demo"))
-    .await?;
+// Hand `handle.clone()` to the agent loop, model adapter, or tool executor.
+// Inside a turn, the consumer captures a checkpoint:
+let checkpoint = TurnCancellation::new(handle.clone());
+assert!(!checkpoint.is_cancelled());
 
-// Ctrl-C fires the interrupt, cancelling the in-flight turn.
-let interrupt = cancellation.clone();
-let ctrl_c = tokio::spawn(async move {
-    let _ = tokio::signal::ctrl_c().await;
-    interrupt.interrupt();
-});
-
-// ... submit input and drive the loop ...
-
-let step = driver.next().await;
-ctrl_c.abort();
-
-if let Ok(LoopStep::Finished(result)) = step {
-    if result.finish_reason == FinishReason::Cancelled {
-        eprintln!("turn cancelled");
-    }
-}
-# Ok(())
-# }
+// A Ctrl-C listener (or any other interrupt source) fires `interrupt()`,
+// flipping every outstanding checkpoint to cancelled.
+controller.interrupt();
+assert!(checkpoint.is_cancelled());
 ```

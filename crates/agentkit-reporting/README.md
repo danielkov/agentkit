@@ -1,8 +1,15 @@
 # agentkit-reporting
 
+<p align="center">
+  <a href="https://crates.io/crates/agentkit-reporting"><img src="https://img.shields.io/crates/v/agentkit-reporting.svg?logo=rust" alt="Crates.io" /></a>
+  <a href="https://docs.rs/agentkit-reporting"><img src="https://img.shields.io/docsrs/agentkit-reporting?logo=docsdotrs" alt="Documentation" /></a>
+  <a href="https://github.com/danielkov/agentkit/blob/main/LICENSE"><img src="https://img.shields.io/crates/l/agentkit-reporting.svg" alt="License" /></a>
+  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/MSRV-1.92-blue?logo=rust" alt="MSRV" /></a>
+</p>
+
 Observers for turning loop events into logs, summaries, and transcript views.
 
-This crate provides [`LoopObserver`] implementations for [`agentkit-loop`].
+This crate provides `LoopObserver` implementations for [`agentkit-loop`](https://crates.io/crates/agentkit-loop).
 Instead of baking reporting into the driver, you attach one or more reporters
 to the loop and they react to every `AgentEvent` that flows through it.
 
@@ -127,7 +134,7 @@ std::thread::spawn(move || {
 is gated behind the `tracing` feature to keep the dependency opt-in:
 
 ```toml
-agentkit-reporting = { version = "0.2.2", features = ["tracing"] }
+agentkit-reporting = { version = "0.5", features = ["tracing"] }
 ```
 
 ```rust,ignore

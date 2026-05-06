@@ -1,5 +1,12 @@
 # agentkit-tool-shell
 
+<p align="center">
+  <a href="https://crates.io/crates/agentkit-tool-shell"><img src="https://img.shields.io/crates/v/agentkit-tool-shell.svg?logo=rust" alt="Crates.io" /></a>
+  <a href="https://docs.rs/agentkit-tool-shell"><img src="https://img.shields.io/docsrs/agentkit-tool-shell?logo=docsdotrs" alt="Documentation" /></a>
+  <a href="https://github.com/danielkov/agentkit/blob/main/LICENSE"><img src="https://img.shields.io/crates/l/agentkit-tool-shell.svg" alt="License" /></a>
+  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/MSRV-1.92-blue?logo=rust" alt="MSRV" /></a>
+</p>
+
 Shell execution tool for running subprocesses inside an agentkit agent loop.
 
 This crate provides `ShellExecTool`, registered under the name `shell_exec`.
@@ -72,7 +79,7 @@ impl PermissionChecker for AllowAll {
 
 #[tokio::main]
 async fn main() {
-    let executor = BasicToolExecutor::new(registry());
+    let executor = BasicToolExecutor::from_registry(registry());
     let metadata = MetadataMap::new();
     let mut ctx = ToolContext {
         capability: CapabilityContext {

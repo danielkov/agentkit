@@ -1,5 +1,12 @@
 # agentkit-adapter-completions
 
+<p align="center">
+  <a href="https://crates.io/crates/agentkit-adapter-completions"><img src="https://img.shields.io/crates/v/agentkit-adapter-completions.svg?logo=rust" alt="Crates.io" /></a>
+  <a href="https://docs.rs/agentkit-adapter-completions"><img src="https://img.shields.io/docsrs/agentkit-adapter-completions?logo=docsdotrs" alt="Documentation" /></a>
+  <a href="https://github.com/danielkov/agentkit/blob/main/LICENSE"><img src="https://img.shields.io/crates/l/agentkit-adapter-completions.svg" alt="License" /></a>
+  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/MSRV-1.92-blue?logo=rust" alt="MSRV" /></a>
+</p>
+
 Shared completion-style adapter plumbing for AgentKit model providers.
 
 This crate provides the common request and response translation layer used by

@@ -7,5 +7,6 @@ src = "src"
 
 [output.html]
 default-theme = "ayu"
+preferred-dark-theme = "ayu"
 git-repository-url = "https://github.com/danielkov/agentkit"
 additional-css = ["theme/custom.css"]

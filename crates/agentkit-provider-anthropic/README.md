@@ -1,5 +1,12 @@
 # agentkit-provider-anthropic
 
+<p align="center">
+  <a href="https://crates.io/crates/agentkit-provider-anthropic"><img src="https://img.shields.io/crates/v/agentkit-provider-anthropic.svg?logo=rust" alt="Crates.io" /></a>
+  <a href="https://docs.rs/agentkit-provider-anthropic"><img src="https://img.shields.io/docsrs/agentkit-provider-anthropic?logo=docsdotrs" alt="Documentation" /></a>
+  <a href="https://github.com/danielkov/agentkit/blob/main/LICENSE"><img src="https://img.shields.io/crates/l/agentkit-provider-anthropic.svg" alt="License" /></a>
+  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/MSRV-1.92-blue?logo=rust" alt="MSRV" /></a>
+</p>
+
 Anthropic Messages API provider for [`agentkit`](https://github.com/danielkov/agentkit).
 
 Connects the agent loop to `https://api.anthropic.com/v1/messages` (or any
@@ -38,5 +45,5 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ## Server tools
 
 Known server tools (`WebSearchTool`, `WebFetchTool`, `CodeExecutionTool`, etc.)
-implement the [`ServerTool`] trait. [`RawServerTool`] passes through any tool
+implement the `ServerTool` trait. `RawServerTool` passes through any tool
 type the crate does not yet cover.

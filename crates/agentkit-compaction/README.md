@@ -1,5 +1,12 @@
 # agentkit-compaction
 
+<p align="center">
+  <a href="https://crates.io/crates/agentkit-compaction"><img src="https://img.shields.io/crates/v/agentkit-compaction.svg?logo=rust" alt="Crates.io" /></a>
+  <a href="https://docs.rs/agentkit-compaction"><img src="https://img.shields.io/docsrs/agentkit-compaction?logo=docsdotrs" alt="Documentation" /></a>
+  <a href="https://github.com/danielkov/agentkit/blob/main/LICENSE"><img src="https://img.shields.io/crates/l/agentkit-compaction.svg" alt="License" /></a>
+  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/MSRV-1.92-blue?logo=rust" alt="MSRV" /></a>
+</p>
+
 Transcript compaction primitives for reducing context size while preserving useful state.
 
 This crate includes:

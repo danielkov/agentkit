@@ -1,6 +1,13 @@
 # agentkit-capabilities
 
-Common abstractions for exposing tools, resources, and prompts as model-facing capabilities within the [agentkit](https://github.com/anthropics/agentkit) ecosystem.
+<p align="center">
+  <a href="https://crates.io/crates/agentkit-capabilities"><img src="https://img.shields.io/crates/v/agentkit-capabilities.svg?logo=rust" alt="Crates.io" /></a>
+  <a href="https://docs.rs/agentkit-capabilities"><img src="https://img.shields.io/docsrs/agentkit-capabilities?logo=docsdotrs" alt="Documentation" /></a>
+  <a href="https://github.com/danielkov/agentkit/blob/main/LICENSE"><img src="https://img.shields.io/crates/l/agentkit-capabilities.svg" alt="License" /></a>
+  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/MSRV-1.92-blue?logo=rust" alt="MSRV" /></a>
+</p>
+
+Common abstractions for exposing tools, resources, and prompts as model-facing capabilities within the [agentkit](https://github.com/danielkov/agentkit) ecosystem.
 
 This crate provides:
 

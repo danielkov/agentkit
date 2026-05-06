@@ -1,5 +1,12 @@
 # agentkit-context
 
+<p align="center">
+  <a href="https://crates.io/crates/agentkit-context"><img src="https://img.shields.io/crates/v/agentkit-context.svg?logo=rust" alt="Crates.io" /></a>
+  <a href="https://docs.rs/agentkit-context"><img src="https://img.shields.io/docsrs/agentkit-context?logo=docsdotrs" alt="Documentation" /></a>
+  <a href="https://github.com/danielkov/agentkit/blob/main/LICENSE"><img src="https://img.shields.io/crates/l/agentkit-context.svg" alt="License" /></a>
+  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/MSRV-1.92-blue?logo=rust" alt="MSRV" /></a>
+</p>
+
 Context loaders for workspace-local agent instructions.
 
 This crate provides:

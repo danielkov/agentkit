@@ -1,30 +1,52 @@
-# agentkit
+<p align="center">
+  <img src="assets/logo.png" alt="agentkit" width="220" />
+</p>
+
+<h1 align="center">agentkit</h1>
+
+<p align="center">
+  <a href="https://crates.io/crates/agentkit"><img src="https://img.shields.io/crates/v/agentkit.svg?logo=rust" alt="Crates.io" /></a>
+  <a href="https://docs.rs/agentkit"><img src="https://img.shields.io/docsrs/agentkit?logo=docsdotrs" alt="Documentation" /></a>
+  <a href="https://github.com/danielkov/agentkit/actions/workflows/book.yml"><img src="https://github.com/danielkov/agentkit/actions/workflows/book.yml/badge.svg" alt="Book" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/crates/l/agentkit.svg" alt="License" /></a>
+  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/MSRV-1.92-blue?logo=rust" alt="MSRV" /></a>
+</p>
 
 `agentkit` is a Rust toolkit for building LLM agent applications such as coding agents, assistant CLIs, and multi-agent tools.
 
-The project is intentionally split into small crates behind feature flags so hosts can pull in only the pieces they need.
+The project is split into small crates behind feature flags so hosts can pull in only the pieces they need.
 
-## Current status
+## Usage
 
-`agentkit` is past the design-only stage. The repo currently includes working implementations for:
+```rust,ignore
+use agentkit_core::{Item, ItemKind};
+use agentkit_loop::{
+    Agent, LoopStep, PromptCacheRequest, PromptCacheRetention, SessionConfig,
+};
+use agentkit_provider_openrouter::{OpenRouterAdapter, OpenRouterConfig};
 
-- normalized transcript, content-part, and delta types with fluent builders
-- a runtime-agnostic loop driver with blocking approval interrupts plus cooperative yields for end-of-turn input and between-tool-round interjection
-- federated tool sources behind a single `ToolSource` trait — frozen `ToolRegistry`s, dynamic catalogs, and MCP-backed sources compose by registration order, with collision policies and live `ToolCatalogChanged` events
-- trait-based tools, permissions, and approval handoff
-- a `TranscriptObserver` channel for loss-free transcript reconstruction (persistence, replication, audit) alongside the operational `LoopObserver` event stream
-- built-in filesystem, shell, and skills tools
-- context loading for `AGENTS.md` and skills directories
-- MCP integration on top of [`rmcp`](https://crates.io/crates/rmcp): stdio + Streamable HTTP transports, discovery, tool/resource/prompt adapters, auth replay, lifecycle management (connect / disconnect / refresh), pluggable sampling/elicitation/roots responders, and a broadcast subscription for server-pushed progress, logging, resource updates, list-changed, and cancellation events
-- reporting observers
-- compaction triggers, strategy pipelines, and backend-driven semantic compaction
-- async task management with foreground/background scheduling, routing policies, detach-after-timeout, and notification of background-tool completion through the loop event stream
-- optional turn cancellation with resumable sessions
-- prompt caching with automatic and explicit strategies, retention hints, and cache keys
-- a generic completions adapter base for building provider crates
-- provider adapters for OpenRouter, OpenAI, Anthropic, Cerebras, Ollama, vLLM, Groq, and Mistral
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let config = OpenRouterConfig::from_env()?;
+    let adapter = OpenRouterAdapter::new(config)?;
 
-The repo also ships multiple examples that exercise these pieces end to end.
+    let agent = Agent::builder()
+        .model(adapter)
+        .input(vec![Item::text(ItemKind::User, "Hello!")])
+        .build()?;
+
+    let mut driver = agent
+        .start(SessionConfig::new("chat").with_cache(
+            PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
+        ))
+        .await?;
+
+    if let LoopStep::Finished(result) = driver.next().await? {
+        println!("Finished: {:?}", result.finish_reason);
+    }
+    Ok(())
+}
+```
 
 ## Crates
 
@@ -33,7 +55,7 @@ The repo also ships multiple examples that exercise these pieces end to end.
 - `agentkit-capabilities`
   - lower-level invocable/resource/prompt abstraction
 - `agentkit-tools-core`
-  - tools, registry, executor, permissions, approvals, auth requests
+  - tools, registry, executor, permissions, approvals
 - `agentkit-loop`
   - model session abstraction, driver, interrupts, tool roundtrips
 - `agentkit-context`

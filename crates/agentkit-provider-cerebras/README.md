@@ -1,6 +1,13 @@
 # agentkit-provider-cerebras
 
-Cerebras Inference API adapter for the [agentkit](../..) agent loop.
+<p align="center">
+  <a href="https://crates.io/crates/agentkit-provider-cerebras"><img src="https://img.shields.io/crates/v/agentkit-provider-cerebras.svg?logo=rust" alt="Crates.io" /></a>
+  <a href="https://docs.rs/agentkit-provider-cerebras"><img src="https://img.shields.io/docsrs/agentkit-provider-cerebras?logo=docsdotrs" alt="Documentation" /></a>
+  <a href="https://github.com/danielkov/agentkit/blob/main/LICENSE"><img src="https://img.shields.io/crates/l/agentkit-provider-cerebras.svg" alt="License" /></a>
+  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/MSRV-1.92-blue?logo=rust" alt="MSRV" /></a>
+</p>
+
+Cerebras Inference API adapter for the [agentkit](https://crates.io/crates/agentkit) agent loop.
 
 Implements the `ModelAdapter` trait directly against Cerebras'
 `/v1/chat/completions` endpoint. Streaming is on by default. Experimental

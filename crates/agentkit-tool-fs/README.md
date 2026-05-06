@@ -1,5 +1,12 @@
 # agentkit-tool-fs
 
+<p align="center">
+  <a href="https://crates.io/crates/agentkit-tool-fs"><img src="https://img.shields.io/crates/v/agentkit-tool-fs.svg?logo=rust" alt="Crates.io" /></a>
+  <a href="https://docs.rs/agentkit-tool-fs"><img src="https://img.shields.io/docsrs/agentkit-tool-fs?logo=docsdotrs" alt="Documentation" /></a>
+  <a href="https://github.com/danielkov/agentkit/blob/main/LICENSE"><img src="https://img.shields.io/crates/l/agentkit-tool-fs.svg" alt="License" /></a>
+  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/MSRV-1.92-blue?logo=rust" alt="MSRV" /></a>
+</p>
+
 Filesystem tools and session-scoped policies for [agentkit](https://crates.io/crates/agentkit).
 
 This crate provides seven tools that let an agent interact with the local

@@ -1,26 +1,48 @@
 # agentkit
 
-Feature-gated umbrella crate for assembling agent applications from the workspace crates.
+<p align="center">
+  <a href="https://crates.io/crates/agentkit"><img src="https://img.shields.io/crates/v/agentkit.svg?logo=rust" alt="Crates.io" /></a>
+  <a href="https://docs.rs/agentkit"><img src="https://img.shields.io/docsrs/agentkit?logo=docsdotrs" alt="Documentation" /></a>
+  <a href="https://github.com/danielkov/agentkit/blob/main/LICENSE"><img src="https://img.shields.io/crates/l/agentkit.svg" alt="License" /></a>
+  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/MSRV-1.92-blue?logo=rust" alt="MSRV" /></a>
+</p>
 
-By default this crate re-exports the core runtime pieces:
+Feature-gated umbrella crate for assembling agent applications from the agentkit workspace. Enable only the features you need and access them through a single dependency.
 
-- `core` -- shared types: `Item`, `Part`, `SessionId`, `Usage`, cancellation primitives
-- `capabilities` -- capability traits: `Invocable`, `CapabilityProvider`, `PermissionChecker`
-- `tools` -- tool abstractions: `Tool`, `ToolRegistry`, `ToolSpec`, permission types
-- `loop` -- agent loop orchestration: `Agent`, `AgentBuilder`, `LoopDriver`, `LoopStep`
-- `reporting` -- loop observers: `StdoutReporter`, `JsonlReporter`, `UsageReporter`, `CompositeReporter`
+## Default features
 
-Additional integrations are available behind optional Cargo features:
+`core`, `capabilities`, `tools`, `loop`, `reporting`. The `loop` feature transitively enables `task-manager`.
 
-| Feature               | Crate                          | Purpose                                                         |
-| --------------------- | ------------------------------ | --------------------------------------------------------------- |
-| `compaction`          | `agentkit-compaction`          | Transcript compaction triggers, strategies, and pipelines       |
-| `context`             | `agentkit-context`             | `AGENTS.md` discovery and loading                               |
-| `mcp`                 | `agentkit-mcp`                 | Model Context Protocol server connections                       |
-| `provider-openrouter` | `agentkit-provider-openrouter` | OpenRouter `ModelAdapter` implementation                        |
-| `tool-fs`             | `agentkit-tool-fs`             | Filesystem tools (read, write, edit, move, delete, list, mkdir) |
-| `tool-shell`          | `agentkit-tool-shell`          | Shell execution tool (`shell_exec`)                             |
-| `tool-skills`         | `agentkit-tool-skills`         | Progressive Agent Skills discovery and activation               |
+| Feature        | Module         | Re-exports                                                                                                                |
+| -------------- | -------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `core`         | `core`         | `Item`, `Part`, `SessionId`, `TurnId`, `Usage`, `CancellationController`, `TurnCancellation`                              |
+| `capabilities` | `capabilities` | `Invocable`, `CapabilityProvider`, `ResourceProvider`, `PromptProvider`                                                   |
+| `tools`        | `tools`        | `Tool`, `ToolRegistry`, `ToolSpec`, `BasicToolExecutor`, `PermissionChecker`, `PermissionPolicy`                          |
+| `loop`         | `loop_`        | `Agent`, `AgentBuilder`, `LoopDriver`, `LoopStep`, `LoopInterrupt`, `ModelAdapter`, `SessionConfig`, `PromptCacheRequest` |
+| `reporting`    | `reporting`    | `StdoutReporter`, `JsonlReporter`, `UsageReporter`, `TranscriptReporter`, `CompositeReporter`                             |
+
+> The agent loop module is re-exported as `loop_` because `loop` is a Rust keyword.
+
+## Optional features
+
+| Feature               | Module                | Purpose                                                                                     |
+| --------------------- | --------------------- | ------------------------------------------------------------------------------------------- |
+| `compaction`          | `compaction`          | Transcript compaction triggers, strategies, and pipelines                                   |
+| `context`             | `context`             | `AGENTS.md` discovery and context loading                                                   |
+| `mcp`                 | `mcp`                 | Model Context Protocol server connections (stdio + Streamable HTTP)                         |
+| `task-manager`        | `task_manager`        | Foreground / background tool task scheduling                                                |
+| `adapter-completions` | `adapter_completions` | Generic chat completions adapter base for building provider crates                          |
+| `provider-anthropic`  | `provider_anthropic`  | Anthropic Messages API adapter (streaming, prompt caching, extended thinking, server tools) |
+| `provider-cerebras`   | `provider_cerebras`   | Cerebras Inference API adapter (streaming, reasoning, compression, Files + Batch)           |
+| `provider-openai`     | `provider_openai`     | OpenAI `/v1/chat/completions` adapter                                                       |
+| `provider-openrouter` | `provider_openrouter` | OpenRouter `/v1/chat/completions` adapter                                                   |
+| `provider-groq`       | `provider_groq`       | Groq adapter                                                                                |
+| `provider-mistral`    | `provider_mistral`    | Mistral adapter                                                                             |
+| `provider-ollama`     | `provider_ollama`     | Ollama adapter                                                                              |
+| `provider-vllm`       | `provider_vllm`       | vLLM adapter                                                                                |
+| `tool-fs`             | `tool_fs`             | Filesystem tools (read, write, edit, move, delete, list, mkdir)                             |
+| `tool-shell`          | `tool_shell`          | Shell execution tool (`shell_exec`)                                                         |
+| `tool-skills`         | `tool_skills`         | Progressive Agent Skills discovery and activation                                           |
 
 ## Quick start
 
@@ -28,7 +50,7 @@ Add agentkit with the features you need:
 
 ```toml
 [dependencies]
-agentkit = { version = "0.2.2", features = ["provider-openrouter", "tool-fs", "tool-shell"] }
+agentkit = { version = "0.5", features = ["provider-openrouter", "tool-fs", "tool-shell"] }
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -39,59 +61,46 @@ tokio = { version = "1", features = ["full"] }
 ```rust,no_run
 use agentkit::core::{Item, ItemKind};
 use agentkit::loop_::{
-    Agent, LoopStep, PromptCacheRequest, PromptCacheRetention, SessionConfig,
+    Agent, LoopInterrupt, LoopStep, PromptCacheRequest, PromptCacheRetention, SessionConfig,
 };
 use agentkit::provider_openrouter::{OpenRouterAdapter, OpenRouterConfig};
 use agentkit::reporting::StdoutReporter;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config = OpenRouterConfig::new("sk-or-v1-...", "openrouter/auto");
-    let adapter = OpenRouterAdapter::new(config)?;
+    let adapter = OpenRouterAdapter::new(OpenRouterConfig::from_env()?)?;
 
+    // Preload the opening user turn through the builder.
     let agent = Agent::builder()
         .model(adapter)
         .observer(StdoutReporter::new(std::io::stdout()))
+        .input(vec![Item::text(ItemKind::User, "What is the capital of France?")])
         .build()?;
 
     let mut driver = agent
-        .start(
-            SessionConfig::new("demo").with_cache(
-                PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
-            ),
-        )
+        .start(SessionConfig::new("demo").with_cache(
+            PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
+        ))
         .await?;
-
-    // Submit a user message and drive the loop to completion.
-    driver.submit_input(vec![Item::text(
-        ItemKind::User,
-        "What is the capital of France?",
-    )])?;
 
     loop {
         match driver.next().await? {
             LoopStep::Finished(result) => {
-                println!("Turn finished: {:?}", result.finish_reason);
+                println!("Finished: {:?}", result.finish_reason);
                 break;
             }
-            LoopStep::Interrupt(interrupt) => match interrupt {
-                agentkit::loop_::LoopInterrupt::ApprovalRequest(req) => {
-                    // Auto-approve for this demo; a real app would prompt the user.
-                    driver.resolve_approval(req.id, true)?;
-                }
-                agentkit::loop_::LoopInterrupt::AuthRequest(req) => {
-                    eprintln!("Auth required: {}", req.provider);
-                    break;
-                }
-                agentkit::loop_::LoopInterrupt::AwaitingInput(_) => {
-                    // Feed the next user message and continue the loop.
-                    break;
-                }
-                // Cooperative yield between tool rounds.  A non-interactive
-                // host resumes immediately; an interactive host may call
-                // driver.submit_input(...) here before calling next() again.
-                agentkit::loop_::LoopInterrupt::AfterToolResult(_) => continue,
-            },
+            LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(approval)) => {
+                approval.approve(&mut driver)?;
+            }
+            LoopStep::Interrupt(LoopInterrupt::AwaitingInput(req)) => {
+                // Real apps would prompt the user; here we end the conversation.
+                req.submit(&mut driver, vec![])?;
+                break;
+            }
+            LoopStep::Interrupt(LoopInterrupt::AfterToolResult(_)) => {
+                // Cooperative yield between tool rounds. Resume immediately.
+                continue;
+            }
         }
     }
 
@@ -102,51 +111,63 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ### Agent with filesystem and shell tools
 
 ```rust,no_run
+use agentkit::core::{Item, ItemKind};
 use agentkit::loop_::{Agent, PromptCacheRequest, PromptCacheRetention, SessionConfig};
-use agentkit::reporting::{CompositeReporter, StdoutReporter, UsageReporter};
 use agentkit::provider_openrouter::{OpenRouterAdapter, OpenRouterConfig};
-use agentkit::tools::ToolRegistry;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let adapter = OpenRouterAdapter::new(
-        OpenRouterConfig::new("sk-or-v1-...", "openrouter/auto"),
-    )?;
-
-    // Build a tool registry with filesystem and shell tools.
-    let mut tools = agentkit::tool_fs::registry();
-    for tool in agentkit::tool_shell::registry().tools() {
-        tools.register_arc(tool);
-    }
+    let adapter = OpenRouterAdapter::new(OpenRouterConfig::from_env()?)?;
 
     let agent = Agent::builder()
         .model(adapter)
-        .tools(tools)
-        .observer(StdoutReporter::new(std::io::stdout()))
+        // Each registry is its own ToolSource — register them independently
+        // so collisions surface at registration time.
+        .add_tool_source(agentkit::tool_fs::registry())
+        .add_tool_source(agentkit::tool_shell::registry())
+        .input(vec![Item::text(
+            ItemKind::User,
+            "List the files under ./src and summarise the entry point.",
+        )])
         .build()?;
 
-    let _driver = agent
-        .start(
-            SessionConfig::new("coding-agent").with_cache(
-                PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
-            ),
-        )
-        .await?;
+    let _driver = agent.start(
+        SessionConfig::new("coding-agent").with_cache(
+            PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
+        ),
+    ).await?;
 
     Ok(())
 }
 ```
 
-### Default features only (no provider)
+### Composing reporters
 
-When writing a custom `ModelAdapter`, only the default features are needed:
+```rust
+use agentkit::reporting::{
+    CompositeReporter, JsonlReporter, TranscriptReporter, UsageReporter,
+};
+
+let reporter = CompositeReporter::new()
+    .with_observer(JsonlReporter::new(Vec::new()))
+    .with_observer(UsageReporter::new())
+    .with_observer(TranscriptReporter::new());
+```
+
+### Bring-your-own `ModelAdapter`
+
+When implementing a custom adapter, only the default features are needed:
+
+```toml
+[dependencies]
+agentkit = "0.5"
+```
 
 ```rust,ignore
-use agentkit::core::{Item, SessionId};
 use agentkit::loop_::{Agent, ModelAdapter, SessionConfig};
-use agentkit::tools::ToolRegistry;
-use agentkit::reporting::StdoutReporter;
 
-// Implement ModelAdapter for your own backend, then:
+// Implement ModelAdapter for your backend, then:
 // let agent = Agent::builder().model(my_adapter).build()?;
 ```
+
+See the [book](https://danielkov.github.io/agentkit/) and the in-tree `examples/` directory for end-to-end programs covering streaming, MCP, compaction, parallel tools, session persistence, and subagents.

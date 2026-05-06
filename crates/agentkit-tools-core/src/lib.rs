@@ -22,8 +22,8 @@ use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use agentkit_capabilities::{
@@ -1211,8 +1211,7 @@ impl CanonicalRoot {
         if let Some(canonical) = self.canonical.get() {
             return std::borrow::Cow::Borrowed(canonical);
         }
-        let abs =
-            std::path::absolute(&self.lexical).unwrap_or_else(|_| self.lexical.clone());
+        let abs = std::path::absolute(&self.lexical).unwrap_or_else(|_| self.lexical.clone());
         if let Ok(canonical) = std::fs::canonicalize(&abs) {
             let _ = self.canonical.set(canonical);
             return std::borrow::Cow::Borrowed(self.canonical.get().unwrap());

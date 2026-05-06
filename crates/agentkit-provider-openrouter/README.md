@@ -1,5 +1,12 @@
 # agentkit-provider-openrouter
 
+<p align="center">
+  <a href="https://crates.io/crates/agentkit-provider-openrouter"><img src="https://img.shields.io/crates/v/agentkit-provider-openrouter.svg?logo=rust" alt="Crates.io" /></a>
+  <a href="https://docs.rs/agentkit-provider-openrouter"><img src="https://img.shields.io/docsrs/agentkit-provider-openrouter?logo=docsdotrs" alt="Documentation" /></a>
+  <a href="https://github.com/danielkov/agentkit/blob/main/LICENSE"><img src="https://img.shields.io/crates/l/agentkit-provider-openrouter.svg" alt="License" /></a>
+  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/MSRV-1.92-blue?logo=rust" alt="MSRV" /></a>
+</p>
+
 OpenRouter model adapter for `agentkit-loop`.
 
 This crate translates between agentkit transcript primitives and OpenRouter chat completion requests, including:
@@ -36,7 +43,7 @@ use agentkit_provider_openrouter::{OpenRouterAdapter, OpenRouterConfig};
 
 # #[tokio::main]
 # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-let config = OpenRouterConfig::new("sk-or-v1-...", "anthropic/claude-sonnet-4")
+let config = OpenRouterConfig::new("sk-or-v1-...", "anthropic/claude-sonnet-4.5")
     .with_app_name("my-agent");
 let adapter = OpenRouterAdapter::new(config)?;
 
@@ -64,7 +71,7 @@ println!("{step:?}");
 use agentkit_provider_openrouter::{OpenRouterAdapter, OpenRouterConfig};
 
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
-let config = OpenRouterConfig::new("sk-or-v1-...", "anthropic/claude-sonnet-4")
+let config = OpenRouterConfig::new("sk-or-v1-...", "anthropic/claude-sonnet-4.5")
     .with_temperature(0.0)
     .with_max_completion_tokens(4096)
     .with_app_name("my-agent")
