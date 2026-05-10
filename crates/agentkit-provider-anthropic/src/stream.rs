@@ -421,6 +421,9 @@ impl EventTranslator {
                 kind: ItemKind::Assistant,
                 parts,
                 metadata: std::mem::take(&mut self.metadata),
+                usage: None,
+                finish_reason: None,
+                created_at: None,
             }]
         };
 

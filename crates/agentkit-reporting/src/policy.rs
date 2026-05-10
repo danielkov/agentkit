@@ -31,9 +31,11 @@ pub enum FailurePolicy {
 /// Implement this trait for reporters that perform I/O or other fallible
 /// operations. Wrap the implementation in [`PolicyReporter`] to obtain a
 /// [`LoopObserver`] with configurable error handling.
-pub trait FallibleObserver: Send {
+pub trait FallibleObserver: Send + Sync {
     /// Process an event, returning an error if something goes wrong.
-    fn try_handle_event(&mut self, event: &AgentEvent) -> Result<(), ReportError>;
+    /// Implementations store mutable state behind interior mutability so the
+    /// wrapper can be shared as `Arc<dyn LoopObserver>`.
+    fn try_handle_event(&self, event: &AgentEvent) -> Result<(), ReportError>;
 }
 
 /// Adapter that wraps a [`FallibleObserver`] and applies a [`FailurePolicy`].
@@ -53,7 +55,7 @@ pub trait FallibleObserver: Send {
 pub struct PolicyReporter<T> {
     inner: T,
     policy: FailurePolicy,
-    errors: Vec<ReportError>,
+    errors: std::sync::Mutex<Vec<ReportError>>,
 }
 
 impl<T: FallibleObserver> PolicyReporter<T> {
@@ -63,18 +65,13 @@ impl<T: FallibleObserver> PolicyReporter<T> {
         Self {
             inner,
             policy,
-            errors: Vec::new(),
+            errors: std::sync::Mutex::new(Vec::new()),
         }
     }
 
     /// Returns a reference to the inner observer.
     pub fn inner(&self) -> &T {
         &self.inner
-    }
-
-    /// Returns a mutable reference to the inner observer.
-    pub fn inner_mut(&mut self) -> &mut T {
-        &mut self.inner
     }
 
     /// Returns the configured failure policy.
@@ -85,14 +82,13 @@ impl<T: FallibleObserver> PolicyReporter<T> {
     /// Drains and returns all accumulated errors.
     ///
     /// Only meaningful when the policy is [`FailurePolicy::Accumulate`].
-    /// Subsequent calls return an empty `Vec` until new errors occur.
-    pub fn take_errors(&mut self) -> Vec<ReportError> {
-        std::mem::take(&mut self.errors)
+    pub fn take_errors(&self) -> Vec<ReportError> {
+        std::mem::take(&mut *self.errors.lock().unwrap_or_else(|e| e.into_inner()))
     }
 }
 
 impl<T: FallibleObserver> LoopObserver for PolicyReporter<T> {
-    fn handle_event(&mut self, event: AgentEvent) {
+    fn handle_event(&self, event: AgentEvent) {
         if let Err(e) = self.inner.try_handle_event(&event) {
             match self.policy {
                 FailurePolicy::Ignore => {}
@@ -100,7 +96,7 @@ impl<T: FallibleObserver> LoopObserver for PolicyReporter<T> {
                     eprintln!("reporter error: {e}");
                 }
                 FailurePolicy::Accumulate => {
-                    self.errors.push(e);
+                    self.errors.lock().unwrap_or_else(|e| e.into_inner()).push(e);
                 }
                 FailurePolicy::FailFast => {
                     panic!("reporter error: {e}");

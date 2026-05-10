@@ -199,8 +199,8 @@ A reporter can display reasoning blocks differently (dimmed, collapsible, in a s
 Reporters observe deltas via the `LoopObserver` trait:
 
 ```rust
-pub trait LoopObserver: Send {
-    fn handle_event(&mut self, event: AgentEvent);
+pub trait LoopObserver: Send + Sync {
+    fn handle_event(&self, event: AgentEvent);
 }
 ```
 
@@ -209,7 +209,7 @@ When the driver receives a `Delta` from the model turn, it wraps it as `AgentEve
 This is how real-time text rendering works — the `StdoutReporter` receives `AppendText` deltas and writes each chunk to the terminal immediately:
 
 ```rust
-fn handle_event(&mut self, event: AgentEvent) {
+fn handle_event(&self, event: AgentEvent) {
     if let AgentEvent::ContentDelta(Delta::AppendText { chunk, .. }) = &event {
         print!("{}", chunk);
         std::io::stdout().flush().ok();

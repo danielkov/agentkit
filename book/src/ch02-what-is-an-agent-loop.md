@@ -134,13 +134,15 @@ Interrupts are the mechanism for user cancellation and external preemption. A us
 
 ## Non-blocking events
 
-Not everything requires host intervention. Streaming deltas, usage updates, tool lifecycle events, and compaction notifications are delivered to `LoopObserver` implementations:
+Not everything requires host intervention. Streaming deltas, usage updates, tool lifecycle events, and mutator notifications are delivered to `LoopObserver` implementations:
 
 ```rust
-pub trait LoopObserver: Send {
-    fn handle_event(&mut self, event: AgentEvent);
+pub trait LoopObserver: Send + Sync {
+    fn handle_event(&self, event: AgentEvent);
 }
 ```
+
+Observers take `&self` and hold mutable state behind interior mutability so the driver can share each one as `Arc<dyn LoopObserver>` across multiple sessions.
 
 Observers are informational — they cannot stall the loop or alter its control flow. This keeps the driver's state machine simple: `next()` either returns a `LoopStep` or doesn't return yet. There is no interleaving of observer handling with loop logic.
 
@@ -150,7 +152,7 @@ Observers are informational — they cannot stall the loop or alter its control 
 | `AwaitingInput`           | `ToolCallRequested` / `ToolResultReceived` |
 | `AfterToolResult`         | `ToolCatalogChanged`                       |
 | `Finished(TurnResult)`    | `UsageUpdated`                             |
-|                           | `CompactionStarted` / `CompactionFinished` |
+|                           | `MutationStarted` / `MutationFinished`     |
 |                           | `TurnStarted` / `TurnFinished` / `Warning` |
 
 For loss-free transcript reconstruction (persistence, replication, audit), register a `TranscriptObserver` alongside the operational `LoopObserver`. The two observe different things:
@@ -158,7 +160,7 @@ For loss-free transcript reconstruction (persistence, replication, audit), regis
 - **`LoopObserver`** sees a stream of `AgentEvent`s. Content arrives as deltas — partial fragments that don't carry their parent-`Item` identity — interleaved with lifecycle and telemetry events. Useful for UIs and logging, but a consumer cannot reassemble the canonical transcript from this stream alone.
 - **`TranscriptObserver`** fires exactly once per `Item` appended, with the fully-formed `Item` ready to persist. Calls happen synchronously from the driver, in transcript order, at the single mutation point that owns the transcript — so what the observer sees is what the loop will send to the model on the next turn.
 
-Compaction rewrites the transcript without firing `on_item_appended`; those rewrites are signalled separately by `AgentEvent::CompactionFinished`, which a persistence layer can use to snapshot the post-compaction state.
+Mutator-driven rewrites (compaction, redaction, repair) do not fire `on_item_appended`; they are signalled separately by `AgentEvent::MutationFinished`, which a persistence layer can use to snapshot the post-mutation state.
 
 ## The three-layer model
 

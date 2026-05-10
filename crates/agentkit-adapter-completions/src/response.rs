@@ -55,6 +55,9 @@ pub(crate) fn build_turn_from_response<P: CompletionsProvider>(
             kind: ItemKind::Assistant,
             parts: std::mem::take(&mut parts),
             metadata: response_metadata,
+            usage: None,
+            finish_reason: None,
+            created_at: None,
         };
 
         for part in &assistant_item.parts {

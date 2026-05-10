@@ -71,12 +71,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use agentkit_compaction::{
-    CompactionConfig, CompactionPipeline, CompactionReason, CompactionTrigger,
-    DropFailedToolResultsStrategy, DropReasoningStrategy, KeepRecentStrategy,
+    AgentBuilderCompactorExt, CompactionPipeline, CompactionReason, DropFailedToolResultsStrategy,
+    DropReasoningStrategy, KeepRecentStrategy, StrategyCompactor,
 };
 use agentkit_core::{
     CancellationController, Delta, FinishReason, Item, ItemKind, MetadataMap, PartId, PartKind,
-    SessionId, TurnId,
 };
 use agentkit_loop::{
     Agent, AgentEvent, InputRequest, LoopDriver, LoopError, LoopInterrupt, LoopObserver, LoopStep,
@@ -185,24 +184,28 @@ impl TokenMeter {
     }
 }
 
-struct TokenBudgetTrigger {
-    meter: TokenMeter,
-}
-
-impl CompactionTrigger for TokenBudgetTrigger {
-    fn should_compact(
-        &self,
-        _session: &SessionId,
-        _turn: Option<&TurnId>,
-        _transcript: &[Item],
-    ) -> Option<CompactionReason> {
-        if self.meter.read() >= self.meter.threshold {
-            self.meter.reset();
-            Some(CompactionReason::Custom("context-window-80pct".into()))
-        } else {
-            None
-        }
-    }
+fn token_budget_compactor(meter: TokenMeter) -> StrategyCompactor {
+    StrategyCompactor::builder()
+        .trigger(move |_transcript, _point| {
+            if meter.read() >= meter.threshold {
+                meter.reset();
+                Some(CompactionReason::Custom("context-window-80pct".into()))
+            } else {
+                None
+            }
+        })
+        .strategy(
+            CompactionPipeline::new()
+                .with_strategy(DropReasoningStrategy::new())
+                .with_strategy(DropFailedToolResultsStrategy::new())
+                .with_strategy(
+                    KeepRecentStrategy::new(16)
+                        .preserve_kind(ItemKind::System)
+                        .preserve_kind(ItemKind::Context),
+                ),
+        )
+        .build()
+        .expect("token budget compactor")
 }
 
 // =============================================================================
@@ -222,7 +225,7 @@ struct MeterObserver {
 }
 
 impl LoopObserver for MeterObserver {
-    fn handle_event(&mut self, event: AgentEvent) {
+    fn handle_event(&self, event: AgentEvent) {
         if let AgentEvent::UsageUpdated(usage) = event
             && let Some(tokens) = usage.tokens.as_ref()
         {
@@ -237,7 +240,7 @@ struct ChannelObserver {
 }
 
 impl LoopObserver for ChannelObserver {
-    fn handle_event(&mut self, event: AgentEvent) {
+    fn handle_event(&self, event: AgentEvent) {
         // If the UI has gone away we simply drop events — the agent task
         // will notice via its own channel and shut down on the next tick.
         let _ = self.tx.send(UiEvent::Agent(event));
@@ -323,16 +326,21 @@ impl Renderer {
                     serde_json::to_string(&call.input).unwrap_or_else(|_| call.input.to_string());
                 println!("⏺ {}({})", call.name, truncate(&args, 160));
             }
-            AgentEvent::CompactionStarted { reason, .. } => {
+            AgentEvent::MutationStarted { mutator, point, .. } => {
                 self.end_text_stream();
-                println!("✻ compacting transcript ({reason:?})…");
+                println!("✻ mutator {mutator} running at {point:?}…");
             }
-            AgentEvent::CompactionFinished {
-                replaced_items,
-                transcript_len,
+            AgentEvent::MutationFinished {
+                mutator,
+                dirty,
+                metadata,
                 ..
             } => {
-                println!("✻ compacted: replaced {replaced_items}, now {transcript_len} items");
+                let replaced = metadata
+                    .get("replaced_items")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                println!("✻ mutator {mutator} finished (dirty={dirty}, replaced={replaced})");
             }
             AgentEvent::Warning { message } => {
                 self.end_text_stream();
@@ -770,19 +778,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             meter: meter.clone(),
         })
         .observer(ChannelObserver { tx: evt_tx.clone() })
-        .compaction(CompactionConfig::new(
-            TokenBudgetTrigger {
-                meter: meter.clone(),
-            },
-            CompactionPipeline::new()
-                .with_strategy(DropReasoningStrategy::new())
-                .with_strategy(DropFailedToolResultsStrategy::new())
-                .with_strategy(
-                    KeepRecentStrategy::new(16)
-                        .preserve_kind(ItemKind::System)
-                        .preserve_kind(ItemKind::Context),
-                ),
-        ));
+        .compactor(token_budget_compactor(meter.clone()));
 
     let session_config = SessionConfig::new("openrouter-coding-agent")
         .with_cache(PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short));

@@ -319,6 +319,9 @@ fn context_item(text: String, metadata: MetadataMap) -> Item {
             metadata: MetadataMap::new(),
         })],
         metadata,
+        usage: None,
+        finish_reason: None,
+        created_at: None,
     }
 }
 

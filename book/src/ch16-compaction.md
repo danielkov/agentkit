@@ -4,30 +4,42 @@ Long conversations exceed context windows. Compaction is how you keep an agent s
 
 ## The design
 
-Compaction is optional and host-configured. It has three concerns:
+Compaction is optional and host-configured. It plugs into the loop through the generic `LoopMutator` seam — a `Compactor` is just a mutator that decides "should I rewrite the transcript right now?" and, if yes, swaps it out. There are three concerns:
 
-1. **When** to compact — the trigger
+1. **When** to compact — the trigger closure
 2. **How** to compact — the strategy (or pipeline of strategies)
 3. **What** to use for semantic summarization — the optional backend
 
 ```rust
+let compactor = StrategyCompactor::builder()
+    .item_count_trigger(12)
+    .strategy(strategy)
+    .build()?;
+
 let agent = Agent::builder()
     .model(adapter)
-    .compaction(CompactionConfig::new(trigger, strategy))
+    .compactor(compactor) // AgentBuilderCompactorExt
     .build()?;
 ```
 
 ## Triggers
 
-A `CompactionTrigger` decides whether compaction should run before a turn:
+A trigger is a closure with the shape `Fn(&[Item], MutationPoint) -> Option<CompactionReason> + Send + Sync` (aliased as `TriggerFn`). Returning `Some(reason)` fires compaction; `None` skips. Built-in helpers:
+
+- `item_count_trigger(max_items)` — fires when the transcript grows beyond `max_items`
+- `context_window_trigger(window, percent)` — fires when the latest item's reported `input_tokens` reaches `window * percent / 100` (only at `AfterTurnEnded`)
+
+Custom triggers are plain closures:
 
 ```rust
-pub trait CompactionTrigger {
-    fn should_compact(&self, transcript: &[Item], reason: &CompactionReason) -> bool;
-}
+StrategyCompactor::builder()
+    .trigger(Box::new(|transcript, point| {
+        (point == MutationPoint::AfterTurnEnded && transcript.len() > 20)
+            .then_some(CompactionReason::TranscriptTooLong)
+    }))
+    .strategy(strategy)
+    .build()?;
 ```
-
-Built-in: `ItemCountTrigger::new(12)` fires when the transcript exceeds 12 items.
 
 ## Strategies
 
@@ -84,10 +96,14 @@ Strategies execute in order. Each one receives the output of the previous.
 For summarization, the host injects a `CompactionBackend`:
 
 ```rust
-let config = CompactionConfig::new(trigger, strategy).with_backend(my_backend);
+let compactor = StrategyCompactor::builder()
+    .trigger(trigger)
+    .strategy(strategy) // e.g. SummarizeOlderStrategy
+    .backend(my_backend)
+    .build()?;
 ```
 
-The backend receives a `SummaryRequest` and returns a `SummaryResult`. agentkit does not include a built-in LLM client — the backend is host-provided. The [`openrouter-compaction-agent`](https://github.com/danielkov/agentkit/tree/main/examples/openrouter-compaction-agent) example uses a nested agent loop as the summarization backend.
+The backend receives a `SummaryRequest` and returns a `SummaryResult`. agentkit ships `AgentCompactor`, a backend that runs a nested loop over a sub-agent (use it directly or roll your own). The [`openrouter-compaction-agent`](https://github.com/danielkov/agentkit/tree/main/examples/openrouter-compaction-agent) example wires `AgentCompactor` into the pipeline.
 
 ## A compaction example
 
@@ -245,31 +261,34 @@ This is why caching is configured separately from compaction in agentkit. Compac
 
 ## Loop integration
 
-When compaction fires:
+Compactors register as `LoopMutator`s. The loop runs every registered mutator at each `MutationPoint` — `AfterToolResult` (between tool results and the next inference call) and `AfterTurnEnded` (after the assistant final, interrupt, or cancellation). The trigger decides which points are relevant.
 
-1. `AgentEvent::CompactionStarted` is emitted (with the trigger reason)
-2. The strategy pipeline transforms the transcript
-3. The loop replaces its working transcript with the compacted result
-4. `AgentEvent::CompactionFinished` is emitted (with before/after item counts)
+When a compactor fires:
+
+1. The compactor emits `AgentEvent::MutationStarted { mutator, point, .. }` with a stable label it chose
+2. The strategy pipeline transforms the transcript through the cursor
+3. The loop validates transcript invariants (tool_use ↔ tool_result pairing) and hard-fails with `LoopError::Mutator` on a protocol violation
+4. The compactor emits `AgentEvent::MutationFinished { mutator, dirty, metadata, .. }`
 
 ```text
-Turn lifecycle with compaction:
+Turn lifecycle with a registered compactor:
 
   next() → merge pending input
        │
        ▼
-  ┌── compaction check ──┐
-  │                      │
-  │  trigger fires?      │
-  │  yes → run pipeline  │
-  │  no  → skip          │
-  └──────────┬───────────┘
-             │
-             ▼
-  begin model turn (with post-compaction transcript)
+  begin model turn
+       │
+       ▼
+  tool_result? ─► run mutators at AfterToolResult ─► continue turn
+       │
+       ▼
+  turn ends ─► run mutators at AfterTurnEnded
+       │
+       ▼
+  next turn sees the post-mutation transcript
 ```
 
-This happens _before_ the model sees the transcript for the next turn. The model never observes raw compaction artifacts — it just sees a shorter transcript.
+The model never observes raw compaction artifacts — it just sees the post-mutation transcript.
 
 ### Compaction is not summarization
 

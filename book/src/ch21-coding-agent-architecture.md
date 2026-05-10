@@ -43,14 +43,16 @@ let permissions = CompositePermissionChecker::new(PermissionDecision::Deny(defau
     .with_policy(CommandPolicy::new().require_approval_for_unknown(true));
 
 // 3. Configure compaction
-let compaction = CompactionConfig::new(
-    ItemCountTrigger::new(20),
-    CompactionPipeline::new()
-        .with_strategy(DropReasoningStrategy::new())
-        .with_strategy(KeepRecentStrategy::new(12)
-            .preserve_kind(ItemKind::System)
-            .preserve_kind(ItemKind::Context)),
-);
+let compactor = StrategyCompactor::builder()
+    .item_count_trigger(20)
+    .strategy(
+        CompactionPipeline::new()
+            .with_strategy(DropReasoningStrategy::new())
+            .with_strategy(KeepRecentStrategy::new(12)
+                .preserve_kind(ItemKind::System)
+                .preserve_kind(ItemKind::Context)),
+    )
+    .build()?;
 
 // 4. Configure task management
 let task_manager = AsyncTaskManager::new().routing(|req: &ToolRequest| {
@@ -77,7 +79,7 @@ let agent = Agent::builder()
     .model(OpenRouterAdapter::new(OpenRouterConfig::new(api_key, model))?)
     .add_tool_source(tools)
     .permissions(permissions)
-    .compaction(compaction)
+    .compactor(compactor) // AgentBuilderCompactorExt
     .task_manager(task_manager)
     .observer(reporter)
     .build()?;

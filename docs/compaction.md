@@ -1,13 +1,11 @@
 # agentkit-compaction
 
-`agentkit-compaction` is the optional transcript replacement layer.
-
-It is intentionally narrow in v1.
+`agentkit-compaction` is the optional transcript replacement layer. It plugs into the loop through a single, generic seam — `LoopMutator` from `agentkit-loop` — so compaction is just one shape of transcript edit alongside redaction, repair, and instrumentation.
 
 ## Core types
 
-- `CompactionTrigger`
-  - decides whether compaction should run
+- `Compactor`
+  - object-safe trait combining "should this fire?" and "rewrite the transcript"; implements `LoopMutator` automatically
 - `CompactionStrategy`
   - applies one transcript transformation
 - `CompactionPipeline`
@@ -15,9 +13,9 @@ It is intentionally narrow in v1.
 - `CompactionBackend`
   - optional host-provided semantic summarization backend
 - `CompactionContext`
-  - gives strategies access to the optional backend and host metadata
+  - gives strategies access to the optional backend
 - `CompactionRequest`
-  - current transcript, session, turn, and reason
+  - transcript, reason, metadata
 - `CompactionResult`
   - replacement transcript plus metadata
 - `CompactionReason`
@@ -27,8 +25,12 @@ It is intentionally narrow in v1.
 
 ## Included helpers
 
-- `ItemCountTrigger`
-  - triggers when transcript length exceeds a configured item count
+- `StrategyCompactor`
+  - bundles a trigger closure + strategy (+ optional backend) into a `Compactor`
+- `context_window_trigger(window, percent)`
+  - fires when the latest item's reported `input_tokens` ≥ `window * percent / 100`
+- `item_count_trigger(max_items)`
+  - fires when the transcript exceeds `max_items`
 - `DropReasoningStrategy`
   - removes reasoning parts and optionally drops empty items
 - `DropFailedToolResultsStrategy`
@@ -37,16 +39,22 @@ It is intentionally narrow in v1.
   - keeps the last N non-preserved items
 - `SummarizeOlderStrategy`
   - summarizes older removable items through the optional backend
+- `AgentCompactor`
+  - `CompactionBackend` that runs a nested loop over a sub-agent to summarise items
 
 ## Loop integration
 
-Compaction is configured on the agent builder:
+Compactors register as mutators on the agent builder via the `AgentBuilderCompactorExt::compactor` extension:
 
 ```rust
-let agent = Agent::builder()
-    .model(adapter)
-    .compaction(CompactionConfig::new(
-        ItemCountTrigger::new(12),
+use agentkit_compaction::{
+    AgentBuilderCompactorExt, CompactionPipeline, DropFailedToolResultsStrategy,
+    DropReasoningStrategy, KeepRecentStrategy, StrategyCompactor,
+};
+
+let compactor = StrategyCompactor::builder()
+    .item_count_trigger(12)
+    .strategy(
         CompactionPipeline::new()
             .with_strategy(DropReasoningStrategy::new())
             .with_strategy(DropFailedToolResultsStrategy::new())
@@ -55,22 +63,34 @@ let agent = Agent::builder()
                     .preserve_kind(ItemKind::System)
                     .preserve_kind(ItemKind::Context),
             ),
-    ))
+    )
+    .build()?;
+
+let agent = Agent::builder()
+    .model(adapter)
+    .compactor(compactor)
     .build()?;
 ```
 
-If a strategy needs semantic summarization, the host can inject a backend:
+If a strategy needs semantic summarisation, pass a backend:
 
 ```rust
-let config = CompactionConfig::new(trigger, strategy).with_backend(my_backend);
+let compactor = StrategyCompactor::builder()
+    .trigger(context_window_trigger(200_000, 80))
+    .strategy(SummarizeOlderStrategy::new(8))
+    .backend(Arc::new(AgentCompactor::builder()
+        .agent(inner_agent)
+        .session_id("compaction")
+        .build()?))
+    .build()?;
 ```
 
-When compaction is configured, `agentkit-loop` emits:
+When a compactor fires, `agentkit-loop` emits:
 
-- `AgentEvent::CompactionStarted`
-- `AgentEvent::CompactionFinished`
+- `AgentEvent::MutationStarted { mutator, point, .. }`
+- `AgentEvent::MutationFinished { mutator, dirty, metadata, .. }`
 
-The loop currently checks compaction before a turn begins. The configured strategy or pipeline decides how much transcript to keep, trim, replace, or summarize.
+Compactors run at every `MutationPoint` — currently `AfterToolResult` (between tool results and the next inference call) and `AfterTurnEnded`. The trigger closure decides which points are relevant. If a mutator's edit leaves the transcript protocol-invalid (orphaned/duplicate tool_use or tool_result), the loop hard-fails with `LoopError::Mutator` rather than letting the next request blow up at the provider.
 
 ## Scope
 

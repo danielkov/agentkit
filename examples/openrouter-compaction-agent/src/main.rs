@@ -77,10 +77,9 @@ fn print_run(run: &openrouter_compaction_agent::ShowcaseRun) {
     } else {
         for event in &run.compaction_events {
             println!(
-                "compaction: reason={:?} replaced_items={} transcript_len={} metadata={}",
+                "compaction: reason={:?} replaced_items={} metadata={}",
                 event.reason,
                 event.replaced_items,
-                event.transcript_len,
                 serde_json::Value::Object(
                     event
                         .metadata

@@ -168,13 +168,14 @@ pub use agentkit_task_manager as task_manager;
 #[cfg(feature = "reporting")]
 pub use agentkit_reporting as reporting;
 
-/// Transcript compaction triggers, strategies, and pipelines.
+/// Transcript compaction compactors, strategies, and pipelines.
 ///
 /// Use this module to keep transcripts from growing without bound. Combine
-/// [`compaction::CompactionTrigger`]s (which decide *when* to compact) with
-/// [`compaction::CompactionStrategy`]s (which decide *how*) through a
-/// [`compaction::CompactionPipeline`], and hand the resulting
-/// [`compaction::CompactionConfig`] to the agent builder.
+/// [`compaction::CompactionStrategy`]s (which decide *how* to compact) into a
+/// [`compaction::CompactionPipeline`], then wrap them in a
+/// [`compaction::StrategyCompactor`] (or any [`compaction::Compactor`] impl)
+/// and register it on the agent builder via
+/// [`compaction::AgentBuilderCompactorExt::compactor`].
 ///
 /// Requires the `compaction` feature.
 #[cfg(feature = "compaction")]

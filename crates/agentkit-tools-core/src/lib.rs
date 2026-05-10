@@ -2499,6 +2499,9 @@ impl Invocable for ToolInvocableAdapter {
                     kind: ItemKind::Tool,
                     parts,
                     metadata: MetadataMap::new(),
+                    usage: None,
+                    finish_reason: None,
+                    created_at: None,
                 }]),
                 ToolOutput::Files(files) => {
                     let parts = files.into_iter().map(Part::File).collect();
@@ -2507,6 +2510,9 @@ impl Invocable for ToolInvocableAdapter {
                         kind: ItemKind::Tool,
                         parts,
                         metadata: MetadataMap::new(),
+                        usage: None,
+                        finish_reason: None,
+                        created_at: None,
                     }])
                 }
             },

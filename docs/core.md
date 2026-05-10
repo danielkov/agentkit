@@ -129,6 +129,15 @@ pub struct Item {
     pub kind: ItemKind,
     pub parts: Vec<Part>,
     pub metadata: MetadataMap,
+    /// Token / cost usage for the turn that produced this item.
+    /// Populated by the loop on assistant items.
+    pub usage: Option<Usage>,
+    /// Why the turn that produced this item ended.
+    /// Populated by the loop on assistant items.
+    pub finish_reason: Option<FinishReason>,
+    /// When this item was appended to the transcript (ms since epoch).
+    /// Stamped by the loop on every appended item.
+    pub created_at: Option<Timestamp>,
 }
 
 pub enum ItemKind {
@@ -439,17 +448,7 @@ Cons:
 
 ### Pattern B: borrowed projection traits
 
-The adapter keeps native types and implements traits that expose normalized views.
-
-Example:
-
-```rust
-pub trait ItemView {
-    fn kind(&self) -> ItemKind;
-    fn parts(&self) -> &[Part];
-    fn metadata(&self) -> &MetadataMap;
-}
-```
+The adapter keeps native types and exposes accessor methods that return normalized borrows.
 
 Pros:
 
@@ -463,11 +462,11 @@ Cons:
 
 ## Recommendation
 
-Use both, but with a clear boundary:
+v1 lands on Pattern A across the workspace: the canonical normalized model is the concrete `Item` struct, and every adapter materialises owned values at its boundaries.
 
 - `agentkit-core` defines concrete normalized types as the canonical interchange model
-- `agentkit-core` also defines projection traits for adapters that want to expose views before materializing owned values
-- `agentkit-loop` should normalize to owned core types at its boundaries
+- `agentkit-loop` normalises to owned core types at its boundaries
+- adapters that want zero-copy internals keep that inside the adapter and convert on egress
 
 That gives efficient adapters a path to stay zero-copy internally, while keeping the rest of the system simple.
 
@@ -523,7 +522,6 @@ agentkit-core/
     finish.rs
     metadata.rs
     error.rs
-    view.rs
 ```
 
 Module intent:
@@ -537,7 +535,6 @@ Module intent:
 - `finish.rs`: normalized finish reasons
 - `metadata.rs`: metadata bag and conventions
 - `error.rs`: shared errors
-- `view.rs`: projection traits from native provider types into normalized views
 
 ## API stability bar
 

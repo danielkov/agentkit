@@ -64,12 +64,10 @@
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-use agentkit_compaction::{
-    CompactionConfig, CompactionContext, CompactionReason, CompactionResult,
-};
 use agentkit_core::{
     CancellationHandle, Delta, FinishReason, Item, ItemKind, MetadataMap, Part, SessionId, TaskId,
-    TextPart, ToolCallId, ToolCallPart, ToolOutput, ToolResultPart, TurnCancellation, Usage,
+    TextPart, Timestamp, ToolCallId, ToolCallPart, ToolOutput, ToolResultPart, TurnCancellation,
+    Usage,
 };
 use agentkit_task_manager::{
     PendingLoopUpdates, SimpleTaskManager, TaskApproval, TaskLaunchKind, TaskLaunchRequest,
@@ -515,14 +513,17 @@ pub trait ModelTurn: Send {
 /// struct StdoutObserver;
 ///
 /// impl LoopObserver for StdoutObserver {
-///     fn handle_event(&mut self, event: AgentEvent) {
+///     fn handle_event(&self, event: AgentEvent) {
 ///         println!("{event:?}");
 ///     }
 /// }
 /// ```
-pub trait LoopObserver: Send {
+pub trait LoopObserver: Send + Sync {
     /// Called synchronously for every [`AgentEvent`] emitted by the loop driver.
-    fn handle_event(&mut self, event: AgentEvent);
+    /// Observers store mutable state behind interior mutability (`Mutex`,
+    /// atomics, channels) so the driver can share an `Arc<dyn LoopObserver>`
+    /// across reusable [`Agent`] starts.
+    fn handle_event(&self, event: AgentEvent);
 }
 
 /// Receives full [`Item`]s as they are appended to the driver's transcript.
@@ -549,19 +550,108 @@ pub trait LoopObserver: Send {
 /// ```rust
 /// use agentkit_core::Item;
 /// use agentkit_loop::TranscriptObserver;
+/// use std::sync::atomic::{AtomicUsize, Ordering};
 ///
-/// struct CountingObserver { items: usize }
+/// struct CountingObserver { items: AtomicUsize }
 ///
 /// impl TranscriptObserver for CountingObserver {
-///     fn on_item_appended(&mut self, _item: &Item) {
-///         self.items += 1;
+///     fn on_item_appended(&self, _item: &Item) {
+///         self.items.fetch_add(1, Ordering::Relaxed);
 ///     }
 /// }
 /// ```
-pub trait TranscriptObserver: Send {
+pub trait TranscriptObserver: Send + Sync {
     /// Called synchronously every time an [`Item`] is appended to the
-    /// driver's transcript, in transcript order.
-    fn on_item_appended(&mut self, item: &Item);
+    /// driver's transcript, in transcript order. Observers store mutable
+    /// state behind interior mutability so the driver can share an
+    /// `Arc<dyn TranscriptObserver>`.
+    fn on_item_appended(&self, item: &Item);
+}
+
+/// Where in the loop a [`LoopMutator`] is given a chance to modify the
+/// transcript. Mutators run synchronously at these points; mid-stream
+/// mutation (e.g. between content deltas) is intentionally not supported
+/// because the assistant item is not yet fully constructed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum MutationPoint {
+    /// A tool result has just been appended; the next loop step will be
+    /// another inference call.
+    AfterToolResult,
+    /// A turn has fully ended (assistant final, interrupt, or cancellation)
+    /// and any new user input has not yet been dispatched.
+    AfterTurnEnded,
+}
+
+/// Sink for emitting [`AgentEvent`]s from inside a [`LoopMutator`].
+/// The driver supplies a concrete implementation via [`LoopCtx::emitter`].
+pub trait EventEmitter: Send + Sync {
+    /// Forward `event` to all registered observers.
+    fn emit(&self, event: AgentEvent);
+}
+
+/// Read-only context handed to a [`LoopMutator`] alongside the cursor.
+#[non_exhaustive]
+pub struct LoopCtx<'a> {
+    /// Session this mutation point belongs to.
+    pub session_id: &'a SessionId,
+    /// Turn the mutation is associated with, if any.
+    pub turn_id: Option<&'a agentkit_core::TurnId>,
+    /// Where in the loop the mutator is running.
+    pub point: MutationPoint,
+    /// Cancellation handle for the active turn, if any.
+    pub cancellation: Option<TurnCancellation>,
+    /// Sink for emitting events from the mutator (telemetry, progress).
+    pub emitter: &'a dyn EventEmitter,
+}
+
+/// Mutable handle over the live transcript with dirty tracking.
+///
+/// Implements [`Deref`](std::ops::Deref)/[`DerefMut`](std::ops::DerefMut) to
+/// `Vec<Item>` so mutators read and write through `Vec`'s native API
+/// (`push`, `retain`, `iter`, `*cursor = ...`). Any `&mut` access marks the
+/// cursor dirty; the loop validates transcript invariants when at least one
+/// mutator dirtied the transcript and hard-fails on protocol violations.
+pub struct TranscriptCursor<'a> {
+    items: &'a mut Vec<Item>,
+    pub(crate) dirty: bool,
+}
+
+impl<'a> std::ops::Deref for TranscriptCursor<'a> {
+    type Target = Vec<Item>;
+    fn deref(&self) -> &Vec<Item> {
+        self.items
+    }
+}
+
+impl<'a> std::ops::DerefMut for TranscriptCursor<'a> {
+    fn deref_mut(&mut self) -> &mut Vec<Item> {
+        self.dirty = true;
+        self.items
+    }
+}
+
+/// Async transcript mutator. Registered via [`AgentBuilder::mutator`] and
+/// invoked at each [`MutationPoint`]. Mutators own their derived state
+/// (e.g. running token totals via interior mutability) and decide for
+/// themselves whether and how to modify the transcript.
+///
+/// The default implementation is a no-op so trait users override only
+/// `mutate`.
+#[async_trait]
+pub trait LoopMutator: Send + Sync {
+    /// Run this mutator. Returning without writing to `cursor` is a no-op.
+    /// Errors abort the loop; protocol-violating mutations (orphaned tool
+    /// uses or results) are detected by validation and turned into
+    /// [`LoopError::Mutator`].
+    async fn mutate(
+        &self,
+        cursor: &mut TranscriptCursor<'_>,
+        ctx: LoopCtx<'_>,
+    ) -> Result<(), LoopError> {
+        let _ = (cursor, ctx);
+        Ok(())
+    }
 }
 
 /// Lifecycle and streaming events emitted by the [`LoopDriver`].
@@ -604,18 +694,22 @@ pub enum AgentEvent {
     ApprovalResolved { approved: bool },
     /// The available tool catalog changed and will be reflected on the next model request.
     ToolCatalogChanged(ToolCatalogEvent),
-    /// Transcript compaction is about to begin.
-    CompactionStarted {
+    /// A [`LoopMutator`] is about to run at one of the mutation points.
+    /// `mutator` is a stable label the implementation chooses for itself.
+    MutationStarted {
         session_id: SessionId,
         turn_id: Option<agentkit_core::TurnId>,
-        reason: CompactionReason,
+        mutator: String,
+        point: MutationPoint,
     },
-    /// Transcript compaction has finished.
-    CompactionFinished {
+    /// A [`LoopMutator`] has finished running. `dirty` indicates whether the
+    /// transcript was modified; `metadata` carries mutator-specific extras
+    /// (e.g. compaction reason, replaced item count).
+    MutationFinished {
         session_id: SessionId,
         turn_id: Option<agentkit_core::TurnId>,
-        replaced_items: usize,
-        transcript_len: usize,
+        mutator: String,
+        dirty: bool,
         metadata: MetadataMap,
     },
     /// Updated token usage statistics.
@@ -991,9 +1085,9 @@ where
     permissions: Arc<dyn PermissionChecker>,
     resources: Arc<dyn ToolResources>,
     cancellation: Option<CancellationHandle>,
-    compaction: Option<CompactionConfig>,
-    observers: Vec<Box<dyn LoopObserver>>,
-    transcript_observers: Vec<Box<dyn TranscriptObserver>>,
+    mutators: Vec<Arc<dyn LoopMutator>>,
+    observers: Vec<Arc<dyn LoopObserver>>,
+    transcript_observers: Vec<Arc<dyn TranscriptObserver>>,
     transcript: Vec<Item>,
     input: Vec<Item>,
 }
@@ -1007,39 +1101,44 @@ where
         AgentBuilder::default()
     }
 
-    /// Consume the agent and start a session, returning a [`LoopDriver`]
-    /// preloaded with whatever transcript and input were configured on the
-    /// builder. See [`AgentBuilder::transcript`] and [`AgentBuilder::input`]
-    /// for what each one does and when to use them.
+    /// Start a session, returning a [`LoopDriver`] preloaded with whatever
+    /// transcript and input were configured on the builder. See
+    /// [`AgentBuilder::transcript`] and [`AgentBuilder::input`] for what each
+    /// one does and when to use them.
     ///
     /// This calls [`ModelAdapter::start_session`] and emits an
     /// [`AgentEvent::RunStarted`] event to all registered observers.
     ///
+    /// `&self` so a single configured agent can mint multiple sessions over
+    /// its lifetime — e.g. an outer agent that uses an inner sub-agent for
+    /// transcript compaction.
+    ///
     /// # Errors
     ///
     /// Returns [`LoopError`] if the model adapter fails to create a session.
-    pub async fn start(self, config: SessionConfig) -> Result<LoopDriver<M::Session>, LoopError> {
+    pub async fn start(&self, config: SessionConfig) -> Result<LoopDriver<M::Session>, LoopError> {
         let session_id = config.session_id.clone();
         let default_cache = config.cache.clone();
         let session = self.model.start_session(config).await?;
         let tool_executor = self
             .tool_executor
+            .clone()
             .unwrap_or_else(|| Arc::new(BasicToolExecutor::new(self.tool_sources.clone())));
-        let mut driver = LoopDriver {
+        let driver = LoopDriver {
             session_id: session_id.clone(),
             default_cache,
             next_turn_cache: None,
             session: Some(session),
             tool_executor,
-            task_manager: self.task_manager,
-            permissions: self.permissions,
-            resources: self.resources,
-            cancellation: self.cancellation,
-            compaction: self.compaction,
-            observers: self.observers,
-            transcript_observers: self.transcript_observers,
-            transcript: self.transcript,
-            pending_input: self.input,
+            task_manager: self.task_manager.clone(),
+            permissions: self.permissions.clone(),
+            resources: self.resources.clone(),
+            cancellation: self.cancellation.clone(),
+            mutators: self.mutators.clone(),
+            observers: self.observers.clone(),
+            transcript_observers: self.transcript_observers.clone(),
+            transcript: self.transcript.clone(),
+            pending_input: self.input.clone(),
             pending_approvals: BTreeMap::new(),
             pending_approval_order: VecDeque::new(),
             active_tool_round: None,
@@ -1068,9 +1167,9 @@ where
     permissions: Arc<dyn PermissionChecker>,
     resources: Arc<dyn ToolResources>,
     cancellation: Option<CancellationHandle>,
-    compaction: Option<CompactionConfig>,
-    observers: Vec<Box<dyn LoopObserver>>,
-    transcript_observers: Vec<Box<dyn TranscriptObserver>>,
+    mutators: Vec<Arc<dyn LoopMutator>>,
+    observers: Vec<Arc<dyn LoopObserver>>,
+    transcript_observers: Vec<Arc<dyn TranscriptObserver>>,
     transcript: Vec<Item>,
     input: Vec<Item>,
 }
@@ -1088,7 +1187,7 @@ where
             permissions: Arc::new(AllowAllPermissions),
             resources: Arc::new(()),
             cancellation: None,
-            compaction: None,
+            mutators: Vec::new(),
             observers: Vec::new(),
             transcript_observers: Vec::new(),
             transcript: Vec::new(),
@@ -1163,20 +1262,23 @@ where
         self
     }
 
-    /// Enable transcript compaction with the given configuration.
+    /// Register a [`LoopMutator`] that runs at every [`MutationPoint`].
     ///
-    /// When configured, the driver checks the compaction trigger before each
-    /// turn and applies the compaction strategy if the transcript is too long.
-    pub fn compaction(mut self, config: CompactionConfig) -> Self {
-        self.compaction = Some(config);
+    /// Multiple mutators may be registered; they run in registration order
+    /// and the dirty flag propagates across the pipeline. After every pass
+    /// in which any mutator dirtied the transcript, the loop validates
+    /// protocol invariants (tool_use/tool_result pairing); a violation is a
+    /// hard [`LoopError::Mutator`] failure.
+    pub fn mutator<L: LoopMutator + 'static>(mut self, mutator: L) -> Self {
+        self.mutators.push(Arc::new(mutator));
         self
     }
 
     /// Register a [`LoopObserver`] that receives [`AgentEvent`]s.
     ///
     /// Multiple observers may be registered; they are called in order.
-    pub fn observer(mut self, observer: impl LoopObserver + 'static) -> Self {
-        self.observers.push(Box::new(observer));
+    pub fn observer<O: LoopObserver + 'static>(mut self, observer: O) -> Self {
+        self.observers.push(Arc::new(observer));
         self
     }
 
@@ -1188,8 +1290,8 @@ where
     /// for persistence or replication) — [`LoopObserver`] alone is
     /// insufficient because it doesn't expose item boundaries for model
     /// output and historically did not surface tool results at all.
-    pub fn transcript_observer(mut self, observer: impl TranscriptObserver + 'static) -> Self {
-        self.transcript_observers.push(Box::new(observer));
+    pub fn transcript_observer<O: TranscriptObserver + 'static>(mut self, observer: O) -> Self {
+        self.transcript_observers.push(Arc::new(observer));
         self
     }
 
@@ -1237,7 +1339,7 @@ where
             permissions: self.permissions,
             resources: self.resources,
             cancellation: self.cancellation,
-            compaction: self.compaction,
+            mutators: self.mutators,
             observers: self.observers,
             transcript_observers: self.transcript_observers,
             transcript: self.transcript,
@@ -1289,9 +1391,9 @@ where
     permissions: Arc<dyn PermissionChecker>,
     resources: Arc<dyn ToolResources>,
     cancellation: Option<CancellationHandle>,
-    compaction: Option<CompactionConfig>,
-    observers: Vec<Box<dyn LoopObserver>>,
-    transcript_observers: Vec<Box<dyn TranscriptObserver>>,
+    mutators: Vec<Arc<dyn LoopMutator>>,
+    observers: Vec<Arc<dyn LoopObserver>>,
+    transcript_observers: Vec<Arc<dyn TranscriptObserver>>,
     transcript: Vec<Item>,
     pending_input: Vec<Item>,
     pending_approvals: BTreeMap<ToolCallId, PendingApprovalToolCall>,
@@ -1483,68 +1585,50 @@ where
         Ok((saw_items, self.take_next_unsurfaced_approval_interrupt()))
     }
 
-    async fn maybe_compact(
+    async fn run_mutators(
         &mut self,
+        point: MutationPoint,
         turn_id: Option<&agentkit_core::TurnId>,
         cancellation: Option<TurnCancellation>,
     ) -> Result<(), LoopError> {
-        let Some(compaction) = self.compaction.as_ref().cloned() else {
+        if self.mutators.is_empty() {
             return Ok(());
-        };
+        }
         if cancellation
             .as_ref()
             .is_some_and(TurnCancellation::is_cancelled)
         {
             return Err(LoopError::Cancelled);
         }
-        let Some(reason) =
-            compaction
-                .trigger
-                .should_compact(&self.session_id, turn_id, &self.transcript)
-        else {
-            return Ok(());
+        let mutators = self.mutators.clone();
+        let session_id = self.session_id.clone();
+        let observers = self.observers.clone();
+        let emitter = DriverEmitter {
+            observers: &observers,
         };
-
-        self.emit(AgentEvent::CompactionStarted {
-            session_id: self.session_id.clone(),
-            turn_id: turn_id.cloned(),
-            reason: reason.clone(),
-        });
-
-        let CompactionResult {
-            transcript,
-            replaced_items,
-            metadata,
-        } = compaction
-            .strategy
-            .apply(
-                agentkit_compaction::CompactionRequest {
-                    session_id: self.session_id.clone(),
-                    turn_id: turn_id.cloned(),
-                    transcript: self.transcript.clone(),
-                    reason,
-                    metadata: compaction.metadata.clone(),
-                },
-                &mut CompactionContext {
-                    backend: compaction.backend.as_deref(),
-                    metadata: &compaction.metadata,
-                    cancellation,
-                },
-            )
-            .await
-            .map_err(|error| match error {
-                agentkit_compaction::CompactionError::Cancelled => LoopError::Cancelled,
-                other => LoopError::Compaction(other.to_string()),
-            })?;
-
-        self.transcript = transcript;
-        self.emit(AgentEvent::CompactionFinished {
-            session_id: self.session_id.clone(),
-            turn_id: turn_id.cloned(),
-            replaced_items,
-            transcript_len: self.transcript.len(),
-            metadata,
-        });
+        let mut cursor = TranscriptCursor {
+            items: &mut self.transcript,
+            dirty: false,
+        };
+        for mutator in &mutators {
+            if cancellation
+                .as_ref()
+                .is_some_and(TurnCancellation::is_cancelled)
+            {
+                return Err(LoopError::Cancelled);
+            }
+            let ctx = LoopCtx {
+                session_id: &session_id,
+                turn_id,
+                point,
+                cancellation: cancellation.clone(),
+                emitter: &emitter,
+            };
+            mutator.mutate(&mut cursor, ctx).await?;
+        }
+        if cursor.dirty {
+            validate_transcript_invariants(cursor.items)?;
+        }
         Ok(())
     }
 
@@ -1671,6 +1755,9 @@ where
                             metadata: MetadataMap::new(),
                         })],
                         metadata: MetadataMap::new(),
+                        usage: None,
+                        finish_reason: None,
+                        created_at: None,
                     });
                     self.detached_call_ids.insert(detached_call_id);
                     if let Some(active) = self.active_tool_round.as_mut() {
@@ -1744,8 +1831,13 @@ where
             .cancellation
             .as_ref()
             .map(CancellationHandle::checkpoint);
+        let mutation_point = if self.pending_round_resume.is_some() {
+            MutationPoint::AfterToolResult
+        } else {
+            MutationPoint::AfterTurnEnded
+        };
         match self
-            .maybe_compact(Some(&turn_id), cancellation.clone())
+            .run_mutators(mutation_point, Some(&turn_id), cancellation.clone())
             .await
         {
             Ok(()) => {}
@@ -1835,7 +1927,7 @@ where
             }
         }
 
-        let result = finished_result.ok_or_else(|| {
+        let mut result = finished_result.ok_or_else(|| {
             LoopError::Provider("model turn ended without a Finished event".into())
         })?;
         tracing::Span::current().record("saw_tool_call", saw_tool_call);
@@ -1843,10 +1935,31 @@ where
             "finish_reason",
             tracing::field::debug(&result.finish_reason),
         );
-        self.extend_transcript(result.output_items.clone());
+        let now = Timestamp::now();
+        let usage = result.usage.clone();
+        let finish_reason = result.finish_reason.clone();
+        let output_items: Vec<Item> = result
+            .output_items
+            .drain(..)
+            .map(|mut item| {
+                if matches!(item.kind, ItemKind::Assistant) {
+                    if item.usage.is_none() {
+                        item.usage = usage.clone();
+                    }
+                    if item.finish_reason.is_none() {
+                        item.finish_reason = Some(finish_reason.clone());
+                    }
+                }
+                if item.created_at.is_none() {
+                    item.created_at = Some(now);
+                }
+                item
+            })
+            .collect();
+        self.extend_transcript(output_items.clone());
 
         if saw_tool_call {
-            let pending_calls = extract_tool_calls(&result.output_items)
+            let pending_calls = extract_tool_calls(&output_items)
                 .into_iter()
                 .map(|call| {
                     let tool_request = ToolRequest {
@@ -1880,7 +1993,7 @@ where
         let turn_result = TurnResult {
             turn_id,
             finish_reason: result.finish_reason,
-            items: result.output_items,
+            items: output_items,
             usage: result.usage,
             metadata: result.metadata,
         };
@@ -1938,6 +2051,9 @@ where
                         metadata: pending.call.metadata.clone(),
                     })],
                     metadata: MetadataMap::new(),
+                    usage: None,
+                    finish_reason: None,
+                    created_at: None,
                 });
             }
         }
@@ -1979,7 +2095,7 @@ where
     /// one-shot calls is preloaded via [`AgentBuilder::input`]. New input
     /// after start-up always flows through one of the typed `submit`
     /// handles.
-    pub(crate) fn submit_input(&mut self, input: Vec<Item>) -> Result<(), LoopError> {
+    pub fn submit_input(&mut self, input: Vec<Item>) -> Result<(), LoopError> {
         if self.has_pending_interrupts() {
             return Err(LoopError::InvalidState(
                 "cannot submit input while an interrupt is pending".into(),
@@ -2173,8 +2289,8 @@ where
         self.drive_turn(turn_id, true).await
     }
 
-    fn emit(&mut self, event: AgentEvent) {
-        for observer in &mut self.observers {
+    fn emit(&self, event: AgentEvent) {
+        for observer in &self.observers {
             observer.handle_event(event.clone());
         }
     }
@@ -2183,8 +2299,11 @@ where
     /// registered [`TranscriptObserver`]s. The single mutation point —
     /// every push to `self.transcript` should funnel through here so
     /// observers see exactly what landed in the transcript.
-    fn append_item(&mut self, item: Item) {
-        for observer in &mut self.transcript_observers {
+    fn append_item(&mut self, mut item: Item) {
+        if item.created_at.is_none() {
+            item.created_at = Some(Timestamp::now());
+        }
+        for observer in &self.transcript_observers {
             observer.on_item_appended(&item);
         }
         self.transcript.push(item);
@@ -2252,8 +2371,14 @@ where
     }
 
     /// Append several Items in order through [`Self::append_item`].
+    /// Pre-stamps `created_at` once per batch so all items in the batch
+    /// share a timestamp and `append_item` skips its own clock read.
     fn extend_transcript(&mut self, items: impl IntoIterator<Item = Item>) {
-        for item in items {
+        let now = Timestamp::now();
+        for mut item in items {
+            if item.created_at.is_none() {
+                item.created_at = Some(now);
+            }
             self.append_item(item);
         }
     }
@@ -2289,6 +2414,9 @@ fn interrupted_assistant_items() -> Vec<Item> {
             metadata: interrupted_metadata("assistant"),
         })],
         metadata: interrupted_metadata("assistant"),
+        usage: None,
+        finish_reason: None,
+        created_at: None,
     }]
 }
 
@@ -2319,12 +2447,76 @@ pub enum LoopError {
     /// An error originating from tool execution.
     #[error("tool error: {0}")]
     Tool(#[from] ToolError),
-    /// An error that occurred during transcript compaction.
-    #[error("compaction error: {0}")]
-    Compaction(String),
+    /// An error reported by a [`LoopMutator`] (compaction, redaction, repair).
+    #[error("mutator error: {0}")]
+    Mutator(String),
     /// The requested operation is not supported.
     #[error("unsupported operation: {0}")]
     Unsupported(String),
+}
+
+/// Internal [`EventEmitter`] backed by the driver's observer slice. Lives
+/// only for the duration of a [`LoopDriver::run_mutators`] call so the
+/// borrow against `self.observers` stays disjoint from the cursor's borrow
+/// of `self.transcript`.
+struct DriverEmitter<'a> {
+    observers: &'a [Arc<dyn LoopObserver>],
+}
+
+impl<'a> EventEmitter for DriverEmitter<'a> {
+    fn emit(&self, event: AgentEvent) {
+        for observer in self.observers {
+            observer.handle_event(event.clone());
+        }
+    }
+}
+
+/// Hard-fails when a mutator's edit leaves the transcript protocol-invalid.
+/// The only invariant currently checked is tool_use ↔ tool_result pairing
+/// — every [`Part::ToolCall`] must be followed (in transcript order) by a
+/// matching [`Part::ToolResult`] with the same `call_id`.
+fn validate_transcript_invariants(transcript: &[Item]) -> Result<(), LoopError> {
+    let mut pending: HashSet<ToolCallId> = HashSet::new();
+    let mut seen_calls: HashSet<ToolCallId> = HashSet::new();
+    let mut seen_results: HashSet<ToolCallId> = HashSet::new();
+    for item in transcript {
+        for part in &item.parts {
+            match part {
+                Part::ToolCall(call) => {
+                    if !seen_calls.insert(call.id.clone()) {
+                        return Err(LoopError::Mutator(format!(
+                            "transcript invariant violation: duplicate tool_use: {}",
+                            call.id.0
+                        )));
+                    }
+                    pending.insert(call.id.clone());
+                }
+                Part::ToolResult(result) => {
+                    if !pending.remove(&result.call_id) {
+                        let kind = if seen_results.contains(&result.call_id) {
+                            "duplicate"
+                        } else {
+                            "orphaned"
+                        };
+                        return Err(LoopError::Mutator(format!(
+                            "transcript invariant violation: {kind} tool_result: {}",
+                            result.call_id.0
+                        )));
+                    }
+                    seen_results.insert(result.call_id.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+    if !pending.is_empty() {
+        let missing: Vec<String> = pending.into_iter().map(|id| id.0).collect();
+        return Err(LoopError::Mutator(format!(
+            "transcript invariant violation: tool_use(s) without matching tool_result: {}",
+            missing.join(", ")
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2333,9 +2525,9 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc as StdArc, Mutex as StdMutex};
 
-    use agentkit_compaction::{CompactionPipeline, CompactionTrigger, KeepRecentStrategy};
     use agentkit_core::{
-        CancellationController, ItemKind, Part, TextPart, ToolCallId, ToolOutput, ToolResultPart,
+        CancellationController, ItemKind, Part, TextPart, ToolCallId, ToolCallPart, ToolOutput,
+        ToolResultPart,
     };
     use agentkit_task_manager::{
         AsyncTaskManager, RoutingDecision, TaskEvent, TaskManager, TaskManagerHandle,
@@ -2484,6 +2676,9 @@ mod tests {
                             metadata: MetadataMap::new(),
                         })],
                         metadata: MetadataMap::new(),
+                        usage: None,
+                        finish_reason: None,
+                        created_at: None,
                     }],
                     usage: None,
                     metadata: MetadataMap::new(),
@@ -2508,6 +2703,9 @@ mod tests {
                                 metadata: MetadataMap::new(),
                             })],
                             metadata: MetadataMap::new(),
+                            usage: None,
+                            finish_reason: None,
+                            created_at: None,
                         }],
                         usage: None,
                         metadata: MetadataMap::new(),
@@ -2598,6 +2796,9 @@ mod tests {
                             metadata: MetadataMap::new(),
                         })],
                         metadata: MetadataMap::new(),
+                        usage: None,
+                        finish_reason: None,
+                        created_at: None,
                     }],
                     usage: None,
                     metadata: MetadataMap::new(),
@@ -2625,6 +2826,9 @@ mod tests {
                             kind: ItemKind::Assistant,
                             parts: vec![Part::ToolCall(foreground), Part::ToolCall(background)],
                             metadata: MetadataMap::new(),
+                            usage: None,
+                            finish_reason: None,
+                            created_at: None,
                         }],
                         usage: None,
                         metadata: MetadataMap::new(),
@@ -2663,6 +2867,9 @@ mod tests {
                             metadata: MetadataMap::new(),
                         })],
                         metadata: MetadataMap::new(),
+                        usage: None,
+                        finish_reason: None,
+                        created_at: None,
                     }],
                     usage: None,
                     metadata: MetadataMap::new(),
@@ -2690,6 +2897,9 @@ mod tests {
                             kind: ItemKind::Assistant,
                             parts: vec![Part::ToolCall(first), Part::ToolCall(second)],
                             metadata: MetadataMap::new(),
+                            usage: None,
+                            finish_reason: None,
+                            created_at: None,
                         }],
                         usage: None,
                         metadata: MetadataMap::new(),
@@ -2737,6 +2947,9 @@ mod tests {
                             metadata: MetadataMap::new(),
                         })],
                         metadata: MetadataMap::new(),
+                        usage: None,
+                        finish_reason: None,
+                        created_at: None,
                     }],
                     usage: None,
                     metadata: MetadataMap::new(),
@@ -2765,6 +2978,9 @@ mod tests {
                             metadata: MetadataMap::new(),
                         })],
                         metadata: MetadataMap::new(),
+                        usage: None,
+                        finish_reason: None,
+                        created_at: None,
                     }],
                     usage: None,
                     metadata: MetadataMap::new(),
@@ -2961,17 +3177,36 @@ mod tests {
         }
     }
 
-    struct CountTrigger;
+    struct KeepRecentMutator {
+        keep: usize,
+    }
 
-    impl CompactionTrigger for CountTrigger {
-        fn should_compact(
+    #[async_trait]
+    impl LoopMutator for KeepRecentMutator {
+        async fn mutate(
             &self,
-            _session_id: &SessionId,
-            _turn_id: Option<&agentkit_core::TurnId>,
-            transcript: &[Item],
-        ) -> Option<agentkit_compaction::CompactionReason> {
-            (transcript.len() >= 2)
-                .then_some(agentkit_compaction::CompactionReason::TranscriptTooLong)
+            cursor: &mut TranscriptCursor<'_>,
+            ctx: LoopCtx<'_>,
+        ) -> Result<(), LoopError> {
+            if cursor.len() < 2 {
+                return Ok(());
+            }
+            let drop = cursor.len().saturating_sub(self.keep);
+            ctx.emitter.emit(AgentEvent::MutationStarted {
+                session_id: ctx.session_id.clone(),
+                turn_id: ctx.turn_id.cloned(),
+                mutator: "keep-recent".into(),
+                point: ctx.point,
+            });
+            cursor.drain(..drop);
+            ctx.emitter.emit(AgentEvent::MutationFinished {
+                session_id: ctx.session_id.clone(),
+                turn_id: ctx.turn_id.cloned(),
+                mutator: "keep-recent".into(),
+                dirty: true,
+                metadata: MetadataMap::new(),
+            });
+            Ok(())
         }
     }
 
@@ -2980,7 +3215,7 @@ mod tests {
     }
 
     impl LoopObserver for RecordingObserver {
-        fn handle_event(&mut self, event: AgentEvent) {
+        fn handle_event(&self, event: AgentEvent) {
             self.events.lock().unwrap().push(event);
         }
     }
@@ -3172,6 +3407,9 @@ mod tests {
                     metadata: MetadataMap::new(),
                 })],
                 metadata: MetadataMap::new(),
+                usage: None,
+                finish_reason: None,
+                created_at: None,
             }])
             .unwrap();
 
@@ -3230,6 +3468,9 @@ mod tests {
                     metadata: MetadataMap::new(),
                 })],
                 metadata: MetadataMap::new(),
+                usage: None,
+                finish_reason: None,
+                created_at: None,
             }])
             .unwrap();
 
@@ -3285,6 +3526,9 @@ mod tests {
                     metadata: MetadataMap::new(),
                 })],
                 metadata: MetadataMap::new(),
+                usage: None,
+                finish_reason: None,
+                created_at: None,
             }])
             .unwrap();
 
@@ -3348,6 +3592,9 @@ mod tests {
                     metadata: MetadataMap::new(),
                 })],
                 metadata: MetadataMap::new(),
+                usage: None,
+                finish_reason: None,
+                created_at: None,
             }])
             .unwrap();
 
@@ -3380,6 +3627,9 @@ mod tests {
                     metadata: MetadataMap::new(),
                 })],
                 metadata: MetadataMap::new(),
+                usage: None,
+                finish_reason: None,
+                created_at: None,
             }])
             .unwrap();
 
@@ -3444,6 +3694,9 @@ mod tests {
                     metadata: MetadataMap::new(),
                 })],
                 metadata: MetadataMap::new(),
+                usage: None,
+                finish_reason: None,
+                created_at: None,
             }])
             .unwrap();
 
@@ -3509,6 +3762,9 @@ mod tests {
                     metadata: MetadataMap::new(),
                 })],
                 metadata: MetadataMap::new(),
+                usage: None,
+                finish_reason: None,
+                created_at: None,
             }])
             .unwrap();
 
@@ -3559,6 +3815,9 @@ mod tests {
                     metadata: MetadataMap::new(),
                 })],
                 metadata: MetadataMap::new(),
+                usage: None,
+                finish_reason: None,
+                created_at: None,
             }])
             .unwrap();
 
@@ -3607,6 +3866,9 @@ mod tests {
                     metadata: MetadataMap::new(),
                 })],
                 metadata: MetadataMap::new(),
+                usage: None,
+                finish_reason: None,
+                created_at: None,
             }])
             .unwrap();
 
@@ -3661,10 +3923,7 @@ mod tests {
         let events = StdArc::new(StdMutex::new(Vec::new()));
         let agent = Agent::builder()
             .model(FakeAdapter)
-            .compaction(CompactionConfig::new(
-                CountTrigger,
-                CompactionPipeline::new().with_strategy(KeepRecentStrategy::new(1)),
-            ))
+            .mutator(KeepRecentMutator { keep: 1 })
             .observer(RecordingObserver {
                 events: events.clone(),
             })
@@ -3690,19 +3949,92 @@ mod tests {
                         metadata: MetadataMap::new(),
                     })],
                     metadata: MetadataMap::new(),
+                    usage: None,
+                    finish_reason: None,
+                    created_at: None,
                 }])
                 .unwrap();
             let _ = driver.next().await.unwrap();
         }
 
         let events = events.lock().unwrap();
-        assert!(events.iter().any(|event| matches!(
-            event,
-            AgentEvent::CompactionFinished {
-                replaced_items,
-                ..
-            } if *replaced_items > 0
-        )));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::MutationFinished { dirty: true, .. }))
+        );
+    }
+
+    #[test]
+    fn transcript_validation_rejects_orphaned_tool_result() {
+        let transcript = vec![Item {
+            id: None,
+            kind: ItemKind::Tool,
+            parts: vec![Part::ToolResult(ToolResultPart {
+                call_id: "call-1".into(),
+                output: ToolOutput::Text("result".into()),
+                is_error: false,
+                metadata: MetadataMap::new(),
+            })],
+            metadata: MetadataMap::new(),
+            usage: None,
+            finish_reason: None,
+            created_at: None,
+        }];
+
+        let error = validate_transcript_invariants(&transcript).unwrap_err();
+        assert!(error.to_string().contains("orphaned tool_result"));
+    }
+
+    #[test]
+    fn transcript_validation_rejects_duplicate_tool_result() {
+        let transcript = vec![
+            Item {
+                id: None,
+                kind: ItemKind::Assistant,
+                parts: vec![Part::ToolCall(ToolCallPart {
+                    id: "call-1".into(),
+                    name: "lookup".into(),
+                    input: serde_json::json!({}),
+                    metadata: MetadataMap::new(),
+                })],
+                metadata: MetadataMap::new(),
+                usage: None,
+                finish_reason: None,
+                created_at: None,
+            },
+            Item {
+                id: None,
+                kind: ItemKind::Tool,
+                parts: vec![Part::ToolResult(ToolResultPart {
+                    call_id: "call-1".into(),
+                    output: ToolOutput::Text("result".into()),
+                    is_error: false,
+                    metadata: MetadataMap::new(),
+                })],
+                metadata: MetadataMap::new(),
+                usage: None,
+                finish_reason: None,
+                created_at: None,
+            },
+            Item {
+                id: None,
+                kind: ItemKind::Tool,
+                parts: vec![Part::ToolResult(ToolResultPart {
+                    call_id: "call-1".into(),
+                    output: ToolOutput::Text("again".into()),
+                    is_error: false,
+                    metadata: MetadataMap::new(),
+                })],
+                metadata: MetadataMap::new(),
+                usage: None,
+                finish_reason: None,
+                created_at: None,
+            },
+        ];
+
+        let error = validate_transcript_invariants(&transcript).unwrap_err();
+        assert!(error.to_string().contains("duplicate tool_result"));
     }
 
     #[tokio::test]
@@ -3739,6 +4071,9 @@ mod tests {
                         metadata: MetadataMap::new(),
                     })],
                     metadata: MetadataMap::new(),
+                    usage: None,
+                    finish_reason: None,
+                    created_at: None,
                 }])
                 .unwrap();
 
@@ -3858,6 +4193,9 @@ mod tests {
                     metadata: MetadataMap::new(),
                 })],
                 metadata: MetadataMap::new(),
+                usage: None,
+                finish_reason: None,
+                created_at: None,
             }])
             .unwrap();
         let _ = driver.next().await.unwrap();
@@ -3872,6 +4210,9 @@ mod tests {
                         metadata: MetadataMap::new(),
                     })],
                     metadata: MetadataMap::new(),
+                    usage: None,
+                    finish_reason: None,
+                    created_at: None,
                 }],
                 override_cache.clone(),
             )
@@ -3958,7 +4299,7 @@ mod tests {
     }
 
     impl TranscriptObserver for RecordingTranscriptObserver {
-        fn on_item_appended(&mut self, item: &Item) {
+        fn on_item_appended(&self, item: &Item) {
             self.items.lock().unwrap().push(item.clone());
         }
     }
@@ -4003,6 +4344,9 @@ mod tests {
                     metadata: MetadataMap::new(),
                 })],
                 metadata: MetadataMap::new(),
+                usage: None,
+                finish_reason: None,
+                created_at: None,
             }])
             .unwrap();
 

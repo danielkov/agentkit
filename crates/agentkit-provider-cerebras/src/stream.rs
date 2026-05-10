@@ -324,6 +324,9 @@ impl EventTranslator {
                     kind: ItemKind::Assistant,
                     parts,
                     metadata: MetadataMap::new(),
+                    usage: None,
+                    finish_reason: None,
+                    created_at: None,
                 });
             }
         }

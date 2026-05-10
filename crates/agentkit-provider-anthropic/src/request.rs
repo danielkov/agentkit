@@ -742,7 +742,7 @@ mod tests {
         let no_leak = body
             .get("system")
             .and_then(|s| s.as_array())
-            .map_or(true, |arr| {
+            .is_none_or(|arr| {
                 arr.iter()
                     .all(|b| !b["text"].as_str().unwrap_or("").contains("Slack install"))
             });

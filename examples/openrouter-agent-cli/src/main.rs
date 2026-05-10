@@ -4,8 +4,8 @@ use std::io;
 use std::path::PathBuf;
 
 use agentkit_compaction::{
-    CompactionConfig, CompactionPipeline, DropFailedToolResultsStrategy, DropReasoningStrategy,
-    ItemCountTrigger, KeepRecentStrategy,
+    AgentBuilderCompactorExt, CompactionPipeline, DropFailedToolResultsStrategy,
+    DropReasoningStrategy, KeepRecentStrategy, StrategyCompactor,
 };
 use agentkit_context::{AgentsMd, ContextLoader};
 use agentkit_core::{Item, ItemKind, MetadataMap, Part};
@@ -112,17 +112,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .model(adapter)
         .add_tool_source(tools)
         .permissions(permissions)
-        .compaction(CompactionConfig::new(
-            ItemCountTrigger::new(12),
-            CompactionPipeline::new()
-                .with_strategy(DropReasoningStrategy::new())
-                .with_strategy(DropFailedToolResultsStrategy::new())
-                .with_strategy(
-                    KeepRecentStrategy::new(8)
-                        .preserve_kind(ItemKind::System)
-                        .preserve_kind(ItemKind::Context),
-                ),
-        ))
+        .compactor(
+            StrategyCompactor::builder()
+                .item_count_trigger(12)
+                .strategy(
+                    CompactionPipeline::new()
+                        .with_strategy(DropReasoningStrategy::new())
+                        .with_strategy(DropFailedToolResultsStrategy::new())
+                        .with_strategy(
+                            KeepRecentStrategy::new(8)
+                                .preserve_kind(ItemKind::System)
+                                .preserve_kind(ItemKind::Context),
+                        ),
+                )
+                .build()?,
+        )
         .observer(reporter);
 
     if let Some(manager) = manager.as_ref() {

@@ -23,53 +23,52 @@ use agentkit_loop::{AgentEvent, LoopObserver};
 /// ```
 pub struct BufferedReporter<T: LoopObserver> {
     inner: T,
-    buffer: Vec<AgentEvent>,
+    buffer: std::sync::Mutex<Vec<AgentEvent>>,
     capacity: usize,
 }
 
 impl<T: LoopObserver> BufferedReporter<T> {
     /// Creates a new `BufferedReporter` that buffers up to `capacity` events
     /// before flushing them to `inner`.
-    ///
-    /// A capacity of `0` disables automatic flushing — events are only
-    /// delivered when [`flush`](BufferedReporter::flush) is called explicitly
-    /// (or on drop).
     pub fn new(inner: T, capacity: usize) -> Self {
         Self {
             inner,
-            buffer: Vec::with_capacity(capacity),
+            buffer: std::sync::Mutex::new(Vec::with_capacity(capacity)),
             capacity,
         }
     }
 
     /// Delivers all buffered events to the inner observer and clears the
     /// buffer.
-    pub fn flush(&mut self) {
-        for event in self.buffer.drain(..) {
+    pub fn flush(&self) {
+        let drained = std::mem::replace(
+            &mut *self.buffer.lock().unwrap_or_else(|e| e.into_inner()),
+            Vec::with_capacity(self.capacity),
+        );
+        for event in drained {
             self.inner.handle_event(event);
         }
     }
 
     /// Returns the number of events currently buffered.
     pub fn pending(&self) -> usize {
-        self.buffer.len()
+        self.buffer.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     /// Returns a reference to the inner observer.
     pub fn inner(&self) -> &T {
         &self.inner
     }
-
-    /// Returns a mutable reference to the inner observer.
-    pub fn inner_mut(&mut self) -> &mut T {
-        &mut self.inner
-    }
 }
 
 impl<T: LoopObserver> LoopObserver for BufferedReporter<T> {
-    fn handle_event(&mut self, event: AgentEvent) {
-        self.buffer.push(event);
-        if self.capacity > 0 && self.buffer.len() >= self.capacity {
+    fn handle_event(&self, event: AgentEvent) {
+        let needs_flush = {
+            let mut buffer = self.buffer.lock().unwrap_or_else(|e| e.into_inner());
+            buffer.push(event);
+            self.capacity > 0 && buffer.len() >= self.capacity
+        };
+        if needs_flush {
             self.flush();
         }
     }

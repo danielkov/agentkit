@@ -89,7 +89,7 @@ use agentkit_tools_core::ToolRegistry;
 struct PrintObserver;
 
 impl LoopObserver for PrintObserver {
-    fn handle_event(&mut self, event: AgentEvent) {
+    fn handle_event(&self, event: AgentEvent) {
         println!("[event] {event:?}");
     }
 }

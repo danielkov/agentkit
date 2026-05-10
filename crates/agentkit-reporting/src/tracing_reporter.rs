@@ -59,7 +59,7 @@ impl TracingReporter {
 }
 
 impl LoopObserver for TracingReporter {
-    fn handle_event(&mut self, event: AgentEvent) {
+    fn handle_event(&self, event: AgentEvent) {
         match &event {
             AgentEvent::RunStarted { session_id } => {
                 tracing::info!(target: "agentkit_reporting", session_id = %session_id, "agent run started");
@@ -103,25 +103,27 @@ impl LoopObserver for TracingReporter {
                     "tool catalog changed"
                 );
             }
-            AgentEvent::CompactionStarted {
+            AgentEvent::MutationStarted {
                 session_id,
                 turn_id,
-                reason,
+                mutator,
+                point,
             } => {
                 let turn = turn_id.as_ref().map(|t| t.to_string()).unwrap_or_default();
                 tracing::debug!(
                     target: "agentkit_reporting",
                     session_id = %session_id,
                     turn_id = %turn,
-                    reason = ?reason,
-                    "compaction started"
+                    mutator = %mutator,
+                    point = ?point,
+                    "mutation started"
                 );
             }
-            AgentEvent::CompactionFinished {
+            AgentEvent::MutationFinished {
                 session_id,
                 turn_id,
-                replaced_items,
-                transcript_len,
+                mutator,
+                dirty,
                 ..
             } => {
                 let turn = turn_id.as_ref().map(|t| t.to_string()).unwrap_or_default();
@@ -129,9 +131,9 @@ impl LoopObserver for TracingReporter {
                     target: "agentkit_reporting",
                     session_id = %session_id,
                     turn_id = %turn,
-                    replaced_items,
-                    transcript_len,
-                    "compaction finished"
+                    mutator = %mutator,
+                    dirty,
+                    "mutation finished"
                 );
             }
             AgentEvent::UsageUpdated(usage) => {

@@ -384,6 +384,10 @@ fn print_banner(cli: &CliArgs, config: &AnthropicConfig) {
 /// so printing here happens as tokens arrive from the Anthropic SSE stream.
 struct StreamPrinter {
     usage_slot: Arc<Mutex<Option<Usage>>>,
+    state: Mutex<StreamPrinterState>,
+}
+
+struct StreamPrinterState {
     in_assistant_turn: bool,
     stdout: io::Stdout,
 }
@@ -392,11 +396,15 @@ impl StreamPrinter {
     fn new(usage_slot: Arc<Mutex<Option<Usage>>>) -> Self {
         Self {
             usage_slot,
-            in_assistant_turn: false,
-            stdout: io::stdout(),
+            state: Mutex::new(StreamPrinterState {
+                in_assistant_turn: false,
+                stdout: io::stdout(),
+            }),
         }
     }
+}
 
+impl StreamPrinterState {
     fn ensure_prefix(&mut self) {
         if !self.in_assistant_turn {
             let _ = self.stdout.write_all(b"assistant> ");
@@ -406,7 +414,6 @@ impl StreamPrinter {
     }
 
     fn print_marker(&mut self, text: &str) {
-        // Make sure the marker starts on its own line even mid-stream.
         if self.in_assistant_turn {
             let _ = self.stdout.write_all(b"\n");
         }
@@ -418,35 +425,29 @@ impl StreamPrinter {
 }
 
 impl LoopObserver for StreamPrinter {
-    fn handle_event(&mut self, event: AgentEvent) {
+    fn handle_event(&self, event: AgentEvent) {
+        let mut state = self.state.lock().unwrap();
         match event {
             AgentEvent::TurnStarted { .. } => {
-                // Prefix is emitted lazily on the first text delta so
-                // tool-only turns don't print a spurious `assistant> ` line.
-                self.in_assistant_turn = false;
+                state.in_assistant_turn = false;
             }
             AgentEvent::ContentDelta(Delta::AppendText { chunk, .. }) => {
-                self.ensure_prefix();
-                let _ = self.stdout.write_all(chunk.as_bytes());
-                let _ = self.stdout.flush();
+                state.ensure_prefix();
+                let _ = state.stdout.write_all(chunk.as_bytes());
+                let _ = state.stdout.flush();
             }
             AgentEvent::ContentDelta(Delta::CommitPart { part }) => match part {
-                // Buffered path: no AppendText events stream in, so the
-                // whole assistant message arrives here in a single commit.
-                // The `!in_assistant_turn` guard prevents double-printing in
-                // streaming mode, where AppendText already rendered the text
-                // and this CommitPart arrives after.
-                Part::Text(t) if !self.in_assistant_turn => {
-                    self.ensure_prefix();
-                    let _ = self.stdout.write_all(t.text.as_bytes());
-                    let _ = self.stdout.flush();
+                Part::Text(t) if !state.in_assistant_turn => {
+                    state.ensure_prefix();
+                    let _ = state.stdout.write_all(t.text.as_bytes());
+                    let _ = state.stdout.flush();
                 }
                 Part::Reasoning(r) if r.redacted => {
-                    self.print_marker("[thinking: <redacted>]");
+                    state.print_marker("[thinking: <redacted>]");
                 }
-                Part::Reasoning(r) if !self.in_assistant_turn => {
+                Part::Reasoning(r) if !state.in_assistant_turn => {
                     if let Some(summary) = &r.summary {
-                        self.print_marker(&format!("[thinking]\n{summary}"));
+                        state.print_marker(&format!("[thinking]\n{summary}"));
                     }
                 }
                 Part::Custom(custom) if custom.kind.starts_with("anthropic.") => {
@@ -460,23 +461,21 @@ impl LoopObserver for StreamPrinter {
                         Some(name) => format!("[anthropic:{suffix} name={name}]"),
                         None => format!("[anthropic:{suffix}]"),
                     };
-                    self.print_marker(&marker);
+                    state.print_marker(&marker);
                 }
                 _ => {}
             },
             AgentEvent::ToolCallRequested(call) => {
-                // User-defined tools — server tools surface as Custom parts
-                // above. Shown for completeness in case the example is
-                // extended with a ToolRegistry later.
-                self.print_marker(&format!("[tool_call: {}]", call.name));
+                state.print_marker(&format!("[tool_call: {}]", call.name));
             }
             AgentEvent::UsageUpdated(usage) => {
+                drop(state);
                 if let Ok(mut slot) = self.usage_slot.lock() {
                     *slot = Some(usage);
                 }
             }
             AgentEvent::TurnFinished(_) => {
-                self.in_assistant_turn = false;
+                state.in_assistant_turn = false;
             }
             _ => {}
         }

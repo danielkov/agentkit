@@ -39,10 +39,7 @@ impl SseDecoder {
     pub(crate) fn feed(&mut self, chunk: &str) -> Vec<SseEvent> {
         self.buffer.push_str(chunk);
         let mut out = Vec::new();
-        loop {
-            let Some(end) = find_record_boundary(&self.buffer) else {
-                break;
-            };
+        while let Some(end) = find_record_boundary(&self.buffer) {
             let record: String = self.buffer.drain(..end).collect();
             let record = record.trim_end_matches(&['\r', '\n'][..]).to_string();
             if record.is_empty() {

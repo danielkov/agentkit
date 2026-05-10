@@ -1,35 +1,37 @@
 # `openrouter-context-window-compaction`
 
-Demonstrates a token/context-window-aware compaction trigger built on top of
-the `Usage` reports the OpenRouter adapter forwards via
-`AgentEvent::UsageUpdated`.
+Demonstrates token-aware compaction driven by the per-item `Usage` that the
+loop now stamps onto every assistant `Item`.
 
-`agentkit-compaction` ships an `ItemCountTrigger` but no token-count
-trigger — implementing one is straightforward: a custom `CompactionTrigger`
-backed by an `Arc<AtomicU64>` that an observer keeps up to date.
+`agentkit-compaction` ships `context_window_trigger(window, percent)`, a
+ready-made `TriggerFn` that walks the transcript looking for the most recent
+reported `input_tokens` and fires when it crosses
+`window * percent / 100`. Older items are summarised into a single `Context`
+item by `AgentCompactor`, which runs a nested loop over the same OpenRouter
+adapter.
 
 ## How it works
 
 ```
-provider response  ──►  AgentEvent::UsageUpdated(Usage)
+provider response  ──►  Item { usage: Some(Usage), .. } appended to transcript
                             │
                             ▼
-                       UsageObserver
-                            │ store(input_tokens)
-                            ▼
-                  Arc<AtomicU64> last_input_tokens
-                            ▲
-                            │ load()
-                            │
-              ContextWindowTrigger::should_compact
+                  context_window_trigger walks transcript on AfterTurnEnded
                             │
                             ▼
-        fires when last_input_tokens ≥ window * percentage / 100
+        fires when last reported input_tokens ≥ window * percent / 100
+                            │
+                            ▼
+                  SummarizeOlderStrategy + AgentCompactor backend
+                            │
+                            ▼
+                  nested loop summarises older items → Context item
 ```
 
-`LoopDriver::maybe_compact` runs before each turn, so by the time the second
-turn starts the trigger has already seen usage from turn 1 and decides
-whether to run the strategy pipeline.
+The compactor is registered as a `LoopMutator` via
+`AgentBuilderCompactorExt::compactor`; the loop runs it at
+`MutationPoint::AfterTurnEnded`, so by the time the second turn starts the
+trigger has already seen usage from turn 1.
 
 ## Why a small-context model?
 
@@ -39,8 +41,8 @@ megabytes of filler. The first user turn carries a ~10 KB short story
 (`src/story.txt`, embedded via `include_str!`) and asks the model to
 summarize it. The reported `input_tokens` for that turn cross the 60%
 threshold; the next turn runs compaction before sending its request,
-dropping the original story while keeping the assistant's summary so
-follow-up questions still work.
+replacing the original story with the assistant's summary so follow-up
+questions still work.
 
 If the slug is unavailable on your OpenRouter account, override
 `OPENROUTER_MODEL` and `MAX_CONTEXT_TOKENS` to match a different small-window
@@ -83,11 +85,11 @@ provider/model, retune `MAX_CONTEXT_TOKENS` to match what
 ## Notes
 
 - The adapter populates `Usage::tokens.input_tokens` from the provider's
-  `prompt_tokens` field. OpenRouter returns this on every non-streaming
-  completion.
+  `prompt_tokens` field, and the loop stamps the resulting `Usage` onto the
+  assistant `Item` for every turn. `context_window_trigger` reads it back.
 - The strategy pipeline used here drops reasoning parts and failed tool
-  results, then keeps only the last two removable items. Swap in
-  `SummarizeOlderStrategy` (with a backend) for semantic compaction.
+  results, then summarises older items via `AgentCompactor`'s nested loop
+  into a single `Context` item.
 - For a real deployment, set `MAX_CONTEXT_TOKENS` to your model's actual
   context window and pick a `CONTEXT_PERCENTAGE` (e.g. `80`) that leaves
   room for the next response.

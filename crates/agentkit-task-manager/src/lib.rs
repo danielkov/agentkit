@@ -821,6 +821,9 @@ fn map_outcome_to_resolution(
             kind: agentkit_core::ItemKind::Tool,
             parts: vec![agentkit_core::Part::ToolResult(result.result)],
             metadata: result.metadata,
+            usage: None,
+            finish_reason: None,
+            created_at: None,
         }),
         ToolExecutionOutcome::Interrupted(
             agentkit_tools_core::ToolInterruption::ApprovalRequired(mut approval),
@@ -843,6 +846,9 @@ fn map_outcome_to_resolution(
                 metadata: request.metadata,
             })],
             metadata: MetadataMap::new(),
+            usage: None,
+            finish_reason: None,
+            created_at: None,
         }),
     }
 }

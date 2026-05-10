@@ -95,6 +95,9 @@ pub fn build_turn_from_response(body: &str) -> Result<VecDeque<ModelTurnEvent>, 
                 kind: ItemKind::Assistant,
                 parts,
                 metadata: MetadataMap::new(),
+                usage: None,
+                finish_reason: None,
+                created_at: None,
             });
         }
     }

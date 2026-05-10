@@ -99,8 +99,8 @@ agentkit-core ──────────── Item, Part, Delta, Usage, Fin
   ▼
 agentkit-loop ──────────── LoopDriver, TurnRequest, LoopStep, AgentEvent
   │
-  ├── agentkit-compaction ─ CompactionTrigger, CompactionPipeline
-  │                         (fires before step 3, trims old items)
+  ├── agentkit-compaction ─ Compactor, StrategyCompactor, CompactionPipeline
+  │                         (LoopMutator at AfterToolResult / AfterTurnEnded)
   │
   ├── agentkit-provider-* ─ ModelAdapter → ModelSession → ModelTurn
   │                         (step 4, sends transcript, streams response)

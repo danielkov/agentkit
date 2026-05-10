@@ -91,7 +91,7 @@ impl RecordingObserver {
 }
 
 impl LoopObserver for RecordingObserver {
-    fn handle_event(&mut self, event: AgentEvent) {
+    fn handle_event(&self, event: AgentEvent) {
         if let AgentEvent::ToolCallRequested(call) = event {
             self.tool_calls.lock().unwrap().push(call.name);
         }

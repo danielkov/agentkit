@@ -229,10 +229,10 @@ async fn wait_for_second_get(
             let mut gets = guard
                 .iter()
                 .filter(|request| request.method == "GET" && request.path == "/mcp");
-            if gets.next().is_some() {
-                if let Some(second) = gets.next() {
-                    return Some(second.clone());
-                }
+            if gets.next().is_some()
+                && let Some(second) = gets.next()
+            {
+                return Some(second.clone());
             }
         }
         if std::time::Instant::now() >= deadline {

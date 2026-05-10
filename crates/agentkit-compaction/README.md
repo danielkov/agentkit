@@ -9,98 +9,103 @@
 
 Transcript compaction primitives for reducing context size while preserving useful state.
 
-This crate includes:
+Compaction plugs into `agentkit-loop` through one generic seam — `LoopMutator`. This crate provides:
 
-- **Triggers** (`CompactionTrigger`, `ItemCountTrigger`) that decide _when_ compaction should run
+- **Compactors** (`Compactor`, `StrategyCompactor`) — the mutator-shaped wrapper around triggers and strategies
+- **Trigger helpers** (`item_count_trigger`, `context_window_trigger`) that decide _when_ a compactor should fire
 - **Strategies** (`DropReasoningStrategy`, `DropFailedToolResultsStrategy`, `KeepRecentStrategy`, `SummarizeOlderStrategy`) that drop, keep, or summarize transcript items
-- **Backends** (`CompactionBackend`) for provider-backed summarization
-- **Pipelines** (`CompactionPipeline`) for composing multiple compaction steps into a single pass
+- **Backends** (`CompactionBackend`, `AgentCompactor`) for nested-loop semantic summarisation
+- **Pipelines** (`CompactionPipeline`) for composing multiple steps into a single pass
 
-Use it from `agentkit-loop` or your own runtime when you need to trim older transcript state without losing essential context.
+Use it from `agentkit-loop` (or your own driver) when you need to trim older transcript state without losing essential context.
 
 ## Quick start
 
-Combine a trigger with a multi-step pipeline to build a `CompactionConfig`:
+Combine a trigger with a multi-step pipeline and register the result on the builder via `AgentBuilderCompactorExt::compactor`:
 
 ```rust
 use agentkit_compaction::{
-    CompactionConfig, CompactionPipeline, DropFailedToolResultsStrategy,
-    DropReasoningStrategy, ItemCountTrigger, KeepRecentStrategy,
+    AgentBuilderCompactorExt, CompactionPipeline, DropFailedToolResultsStrategy,
+    DropReasoningStrategy, KeepRecentStrategy, StrategyCompactor,
 };
 use agentkit_core::ItemKind;
-
-// Trigger compaction once the transcript exceeds 32 items.
-let trigger = ItemCountTrigger::new(32);
 
 // Build a pipeline that:
 //   1. Strips chain-of-thought reasoning parts
 //   2. Removes failed tool results
 //   3. Keeps only the 24 most recent items (preserving system/context)
-let pipeline = CompactionPipeline::new()
-    .with_strategy(DropReasoningStrategy::new())
-    .with_strategy(DropFailedToolResultsStrategy::new())
-    .with_strategy(
-        KeepRecentStrategy::new(24)
-            .preserve_kind(ItemKind::System)
-            .preserve_kind(ItemKind::Context),
-    );
+let compactor = StrategyCompactor::builder()
+    .item_count_trigger(32) // fire once transcript exceeds 32 items
+    .strategy(
+        CompactionPipeline::new()
+            .with_strategy(DropReasoningStrategy::new())
+            .with_strategy(DropFailedToolResultsStrategy::new())
+            .with_strategy(
+                KeepRecentStrategy::new(24)
+                    .preserve_kind(ItemKind::System)
+                    .preserve_kind(ItemKind::Context),
+            ),
+    )
+    .build()?;
 
-let config = CompactionConfig::new(trigger, pipeline);
-assert!(config.backend.is_none());
+let agent = Agent::builder()
+    .model(adapter)
+    .compactor(compactor)
+    .build()?;
 ```
 
 ## Using a summarization backend
 
-When you want older items to be condensed rather than dropped, use
-`SummarizeOlderStrategy` together with a `CompactionBackend`:
+When you want older items to be condensed rather than dropped, pair `SummarizeOlderStrategy` with a `CompactionBackend`. The crate ships `AgentCompactor`, which runs a nested loop over a sub-agent:
 
 ```rust
+use std::sync::Arc;
 use agentkit_compaction::{
-    CompactionBackend, CompactionConfig, CompactionError, CompactionPipeline,
-    DropReasoningStrategy, ItemCountTrigger, SummarizeOlderStrategy, SummaryRequest,
-    SummaryResult,
+    AgentBuilderCompactorExt, AgentCompactor, CompactionPipeline, DropReasoningStrategy,
+    StrategyCompactor, SummarizeOlderStrategy, context_window_trigger,
 };
-use agentkit_core::{Item, ItemKind, TurnCancellation};
-use async_trait::async_trait;
+use agentkit_core::ItemKind;
 
-struct MyBackend;
+let nested = Arc::new(
+    AgentCompactor::builder()
+        .agent(Arc::new(inner_agent))
+        .session_id("compaction")
+        .build()?,
+);
 
-#[async_trait]
-impl CompactionBackend for MyBackend {
-    async fn summarize(
-        &self,
-        request: SummaryRequest,
-        _cancellation: Option<TurnCancellation>,
-    ) -> Result<SummaryResult, CompactionError> {
-        // Call your LLM here to produce a summary.
-        let summary_text = format!("Summary of {} items", request.items.len());
-        Ok(SummaryResult::new(vec![Item::text(ItemKind::Context, summary_text)]))
-    }
-}
+let compactor = StrategyCompactor::builder()
+    .trigger(context_window_trigger(200_000, 80)) // 80% of a 200k window
+    .strategy(
+        CompactionPipeline::new()
+            .with_strategy(DropReasoningStrategy::new())
+            .with_strategy(
+                SummarizeOlderStrategy::new(16)
+                    .preserve_kind(ItemKind::System),
+            ),
+    )
+    .backend(nested)
+    .build()?;
 
-let config = CompactionConfig::new(
-    ItemCountTrigger::new(64),
-    CompactionPipeline::new()
-        .with_strategy(DropReasoningStrategy::new())
-        .with_strategy(
-            SummarizeOlderStrategy::new(16)
-                .preserve_kind(ItemKind::System),
-        ),
-)
-.with_backend(MyBackend);
-
-assert!(config.backend.is_some());
+let agent = Agent::builder()
+    .model(adapter)
+    .compactor(compactor)
+    .build()?;
 ```
 
-## Checking the trigger manually
+## Roll your own trigger
 
-You can query the trigger yourself outside of the agent loop:
+Triggers are plain closures with the `TriggerFn` shape — `Fn(&[Item], MutationPoint) -> Option<CompactionReason> + Send + Sync`. The built-ins are just convenience constructors:
 
 ```rust
-use agentkit_compaction::{CompactionTrigger, ItemCountTrigger};
-use agentkit_core::SessionId;
+use agentkit_compaction::{CompactionReason, MutationPoint, StrategyCompactor};
 
-let trigger = ItemCountTrigger::new(10);
-let transcript = Vec::new();
-assert!(trigger.should_compact(&SessionId::new("sess-1"), None, &transcript).is_none());
+let compactor = StrategyCompactor::builder()
+    .trigger(Box::new(|transcript, point| {
+        if point != MutationPoint::AfterTurnEnded {
+            return None;
+        }
+        (transcript.len() > 10).then_some(CompactionReason::TranscriptTooLong)
+    }))
+    .strategy(/* ... */)
+    .build()?;
 ```

@@ -110,15 +110,16 @@ MCP auth requests now carry typed operation data and can be resumed through:
 - loop auth resume for tool-path interruptions
 - `McpServerManager::resolve_auth_and_resume(...)` for non-tool MCP operations
 
-## Compaction path
+## Mutator path
 
-Compaction is optional.
+Transcript edits — compaction, redaction, repair — plug into the loop through one generic seam, `LoopMutator`. Mutators run at well-defined `MutationPoint`s (`AfterToolResult`, `AfterTurnEnded`) and decide for themselves whether to touch the transcript via a `TranscriptCursor`.
 
-If configured, the loop asks the compaction trigger whether transcript replacement should happen before a turn. If so:
+For each registered mutator the loop:
 
-1. `AgentEvent::CompactionStarted` is emitted
-2. the configured compaction strategy or pipeline receives the current transcript
-3. the loop replaces its in-memory transcript with the result
-4. `AgentEvent::CompactionFinished` is emitted
+1. emits `AgentEvent::MutationStarted { mutator, point, .. }` (mutators are expected to emit their own start/finish events with a stable label)
+2. runs the mutator with read-only context and a mutable cursor over the transcript
+3. emits `AgentEvent::MutationFinished { mutator, dirty, metadata, .. }`
 
-The loop owns when compaction hooks are checked, but not how compaction is performed. Semantic compaction, if needed, is provided through an injected backend rather than a built-in model client.
+If any mutator in the pass dirtied the cursor, the loop validates transcript invariants (tool_use ↔ tool_result pairing) and hard-fails with `LoopError::Mutator` if a mutator left the transcript protocol-invalid.
+
+Compaction is the canonical mutator: `agentkit-compaction` provides a `Compactor` trait, `StrategyCompactor`, and trigger helpers (`item_count_trigger`, `context_window_trigger`) that wire into this seam through the `AgentBuilderCompactorExt::compactor` extension. Semantic compaction is provided through an injected `CompactionBackend` (e.g. `AgentCompactor`, which runs a nested sub-agent) rather than a built-in model client.

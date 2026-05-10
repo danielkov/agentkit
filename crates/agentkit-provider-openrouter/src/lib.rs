@@ -852,6 +852,9 @@ mod tests {
                                 metadata: MetadataMap::new(),
                             })],
                             metadata: MetadataMap::new(),
+                            usage: None,
+                            finish_reason: None,
+                            created_at: None,
                         },
                         Item {
                             id: None,
@@ -861,6 +864,9 @@ mod tests {
                                 metadata: MetadataMap::new(),
                             })],
                             metadata: MetadataMap::new(),
+                            usage: None,
+                            finish_reason: None,
+                            created_at: None,
                         },
                     ],
                     Some(
@@ -923,6 +929,9 @@ mod tests {
                             metadata: MetadataMap::new(),
                         })],
                         metadata: MetadataMap::new(),
+                        usage: None,
+                        finish_reason: None,
+                        created_at: None,
                     }],
                     Some(PromptCacheRequest::required(
                         PromptCacheStrategy::Explicit {

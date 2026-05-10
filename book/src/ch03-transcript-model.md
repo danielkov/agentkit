@@ -402,19 +402,25 @@ tokio::select! {
 
 The `cancelled()` method polls every 10ms — fast enough for responsive cancellation, cheap enough to run alongside every model call.
 
-## The `ItemView` trait
+## Per-item bookkeeping fields
 
-For downstream crates that need to operate on item-like types without depending on the concrete `Item` struct, agentkit defines a read-only view trait:
+`Item` carries a few optional fields that the loop populates as the transcript is built. They are not part of the wire format — they're host-side bookkeeping that downstream consumers (compaction triggers, reporters, persistence) can read without rebuilding their own indexes:
 
 ```rust
-pub trait ItemView {
-    fn kind(&self) -> ItemKind;
-    fn parts(&self) -> &[Part];
-    fn metadata(&self) -> &MetadataMap;
+pub struct Item {
+    pub id: Option<MessageId>,
+    pub kind: ItemKind,
+    pub parts: Vec<Part>,
+    pub metadata: MetadataMap,
+    pub usage: Option<Usage>,           // populated by the loop on assistant items
+    pub finish_reason: Option<FinishReason>, // populated by the loop on assistant items
+    pub created_at: Option<Timestamp>,  // stamped by the loop on every appended item
 }
 ```
 
-`Item` implements `ItemView`. Compaction strategies and reporters can accept `&dyn ItemView` if they need to work with projected or wrapped item types.
+`Timestamp(u64)` is wall-clock milliseconds since the Unix epoch. The loop stamps `created_at` exactly once per item, when it lands in the transcript. Consumers can sort, filter, or expire by age without depending on a particular date-time crate.
+
+This is what lets `context_window_trigger` find "the last reported `input_tokens`" by walking the transcript directly, instead of needing a separate `Usage` channel to listen on.
 
 ## Design principles
 

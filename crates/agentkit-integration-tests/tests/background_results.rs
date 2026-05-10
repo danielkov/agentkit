@@ -55,10 +55,10 @@ async fn wait_for_completion(handle: &TaskManagerHandle, tool_name: &str) {
     timeout(Duration::from_secs(2), async {
         loop {
             let event = handle.next_event().await.expect("task event stream ended");
-            if let TaskEvent::Completed(snap, _) = event {
-                if snap.tool_name == tool_name {
-                    return;
-                }
+            if let TaskEvent::Completed(snap, _) = event
+                && snap.tool_name == tool_name
+            {
+                return;
             }
         }
     })

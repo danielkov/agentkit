@@ -79,5 +79,5 @@ async fn cancellation_during_tool_call_finishes_with_cancelled_reason() {
     // Release the parked task so the spawned tool future can unwind
     // before the test exits.
     tool.release();
-    let _ = driver.next();
+    let _ = driver.next().await;
 }

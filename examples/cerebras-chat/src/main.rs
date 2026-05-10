@@ -1056,6 +1056,10 @@ struct StreamPrinter {
     usage_slot: Arc<Mutex<Option<Usage>>>,
     last_usage: Arc<Mutex<Option<Usage>>>,
     streaming: bool,
+    state: Mutex<StreamPrinterState>,
+}
+
+struct StreamPrinterState {
     in_assistant_turn: bool,
     in_reasoning: bool,
     stdout: io::Stdout,
@@ -1071,12 +1075,16 @@ impl StreamPrinter {
             usage_slot,
             last_usage,
             streaming,
-            in_assistant_turn: false,
-            in_reasoning: false,
-            stdout: io::stdout(),
+            state: Mutex::new(StreamPrinterState {
+                in_assistant_turn: false,
+                in_reasoning: false,
+                stdout: io::stdout(),
+            }),
         }
     }
+}
 
+impl StreamPrinterState {
     fn write(&mut self, bytes: &[u8]) {
         let _ = self.stdout.write_all(bytes);
         let _ = self.stdout.flush();
@@ -1102,47 +1110,47 @@ impl StreamPrinter {
 }
 
 impl LoopObserver for StreamPrinter {
-    fn handle_event(&mut self, event: AgentEvent) {
+    fn handle_event(&self, event: AgentEvent) {
+        let mut state = self.state.lock().unwrap();
         match event {
             AgentEvent::TurnStarted { .. } => {
-                self.in_assistant_turn = false;
-                self.in_reasoning = false;
+                state.in_assistant_turn = false;
+                state.in_reasoning = false;
             }
             AgentEvent::ContentDelta(Delta::AppendText { part_id, chunk }) => {
                 if part_id.0.contains("reasoning") {
-                    self.ensure_reasoning_prefix();
+                    state.ensure_reasoning_prefix();
                 } else {
-                    self.ensure_assistant_prefix();
+                    state.ensure_assistant_prefix();
                 }
-                self.write(chunk.as_bytes());
+                state.write(chunk.as_bytes());
             }
             AgentEvent::ContentDelta(Delta::CommitPart { part }) => match part {
-                // Redundant with AppendText on the streaming path; the
-                // atomic render for the buffered path.
                 Part::Text(_) | Part::Reasoning(_) if self.streaming => {}
                 Part::Text(t) => {
-                    self.ensure_assistant_prefix();
-                    self.write(t.text.as_bytes());
+                    state.ensure_assistant_prefix();
+                    state.write(t.text.as_bytes());
                 }
                 Part::Reasoning(r) => {
                     if let Some(s) = &r.summary {
-                        self.write(b"[reasoning]\n");
-                        self.write(s.as_bytes());
-                        self.write(b"\n");
+                        state.write(b"[reasoning]\n");
+                        state.write(s.as_bytes());
+                        state.write(b"\n");
                     }
                 }
                 _ => {}
             },
             AgentEvent::ToolCallRequested(call) => {
-                if self.in_assistant_turn || self.in_reasoning {
-                    self.write(b"\n");
+                if state.in_assistant_turn || state.in_reasoning {
+                    state.write(b"\n");
                 }
                 let msg = format!("[tool_call: {} {}]\n", call.name, call.input);
-                self.write(msg.as_bytes());
-                self.in_assistant_turn = false;
-                self.in_reasoning = false;
+                state.write(msg.as_bytes());
+                state.in_assistant_turn = false;
+                state.in_reasoning = false;
             }
             AgentEvent::UsageUpdated(usage) => {
+                drop(state);
                 if let Ok(mut slot) = self.usage_slot.lock() {
                     *slot = Some(usage.clone());
                 }
@@ -1151,8 +1159,8 @@ impl LoopObserver for StreamPrinter {
                 }
             }
             AgentEvent::TurnFinished(_) => {
-                self.in_assistant_turn = false;
-                self.in_reasoning = false;
+                state.in_assistant_turn = false;
+                state.in_reasoning = false;
             }
             _ => {}
         }

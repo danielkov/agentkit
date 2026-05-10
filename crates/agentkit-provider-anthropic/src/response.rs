@@ -89,6 +89,9 @@ pub(crate) fn build_turn_from_response(
         kind: ItemKind::Assistant,
         parts,
         metadata,
+        usage: None,
+        finish_reason: None,
+        created_at: None,
     };
 
     events.push_back(ModelTurnEvent::Finished(ModelTurnResult {

@@ -1,10 +1,11 @@
 //! Demonstrates a context-window-aware compaction trigger driven by
 //! `Usage` reports from the OpenRouter adapter.
 //!
-//! - `ContextWindowTrigger` reads a shared `AtomicU64` of last-known input
-//!   tokens and fires when it crosses `context_length * percentage / 100`.
-//! - `UsageObserver` watches `AgentEvent::UsageUpdated` and writes the
-//!   provider-reported `input_tokens` into the same atomic.
+//! - `agentkit_compaction::context_window_trigger` fires when the latest
+//!   transcript item's reported `input_tokens` crosses
+//!   `context_length * percentage / 100`.
+//! - `agentkit_compaction::AgentCompactor` runs a nested loop over the same
+//!   adapter to summarise older items into a single `Context` item.
 //! - The model's `context_length` is fetched from OpenRouter's
 //!   `/api/v1/models` catalog at startup, so the threshold matches the
 //!   pinned model rather than a hardcoded value.
@@ -12,14 +13,12 @@
 use std::env;
 use std::error::Error;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use agentkit_compaction::{
-    CompactionBackend, CompactionConfig, CompactionError, CompactionPipeline, CompactionReason,
-    CompactionTrigger, DropFailedToolResultsStrategy, DropReasoningStrategy,
-    SummarizeOlderStrategy, SummaryRequest, SummaryResult,
+    AgentBuilderCompactorExt, AgentCompactor, CompactionPipeline, DropFailedToolResultsStrategy,
+    DropReasoningStrategy, StrategyCompactor, SummarizeOlderStrategy, context_window_trigger,
 };
-use agentkit_core::{Item, ItemKind, MetadataMap, Part, SessionId, TurnCancellation, TurnId};
+use agentkit_core::{Item, ItemKind, Part, SessionId};
 use agentkit_http::Http;
 use agentkit_loop::{
     Agent, AgentEvent, InputRequest, LoopInterrupt, LoopObserver, LoopStep, PromptCacheRequest,
@@ -27,7 +26,6 @@ use agentkit_loop::{
 };
 use agentkit_provider_openrouter::{OpenRouterAdapter, OpenRouterConfig};
 use agentkit_tools_core::{PermissionChecker, PermissionDecision};
-use async_trait::async_trait;
 use serde::Deserialize;
 
 const SYSTEM_PROMPT: &str = "\
@@ -55,80 +53,12 @@ const DEFAULT_MODEL: &str = "openai/gpt-3.5-turbo";
 /// Fire compaction once input tokens reach this share of the window.
 const DEFAULT_PERCENTAGE: u32 = 60;
 
-#[derive(Clone, Debug)]
-struct ContextWindowTrigger {
-    max_context_tokens: u64,
-    percentage: u32,
-    last_input_tokens: Arc<AtomicU64>,
-}
-
-impl ContextWindowTrigger {
-    fn new(max_context_tokens: u64) -> Self {
-        Self {
-            max_context_tokens,
-            percentage: 80,
-            last_input_tokens: Arc::new(AtomicU64::new(0)),
-        }
-    }
-
-    /// Fire compaction once the last reported `input_tokens` reaches this
-    /// percentage of `max_context_tokens`. Values are clamped to `0..=100`.
-    fn with_percentage(mut self, percentage: u32) -> Self {
-        self.percentage = percentage.min(100);
-        self
-    }
-
-    fn threshold(&self) -> u64 {
-        self.max_context_tokens
-            .saturating_mul(self.percentage as u64)
-            / 100
-    }
-}
-
-impl CompactionTrigger for ContextWindowTrigger {
-    fn should_compact(
-        &self,
-        _session_id: &SessionId,
-        turn_id: Option<&TurnId>,
-        transcript: &[Item],
-    ) -> Option<CompactionReason> {
-        let last = self.last_input_tokens.load(Ordering::Acquire);
-        let threshold = self.threshold();
-        let fire = last >= threshold;
-        println!(
-            "[trigger] turn={} transcript_len={} last_input_tokens={last} threshold={threshold} -> {}",
-            turn_id.map(|t| t.to_string()).unwrap_or_else(|| "?".into()),
-            transcript.len(),
-            if fire { "FIRE" } else { "skip" },
-        );
-        fire.then(|| {
-            CompactionReason::Custom(format!(
-                "input_tokens={last} >= threshold={threshold} (window={}, {}%)",
-                self.max_context_tokens, self.percentage
-            ))
-        })
-    }
-}
-
-impl LoopObserver for ContextWindowTrigger {
-    fn handle_event(&mut self, event: AgentEvent) {
-        if let AgentEvent::UsageUpdated(usage) = event
-            && let Some(tokens) = usage.tokens
-        {
-            self.last_input_tokens
-                .store(tokens.input_tokens, Ordering::Release);
-        }
-    }
-}
-
 /// Prints turn, usage, compaction, and failure events to stdout/stderr.
-/// Kept separate from `UsageObserver` so display logic doesn't muddy the
-/// trigger's data source.
 #[derive(Clone, Default)]
 struct DisplayObserver;
 
 impl LoopObserver for DisplayObserver {
-    fn handle_event(&mut self, event: AgentEvent) {
+    fn handle_event(&self, event: AgentEvent) {
         match event {
             AgentEvent::TurnStarted { turn_id, .. } => {
                 println!("[turn] {turn_id} started");
@@ -151,17 +81,20 @@ impl LoopObserver for DisplayObserver {
                     result.items.len(),
                 );
             }
-            AgentEvent::CompactionStarted { reason, .. } => {
-                println!("[compaction] start reason={reason:?}");
+            AgentEvent::MutationStarted { mutator, point, .. } => {
+                println!("[mutation] start mutator={mutator} point={point:?}");
             }
-            AgentEvent::CompactionFinished {
-                replaced_items,
-                transcript_len,
+            AgentEvent::MutationFinished {
+                mutator,
+                dirty,
+                metadata,
                 ..
             } => {
-                println!(
-                    "[compaction] finished replaced={replaced_items} transcript_len={transcript_len}"
-                );
+                let replaced = metadata
+                    .get("replaced_items")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                println!("[mutation] finished mutator={mutator} dirty={dirty} replaced={replaced}");
             }
             AgentEvent::Warning { message } => {
                 eprintln!("[warning] {message}");
@@ -182,131 +115,6 @@ impl PermissionChecker for AllowAll {
         _request: &dyn agentkit_tools_core::PermissionRequest,
     ) -> PermissionDecision {
         PermissionDecision::Allow
-    }
-}
-
-/// `CompactionBackend` that runs a nested `Agent` loop over the same
-/// OpenRouter adapter to summarise older transcript items into a single
-/// `Context` item. `SummarizeOlderStrategy` calls this when the trigger
-/// fires.
-#[derive(Clone)]
-struct NestedLoopCompactionBackend {
-    adapter: OpenRouterAdapter,
-}
-
-#[async_trait]
-impl CompactionBackend for NestedLoopCompactionBackend {
-    async fn summarize(
-        &self,
-        request: SummaryRequest,
-        cancellation: Option<TurnCancellation>,
-    ) -> Result<SummaryResult, CompactionError> {
-        if cancellation
-            .as_ref()
-            .is_some_and(TurnCancellation::is_cancelled)
-        {
-            return Err(CompactionError::Cancelled);
-        }
-
-        let rendered = render_items(&request.items);
-        let mut builder = Agent::builder()
-            .model(self.adapter.clone())
-            .permissions(AllowAll)
-            .transcript(vec![Item::text(ItemKind::System, COMPACTION_SYSTEM_PROMPT)])
-            .input(vec![Item::text(
-                ItemKind::User,
-                format!(
-                    "Compress the transcript below into a comprehensive context note. \
-                     Preserve every name, year, place, and event.\n\n{rendered}"
-                ),
-            )]);
-        if let Some(c) = cancellation.as_ref() {
-            builder = builder.cancellation(c.handle().clone());
-        }
-        let agent = builder
-            .build()
-            .map_err(|e| CompactionError::Failed(e.to_string()))?;
-
-        let mut driver = agent
-            .start(SessionConfig::new(format!(
-                "{}-compactor",
-                request.session_id
-            )))
-            .await
-            .map_err(|e| CompactionError::Failed(e.to_string()))?;
-
-        let summary = run_to_completion(&mut driver)
-            .await
-            .map_err(|e| CompactionError::Failed(e.to_string()))?;
-
-        println!("[compaction] backend produced {} chars", summary.len());
-
-        Ok(SummaryResult {
-            items: vec![Item::text(ItemKind::Context, summary)],
-            metadata: MetadataMap::new(),
-        })
-    }
-}
-
-fn render_items(items: &[Item]) -> String {
-    items
-        .iter()
-        .map(|item| {
-            let kind = match item.kind {
-                ItemKind::User => "USER",
-                ItemKind::Assistant => "ASSISTANT",
-                ItemKind::System => "SYSTEM",
-                ItemKind::Developer => "DEVELOPER",
-                ItemKind::Tool => "TOOL",
-                ItemKind::Context => "CONTEXT",
-                ItemKind::Notification => "NOTIFICATION",
-            };
-            let body = item
-                .parts
-                .iter()
-                .filter_map(|p| match p {
-                    Part::Text(t) => Some(t.text.clone()),
-                    Part::Structured(v) => Some(v.value.to_string()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            format!("[{kind}]\n{body}")
-        })
-        .collect::<Vec<_>>()
-        .join("\n\n")
-}
-
-async fn run_to_completion<S>(
-    driver: &mut agentkit_loop::LoopDriver<S>,
-) -> Result<String, Box<dyn Error>>
-where
-    S: agentkit_loop::ModelSession,
-{
-    loop {
-        match driver.next().await? {
-            LoopStep::Finished(result) => {
-                let mut sections = Vec::new();
-                for item in result.items {
-                    if item.kind != ItemKind::Assistant {
-                        continue;
-                    }
-                    for part in item.parts {
-                        if let Part::Text(text) = part {
-                            sections.push(text.text);
-                        }
-                    }
-                }
-                return Ok(sections.join("\n"));
-            }
-            LoopStep::Interrupt(LoopInterrupt::AfterToolResult(_)) => continue,
-            LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_)) => {
-                return Err("compaction sub-agent unexpectedly awaiting input".into());
-            }
-            LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(_)) => {
-                return Err("compaction sub-agent unexpectedly required approval".into());
-            }
-        }
     }
 }
 
@@ -380,20 +188,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("[startup] fetching context_length for {model} from OpenRouter...");
     let context_length = fetch_context_length(&api_key, &model).await?;
 
-    let trigger = ContextWindowTrigger::new(context_length).with_percentage(percentage);
-
-    let strategy = CompactionPipeline::new()
-        .with_strategy(DropReasoningStrategy::new())
-        .with_strategy(DropFailedToolResultsStrategy::new())
-        .with_strategy(
-            SummarizeOlderStrategy::new(1)
-                .preserve_kind(ItemKind::System)
-                .preserve_kind(ItemKind::Context),
-        );
-
-    let backend = NestedLoopCompactionBackend {
-        adapter: adapter.clone(),
-    };
+    let backend_agent = Arc::new(
+        Agent::builder()
+            .model(adapter.clone())
+            .permissions(AllowAll)
+            .build()?,
+    );
+    let backend = AgentCompactor::builder()
+        .agent(backend_agent)
+        .session_id(SessionId::from(
+            "openrouter-context-window-compaction-compactor",
+        ))
+        .system_prompt(COMPACTION_SYSTEM_PROMPT)
+        .build()?;
 
     let prompts = [
         format!(
@@ -404,19 +211,33 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "Based on your summary, who is Holger Kvist?".to_owned(),
     ];
 
+    let compactor = StrategyCompactor::builder()
+        .trigger(context_window_trigger(context_length, percentage))
+        .strategy(
+            CompactionPipeline::new()
+                .with_strategy(DropReasoningStrategy::new())
+                .with_strategy(DropFailedToolResultsStrategy::new())
+                .with_strategy(
+                    SummarizeOlderStrategy::new(1)
+                        .preserve_kind(ItemKind::System)
+                        .preserve_kind(ItemKind::Context),
+                ),
+        )
+        .backend(backend)
+        .build()?;
+
     let agent = Agent::builder()
         .model(adapter)
         .permissions(AllowAll)
-        .compaction(CompactionConfig::new(trigger.clone(), strategy).with_backend(backend))
-        .observer(trigger.clone())
+        .compactor(compactor)
         .observer(DisplayObserver)
         .transcript(vec![Item::text(ItemKind::System, SYSTEM_PROMPT)])
         .input(vec![Item::text(ItemKind::User, &prompts[0])])
         .build()?;
 
+    let threshold = context_length.saturating_mul(percentage as u64) / 100;
     println!(
-        "[config] model={model} context_length={context_length} percentage={percentage}% threshold={}",
-        trigger.threshold()
+        "[config] model={model} context_length={context_length} percentage={percentage}% threshold={threshold}"
     );
 
     let mut driver = agent

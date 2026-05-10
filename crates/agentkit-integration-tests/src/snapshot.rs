@@ -256,6 +256,8 @@ fn update_mode() -> bool {
 pub fn assert_recording(observed: &SessionRecording, path: impl AsRef<Path>) {
     let path = path.as_ref();
     let bootstrapping = !path.exists();
+    let mut observed = observed.clone();
+    normalise_recording(&mut observed);
     if update_mode() || bootstrapping {
         observed.save(path);
         eprintln!(
@@ -269,17 +271,39 @@ pub fn assert_recording(observed: &SessionRecording, path: impl AsRef<Path>) {
         );
         return;
     }
-    let expected = SessionRecording::load(path);
+    let mut expected = SessionRecording::load(path);
+    normalise_recording(&mut expected);
     let exp_text = expected.to_pretty_ron();
     let obs_text = observed.to_pretty_ron();
     if exp_text != obs_text {
-        // pretty_assertions::assert_eq! prints a colored line-by-line
-        // diff for &str arguments — exactly what we want here.
         pretty_assertions::assert_eq!(
             exp_text,
             obs_text,
             "\nsnapshot mismatch: {}\n(re-run with UPDATE_SNAPSHOTS=1 to accept)",
             path.display(),
         );
+    }
+}
+
+/// Strips non-deterministic fields the loop populates so snapshot comparisons
+/// stay stable. Currently zeroes [`Item::created_at`] across every Item.
+fn normalise_recording(recording: &mut SessionRecording) {
+    for item in &mut recording.initial_items {
+        item.created_at = None;
+    }
+    for turn in &mut recording.turns {
+        for item in &mut turn.input {
+            item.created_at = None;
+        }
+        for event in &mut turn.events {
+            if let ModelTurnEvent::Finished(result) = event {
+                for item in &mut result.output_items {
+                    item.created_at = None;
+                }
+            }
+        }
+    }
+    for item in &mut recording.final_transcript {
+        item.created_at = None;
     }
 }

@@ -20,7 +20,7 @@ That is the whole protocol. Any storage backend — in-memory map, sqlite, Postg
 
 **Append-only ordering.** `on_item_appended` is called synchronously by the loop, in the exact order items land in the transcript. The observer is the single mutation point — every push to the transcript funnels through it. This means a strictly monotonic `seq` column on a sqlite `items` table reproduces the transcript byte-for-byte on reload.
 
-**Compaction is out-of-band.** Compaction-driven transcript rewrites do **not** fire `on_item_appended`. They are signalled via `AgentEvent::CompactionFinished`, observable through a `LoopObserver`. A compaction-aware persistor subscribes to both channels and replaces the stored transcript when it sees `CompactionFinished`. A non-compacting agent (most coding agents that rely on the provider's prompt cache plus a long context window) can ignore this.
+**Mutators are out-of-band.** Mutator-driven transcript rewrites (compaction, redaction, repair) do **not** fire `on_item_appended`. They are signalled via `AgentEvent::MutationFinished { dirty: true, .. }`, observable through a `LoopObserver`. A mutation-aware persistor subscribes to both channels and replaces the stored transcript when it sees a dirty mutation finish. An agent without mutators (most coding agents that rely on the provider's prompt cache plus a long context window) can ignore this.
 
 ## A complete sqlite implementation
 
@@ -49,7 +49,7 @@ struct SqliteTranscriptObserver {
 }
 
 impl TranscriptObserver for SqliteTranscriptObserver {
-    fn on_item_appended(&mut self, item: &Item) {
+    fn on_item_appended(&self, item: &Item) {
         if let Err(error) = self.store.append(&self.session_id, item) {
             eprintln!("[persistence] failed to append item: {error}");
         }
@@ -91,12 +91,12 @@ agentkit doesn't consume the backend. The loop just calls `on_item_appended`. Re
 
 The integration test crate exercises the round-trip pattern internally; see `crates/agentkit-integration-tests` for the canonical worked tests.
 
-## Compaction-aware persistence
+## Mutation-aware persistence
 
-If your agent runs compaction, the persistence flow extends:
+If your agent registers any `LoopMutator`s (compaction, redaction, repair), the persistence flow extends:
 
 1. `TranscriptObserver::on_item_appended` continues to mirror new items as they arrive.
-2. A `LoopObserver` subscribes to `AgentEvent::CompactionFinished { transcript_len, replaced_items, .. }` and uses it as a signal to replace the stored transcript.
-3. After a `CompactionFinished` event, call `LoopDriver::snapshot()` from the host's main task and replace the persisted transcript with `snapshot.transcript`. Subsequent `on_item_appended` calls resume appending from the new tail.
+2. A `LoopObserver` subscribes to `AgentEvent::MutationFinished { dirty: true, .. }` and uses it as a signal to replace the stored transcript.
+3. After a dirty mutation finish, call `LoopDriver::snapshot()` from the host's main task and replace the persisted transcript with `snapshot.transcript`. Subsequent `on_item_appended` calls resume appending from the new tail.
 
-The two channels exist precisely so persistence can stay simple in the no-compaction case (one observer) without sacrificing correctness in the compacting case (one observer plus one event listener).
+The two channels exist precisely so persistence can stay simple in the no-mutator case (one observer) without sacrificing correctness when mutators are wired in (one observer plus one event listener).

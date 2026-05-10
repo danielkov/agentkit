@@ -2726,6 +2726,9 @@ fn prompt_message_to_item(message: PromptMessage) -> Item {
         kind,
         parts: vec![prompt_message_content_to_part(message.content)],
         metadata: MetadataMap::new(),
+        usage: None,
+        finish_reason: None,
+        created_at: None,
     }
 }
 

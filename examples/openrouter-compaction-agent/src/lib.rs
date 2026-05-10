@@ -3,13 +3,13 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use agentkit_compaction::{
-    CompactionBackend, CompactionConfig, CompactionPipeline, CompactionReason,
-    DropFailedToolResultsStrategy, DropReasoningStrategy, ItemCountTrigger, KeepRecentStrategy,
-    SummarizeOlderStrategy, SummaryRequest, SummaryResult,
+    AgentBuilderCompactorExt, AgentCompactor, CompactionPipeline, CompactionReason,
+    DropFailedToolResultsStrategy, DropReasoningStrategy, KeepRecentStrategy, StrategyCompactor,
+    SummarizeOlderStrategy,
 };
 use agentkit_core::{
-    Item, ItemKind, MetadataMap, Part, ReasoningPart, ToolCallId, ToolOutput, ToolResultPart,
-    TurnCancellation,
+    Item, ItemKind, MetadataMap, Part, ReasoningPart, SessionId, ToolCallId, ToolOutput,
+    ToolResultPart,
 };
 use agentkit_loop::{
     Agent, AgentEvent, LoopInterrupt, LoopObserver, LoopStep, PromptCacheRequest,
@@ -17,7 +17,6 @@ use agentkit_loop::{
 };
 use agentkit_provider_openrouter::{OpenRouterAdapter, OpenRouterConfig};
 use agentkit_tools_core::{PermissionChecker, PermissionDecision};
-use async_trait::async_trait;
 
 const ROOT_SYSTEM_PROMPT: &str = "\
 You are a root agent operating on a long transcript.
@@ -81,7 +80,6 @@ impl std::str::FromStr for ShowcaseMode {
 pub struct CompactionEventRecord {
     pub reason: Option<CompactionReason>,
     pub replaced_items: usize,
-    pub transcript_len: usize,
     pub metadata: MetadataMap,
 }
 
@@ -119,10 +117,11 @@ pub async fn run_mode(
         .map(|item| vec![item])
         .unwrap_or_default();
 
+    let session_id = SessionId::from(format!("openrouter-compaction-agent-{mode}"));
     let agent = Agent::builder()
         .model(adapter.clone())
         .permissions(AllowAll)
-        .compaction(compaction_config(mode, adapter))
+        .compactor(showcase_compactor(mode, adapter, session_id.clone()))
         .observer(observer.clone())
         .transcript(prior_transcript)
         .input(first_input)
@@ -130,7 +129,7 @@ pub async fn run_mode(
 
     let mut driver = agent
         .start(
-            SessionConfig::new(format!("openrouter-compaction-agent-{mode}")).with_cache(
+            SessionConfig::new(session_id).with_cache(
                 PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
             ),
         )
@@ -209,46 +208,79 @@ fn tool_output_to_string(output: &ToolOutput) -> String {
     }
 }
 
-fn compaction_config(mode: ShowcaseMode, adapter: OpenRouterAdapter) -> CompactionConfig {
+fn nested_backend(
+    adapter: OpenRouterAdapter,
+    session_id: &SessionId,
+) -> AgentCompactor<OpenRouterAdapter> {
+    let inner = Arc::new(
+        Agent::builder()
+            .model(adapter)
+            .permissions(AllowAll)
+            .build()
+            .expect("nested compactor agent"),
+    );
+    AgentCompactor::builder()
+        .agent(inner)
+        .session_id(SessionId::from(format!("{session_id}-compactor")))
+        .system_prompt(COMPACTION_SYSTEM_PROMPT)
+        .build()
+        .expect("nested compactor")
+}
+
+fn showcase_compactor(
+    mode: ShowcaseMode,
+    adapter: OpenRouterAdapter,
+    session_id: SessionId,
+) -> StrategyCompactor {
+    let metadata = mode_metadata(mode);
     match mode {
-        ShowcaseMode::Structural => CompactionConfig::new(
-            ItemCountTrigger::new(10),
-            CompactionPipeline::new()
-                .with_strategy(DropReasoningStrategy::new())
-                .with_strategy(DropFailedToolResultsStrategy::new())
-                .with_strategy(
-                    KeepRecentStrategy::new(8)
-                        .preserve_kind(ItemKind::System)
-                        .preserve_kind(ItemKind::Context),
-                ),
-        )
-        .with_metadata(mode_metadata(mode)),
-        ShowcaseMode::Semantic => CompactionConfig::new(
-            ItemCountTrigger::new(8),
-            SummarizeOlderStrategy::new(4)
-                .preserve_kind(ItemKind::System)
-                .preserve_kind(ItemKind::Context),
-        )
-        .with_backend(NestedLoopCompactionBackend::new(adapter))
-        .with_metadata(mode_metadata(mode)),
-        ShowcaseMode::Hybrid => CompactionConfig::new(
-            ItemCountTrigger::new(10),
-            CompactionPipeline::new()
-                .with_strategy(DropReasoningStrategy::new())
-                .with_strategy(DropFailedToolResultsStrategy::new())
-                .with_strategy(
-                    SummarizeOlderStrategy::new(4)
-                        .preserve_kind(ItemKind::System)
-                        .preserve_kind(ItemKind::Context),
-                )
-                .with_strategy(
-                    KeepRecentStrategy::new(6)
-                        .preserve_kind(ItemKind::System)
-                        .preserve_kind(ItemKind::Context),
-                ),
-        )
-        .with_backend(NestedLoopCompactionBackend::new(adapter))
-        .with_metadata(mode_metadata(mode)),
+        ShowcaseMode::Structural => StrategyCompactor::builder()
+            .item_count_trigger(10)
+            .strategy(
+                CompactionPipeline::new()
+                    .with_strategy(DropReasoningStrategy::new())
+                    .with_strategy(DropFailedToolResultsStrategy::new())
+                    .with_strategy(
+                        KeepRecentStrategy::new(8)
+                            .preserve_kind(ItemKind::System)
+                            .preserve_kind(ItemKind::Context),
+                    ),
+            )
+            .metadata(metadata)
+            .build()
+            .expect("structural compactor"),
+        ShowcaseMode::Semantic => StrategyCompactor::builder()
+            .item_count_trigger(8)
+            .strategy(
+                SummarizeOlderStrategy::new(4)
+                    .preserve_kind(ItemKind::System)
+                    .preserve_kind(ItemKind::Context),
+            )
+            .backend(nested_backend(adapter.clone(), &session_id))
+            .metadata(metadata)
+            .build()
+            .expect("semantic compactor"),
+        ShowcaseMode::Hybrid => StrategyCompactor::builder()
+            .item_count_trigger(10)
+            .strategy(
+                CompactionPipeline::new()
+                    .with_strategy(DropReasoningStrategy::new())
+                    .with_strategy(DropFailedToolResultsStrategy::new())
+                    .with_strategy(
+                        SummarizeOlderStrategy::new(4)
+                            .preserve_kind(ItemKind::System)
+                            .preserve_kind(ItemKind::Context),
+                    )
+                    .with_strategy(
+                        KeepRecentStrategy::new(6)
+                            .preserve_kind(ItemKind::System)
+                            .preserve_kind(ItemKind::Context),
+                    ),
+            )
+            .backend(nested_backend(adapter.clone(), &session_id))
+            .metadata(metadata)
+            .build()
+            .expect("hybrid compactor"),
     }
 }
 
@@ -283,7 +315,7 @@ fn build_seed_transcript(mode: ShowcaseMode, prompt: &str) -> Vec<Item> {
             ),
             Item::text(
                 ItemKind::Assistant,
-                &format!("Recorded. The sealed release codename is {secret}."),
+                format!("Recorded. The sealed release codename is {secret}."),
             ),
             assistant_with_reasoning(
                 "I can expand on the checklist if needed.",
@@ -363,90 +395,9 @@ fn build_seed_transcript(mode: ShowcaseMode, prompt: &str) -> Vec<Item> {
     }
 }
 
-#[derive(Clone)]
-struct NestedLoopCompactionBackend {
-    adapter: OpenRouterAdapter,
-}
-
-impl NestedLoopCompactionBackend {
-    fn new(adapter: OpenRouterAdapter) -> Self {
-        Self { adapter }
-    }
-}
-
-#[async_trait]
-impl CompactionBackend for NestedLoopCompactionBackend {
-    async fn summarize(
-        &self,
-        request: SummaryRequest,
-        cancellation: Option<TurnCancellation>,
-    ) -> Result<SummaryResult, agentkit_compaction::CompactionError> {
-        if cancellation
-            .as_ref()
-            .is_some_and(TurnCancellation::is_cancelled)
-        {
-            return Err(agentkit_compaction::CompactionError::Cancelled);
-        }
-
-        let mut builder = Agent::builder()
-            .model(self.adapter.clone())
-            .permissions(AllowAll)
-            .transcript(vec![
-                Item::text(ItemKind::System, COMPACTION_SYSTEM_PROMPT),
-                context_item("compaction transcript", &render_items(&request.items)),
-            ])
-            .input(vec![Item::text(
-                ItemKind::User,
-                "Compress the supplied transcript into a context note for future turns. Preserve exact identifiers and actionable facts. Return only the compacted note.",
-            )]);
-        if let Some(cancellation) = cancellation.as_ref() {
-            builder = builder.cancellation(cancellation.handle().clone());
-        }
-        let agent = builder
-            .build()
-            .map_err(|error| agentkit_compaction::CompactionError::Failed(error.to_string()))?;
-
-        let mut metadata = MetadataMap::new();
-        metadata.insert("compaction_agent".into(), "nested-loop".into());
-
-        let mut driver = agent
-            .start(
-                SessionConfig::new(format!(
-                    "{}-compactor-{}",
-                    request.session_id,
-                    request.turn_id.clone().unwrap_or_else(|| "manual".into())
-                ))
-                .with_cache(
-                    PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
-                ),
-            )
-            .await
-            .map_err(|error| agentkit_compaction::CompactionError::Failed(error.to_string()))?;
-
-        let summary = run_to_completion(&mut driver)
-            .await
-            .map_err(|error| agentkit_compaction::CompactionError::Failed(error.to_string()))?;
-
-        Ok(SummaryResult {
-            items: vec![context_item("compaction summary", &summary)],
-            metadata,
-        })
-    }
-}
-
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct RecordingObserver {
     compaction_events: Arc<Mutex<Vec<CompactionEventRecord>>>,
-    pending_reason: Arc<Mutex<Option<CompactionReason>>>,
-}
-
-impl Default for RecordingObserver {
-    fn default() -> Self {
-        Self {
-            compaction_events: Arc::new(Mutex::new(Vec::new())),
-            pending_reason: Arc::new(Mutex::new(None)),
-        }
-    }
 }
 
 impl RecordingObserver {
@@ -459,36 +410,30 @@ impl RecordingObserver {
 }
 
 impl LoopObserver for RecordingObserver {
-    fn handle_event(&mut self, event: AgentEvent) {
-        match event {
-            AgentEvent::CompactionStarted { reason, .. } => {
-                *self
-                    .pending_reason
-                    .lock()
-                    .unwrap_or_else(|err| err.into_inner()) = Some(reason);
-            }
-            AgentEvent::CompactionFinished {
-                replaced_items,
-                transcript_len,
-                metadata,
-                ..
-            } => {
-                let reason = self
-                    .pending_reason
-                    .lock()
-                    .unwrap_or_else(|err| err.into_inner())
-                    .take();
-                self.compaction_events
-                    .lock()
-                    .unwrap_or_else(|err| err.into_inner())
-                    .push(CompactionEventRecord {
-                        reason,
-                        replaced_items,
-                        transcript_len,
-                        metadata,
-                    });
-            }
-            _ => {}
+    fn handle_event(&self, event: AgentEvent) {
+        if let AgentEvent::MutationFinished {
+            dirty: true,
+            metadata,
+            ..
+        } = event
+        {
+            let reason = metadata
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .map(|s| CompactionReason::Custom(s.to_string()));
+            let replaced_items = metadata
+                .get("replaced_items")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize)
+                .unwrap_or(0);
+            self.compaction_events
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .push(CompactionEventRecord {
+                    reason,
+                    replaced_items,
+                    metadata,
+                });
         }
     }
 }
@@ -502,12 +447,6 @@ impl PermissionChecker for AllowAll {
     ) -> PermissionDecision {
         PermissionDecision::Allow
     }
-}
-
-fn context_item(title: &str, text: &str) -> Item {
-    let mut metadata = MetadataMap::new();
-    metadata.insert("title".into(), title.into());
-    Item::text(ItemKind::Context, text).with_metadata(metadata)
 }
 
 fn assistant_with_reasoning(reasoning: &str, text: &str) -> Item {
@@ -528,10 +467,6 @@ fn failed_tool_item(text: &str) -> Item {
             ToolOutput::text(text),
         ))],
     )
-}
-
-fn render_items(items: &[Item]) -> String {
-    items.iter().map(format_item).collect::<Vec<_>>().join("\n")
 }
 
 async fn run_to_completion<S>(

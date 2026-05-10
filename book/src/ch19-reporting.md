@@ -5,10 +5,12 @@ An agent that you can't observe is an agent you can't debug. This chapter covers
 ## The observer contract
 
 ```rust
-pub trait LoopObserver: Send {
-    fn handle_event(&mut self, event: AgentEvent);
+pub trait LoopObserver: Send + Sync {
+    fn handle_event(&self, event: AgentEvent);
 }
 ```
+
+Observers take `&self` and keep mutable state behind interior mutability (`Mutex`, atomics, channels). The driver shares each observer as `Arc<dyn LoopObserver>`, so a single configured `Agent` can mint multiple sessions and the same reporter sees them all.
 
 Observers are synchronous and called in deterministic order. This is a deliberate choice:
 
@@ -99,7 +101,7 @@ Field naming follows the [OpenTelemetry GenAI semantic conventions](https://open
 | Agent event                                                                                                                                          | Level   |
 | ---------------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
 | `RunStarted`, `TurnStarted`, `TurnFinished`, `ToolCallRequested`, `ToolResultReceived`, `ApprovalRequired`, `ApprovalResolved`, `ToolCatalogChanged` | `INFO`  |
-| `InputAccepted`, `UsageUpdated`, `CompactionStarted`, `CompactionFinished`                                                                           | `DEBUG` |
+| `InputAccepted`, `UsageUpdated`, `MutationStarted`, `MutationFinished`                                                                               | `DEBUG` |
 | `ContentDelta`                                                                                                                                       | `TRACE` |
 | `Warning`                                                                                                                                            | `WARN`  |
 | `RunFailed`                                                                                                                                          | `ERROR` |
@@ -200,14 +202,16 @@ Reporter failures are non-fatal by default. A broken log writer shouldn't crash 
 The trait is simple enough that custom observers are straightforward:
 
 ```rust
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 struct ToolCallCounter {
-    count: usize,
+    count: AtomicUsize,
 }
 
 impl LoopObserver for ToolCallCounter {
-    fn handle_event(&mut self, event: AgentEvent) {
+    fn handle_event(&self, event: AgentEvent) {
         if matches!(event, AgentEvent::ToolCallRequested(_)) {
-            self.count += 1;
+            self.count.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -216,20 +220,23 @@ impl LoopObserver for ToolCallCounter {
 A more practical example — a reporter that writes tool calls to a structured log:
 
 ```rust
+use std::sync::Mutex;
+
 struct AuditLogger {
-    writer: BufWriter<File>,
+    writer: Mutex<BufWriter<File>>,
 }
 
 impl LoopObserver for AuditLogger {
-    fn handle_event(&mut self, event: AgentEvent) {
+    fn handle_event(&self, event: AgentEvent) {
+        let mut writer = self.writer.lock().unwrap();
         match &event {
             AgentEvent::ToolCallRequested(call) => {
-                writeln!(self.writer, "TOOL_CALL: {} input={}", call.name,
+                writeln!(writer, "TOOL_CALL: {} input={}", call.name,
                     serde_json::to_string(&call.input).unwrap_or_default()
                 ).ok();
             }
             AgentEvent::ApprovalRequired(req) => {
-                writeln!(self.writer, "APPROVAL_REQUIRED: {} reason={:?}",
+                writeln!(writer, "APPROVAL_REQUIRED: {} reason={:?}",
                     req.summary, req.reason
                 ).ok();
             }
@@ -248,7 +255,7 @@ impl LoopObserver for AuditLogger {
 | Streaming  | `ContentDelta`                                                  |
 | Tools      | `ToolCallRequested`, `ToolResultReceived`, `ToolCatalogChanged` |
 | Approval   | `ApprovalRequired`, `ApprovalResolved`                          |
-| Compaction | `CompactionStarted`, `CompactionFinished`                       |
+| Mutators   | `MutationStarted`, `MutationFinished`                           |
 | Usage      | `UsageUpdated`                                                  |
 | Diagnostic | `Warning`                                                       |
 

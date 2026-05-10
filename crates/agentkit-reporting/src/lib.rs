@@ -149,8 +149,8 @@ impl CompositeReporter {
 }
 
 impl LoopObserver for CompositeReporter {
-    fn handle_event(&mut self, event: AgentEvent) {
-        for child in &mut self.children {
+    fn handle_event(&self, event: AgentEvent) {
+        for child in &self.children {
             child.handle_event(event.clone());
         }
     }
@@ -181,9 +181,9 @@ impl LoopObserver for CompositeReporter {
 /// # }
 /// ```
 pub struct JsonlReporter<W> {
-    writer: W,
+    writer: std::sync::Mutex<W>,
     flush_each_event: bool,
-    errors: Vec<ReportError>,
+    errors: std::sync::Mutex<Vec<ReportError>>,
 }
 
 impl<W> JsonlReporter<W>
@@ -191,53 +191,34 @@ where
     W: Write,
 {
     /// Creates a new `JsonlReporter` writing to the given writer.
-    ///
-    /// Flushing after each event is enabled by default. Disable it with
-    /// [`with_flush_each_event(false)`](JsonlReporter::with_flush_each_event)
-    /// if you are writing to a buffered sink and prefer to flush manually.
-    ///
-    /// # Arguments
-    ///
-    /// * `writer` - Any [`Write`] implementation (file, buffer, stdout, etc.).
     pub fn new(writer: W) -> Self {
         Self {
-            writer,
+            writer: std::sync::Mutex::new(writer),
             flush_each_event: true,
-            errors: Vec::new(),
+            errors: std::sync::Mutex::new(Vec::new()),
         }
     }
 
     /// Controls whether the writer is flushed after every event (builder pattern).
-    ///
-    /// Defaults to `true`. Set to `false` when batching writes for throughput.
     pub fn with_flush_each_event(mut self, flush_each_event: bool) -> Self {
         self.flush_each_event = flush_each_event;
         self
     }
 
-    /// Returns a shared reference to the underlying writer.
-    ///
-    /// Useful for inspecting an in-memory buffer after the loop finishes.
-    pub fn writer(&self) -> &W {
-        &self.writer
-    }
-
-    /// Returns a mutable reference to the underlying writer.
-    pub fn writer_mut(&mut self) -> &mut W {
-        &mut self.writer
-    }
-
     /// Drains and returns all errors accumulated during event handling.
-    ///
-    /// Subsequent calls return an empty `Vec` until new errors occur.
-    pub fn take_errors(&mut self) -> Vec<ReportError> {
-        std::mem::take(&mut self.errors)
+    pub fn take_errors(&self) -> Vec<ReportError> {
+        std::mem::take(&mut *self.errors.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
-    fn record_result(&mut self, result: Result<(), ReportError>) {
+    fn record_result(&self, result: Result<(), ReportError>) {
         if let Err(error) = result {
-            self.errors.push(error);
+            self.errors.lock().unwrap_or_else(|e| e.into_inner()).push(error);
         }
+    }
+
+    /// Consumes the reporter and returns the underlying writer.
+    pub fn into_inner(self) -> W {
+        self.writer.into_inner().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -245,16 +226,18 @@ impl<W> LoopObserver for JsonlReporter<W>
 where
     W: Write + Send,
 {
-    fn handle_event(&mut self, event: AgentEvent) {
+    fn handle_event(&self, event: AgentEvent) {
         let result = (|| -> Result<(), ReportError> {
             let envelope = EventEnvelope {
                 timestamp: SystemTime::now(),
                 event: &event,
             };
-            serde_json::to_writer(&mut self.writer, &envelope)?;
-            self.writer.write_all(b"\n")?;
+            let mut buf = serde_json::to_vec(&envelope)?;
+            buf.push(b'\n');
+            let mut writer = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+            writer.write_all(&buf)?;
             if self.flush_each_event {
-                self.writer.flush()?;
+                writer.flush()?;
             }
             Ok(())
         })();
@@ -329,7 +312,7 @@ pub struct UsageSummary {
 /// ```
 #[derive(Default)]
 pub struct UsageReporter {
-    summary: UsageSummary,
+    summary: std::sync::Mutex<UsageSummary>,
 }
 
 impl UsageReporter {
@@ -338,24 +321,23 @@ impl UsageReporter {
         Self::default()
     }
 
-    /// Returns a reference to the current [`UsageSummary`].
-    pub fn summary(&self) -> &UsageSummary {
-        &self.summary
+    /// Returns a snapshot of the current [`UsageSummary`].
+    pub fn summary(&self) -> UsageSummary {
+        self.summary.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
-    fn absorb(&mut self, usage: &Usage) {
-        self.summary.usage_events_seen += 1;
+    fn absorb(summary: &mut UsageSummary, usage: &Usage) {
+        summary.usage_events_seen += 1;
         if let Some(tokens) = &usage.tokens {
-            self.summary.totals.input_tokens += tokens.input_tokens;
-            self.summary.totals.output_tokens += tokens.output_tokens;
-            self.summary.totals.reasoning_tokens += tokens.reasoning_tokens.unwrap_or_default();
-            self.summary.totals.cached_input_tokens +=
-                tokens.cached_input_tokens.unwrap_or_default();
-            self.summary.totals.cache_write_input_tokens +=
+            summary.totals.input_tokens += tokens.input_tokens;
+            summary.totals.output_tokens += tokens.output_tokens;
+            summary.totals.reasoning_tokens += tokens.reasoning_tokens.unwrap_or_default();
+            summary.totals.cached_input_tokens += tokens.cached_input_tokens.unwrap_or_default();
+            summary.totals.cache_write_input_tokens +=
                 tokens.cache_write_input_tokens.unwrap_or_default();
         }
         if let Some(cost) = &usage.cost {
-            let totals = self.summary.cost.get_or_insert_with(CostTotals::default);
+            let totals = summary.cost.get_or_insert_with(CostTotals::default);
             totals.amount += cost.amount;
             if totals.currency.is_none() {
                 totals.currency = Some(cost.currency.clone());
@@ -365,18 +347,19 @@ impl UsageReporter {
 }
 
 impl LoopObserver for UsageReporter {
-    fn handle_event(&mut self, event: AgentEvent) {
-        self.summary.events_seen += 1;
+    fn handle_event(&self, event: AgentEvent) {
+        let mut summary = self.summary.lock().unwrap_or_else(|e| e.into_inner());
+        summary.events_seen += 1;
         match event {
-            AgentEvent::UsageUpdated(usage) => self.absorb(&usage),
+            AgentEvent::UsageUpdated(usage) => Self::absorb(&mut summary, &usage),
             AgentEvent::TurnFinished(TurnResult {
                 usage: Some(usage), ..
             }) => {
-                self.summary.turn_results_seen += 1;
-                self.absorb(&usage);
+                summary.turn_results_seen += 1;
+                Self::absorb(&mut summary, &usage);
             }
             AgentEvent::TurnFinished(_) => {
-                self.summary.turn_results_seen += 1;
+                summary.turn_results_seen += 1;
             }
             _ => {}
         }
@@ -415,7 +398,7 @@ pub struct TranscriptView {
 /// ```
 #[derive(Default)]
 pub struct TranscriptReporter {
-    transcript: TranscriptView,
+    transcript: std::sync::Mutex<TranscriptView>,
 }
 
 impl TranscriptReporter {
@@ -424,20 +407,21 @@ impl TranscriptReporter {
         Self::default()
     }
 
-    /// Returns a reference to the current [`TranscriptView`].
-    pub fn transcript(&self) -> &TranscriptView {
-        &self.transcript
+    /// Returns a snapshot of the current [`TranscriptView`].
+    pub fn transcript(&self) -> TranscriptView {
+        self.transcript.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }
 
 impl LoopObserver for TranscriptReporter {
-    fn handle_event(&mut self, event: AgentEvent) {
+    fn handle_event(&self, event: AgentEvent) {
+        let mut transcript = self.transcript.lock().unwrap_or_else(|e| e.into_inner());
         match event {
             AgentEvent::InputAccepted { items, .. } => {
-                self.transcript.items.extend(items);
+                transcript.items.extend(items);
             }
             AgentEvent::TurnFinished(result) => {
-                self.transcript.items.extend(result.items);
+                transcript.items.extend(result.items);
             }
             _ => {}
         }
@@ -464,9 +448,9 @@ impl LoopObserver for TranscriptReporter {
 ///     .with_usage(false);
 /// ```
 pub struct StdoutReporter<W> {
-    writer: W,
+    writer: std::sync::Mutex<W>,
     show_usage: bool,
-    errors: Vec<ReportError>,
+    errors: std::sync::Mutex<Vec<ReportError>>,
 }
 
 impl<W> StdoutReporter<W>
@@ -474,46 +458,28 @@ where
     W: Write,
 {
     /// Creates a new `StdoutReporter` that writes to the given writer.
-    ///
-    /// Usage lines are shown by default. Disable them with
-    /// [`with_usage(false)`](StdoutReporter::with_usage).
-    ///
-    /// # Arguments
-    ///
-    /// * `writer` - Any [`Write`] implementation (typically `std::io::stdout()`
-    ///   or `std::io::stderr()`).
     pub fn new(writer: W) -> Self {
         Self {
-            writer,
+            writer: std::sync::Mutex::new(writer),
             show_usage: true,
-            errors: Vec::new(),
+            errors: std::sync::Mutex::new(Vec::new()),
         }
     }
 
     /// Controls whether `[usage]` lines are printed (builder pattern).
-    ///
-    /// Defaults to `true`. Set to `false` to reduce output noise when
-    /// you are already tracking usage through a [`UsageReporter`].
     pub fn with_usage(mut self, show_usage: bool) -> Self {
         self.show_usage = show_usage;
         self
     }
 
-    /// Returns a shared reference to the underlying writer.
-    pub fn writer(&self) -> &W {
-        &self.writer
-    }
-
     /// Drains and returns all errors accumulated during event handling.
-    ///
-    /// Subsequent calls return an empty `Vec` until new errors occur.
-    pub fn take_errors(&mut self) -> Vec<ReportError> {
-        std::mem::take(&mut self.errors)
+    pub fn take_errors(&self) -> Vec<ReportError> {
+        std::mem::take(&mut *self.errors.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
-    fn record_result(&mut self, result: Result<(), ReportError>) {
+    fn record_result(&self, result: Result<(), ReportError>) {
         if let Err(error) = result {
-            self.errors.push(error);
+            self.errors.lock().unwrap_or_else(|e| e.into_inner()).push(error);
         }
     }
 }
@@ -522,8 +488,15 @@ impl<W> LoopObserver for StdoutReporter<W>
 where
     W: Write + Send,
 {
-    fn handle_event(&mut self, event: AgentEvent) {
-        let result = write_stdout_event(&mut self.writer, &event, self.show_usage);
+    fn handle_event(&self, event: AgentEvent) {
+        let result = (|| -> Result<(), ReportError> {
+            let mut buf: Vec<u8> = Vec::new();
+            write_stdout_event(&mut buf, &event, self.show_usage)?;
+            let mut writer = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+            writer.write_all(&buf)?;
+            writer.flush()?;
+            Ok(())
+        })();
         self.record_result(result);
     }
 }
@@ -582,33 +555,34 @@ where
                 event.changed.len()
             )?;
         }
-        AgentEvent::CompactionStarted {
-            turn_id, reason, ..
-        } => {
-            writeln!(
-                writer,
-                "[compaction] started turn={} reason={reason:?}",
-                turn_id
-                    .as_ref()
-                    .map(ToString::to_string)
-                    .unwrap_or_else(|| "none".into())
-            )?;
-        }
-        AgentEvent::CompactionFinished {
+        AgentEvent::MutationStarted {
             turn_id,
-            replaced_items,
-            transcript_len,
+            mutator,
+            point,
             ..
         } => {
             writeln!(
                 writer,
-                "[compaction] finished turn={} replaced_items={} transcript_len={}",
+                "[mutation] started turn={} mutator={mutator} point={point:?}",
                 turn_id
                     .as_ref()
                     .map(ToString::to_string)
                     .unwrap_or_else(|| "none".into()),
-                replaced_items,
-                transcript_len
+            )?;
+        }
+        AgentEvent::MutationFinished {
+            turn_id,
+            mutator,
+            dirty,
+            ..
+        } => {
+            writeln!(
+                writer,
+                "[mutation] finished turn={} mutator={mutator} dirty={dirty}",
+                turn_id
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "none".into()),
             )?;
         }
         AgentEvent::UsageUpdated(usage) if show_usage => {
@@ -721,7 +695,7 @@ mod tests {
 
     #[test]
     fn usage_reporter_accumulates_usage_events_and_turn_results() {
-        let mut reporter = UsageReporter::new();
+        let reporter = UsageReporter::new();
 
         reporter.handle_event(AgentEvent::UsageUpdated(Usage {
             tokens: Some(TokenUsage {
@@ -766,7 +740,7 @@ mod tests {
 
     #[test]
     fn transcript_reporter_tracks_inputs_and_outputs() {
-        let mut reporter = TranscriptReporter::new();
+        let reporter = TranscriptReporter::new();
 
         reporter.handle_event(AgentEvent::InputAccepted {
             session_id: SessionId::new("session-1"),
@@ -778,6 +752,9 @@ mod tests {
                     metadata: MetadataMap::new(),
                 })],
                 metadata: MetadataMap::new(),
+                usage: None,
+                finish_reason: None,
+                created_at: None,
             }],
         });
 
@@ -792,6 +769,9 @@ mod tests {
                     metadata: MetadataMap::new(),
                 })],
                 metadata: MetadataMap::new(),
+                usage: None,
+                finish_reason: None,
+                created_at: None,
             }],
             usage: None,
             metadata: MetadataMap::new(),
@@ -804,12 +784,12 @@ mod tests {
 
     #[test]
     fn jsonl_reporter_serializes_event_envelopes() {
-        let mut reporter = JsonlReporter::new(Vec::new());
+        let reporter = JsonlReporter::new(Vec::new());
         reporter.handle_event(AgentEvent::RunStarted {
             session_id: SessionId::new("session-1"),
         });
 
-        let output = String::from_utf8(reporter.writer().clone()).unwrap();
+        let output = String::from_utf8(reporter.into_inner()).unwrap();
         assert!(output.contains("\"RunStarted\""));
         assert!(output.contains("session-1"));
     }
@@ -822,7 +802,7 @@ mod tests {
 
     #[test]
     fn buffered_reporter_flushes_at_capacity() {
-        let mut reporter = BufferedReporter::new(UsageReporter::new(), 2);
+        let reporter = BufferedReporter::new(UsageReporter::new(), 2);
         reporter.handle_event(run_started_event());
         assert_eq!(reporter.pending(), 1);
         assert_eq!(reporter.inner().summary().events_seen, 0);
@@ -834,7 +814,7 @@ mod tests {
 
     #[test]
     fn buffered_reporter_manual_flush() {
-        let mut reporter = BufferedReporter::new(UsageReporter::new(), 0);
+        let reporter = BufferedReporter::new(UsageReporter::new(), 0);
         reporter.handle_event(run_started_event());
         reporter.handle_event(run_started_event());
         assert_eq!(reporter.pending(), 2);
@@ -847,7 +827,7 @@ mod tests {
     #[test]
     fn buffered_reporter_flushes_on_drop() {
         let inner = {
-            let mut reporter = BufferedReporter::new(UsageReporter::new(), 100);
+            let reporter = BufferedReporter::new(UsageReporter::new(), 100);
             reporter.handle_event(run_started_event());
             reporter.handle_event(run_started_event());
             assert_eq!(reporter.inner().summary().events_seen, 0);
@@ -866,7 +846,7 @@ mod tests {
 
     #[test]
     fn channel_reporter_delivers_events() {
-        let (mut reporter, rx) = ChannelReporter::pair();
+        let (reporter, rx) = ChannelReporter::pair();
         reporter.handle_event(run_started_event());
         reporter.handle_event(run_started_event());
 
@@ -876,7 +856,7 @@ mod tests {
 
     #[test]
     fn channel_reporter_survives_dropped_receiver() {
-        let (mut reporter, rx) = ChannelReporter::pair();
+        let (reporter, rx) = ChannelReporter::pair();
         drop(rx);
         // Should not panic — errors are silently dropped.
         reporter.handle_event(run_started_event());
@@ -884,7 +864,7 @@ mod tests {
 
     #[test]
     fn channel_reporter_fallible_returns_error_on_dropped_receiver() {
-        let (mut reporter, rx) = ChannelReporter::pair();
+        let (reporter, rx) = ChannelReporter::pair();
         drop(rx);
 
         let result = reporter.try_handle_event(&run_started_event());
@@ -895,7 +875,7 @@ mod tests {
     fn policy_reporter_ignore_swallows_errors() {
         let (reporter, rx) = ChannelReporter::pair();
         drop(rx);
-        let mut policy = PolicyReporter::new(reporter, FailurePolicy::Ignore);
+        let policy = PolicyReporter::new(reporter, FailurePolicy::Ignore);
         policy.handle_event(run_started_event());
         assert!(policy.take_errors().is_empty());
     }
@@ -904,7 +884,7 @@ mod tests {
     fn policy_reporter_accumulate_collects_errors() {
         let (reporter, rx) = ChannelReporter::pair();
         drop(rx);
-        let mut policy = PolicyReporter::new(reporter, FailurePolicy::Accumulate);
+        let policy = PolicyReporter::new(reporter, FailurePolicy::Accumulate);
         policy.handle_event(run_started_event());
         policy.handle_event(run_started_event());
 
@@ -918,7 +898,7 @@ mod tests {
     fn policy_reporter_fail_fast_panics() {
         let (reporter, rx) = ChannelReporter::pair();
         drop(rx);
-        let mut policy = PolicyReporter::new(reporter, FailurePolicy::FailFast);
+        let policy = PolicyReporter::new(reporter, FailurePolicy::FailFast);
         policy.handle_event(run_started_event());
     }
 }

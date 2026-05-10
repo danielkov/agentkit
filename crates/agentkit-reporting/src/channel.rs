@@ -35,35 +35,36 @@ use crate::policy::FallibleObserver;
 /// // `reporter` implements `LoopObserver` — hand it to the agent loop.
 /// ```
 pub struct ChannelReporter {
-    sender: Sender<AgentEvent>,
+    sender: std::sync::Mutex<Sender<AgentEvent>>,
 }
 
 impl ChannelReporter {
     /// Creates a `ChannelReporter` from an existing sender.
     pub fn new(sender: Sender<AgentEvent>) -> Self {
-        Self { sender }
+        Self {
+            sender: std::sync::Mutex::new(sender),
+        }
     }
 
     /// Creates a `ChannelReporter` together with the receiving end of the
     /// channel.
-    ///
-    /// This is a convenience wrapper around [`std::sync::mpsc::channel`].
     pub fn pair() -> (Self, Receiver<AgentEvent>) {
         let (sender, receiver) = mpsc::channel();
-        (Self { sender }, receiver)
+        (Self::new(sender), receiver)
     }
 }
 
 impl LoopObserver for ChannelReporter {
-    fn handle_event(&mut self, event: AgentEvent) {
-        // Silently drop if the receiver is gone — reporters are non-fatal.
-        let _ = self.sender.send(event);
+    fn handle_event(&self, event: AgentEvent) {
+        let _ = self.sender.lock().unwrap_or_else(|e| e.into_inner()).send(event);
     }
 }
 
 impl FallibleObserver for ChannelReporter {
-    fn try_handle_event(&mut self, event: &AgentEvent) -> Result<(), ReportError> {
+    fn try_handle_event(&self, event: &AgentEvent) -> Result<(), ReportError> {
         self.sender
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
             .send(event.clone())
             .map_err(|_| ReportError::ChannelSend)
     }

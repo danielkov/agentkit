@@ -118,7 +118,7 @@ It contains:
 - one tool registry
 - one approval policy or interrupt policy
 - zero or more event sinks
-- optional compaction hooks
+- zero or more `LoopMutator`s (e.g. compaction)
 
 `LoopDriver` is the mutable runtime instance.
 
@@ -275,10 +275,12 @@ Non-blocking activity should be delivered through event sinks.
 Recommended minimal contract:
 
 ```rust
-pub trait LoopObserver {
-    fn handle_event(&mut self, event: AgentEvent);
+pub trait LoopObserver: Send + Sync {
+    fn handle_event(&self, event: AgentEvent);
 }
 ```
+
+Observers take `&self` and hold mutable state behind interior mutability (`Mutex`, atomics, channels). The driver shares each observer as `Arc<dyn LoopObserver>` so a single configured agent can mint multiple sessions over its lifetime (e.g. an outer agent that uses an inner sub-agent for compaction).
 
 V1 should make this synchronous.
 
@@ -318,8 +320,8 @@ Recommended categories:
 - `ToolExecutionFinished`
 - `ApprovalRequired`
 - `ApprovalResolved`
-- `CompactionStarted`
-- `CompactionFinished`
+- `MutationStarted`
+- `MutationFinished`
 - `UsageUpdated`
 - `Warning`
 - `RunFailed`
@@ -459,7 +461,7 @@ Recommended internal states:
 - `RunningModelTurn`
 - `WaitingForApproval`
 - `ExecutingTool`
-- `Compacting`
+- `RunningMutators`
 - `FinishedTurn`
 - `Failed`
 
@@ -476,7 +478,7 @@ Recommended execution flow:
 
 1. host submits input items
 2. driver merges input into working transcript
-3. driver optionally loads context or compaction artifacts for the turn
+3. driver runs registered `LoopMutator`s at `MutationPoint::AfterTurnEnded` / `AfterToolResult` (compaction, redaction, repair); the loop validates transcript invariants if any mutator dirtied the cursor
 4. driver constructs `TurnRequest`
 5. driver starts a provider turn
 6. driver forwards streamed deltas to observers
@@ -504,7 +506,7 @@ Recommended execution flow:
 - provider failure
 - tool execution failure when not representable as a tool result
 - observer failure if configured as fatal
-- compaction failure if configured as fatal
+- mutator failure (compaction, redaction, repair) — including transcript invariant violations
 
 V1 should default to making reporter failures non-fatal.
 

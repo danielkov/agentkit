@@ -15,9 +15,9 @@ pub struct LoopDriver<S: ModelSession> {
     permissions: Arc<dyn PermissionChecker>,
     resources: Arc<dyn ToolResources>,
     cancellation: Option<CancellationHandle>,
-    compaction: Option<CompactionConfig>,
-    observers: Vec<Box<dyn LoopObserver>>,
-    transcript_observers: Vec<Box<dyn TranscriptObserver>>,
+    mutators: Vec<Arc<dyn LoopMutator>>,
+    observers: Vec<Arc<dyn LoopObserver>>,
+    transcript_observers: Vec<Arc<dyn TranscriptObserver>>,
     transcript: Vec<Item>,
     pending_input: Vec<Item>,
     pending_approvals: BTreeMap<ToolCallId, PendingApprovalToolCall>,
@@ -85,14 +85,6 @@ Driver state machine:
                 │
                 ▼
   ┌─────────────────────────────────┐
-  │      Compaction trigger?        │
-  │                                 │
-  │  yes ──▶ run compaction pipeline│
-  │  no  ──▶ skip                   │
-  └─────────────┬───────────────────┘
-                │
-                ▼
-  ┌─────────────────────────────────┐
   │      Model turn                 │
   │                                 │
   │  stream events from model       │
@@ -120,6 +112,9 @@ Driver state machine:
        append tool results
                 │
                 ▼
+       run mutators at MutationPoint::AfterToolResult
+                │
+                ▼
   ┌─────────────────────────────────┐
   │   AfterToolResult              ─┼──▶ Interrupt (cooperative)
   │                                 │    host: info.submit(...) to
@@ -128,6 +123,10 @@ Driver state machine:
                 │
                 ▼
        go to "Model turn" ◀─── automatic tool roundtrip
+
+
+When a turn ends (Finished, Interrupt, Cancelled), mutators run again at
+MutationPoint::AfterTurnEnded before the next user turn begins.
 ```
 
 The host cannot call `next()` twice without resolving an outstanding _blocking_ interrupt (`ApprovalRequest`) — that's a state error. Cooperative interrupts (`AwaitingInput`, `AfterToolResult`) require no resolution; calling `next()` again resumes the loop as described in the diagram. The driver forces the host to deal with blocking interrupts before proceeding so an approval request can never be silently skipped.
@@ -150,23 +149,7 @@ After merge:
   pending:    []
 ```
 
-### 2. Check compaction
-
-If a `CompactionConfig` is set, the trigger evaluates the transcript. If it fires, the strategy pipeline transforms the transcript before the model sees it:
-
-```text
-Before compaction (18 items, trigger threshold: 12):
-  [System, Context, User, Asst, Tool, User, Asst, Tool, Tool, User, Asst, Tool, User, Asst, Tool, User, Asst, Tool]
-
-After compaction (keep recent 8 + preserve System/Context):
-  [System, Context, User, Asst, Tool, User, Asst, Tool]
-                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-                    most recent 8 non-preserved items
-```
-
-Compaction happens before the model turn, not after. The model always sees the post-compaction transcript.
-
-### 3. Construct TurnRequest
+### 2. Construct TurnRequest
 
 The loop builds a `TurnRequest` from the working transcript and tool registry:
 
@@ -181,11 +164,11 @@ TurnRequest {
 }
 ```
 
-### 4. Start model turn
+### 3. Start model turn
 
 `session.begin_turn(request, cancellation)` sends the transcript to the provider and returns a streaming turn handle.
 
-### 5. Stream model output
+### 4. Stream model output
 
 The driver polls `turn.next_event()` in a loop:
 
@@ -199,7 +182,7 @@ Loop:
   next_event() ──▶ Some(Finished(result))       ──▶ break
 ```
 
-### 6. Execute tools
+### 5. Execute tools
 
 If the model requested tool calls (indicated by `FinishReason::ToolCall`):
 
@@ -212,9 +195,13 @@ If the model requested tool calls (indicated by `FinishReason::ToolCall`):
 
 Auth challenges from MCP-backed tools are not loop interrupts. They surface as `ToolError::AuthRequired(AuthRequest)` from the tool, the driver records the failure on the transcript, and the host completes the auth flow out-of-band via [`McpServerManager::resolve_auth`](./ch17-mcp.md). The next tool call reconnects with the new credentials.
 
+### 6. Run AfterToolResult mutators
+
+After tool results are appended, the driver runs every registered `LoopMutator` at `MutationPoint::AfterToolResult`. Mutators decide for themselves whether to fire (compaction triggers, redaction rules, etc.). If any mutator dirtied the transcript, the loop validates protocol invariants (tool_use ↔ tool_result pairing); a violation is a hard `LoopError::Mutator` failure rather than letting the next request blow up at the provider.
+
 ### 7. Tool roundtrip
 
-If tools were executed, the driver yields `LoopStep::Interrupt(AfterToolResult(info))` before invoking the model again. The host has a chance to call `info.submit(&mut driver, items)?` to interject a user message at this boundary — the resulting transcript `[..., tool_call, tool_result, user]` is valid for the next model call. Calling `next()` again resumes the turn into the next model call (back to step 3). The model sees the tool results (and any injected message) and may request more tools or produce a final response.
+The driver yields `LoopStep::Interrupt(AfterToolResult(info))` before invoking the model again. The host has a chance to call `info.submit(&mut driver, items)?` to interject a user message at this boundary — the resulting transcript `[..., tool_call, tool_result, user]` is valid for the next model call. Calling `next()` again resumes the turn into the next model call (back to step 3). The model sees the tool results (and any injected message) and may request more tools or produce a final response.
 
 ### 8. Return result
 
@@ -264,10 +251,12 @@ From the host's perspective, each tool round ends with a cooperative yield. Non-
 While the driver processes a turn, non-blocking events are delivered to observers synchronously:
 
 ```rust
-pub trait LoopObserver: Send {
-    fn handle_event(&mut self, event: AgentEvent);
+pub trait LoopObserver: Send + Sync {
+    fn handle_event(&self, event: AgentEvent);
 }
 ```
+
+Observers take `&self` and store mutable state behind interior mutability (`Mutex`, atomics, channels). The driver shares each observer as `Arc<dyn LoopObserver>` so a single configured `Agent` can mint multiple sessions over its lifetime.
 
 The full event taxonomy:
 
@@ -282,8 +271,8 @@ The full event taxonomy:
 | `ApprovalRequired`         | A tool requires approval                                                               |
 | `ApprovalResolved`         | An approval interrupt is resolved                                                      |
 | `ToolCatalogChanged`       | A federated tool source's catalog changed; the next request will see the new tool list |
-| `CompactionStarted`        | Compaction trigger fires                                                               |
-| `CompactionFinished`       | Compaction pipeline completes                                                          |
+| `MutationStarted`          | A `LoopMutator` is about to run at a `MutationPoint`                                   |
+| `MutationFinished`         | A `LoopMutator` finished; `dirty` indicates whether the transcript was modified        |
 | `UsageUpdated(Usage)`      | Token usage reported                                                                   |
 | `Warning(String)`          | Non-fatal issue (recovered tool error, etc.)                                           |
 | `RunFailed(String)`        | Unrecoverable error                                                                    |
@@ -291,7 +280,7 @@ The full event taxonomy:
 
 Observers are called inline, synchronously, in registration order. The loop task blocks briefly for each observer call. This is acceptable because observers should be fast — write to stderr, increment a counter, append to a buffer. Expensive processing should happen asynchronously behind a channel adapter.
 
-For loss-free transcript reconstruction (persistence, replication, audit), the driver also fans out to a separate `TranscriptObserver` channel that fires once per `Item` appended, in transcript order. `LoopObserver` alone is not sufficient for this — content deltas span partial parts and historically tool results were appended without an event at all. Compaction-driven rewrites do **not** fire `on_item_appended`; those are signaled by `AgentEvent::CompactionFinished`. Register via `AgentBuilder::transcript_observer`.
+For loss-free transcript reconstruction (persistence, replication, audit), the driver also fans out to a separate `TranscriptObserver` channel that fires once per `Item` appended, in transcript order. `LoopObserver` alone is not sufficient for this — content deltas span partial parts and historically tool results were appended without an event at all. Mutator-driven rewrites do **not** fire `on_item_appended`; those are signaled by `AgentEvent::MutationFinished`. Register via `AgentBuilder::transcript_observer`.
 
 ## Building the agent
 

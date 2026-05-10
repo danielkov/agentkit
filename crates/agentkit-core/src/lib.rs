@@ -375,6 +375,15 @@ pub struct Item {
     pub parts: Vec<Part>,
     /// Arbitrary key-value metadata for this item.
     pub metadata: MetadataMap,
+    /// Token / cost usage produced by the model turn that emitted this item.
+    /// Populated by the loop on assistant items when the provider reports it.
+    pub usage: Option<Usage>,
+    /// Why the model turn that produced this item ended. Populated by the
+    /// loop on assistant items.
+    pub finish_reason: Option<FinishReason>,
+    /// When this item was appended to the transcript. Populated by the loop
+    /// for every appended item.
+    pub created_at: Option<Timestamp>,
 }
 
 impl Item {
@@ -385,6 +394,9 @@ impl Item {
             kind,
             parts,
             metadata: MetadataMap::new(),
+            usage: None,
+            finish_reason: None,
+            created_at: None,
         }
     }
 
@@ -417,6 +429,43 @@ impl Item {
     pub fn push_part(mut self, part: Part) -> Self {
         self.parts.push(part);
         self
+    }
+
+    /// Sets the model usage that produced this item.
+    pub fn with_usage(mut self, usage: Usage) -> Self {
+        self.usage = Some(usage);
+        self
+    }
+
+    /// Sets the finish reason for the model turn that produced this item.
+    pub fn with_finish_reason(mut self, reason: FinishReason) -> Self {
+        self.finish_reason = Some(reason);
+        self
+    }
+
+    /// Sets when this item was created.
+    pub fn with_created_at(mut self, ts: Timestamp) -> Self {
+        self.created_at = Some(ts);
+        self
+    }
+}
+
+/// A wall-clock instant carried on items, expressed as milliseconds since
+/// the Unix epoch in UTC. Stamped by the loop when items land in the
+/// transcript so consumers can sort, filter, or expire by age without
+/// depending on a particular date-time crate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct Timestamp(pub u64);
+
+impl Timestamp {
+    /// Captures the current wall-clock time. Returns `Timestamp(0)` on the
+    /// vanishingly unlikely event the system clock is before the epoch.
+    pub fn now() -> Self {
+        let millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        Self(millis)
     }
 }
 
@@ -1210,33 +1259,6 @@ pub enum FinishReason {
     Error,
     /// A provider-specific reason not covered by the standard variants.
     Other(String),
-}
-
-/// Read-only view over an [`Item`]'s essential fields.
-///
-/// This trait lets downstream crates (compaction, reporting) operate on
-/// item-like types without depending on the concrete [`Item`] struct.
-pub trait ItemView {
-    /// Returns the role of this item.
-    fn kind(&self) -> ItemKind;
-    /// Returns the content parts.
-    fn parts(&self) -> &[Part];
-    /// Returns the metadata map.
-    fn metadata(&self) -> &MetadataMap;
-}
-
-impl ItemView for Item {
-    fn kind(&self) -> ItemKind {
-        self.kind
-    }
-
-    fn parts(&self) -> &[Part] {
-        &self.parts
-    }
-
-    fn metadata(&self) -> &MetadataMap {
-        &self.metadata
-    }
 }
 
 /// Error returned when content cannot be normalised into the agentkit data model.

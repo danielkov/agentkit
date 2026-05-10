@@ -272,28 +272,32 @@ Configure structural compaction that drops reasoning and failed tool results, th
 
 ```rust
 use agentkit_compaction::{
-    CompactionConfig, CompactionPipeline, DropFailedToolResultsStrategy,
-    DropReasoningStrategy, ItemCountTrigger, KeepRecentStrategy,
+    AgentBuilderCompactorExt, CompactionPipeline, DropFailedToolResultsStrategy,
+    DropReasoningStrategy, KeepRecentStrategy, StrategyCompactor,
 };
 use agentkit_core::ItemKind;
 
-let compaction = CompactionConfig::new(
-    ItemCountTrigger::new(10),
-    CompactionPipeline::new()
-        .with_strategy(DropReasoningStrategy::new())
-        .with_strategy(DropFailedToolResultsStrategy::new())
-        .with_strategy(
-            KeepRecentStrategy::new(8)
-                .preserve_kind(ItemKind::System)
-                .preserve_kind(ItemKind::Context),
-        ),
-);
+let compactor = StrategyCompactor::builder()
+    .item_count_trigger(10)
+    .strategy(
+        CompactionPipeline::new()
+            .with_strategy(DropReasoningStrategy::new())
+            .with_strategy(DropFailedToolResultsStrategy::new())
+            .with_strategy(
+                KeepRecentStrategy::new(8)
+                    .preserve_kind(ItemKind::System)
+                    .preserve_kind(ItemKind::Context),
+            ),
+    )
+    .build()?;
 
 let agent = Agent::builder()
     .model(adapter)
-    .compaction(compaction)
+    .compactor(compactor)
     .build()?;
 ```
+
+Compactors plug into the loop's generic `LoopMutator` seam, so the same hook handles redaction, repair, or any other transcript edit. Use `context_window_trigger(window, percent)` for token-aware triggering driven by provider-reported `input_tokens`.
 
 ### Async task management
 

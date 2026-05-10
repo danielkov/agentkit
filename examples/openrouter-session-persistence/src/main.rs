@@ -272,7 +272,7 @@ struct SqliteTranscriptObserver {
 }
 
 impl TranscriptObserver for SqliteTranscriptObserver {
-    fn on_item_appended(&mut self, item: &Item) {
+    fn on_item_appended(&self, item: &Item) {
         if let Err(error) = self.store.append(&self.session_id, item) {
             eprintln!("[persistence] failed to append item: {error}");
         }

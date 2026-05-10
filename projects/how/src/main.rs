@@ -332,30 +332,22 @@ fn read_prompt() -> Result<String, Box<dyn std::error::Error>> {
         match key.code {
             KeyCode::Enter => return Ok(input),
             KeyCode::Char('c') if ctrl => return Ok(String::new()),
-            KeyCode::Backspace => {
-                if pos > 0 {
-                    input.remove(pos - 1);
-                    pos -= 1;
-                    redraw_prompt(&mut w, &input, pos)?;
-                }
+            KeyCode::Backspace if pos > 0 => {
+                input.remove(pos - 1);
+                pos -= 1;
+                redraw_prompt(&mut w, &input, pos)?;
             }
-            KeyCode::Delete => {
-                if pos < input.len() {
-                    input.remove(pos);
-                    redraw_prompt(&mut w, &input, pos)?;
-                }
+            KeyCode::Delete if pos < input.len() => {
+                input.remove(pos);
+                redraw_prompt(&mut w, &input, pos)?;
             }
-            KeyCode::Left => {
-                if pos > 0 {
-                    pos -= 1;
-                    redraw_prompt(&mut w, &input, pos)?;
-                }
+            KeyCode::Left if pos > 0 => {
+                pos -= 1;
+                redraw_prompt(&mut w, &input, pos)?;
             }
-            KeyCode::Right => {
-                if pos < input.len() {
-                    pos += 1;
-                    redraw_prompt(&mut w, &input, pos)?;
-                }
+            KeyCode::Right if pos < input.len() => {
+                pos += 1;
+                redraw_prompt(&mut w, &input, pos)?;
             }
             KeyCode::Home => {
                 pos = 0;

@@ -70,10 +70,12 @@ Because `agentkit-loop` uses synchronous observer delivery, the reporting layer 
 That means the simplest reporters implement:
 
 ```rust
-pub trait LoopObserver {
-    fn handle_event(&mut self, event: AgentEvent);
+pub trait LoopObserver: Send + Sync {
+    fn handle_event(&self, event: AgentEvent);
 }
 ```
+
+Observers take `&self` and keep mutable state behind interior mutability so the driver can share each one as `Arc<dyn LoopObserver>` across multiple sessions started from the same `Agent`.
 
 This keeps event ordering deterministic and avoids async leakage into the loop.
 
@@ -200,7 +202,7 @@ Recommended shape:
 
 ```rust
 pub struct CompositeReporter {
-    children: Vec<Box<dyn LoopObserver>>,
+    children: Vec<Arc<dyn LoopObserver>>,
 }
 ```
 

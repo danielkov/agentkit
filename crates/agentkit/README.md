@@ -50,7 +50,7 @@ Add agentkit with the features you need:
 
 ```toml
 [dependencies]
-agentkit = { version = "0.5", features = ["provider-openrouter", "tool-fs", "tool-shell"] }
+agentkit = { version = "0.6", features = ["provider-openrouter", "tool-fs", "tool-shell"] }
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -160,7 +160,7 @@ When implementing a custom adapter, only the default features are needed:
 
 ```toml
 [dependencies]
-agentkit = "0.5"
+agentkit = "0.6"
 ```
 
 ```rust,ignore
