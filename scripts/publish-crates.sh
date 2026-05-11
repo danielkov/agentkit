@@ -30,12 +30,12 @@ CRATES=(
   agentkit-core
   agentkit-http
   agentkit-capabilities
-  agentkit-compaction
   agentkit-context
   agentkit-tools-core
   agentkit-tools-derive
   agentkit-task-manager
   agentkit-loop
+  agentkit-compaction
   agentkit-adapter-completions
   agentkit-reporting
   agentkit-mcp
