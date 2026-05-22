@@ -128,11 +128,9 @@ pub async fn run_mode(
         .build()?;
 
     let mut driver = agent
-        .start(
-            SessionConfig::new(session_id).with_cache(
-                PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
-            ),
-        )
+        .start(SessionConfig::new(session_id).with_cache(
+            PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
+        ))
         .await?;
 
     let output = run_to_completion(&mut driver).await?;

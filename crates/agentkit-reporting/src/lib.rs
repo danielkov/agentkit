@@ -212,7 +212,10 @@ where
 
     fn record_result(&self, result: Result<(), ReportError>) {
         if let Err(error) = result {
-            self.errors.lock().unwrap_or_else(|e| e.into_inner()).push(error);
+            self.errors
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(error);
         }
     }
 
@@ -323,7 +326,10 @@ impl UsageReporter {
 
     /// Returns a snapshot of the current [`UsageSummary`].
     pub fn summary(&self) -> UsageSummary {
-        self.summary.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.summary
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     fn absorb(summary: &mut UsageSummary, usage: &Usage) {
@@ -409,7 +415,10 @@ impl TranscriptReporter {
 
     /// Returns a snapshot of the current [`TranscriptView`].
     pub fn transcript(&self) -> TranscriptView {
-        self.transcript.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.transcript
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 }
 
@@ -479,7 +488,10 @@ where
 
     fn record_result(&self, result: Result<(), ReportError>) {
         if let Err(error) = result {
-            self.errors.lock().unwrap_or_else(|e| e.into_inner()).push(error);
+            self.errors
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(error);
         }
     }
 }
