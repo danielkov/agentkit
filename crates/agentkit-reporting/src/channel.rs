@@ -56,7 +56,11 @@ impl ChannelReporter {
 
 impl LoopObserver for ChannelReporter {
     fn handle_event(&self, event: AgentEvent) {
-        let _ = self.sender.lock().unwrap_or_else(|e| e.into_inner()).send(event);
+        let _ = self
+            .sender
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .send(event);
     }
 }
 

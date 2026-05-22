@@ -96,7 +96,10 @@ impl<T: FallibleObserver> LoopObserver for PolicyReporter<T> {
                     eprintln!("reporter error: {e}");
                 }
                 FailurePolicy::Accumulate => {
-                    self.errors.lock().unwrap_or_else(|e| e.into_inner()).push(e);
+                    self.errors
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(e);
                 }
                 FailurePolicy::FailFast => {
                     panic!("reporter error: {e}");

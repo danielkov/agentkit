@@ -10,10 +10,11 @@ use agentkit_capabilities::{
 };
 use agentkit_core::{MetadataMap, ToolOutput};
 use agentkit_mcp::{
-    McpCapabilityProvider, McpConnection, McpCreateElicitationRequestParams,
+    ErrorResponderOutcome, McpCapabilityProvider, McpConnection, McpCreateElicitationRequestParams,
     McpCreateElicitationResult, McpCreateMessageRequestParams, McpCreateMessageResult,
-    McpElicitationAction, McpElicitationResponder, McpError, McpHandlerConfig, McpLoggingLevel,
-    McpLoggingMessageNotificationParam, McpProgressNotificationParam, McpResourceContents,
+    McpElicitationAction, McpElicitationResponder, McpError, McpErrorContext, McpErrorResponder,
+    McpHandlerConfig, McpInvocationError, McpLoggingLevel, McpLoggingMessageNotificationParam,
+    McpMethod, McpProgressNotificationParam, McpResourceContents,
     McpResourceUpdatedNotificationParam, McpRoot, McpRootsProvider, McpSamplingMessage,
     McpSamplingResponder, McpServerCapabilities, McpServerEvent, McpServerId, McpToolAdapter,
     McpToolNamespace, PromptMessageContent,
@@ -34,6 +35,7 @@ use rmcp::model::{
 use rmcp::service::{Peer, RequestContext, RoleServer};
 use rmcp::{ServerHandler, ServiceExt, schemars, tool, tool_handler, tool_router};
 use serde::Deserialize;
+use serde_json::json;
 use tokio::sync::oneshot;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -154,6 +156,7 @@ async fn connect_in_memory() -> McpConnection {
 async fn connect_in_memory_with_server_peer(
     builder: agentkit_mcp::McpHandlerConfig,
 ) -> (McpConnection, Peer<RoleServer>) {
+    let handler_config = builder.clone();
     let (handler, channels) = builder.build();
     let (server_io, client_io) = tokio::io::duplex(8 * 1024);
     let (peer_tx, peer_rx) = oneshot::channel();
@@ -175,11 +178,12 @@ async fn connect_in_memory_with_server_peer(
         .expect("client init succeeds");
 
     let peer = peer_rx.await.expect("server peer arrives");
-    let connection = McpConnection::from_running_service_with_events(
+    let connection = McpConnection::from_running_service_with_events_and_handler_config(
         McpServerId::new("in-memory"),
         service,
         channels.notifications,
         channels.events,
+        handler_config,
     );
     (connection, peer)
 }
@@ -189,6 +193,33 @@ struct AllowAll;
 impl PermissionChecker for AllowAll {
     fn evaluate(&self, _request: &dyn PermissionRequest) -> PermissionDecision {
         PermissionDecision::Allow
+    }
+}
+
+struct InvalidParamsResponder;
+
+#[async_trait]
+impl McpErrorResponder for InvalidParamsResponder {
+    async fn handle(
+        &self,
+        error: &McpInvocationError,
+        ctx: McpErrorContext<'_>,
+    ) -> ErrorResponderOutcome {
+        let McpInvocationError::InvalidParams { data, .. } = error else {
+            return ErrorResponderOutcome::PassThrough;
+        };
+        let McpMethod::ToolsCall { name, arguments } = ctx.method else {
+            return ErrorResponderOutcome::PassThrough;
+        };
+        assert_eq!(ctx.server_id.0.as_str(), "in-memory");
+        assert_eq!(name, "echo");
+        assert_eq!(arguments, &json!({}));
+        assert_eq!(ctx.input, Some(&json!({})));
+        assert!(data.is_none());
+
+        ErrorResponderOutcome::SynthesizeResult(CallToolResult::success(vec![Content::text(
+            "handled invalid params",
+        )]))
     }
 }
 
@@ -237,7 +268,7 @@ async fn discovery_returns_advertised_tools_resources_prompts() {
 async fn call_tool_returns_typed_result_with_content_blocks() {
     let connection = connect_in_memory().await;
     let result = connection
-        .call_tool("echo", serde_json::json!({ "text": "hi" }))
+        .call_tool("echo", json!({ "text": "hi" }))
         .await
         .expect("tool call succeeds");
     assert_eq!(result.is_error, Some(false));
@@ -248,6 +279,56 @@ async fn call_tool_returns_typed_result_with_content_blocks() {
         .map(|text| text.text.clone())
         .expect("first content block is text");
     assert_eq!(text, "hi");
+}
+
+#[test]
+fn invocation_error_preserves_url_elicitation_data() {
+    let raw_data = json!({
+        "mode": "url",
+        "message": "Complete browser authorization",
+        "url": "https://example.com/oauth",
+        "elicitationId": "elicit-123",
+    });
+
+    let error = McpInvocationError::from_error_data(RmcpError::url_elicitation_required(
+        "authorization needed",
+        Some(raw_data.clone()),
+    ));
+
+    match error {
+        McpInvocationError::UrlElicitation {
+            message,
+            data: Some(data),
+            raw_data: Some(raw),
+        } => {
+            assert_eq!(message, "authorization needed");
+            assert_eq!(data.url, "https://example.com/oauth");
+            assert_eq!(data.elicitation_id, "elicit-123");
+            assert_eq!(
+                data.message.as_deref(),
+                Some("Complete browser authorization")
+            );
+            assert_eq!(raw, raw_data);
+        }
+        other => panic!("expected URL elicitation error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn read_resource_surfaces_json_rpc_error_as_invocation_enum() {
+    let connection = connect_in_memory().await;
+    let error = connection
+        .read_resource("memo:missing")
+        .await
+        .expect_err("unknown resource should be a JSON-RPC error");
+
+    match error {
+        McpError::Invocation(McpInvocationError::InvalidParams { message, data }) => {
+            assert_eq!(message, "unknown resource");
+            assert!(data.is_none());
+        }
+        other => panic!("expected invalid-params invocation error, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -323,6 +404,50 @@ async fn tool_adapter_propagates_call_through_running_service() {
 
     match result.result.output {
         ToolOutput::Text(text) => assert_eq!(text, "via-adapter"),
+        other => panic!("unexpected output: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn tool_adapter_error_responder_receives_typed_invocation_error() {
+    let (connection, _peer) = connect_in_memory_with_server_peer(
+        McpHandlerConfig::new().with_error_responder(Arc::new(InvalidParamsResponder)),
+    )
+    .await;
+    let connection = Arc::new(connection);
+    let server_id = connection.server_id().clone();
+    let snapshot = connection.discover().await.unwrap();
+    let descriptor = snapshot.tools[0].clone();
+    let adapter = McpToolAdapter::new(&server_id, connection.clone(), descriptor);
+    let metadata = MetadataMap::new();
+    let mut ctx = ToolContext {
+        capability: CapabilityContext {
+            session_id: None,
+            turn_id: None,
+            metadata: &metadata,
+        },
+        permissions: &AllowAll,
+        resources: &(),
+        cancellation: None,
+    };
+
+    let result = adapter
+        .invoke(
+            ToolRequest {
+                call_id: "call-1".into(),
+                tool_name: ToolName::new("mcp_in-memory_echo"),
+                input: json!({}),
+                session_id: "session-1".into(),
+                turn_id: "turn-1".into(),
+                metadata: MetadataMap::new(),
+            },
+            &mut ctx,
+        )
+        .await
+        .expect("responder should synthesize a tool result");
+
+    match result.result.output {
+        ToolOutput::Text(text) => assert_eq!(text, "handled invalid params"),
         other => panic!("unexpected output: {other:?}"),
     }
 }

@@ -948,8 +948,7 @@ impl<M: ModelAdapter> AgentBuilderCompactorExt<M> for AgentBuilder<M> {
 /// Boxed predicate driving [`StrategyCompactor`]: it inspects the transcript
 /// and current [`MutationPoint`] and returns the reason to fire compaction,
 /// or `None` to skip.
-pub type TriggerFn =
-    Box<dyn Fn(&[Item], MutationPoint) -> Option<CompactionReason> + Send + Sync>;
+pub type TriggerFn = Box<dyn Fn(&[Item], MutationPoint) -> Option<CompactionReason> + Send + Sync>;
 
 /// A reusable [`Compactor`] that bundles a trigger closure with a
 /// [`CompactionStrategy`] (often a [`CompactionPipeline`]) and an optional
