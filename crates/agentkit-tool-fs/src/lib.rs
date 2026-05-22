@@ -30,19 +30,150 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use agentkit_core::{MetadataMap, SessionId, ToolOutput, ToolResultPart};
 use agentkit_tools_core::{
     FileSystemPermissionRequest, PermissionCode, PermissionDenial, PermissionRequest, Tool,
-    ToolAnnotations, ToolContext, ToolError, ToolName, ToolRegistry, ToolRequest, ToolResources,
-    ToolResult, ToolSpec,
+    ToolAnnotations, ToolContext, ToolError, ToolName, ToolOutputArtifact, ToolOutputArtifactId,
+    ToolOutputArtifactSlice, ToolOutputArtifactStore, ToolOutputLimit, ToolOutputTruncationContext,
+    ToolRegistry, ToolRequest, ToolResources, ToolResult, ToolSpec,
 };
 use async_trait::async_trait;
 use futures_lite::StreamExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use thiserror::Error;
+
+/// Default model-facing budget advertised by filesystem tools that can return
+/// unbounded data. Hosts can override this per tool in their executor output
+/// truncation strategy.
+pub const DEFAULT_UNBOUNDED_OUTPUT_MAX_BYTES: usize = 150_000;
+
+/// File-backed store for oversized tool-result artifacts.
+///
+/// This is intended for hosts that want stored results to survive outside the
+/// current process. Pair it with `agentkit_tools_core::tool_result_readback_registry`
+/// for bounded readback.
+#[derive(Debug)]
+pub struct FileToolOutputArtifactStore {
+    root: PathBuf,
+    next_id: AtomicU64,
+}
+
+impl FileToolOutputArtifactStore {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self {
+            root: root.into(),
+            next_id: AtomicU64::new(0),
+        }
+    }
+
+    fn artifact_path(&self, id: &ToolOutputArtifactId) -> Result<PathBuf, ToolError> {
+        if id.0.is_empty()
+            || !id
+                .0
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err(ToolError::InvalidInput(format!(
+                "invalid tool result artifact id: {id}"
+            )));
+        }
+        Ok(self.root.join(format!("{}.txt", id.0)))
+    }
+}
+
+#[async_trait]
+impl ToolOutputArtifactStore for FileToolOutputArtifactStore {
+    async fn put(
+        &self,
+        ctx: &ToolOutputTruncationContext,
+        body: String,
+        original_bytes: usize,
+    ) -> Result<ToolOutputArtifact, ToolError> {
+        async_fs::create_dir_all(&self.root)
+            .await
+            .map_err(|error| {
+                ToolError::ExecutionFailed(format!(
+                    "failed to create tool result artifact directory {}: {error}",
+                    self.root.display()
+                ))
+            })?;
+        let n = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let id = ToolOutputArtifactId(format!(
+            "{}-{}-{n}",
+            sanitize_artifact_id_component(ctx.session_id.0.as_str()),
+            sanitize_artifact_id_component(ctx.call_id.0.as_str())
+        ));
+        async_fs::write(self.artifact_path(&id)?, body.as_bytes())
+            .await
+            .map_err(|error| {
+                ToolError::ExecutionFailed(format!(
+                    "failed to write tool result artifact {id}: {error}"
+                ))
+            })?;
+        Ok(ToolOutputArtifact {
+            id,
+            tool_name: ctx.tool_name.clone(),
+            call_id: ctx.call_id.clone(),
+            session_id: ctx.session_id.clone(),
+            turn_id: ctx.turn_id.clone(),
+            original_bytes,
+            body,
+        })
+    }
+
+    async fn read(
+        &self,
+        id: &ToolOutputArtifactId,
+        offset: usize,
+        max_bytes: usize,
+    ) -> Result<ToolOutputArtifactSlice, ToolError> {
+        let body = async_fs::read_to_string(self.artifact_path(id)?)
+            .await
+            .map_err(|error| {
+                ToolError::ExecutionFailed(format!(
+                    "failed to read tool result artifact {id}: {error}"
+                ))
+            })?;
+        if offset > body.len() || !body.is_char_boundary(offset) {
+            return Err(ToolError::InvalidInput(format!(
+                "offset {offset} is not a UTF-8 boundary in tool result artifact {id}"
+            )));
+        }
+        let requested_end = offset.saturating_add(max_bytes).min(body.len());
+        let end = body.floor_char_boundary(requested_end);
+        Ok(ToolOutputArtifactSlice {
+            id: id.clone(),
+            offset,
+            next_offset: end,
+            original_bytes: body.len(),
+            eof: end == body.len(),
+            content: body[offset..end].to_string(),
+        })
+    }
+}
+
+fn sanitize_artifact_id_component(s: &str) -> String {
+    let cleaned: String = s
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(64)
+        .collect();
+    if cleaned.is_empty() {
+        "_".to_string()
+    } else {
+        cleaned
+    }
+}
 
 /// Creates a [`ToolRegistry`] pre-populated with all filesystem tools.
 ///
@@ -300,6 +431,18 @@ impl Default for ReadFileTool {
                 metadata: MetadataMap::new(),
             },
         }
+        .with_default_output_limit()
+    }
+}
+
+impl ReadFileTool {
+    fn with_default_output_limit(mut self) -> Self {
+        self.spec = self
+            .spec
+            .with_output_limit(ToolOutputLimit::store_for_readback(
+                DEFAULT_UNBOUNDED_OUTPUT_MAX_BYTES,
+            ));
+        self
     }
 }
 
@@ -535,6 +678,17 @@ impl Default for ReplaceInFileTool {
                 metadata: MetadataMap::new(),
             },
         }
+    }
+}
+
+impl ListDirectoryTool {
+    fn with_default_output_limit(mut self) -> Self {
+        self.spec = self
+            .spec
+            .with_output_limit(ToolOutputLimit::store_for_readback(
+                DEFAULT_UNBOUNDED_OUTPUT_MAX_BYTES,
+            ));
+        self
     }
 }
 
@@ -930,6 +1084,7 @@ impl Default for ListDirectoryTool {
                 metadata: MetadataMap::new(),
             },
         }
+        .with_default_output_limit()
     }
 }
 
@@ -1251,8 +1406,8 @@ mod tests {
     use agentkit_capabilities::CapabilityContext;
     use agentkit_core::{SessionId, ToolCallId, TurnId};
     use agentkit_tools_core::{
-        BasicToolExecutor, PermissionChecker, PermissionDecision, ToolExecutionOutcome,
-        ToolExecutor,
+        BasicToolExecutor, PermissionChecker, PermissionDecision, TOOL_OUTPUT_LIMIT_METADATA_KEY,
+        ToolExecutionOutcome, ToolExecutor,
     };
 
     use super::*;
@@ -1318,6 +1473,62 @@ mod tests {
         assert!(names.contains(&"fs_delete".into()));
         assert!(names.contains(&"fs_list_directory".into()));
         assert!(names.contains(&"fs_create_directory".into()));
+    }
+
+    #[test]
+    fn unbounded_read_tools_advertise_store_for_readback_output_limit() {
+        let specs = registry().specs();
+        for name in ["fs_read_file", "fs_list_directory"] {
+            let spec = specs.iter().find(|spec| spec.name.0 == name).expect("spec");
+            let limit: ToolOutputLimit = serde_json::from_value(
+                spec.metadata
+                    .get(TOOL_OUTPUT_LIMIT_METADATA_KEY)
+                    .expect("output limit metadata")
+                    .clone(),
+            )
+            .expect("valid output limit metadata");
+            assert_eq!(limit, ToolOutputLimit::store_for_readback(150_000));
+        }
+    }
+
+    #[tokio::test]
+    async fn file_tool_output_artifact_store_roundtrips_bounded_slices() {
+        let root = temp_dir("artifact-store");
+        let store = FileToolOutputArtifactStore::new(&root);
+        let ctx = ToolOutputTruncationContext {
+            tool_name: ToolName::new("big"),
+            call_id: ToolCallId::new("call"),
+            session_id: SessionId::new("session"),
+            turn_id: TurnId::new("turn"),
+            tool_spec: ToolSpec::new("big", "big output", json!({"type": "object"})),
+        };
+
+        let artifact = store
+            .put(&ctx, "abcdef".to_string(), 6)
+            .await
+            .expect("store artifact");
+        let slice = store
+            .read(&artifact.id, 2, 3)
+            .await
+            .expect("read artifact slice");
+        assert_eq!(slice.content, "cde");
+        assert_eq!(slice.next_offset, 5);
+        assert!(!slice.eof);
+    }
+
+    #[tokio::test]
+    async fn file_tool_output_artifact_store_rejects_path_like_ids() {
+        let root = temp_dir("artifact-store-escape");
+        let store = FileToolOutputArtifactStore::new(&root);
+
+        let err = store
+            .read(&ToolOutputArtifactId("../secret".to_string()), 0, 1)
+            .await
+            .expect_err("path-like artifact ids must be rejected");
+        match err {
+            ToolError::InvalidInput(message) => assert!(message.contains("invalid")),
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
     }
 
     #[tokio::test]

@@ -239,6 +239,198 @@ pub trait McpAuthResponder: Send + Sync + 'static {
     async fn resolve(&self, request: AuthRequest) -> Result<AuthResolution, McpError>;
 }
 
+/// Typed view of a JSON-RPC error returned by an MCP server for an invoked
+/// method.
+///
+/// Surfaced by [`McpError::Invocation`] so callers can branch on the
+/// underlying error code without re-parsing strings. The variants cover
+/// every rmcp [`rmcp::model::ErrorCode`] constant defined at the time of
+/// writing; anything else (custom server codes, future protocol additions)
+/// lands in [`Self::Other`] with the original code preserved.
+///
+/// For the URL elicitation case ([`rmcp::model::ErrorCode::URL_ELICITATION_REQUIRED`])
+/// the `data` payload is best-effort parsed into [`UrlElicitationData`].
+/// When the server's payload does not match the documented shape the typed
+/// `data` slot is `None` but `raw_data` always preserves the original
+/// [`serde_json::Value`] so callers can fall back to ad-hoc inspection.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum McpInvocationError {
+    /// JSON-RPC error `-32042` (URL elicitation required).
+    #[error("url elicitation required: {message}")]
+    UrlElicitation {
+        /// Human-readable message from the server.
+        message: String,
+        /// Typed view of the server's `data` payload, when it matched the
+        /// documented URL elicitation shape.
+        data: Option<UrlElicitationData>,
+        /// The original `data` value, preserved verbatim.
+        raw_data: Option<serde_json::Value>,
+    },
+    /// JSON-RPC error `-32600` (invalid request).
+    #[error("invalid request: {message}")]
+    InvalidRequest {
+        message: String,
+        data: Option<serde_json::Value>,
+    },
+    /// JSON-RPC error `-32601` (method not found).
+    #[error("method not found: {message}")]
+    MethodNotFound {
+        message: String,
+        data: Option<serde_json::Value>,
+    },
+    /// JSON-RPC error `-32602` (invalid params).
+    #[error("invalid params: {message}")]
+    InvalidParams {
+        message: String,
+        data: Option<serde_json::Value>,
+    },
+    /// JSON-RPC error `-32603` (internal error).
+    #[error("internal error: {message}")]
+    InternalError {
+        message: String,
+        data: Option<serde_json::Value>,
+    },
+    /// JSON-RPC error `-32700` (parse error).
+    #[error("parse error: {message}")]
+    ParseError {
+        message: String,
+        data: Option<serde_json::Value>,
+    },
+    /// JSON-RPC error `-32002` (resource not found).
+    #[error("resource not found: {message}")]
+    ResourceNotFound {
+        message: String,
+        data: Option<serde_json::Value>,
+    },
+    /// Forward-compat for custom server codes and any future rmcp additions
+    /// not yet recognized by this crate.
+    #[error("mcp error code {code}: {message}")]
+    Other {
+        code: i32,
+        message: String,
+        data: Option<serde_json::Value>,
+    },
+}
+
+/// Typed payload for the URL elicitation error case.
+///
+/// Mirrors the shape of [`rmcp::model::CreateElicitationRequestParams::UrlElicitationParams`]
+/// (camelCase on the wire). Server messages that include extra fields are
+/// accepted; missing required fields make typed parsing fail and the
+/// surrounding [`McpInvocationError::UrlElicitation`] preserves the raw
+/// payload instead.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UrlElicitationData {
+    /// The URL where the user can complete the elicitation.
+    pub url: String,
+    /// The server-issued identifier for this elicitation request.
+    pub elicitation_id: String,
+    /// Optional human-readable message that accompanied the payload.
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+impl McpInvocationError {
+    /// Lifts an rmcp wire error into the typed enum. Infallible: well-known
+    /// codes attempt a typed `data` parse and degrade to a raw-only view
+    /// when parsing fails; unrecognized codes land in [`Self::Other`].
+    pub fn from_error_data(err: rmcp::model::ErrorData) -> Self {
+        let rmcp::model::ErrorData {
+            code,
+            message,
+            data,
+        } = err;
+        let message = message.into_owned();
+        match code {
+            rmcp::model::ErrorCode::URL_ELICITATION_REQUIRED => {
+                let typed = data.as_ref().and_then(|value| {
+                    serde_json::from_value::<UrlElicitationData>(value.clone()).ok()
+                });
+                Self::UrlElicitation {
+                    message,
+                    data: typed,
+                    raw_data: data,
+                }
+            }
+            rmcp::model::ErrorCode::INVALID_REQUEST => Self::InvalidRequest { message, data },
+            rmcp::model::ErrorCode::METHOD_NOT_FOUND => Self::MethodNotFound { message, data },
+            rmcp::model::ErrorCode::INVALID_PARAMS => Self::InvalidParams { message, data },
+            rmcp::model::ErrorCode::INTERNAL_ERROR => Self::InternalError { message, data },
+            rmcp::model::ErrorCode::PARSE_ERROR => Self::ParseError { message, data },
+            rmcp::model::ErrorCode::RESOURCE_NOT_FOUND => Self::ResourceNotFound { message, data },
+            other => Self::Other {
+                code: other.0,
+                message,
+                data,
+            },
+        }
+    }
+
+    /// Returns the underlying JSON-RPC error code.
+    pub fn code(&self) -> i32 {
+        match self {
+            Self::UrlElicitation { .. } => rmcp::model::ErrorCode::URL_ELICITATION_REQUIRED.0,
+            Self::InvalidRequest { .. } => rmcp::model::ErrorCode::INVALID_REQUEST.0,
+            Self::MethodNotFound { .. } => rmcp::model::ErrorCode::METHOD_NOT_FOUND.0,
+            Self::InvalidParams { .. } => rmcp::model::ErrorCode::INVALID_PARAMS.0,
+            Self::InternalError { .. } => rmcp::model::ErrorCode::INTERNAL_ERROR.0,
+            Self::ParseError { .. } => rmcp::model::ErrorCode::PARSE_ERROR.0,
+            Self::ResourceNotFound { .. } => rmcp::model::ErrorCode::RESOURCE_NOT_FOUND.0,
+            Self::Other { code, .. } => *code,
+        }
+    }
+}
+
+/// Userland hook invoked when an MCP server returns a JSON-RPC error for an
+/// invoked method.
+///
+/// Lets the host translate well-known errors (e.g. URL elicitation
+/// challenges) into a synthesized tool result the agent can render —
+/// without agentkit-mcp baking in any specific UX or response policy.
+///
+/// Install one via [`McpHandlerConfig::with_error_responder`]. When set,
+/// [`McpToolAdapter::invoke`] forwards every JSON-RPC error to the
+/// responder before falling back to [`ToolError::ExecutionFailed`]; the
+/// responder returns either a synthesized [`CallToolResult`] (treated as a
+/// successful call so `structured_content` flows through
+/// [`ToolOutput::Structured`]) or [`ErrorResponderOutcome::PassThrough`] to
+/// preserve the default failure path.
+#[async_trait]
+pub trait McpErrorResponder: Send + Sync + 'static {
+    /// Inspects an invocation error and decides whether to synthesize a
+    /// replacement [`CallToolResult`] or propagate the error.
+    async fn handle(
+        &self,
+        error: &McpInvocationError,
+        ctx: McpErrorContext<'_>,
+    ) -> ErrorResponderOutcome;
+}
+
+/// Context describing which server / method / input produced the
+/// invocation error currently being inspected by [`McpErrorResponder::handle`].
+pub struct McpErrorContext<'a> {
+    /// The server that returned the error.
+    pub server_id: &'a McpServerId,
+    /// The MCP method that was invoked.
+    pub method: &'a McpMethod,
+    /// The input payload supplied to the invocation, when available.
+    pub input: Option<&'a serde_json::Value>,
+}
+
+/// Decision returned by an [`McpErrorResponder`].
+pub enum ErrorResponderOutcome {
+    /// Replace the error with a synthesized successful response. The
+    /// returned [`CallToolResult`] flows through agentkit-mcp's normal
+    /// tool-result conversion: `structured_content` becomes
+    /// [`ToolOutput::Structured`], `content` becomes text / media parts,
+    /// and `is_error` is honoured.
+    SynthesizeResult(CallToolResult),
+    /// Defer to default behavior; the invocation error continues to surface
+    /// as [`ToolError::ExecutionFailed`].
+    PassThrough,
+}
+
 /// Unique identifier for a registered MCP server.
 ///
 /// Each MCP server in a [`McpServerManager`] is addressed by its `McpServerId`.
@@ -832,7 +1024,10 @@ const DEFAULT_EVENTS_CAPACITY: usize = 128;
 /// path inside [`McpServerManager::refresh_changed_catalogs`]. `events` is the
 /// broadcast sender that surfaces every [`McpServerEvent`] — clone it once and
 /// pass it into [`McpConnection::from_running_service_with_events`] when
-/// adopting an externally constructed [`rmcp::service::RunningService`].
+/// adopting an externally constructed [`rmcp::service::RunningService`]. If the
+/// adopted connection also needs adapter-time hooks from the same
+/// [`McpHandlerConfig`], use
+/// [`McpConnection::from_running_service_with_events_and_handler_config`].
 pub struct McpClientChannels {
     /// Legacy mpsc receiver for catalog list-changed announcements.
     pub notifications: mpsc::UnboundedReceiver<McpServerNotification>,
@@ -845,8 +1040,10 @@ pub struct McpClientChannels {
 /// You only need to construct this directly if you're wiring rmcp transports
 /// that [`McpTransportBinding`] does not cover (in-memory pipes, websockets,
 /// custom IO). Build one via [`McpHandlerConfig::build`], then pair the
-/// resulting service with [`McpConnection::from_running_service`] or
-/// [`McpConnection::from_running_service_with_events`].
+/// resulting service with [`McpConnection::from_running_service`],
+/// [`McpConnection::from_running_service_with_events`], or
+/// [`McpConnection::from_running_service_with_events_and_handler_config`] when
+/// the connection must preserve adapter-time hooks from the config.
 #[derive(Clone)]
 pub struct McpClientHandler {
     info: rmcp_model::ClientInfo,
@@ -1017,6 +1214,13 @@ pub struct McpHandlerConfig {
     /// invoke the responder inline on auth challenges and retry — auth
     /// never surfaces as a loop interrupt.
     pub auth: Option<Arc<dyn McpAuthResponder>>,
+    /// Handler invoked when an MCP server returns a JSON-RPC error for an
+    /// invoked tool. When installed, [`McpToolAdapter::invoke`] forwards
+    /// the typed [`McpInvocationError`] to the responder before falling
+    /// back to [`ToolError::ExecutionFailed`]; the responder may synthesize
+    /// a [`CallToolResult`] (the agent sees a successful tool call) or
+    /// pass the error through unchanged.
+    pub error_responder: Option<Arc<dyn McpErrorResponder>>,
     /// Broadcast capacity for the [`McpServerEvent`] channel. Defaults to
     /// `DEFAULT_EVENTS_CAPACITY` when `None`.
     pub events_capacity: Option<usize>,
@@ -1052,6 +1256,12 @@ impl McpHandlerConfig {
     /// Sets the auth responder.
     pub fn with_auth_responder(mut self, responder: Arc<dyn McpAuthResponder>) -> Self {
         self.auth = Some(responder);
+        self
+    }
+
+    /// Sets the invocation-error responder.
+    pub fn with_error_responder(mut self, responder: Arc<dyn McpErrorResponder>) -> Self {
+        self.error_responder = Some(responder);
         self
     }
 
@@ -1241,6 +1451,28 @@ impl McpConnection {
         notifications: mpsc::UnboundedReceiver<McpServerNotification>,
         events: broadcast::Sender<McpServerEvent>,
     ) -> Self {
+        Self::from_running_service_with_events_and_handler_config(
+            server_id,
+            service,
+            notifications,
+            events,
+            McpHandlerConfig::default(),
+        )
+    }
+
+    /// Variant of [`Self::from_running_service_with_events`] that also
+    /// preserves the handler config used to build the adopted service.
+    ///
+    /// Use this when the connection needs to reach client-side hooks that are
+    /// not carried by the rmcp handler itself, such as [`McpAuthResponder`] and
+    /// [`McpErrorResponder`] during [`McpToolAdapter`] invocation.
+    pub fn from_running_service_with_events_and_handler_config(
+        server_id: impl Into<McpServerId>,
+        service: RmcpClientService,
+        notifications: mpsc::UnboundedReceiver<McpServerNotification>,
+        events: broadcast::Sender<McpServerEvent>,
+        handler_config: McpHandlerConfig,
+    ) -> Self {
         let capabilities = service
             .peer_info()
             .map(|info| rmcp_server_capabilities_to_agentkit(&info.capabilities))
@@ -1254,7 +1486,7 @@ impl McpConnection {
             auth: Mutex::new(None),
             notifications: Mutex::new(notifications),
             events,
-            handler_config: McpHandlerConfig::default(),
+            handler_config,
             capabilities,
         }
     }
@@ -2480,6 +2712,29 @@ impl McpToolAdapter {
             spec,
         }
     }
+
+    async fn handle_invocation_error(
+        &self,
+        err: McpInvocationError,
+        input: &Value,
+    ) -> Result<CallToolResult, ToolError> {
+        let Some(responder) = self.connection.handler_config().error_responder.clone() else {
+            return Err(ToolError::ExecutionFailed(err.to_string()));
+        };
+        let method = McpMethod::ToolsCall {
+            name: self.tool_name.clone(),
+            arguments: input.clone(),
+        };
+        let ctx = McpErrorContext {
+            server_id: self.connection.server_id(),
+            method: &method,
+            input: Some(input),
+        };
+        match responder.handle(&err, ctx).await {
+            ErrorResponderOutcome::SynthesizeResult(result) => Ok(result),
+            ErrorResponderOutcome::PassThrough => Err(ToolError::ExecutionFailed(err.to_string())),
+        }
+    }
 }
 
 #[async_trait]
@@ -2531,17 +2786,25 @@ impl Tool for McpToolAdapter {
                         ));
                     }
                 }
-                self.connection
-                    .call_tool(&self.tool_name, input)
+                match self
+                    .connection
+                    .call_tool(&self.tool_name, input.clone())
                     .await
-                    .map_err(|err| match err {
-                        McpError::AuthRequired(req) => ToolError::ExecutionFailed(format!(
+                {
+                    Ok(result) => result,
+                    Err(McpError::AuthRequired(req)) => {
+                        return Err(ToolError::ExecutionFailed(format!(
                             "MCP auth challenge unresolved after retry: {}",
                             req.id
-                        )),
-                        other => ToolError::ExecutionFailed(other.to_string()),
-                    })?
+                        )));
+                    }
+                    Err(McpError::Invocation(err)) => {
+                        self.handle_invocation_error(err, &input).await?
+                    }
+                    Err(other) => return Err(ToolError::ExecutionFailed(other.to_string())),
+                }
             }
+            Err(McpError::Invocation(err)) => self.handle_invocation_error(err, &input).await?,
             Err(other) => return Err(ToolError::ExecutionFailed(other.to_string())),
         };
 
@@ -2836,7 +3099,7 @@ fn rmcp_initialize_error(config: &McpServerConfig, error: ClientInitializeError)
 }
 
 fn rmcp_service_error(error: ServiceError) -> McpError {
-    McpError::Invocation(error.to_string())
+    service_error_to_mcp_error(error)
 }
 
 fn rmcp_operation_error(
@@ -2852,7 +3115,16 @@ fn rmcp_operation_error(
             &error.to_string(),
         )));
     }
-    McpError::Invocation(error.to_string())
+    service_error_to_mcp_error(error)
+}
+
+fn service_error_to_mcp_error(error: ServiceError) -> McpError {
+    match error {
+        ServiceError::McpError(data) => {
+            McpError::Invocation(McpInvocationError::from_error_data(data))
+        }
+        other => McpError::Transport(other.to_string()),
+    }
 }
 
 #[derive(Debug)]
@@ -2935,23 +3207,55 @@ fn auth_request_from_signal(
     }
 }
 
-/// Typed dispatch for MCP requests that may surface auth challenges. Each
-/// peer call constructs the matching variant; [`auth_request_from_signal`]
-/// converts to a public [`AuthOperation`] (typed for the four common cases,
-/// [`AuthOperation::McpOther`] for the long tail).
+/// Typed dispatch for MCP requests that may surface auth or invocation
+/// errors. Each peer call constructs the matching variant;
+/// [`auth_request_from_signal`] converts to a public [`AuthOperation`]
+/// (typed for the four common cases, [`AuthOperation::McpOther`] for the
+/// long tail). The same value is also exposed to [`McpErrorResponder`]
+/// implementations via [`McpErrorContext::method`].
 #[derive(Debug, Clone)]
-enum McpMethod {
+pub enum McpMethod {
+    /// `initialize` — the MCP handshake.
     Initialize,
-    ToolsCall { name: String, arguments: Value },
-    ResourcesRead { uri: String },
-    ResourcesSubscribe { uri: String },
-    ResourcesUnsubscribe { uri: String },
-    PromptsGet { name: String, arguments: Value },
-    LoggingSetLevel { level: String },
+    /// `tools/call`.
+    ToolsCall {
+        /// The raw MCP tool name (no agentkit namespacing).
+        name: String,
+        /// The arguments object as sent to the server.
+        arguments: Value,
+    },
+    /// `resources/read`.
+    ResourcesRead {
+        /// Resource URI being read.
+        uri: String,
+    },
+    /// `resources/subscribe`.
+    ResourcesSubscribe {
+        /// Resource URI being subscribed to.
+        uri: String,
+    },
+    /// `resources/unsubscribe`.
+    ResourcesUnsubscribe {
+        /// Resource URI being unsubscribed from.
+        uri: String,
+    },
+    /// `prompts/get`.
+    PromptsGet {
+        /// The raw MCP prompt name.
+        name: String,
+        /// Arguments forwarded to the prompt.
+        arguments: Value,
+    },
+    /// `logging/setLevel`.
+    LoggingSetLevel {
+        /// Negotiated minimum log severity, formatted for diagnostics.
+        level: String,
+    },
 }
 
 impl McpMethod {
-    fn method_name(&self) -> &'static str {
+    /// Returns the JSON-RPC method name (e.g. `"tools/call"`).
+    pub fn method_name(&self) -> &'static str {
         match self {
             Self::Initialize => "initialize",
             Self::ToolsCall { .. } => "tools/call",
@@ -3037,9 +3341,9 @@ pub enum McpError {
     /// An error occurred while resolving or replaying authentication.
     #[error("auth resolution error: {0}")]
     AuthResolution(String),
-    /// The MCP server returned an error for the invoked method.
+    /// The MCP server returned a JSON-RPC error for the invoked method.
     #[error("invocation error: {0}")]
-    Invocation(String),
+    Invocation(McpInvocationError),
     /// The referenced server ID is not registered in the [`McpServerManager`].
     #[error("unknown MCP server: {0}")]
     UnknownServer(String),

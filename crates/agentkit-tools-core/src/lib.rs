@@ -23,7 +23,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use agentkit_capabilities::{
@@ -37,7 +37,7 @@ use agentkit_core::{
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use thiserror::Error;
 
 /// Re-exports used by the `#[tool]` proc macro so generated code does not
@@ -159,6 +159,75 @@ impl ToolAnnotations {
     }
 }
 
+/// Metadata key used by tool specs to advertise their preferred output
+/// overflow behaviour. Hosts can respect this through
+/// [`ConfigurableToolOutputTruncationStrategy`], while still overriding
+/// individual tools in executor configuration.
+pub const TOOL_OUTPUT_LIMIT_METADATA_KEY: &str = "agentkit.tool_output_limit";
+
+/// What the executor should do when a tool result exceeds its configured
+/// model-facing byte budget.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolOutputOverflowAction {
+    /// Return an execution failure instead of placing an oversized result in
+    /// the transcript. Use this for readback tools where silent truncation
+    /// would reintroduce an unbounded loop.
+    Fail,
+    /// Clip the output inline with an explicit truncation marker.
+    InlineClip,
+    /// Store the full output in the configured tool-result artifact store and
+    /// return a small pointer envelope that can be read back with
+    /// `tool_result_read`.
+    StoreForReadback,
+}
+
+/// Per-tool output limit configuration.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolOutputLimit {
+    /// Maximum model-facing bytes allowed for this tool result.
+    pub max_bytes: usize,
+    /// Overflow behaviour once `max_bytes` is exceeded.
+    pub action: ToolOutputOverflowAction,
+}
+
+impl ToolOutputLimit {
+    /// Fail execution if output exceeds `max_bytes`.
+    pub fn fail(max_bytes: usize) -> Self {
+        Self {
+            max_bytes,
+            action: ToolOutputOverflowAction::Fail,
+        }
+    }
+
+    /// Clip output inline if it exceeds `max_bytes`.
+    pub fn inline_clip(max_bytes: usize) -> Self {
+        Self {
+            max_bytes,
+            action: ToolOutputOverflowAction::InlineClip,
+        }
+    }
+
+    /// Store oversized output in the configured artifact store for bounded
+    /// readback.
+    pub fn store_for_readback(max_bytes: usize) -> Self {
+        Self {
+            max_bytes,
+            action: ToolOutputOverflowAction::StoreForReadback,
+        }
+    }
+
+    fn to_metadata_value(&self) -> Value {
+        serde_json::to_value(self).expect("ToolOutputLimit serializes")
+    }
+
+    fn from_metadata(metadata: &MetadataMap) -> Option<Self> {
+        metadata
+            .get(TOOL_OUTPUT_LIMIT_METADATA_KEY)
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
+    }
+}
+
 /// Declarative specification of a tool's identity, schema, and behavioural hints.
 ///
 /// Every [`Tool`] implementation exposes a `ToolSpec` that the framework uses to
@@ -269,6 +338,19 @@ impl ToolSpec {
     /// Replaces the tool metadata.
     pub fn with_metadata(mut self, metadata: MetadataMap) -> Self {
         self.metadata = metadata;
+        self
+    }
+
+    /// Advertises this tool's preferred output overflow behaviour.
+    ///
+    /// This is advisory metadata: hosts opt into it by configuring an output
+    /// truncation strategy that reads tool metadata. Executor-level per-tool
+    /// overrides still take precedence.
+    pub fn with_output_limit(mut self, limit: ToolOutputLimit) -> Self {
+        self.metadata.insert(
+            TOOL_OUTPUT_LIMIT_METADATA_KEY.to_string(),
+            limit.to_metadata_value(),
+        );
         self
     }
 }
@@ -445,6 +527,474 @@ impl OwnedToolContext {
             cancellation: self.cancellation.clone(),
         }
     }
+}
+
+/// Context passed to a tool-output truncation strategy after a tool invocation
+/// succeeds and before the result is appended to the transcript.
+#[derive(Clone, Debug)]
+pub struct ToolOutputTruncationContext {
+    pub tool_name: ToolName,
+    pub call_id: ToolCallId,
+    pub session_id: SessionId,
+    pub turn_id: TurnId,
+    pub tool_spec: ToolSpec,
+}
+
+impl From<(&ToolRequest, ToolSpec)> for ToolOutputTruncationContext {
+    fn from((request, tool_spec): (&ToolRequest, ToolSpec)) -> Self {
+        Self {
+            tool_name: request.tool_name.clone(),
+            call_id: request.call_id.clone(),
+            session_id: request.session_id.clone(),
+            turn_id: request.turn_id.clone(),
+            tool_spec,
+        }
+    }
+}
+
+/// Strategy hook for enforcing model-facing tool-output budgets.
+///
+/// This runs centrally in [`BasicToolExecutor`], so it applies uniformly to
+/// native tools, filesystem tools, MCP tools, and any custom tool source.
+#[async_trait]
+pub trait ToolOutputTruncationStrategy: Send + Sync {
+    async fn apply(
+        &self,
+        ctx: ToolOutputTruncationContext,
+        output: ToolOutput,
+    ) -> Result<ToolOutput, ToolError>;
+}
+
+/// Identifier returned when oversized tool output is stored out-of-band.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ToolOutputArtifactId(pub String);
+
+impl fmt::Display for ToolOutputArtifactId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// Stored representation of an oversized tool result.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolOutputArtifact {
+    pub id: ToolOutputArtifactId,
+    pub tool_name: ToolName,
+    pub call_id: ToolCallId,
+    pub session_id: SessionId,
+    pub turn_id: TurnId,
+    pub original_bytes: usize,
+    pub body: String,
+}
+
+/// Bounded UTF-8 slice of a stored tool-result artifact.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolOutputArtifactSlice {
+    pub id: ToolOutputArtifactId,
+    pub offset: usize,
+    pub next_offset: usize,
+    pub original_bytes: usize,
+    pub eof: bool,
+    pub content: String,
+}
+
+#[async_trait]
+pub trait ToolOutputArtifactStore: Send + Sync {
+    async fn put(
+        &self,
+        ctx: &ToolOutputTruncationContext,
+        body: String,
+        original_bytes: usize,
+    ) -> Result<ToolOutputArtifact, ToolError>;
+
+    async fn read(
+        &self,
+        id: &ToolOutputArtifactId,
+        offset: usize,
+        max_bytes: usize,
+    ) -> Result<ToolOutputArtifactSlice, ToolError>;
+}
+
+/// Process-local artifact store for oversized tool results.
+#[derive(Debug, Default)]
+pub struct InMemoryToolOutputArtifactStore {
+    next_id: AtomicU64,
+    artifacts: Mutex<BTreeMap<ToolOutputArtifactId, ToolOutputArtifact>>,
+}
+
+impl InMemoryToolOutputArtifactStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+#[async_trait]
+impl ToolOutputArtifactStore for InMemoryToolOutputArtifactStore {
+    async fn put(
+        &self,
+        ctx: &ToolOutputTruncationContext,
+        body: String,
+        original_bytes: usize,
+    ) -> Result<ToolOutputArtifact, ToolError> {
+        let n = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let id = ToolOutputArtifactId(format!(
+            "{}:{}:{}",
+            sanitize_artifact_id_component(ctx.session_id.0.as_str()),
+            sanitize_artifact_id_component(ctx.call_id.0.as_str()),
+            n
+        ));
+        let artifact = ToolOutputArtifact {
+            id: id.clone(),
+            tool_name: ctx.tool_name.clone(),
+            call_id: ctx.call_id.clone(),
+            session_id: ctx.session_id.clone(),
+            turn_id: ctx.turn_id.clone(),
+            original_bytes,
+            body,
+        };
+        self.artifacts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, artifact.clone());
+        Ok(artifact)
+    }
+
+    async fn read(
+        &self,
+        id: &ToolOutputArtifactId,
+        offset: usize,
+        max_bytes: usize,
+    ) -> Result<ToolOutputArtifactSlice, ToolError> {
+        let artifact = self
+            .artifacts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .cloned()
+            .ok_or_else(|| {
+                ToolError::InvalidInput(format!("unknown tool result artifact: {id}"))
+            })?;
+        let body = artifact.body;
+        if offset > body.len() || !body.is_char_boundary(offset) {
+            return Err(ToolError::InvalidInput(format!(
+                "offset {offset} is not a UTF-8 boundary in tool result artifact {id}"
+            )));
+        }
+        let requested_end = offset.saturating_add(max_bytes).min(body.len());
+        let end = body.floor_char_boundary(requested_end);
+        Ok(ToolOutputArtifactSlice {
+            id: id.clone(),
+            offset,
+            next_offset: end,
+            original_bytes: artifact.original_bytes,
+            eof: end == body.len(),
+            content: body[offset..end].to_string(),
+        })
+    }
+}
+
+fn sanitize_artifact_id_component(s: &str) -> String {
+    let cleaned: String = s
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(64)
+        .collect();
+    if cleaned.is_empty() {
+        "_".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// Configurable truncation strategy with executor-level defaults, per-tool
+/// overrides, and optional tool-metadata defaults.
+pub struct ConfigurableToolOutputTruncationStrategy {
+    default_limit: Option<ToolOutputLimit>,
+    per_tool_limits: BTreeMap<ToolName, ToolOutputLimit>,
+    use_tool_metadata: bool,
+    store: Arc<dyn ToolOutputArtifactStore>,
+}
+
+impl ConfigurableToolOutputTruncationStrategy {
+    pub fn new(store: Arc<dyn ToolOutputArtifactStore>) -> Self {
+        Self {
+            default_limit: None,
+            per_tool_limits: BTreeMap::new(),
+            use_tool_metadata: true,
+            store,
+        }
+    }
+
+    pub fn with_default_limit(mut self, limit: ToolOutputLimit) -> Self {
+        self.default_limit = Some(limit);
+        self
+    }
+
+    pub fn with_tool_limit(
+        mut self,
+        tool_name: impl Into<ToolName>,
+        limit: ToolOutputLimit,
+    ) -> Self {
+        self.per_tool_limits.insert(tool_name.into(), limit);
+        self
+    }
+
+    pub fn use_tool_metadata(mut self, value: bool) -> Self {
+        self.use_tool_metadata = value;
+        self
+    }
+
+    fn limit_for(&self, ctx: &ToolOutputTruncationContext) -> Option<ToolOutputLimit> {
+        self.per_tool_limits
+            .get(&ctx.tool_name)
+            .cloned()
+            .or_else(|| {
+                self.use_tool_metadata
+                    .then(|| ToolOutputLimit::from_metadata(&ctx.tool_spec.metadata))
+                    .flatten()
+            })
+            .or_else(|| self.default_limit.clone())
+    }
+}
+
+#[async_trait]
+impl ToolOutputTruncationStrategy for ConfigurableToolOutputTruncationStrategy {
+    async fn apply(
+        &self,
+        ctx: ToolOutputTruncationContext,
+        output: ToolOutput,
+    ) -> Result<ToolOutput, ToolError> {
+        let Some(limit) = self.limit_for(&ctx) else {
+            return Ok(output);
+        };
+        let model_bytes = tool_output_model_bytes(&output);
+        if model_bytes <= limit.max_bytes {
+            return Ok(output);
+        }
+
+        match limit.action {
+            ToolOutputOverflowAction::Fail => Err(ToolError::ExecutionFailed(format!(
+                "tool {} produced {model_bytes} bytes, exceeding configured limit of {} bytes",
+                ctx.tool_name, limit.max_bytes
+            ))),
+            ToolOutputOverflowAction::InlineClip => Ok(clip_tool_output_inline(
+                output,
+                limit.max_bytes,
+                model_bytes,
+            )),
+            ToolOutputOverflowAction::StoreForReadback => {
+                let body = tool_output_readback_body(&output);
+                let artifact = self.store.put(&ctx, body, model_bytes).await?;
+                Ok(fit_structured_tool_output(
+                    json!({
+                        "truncated": true,
+                        "tool_result_id": artifact.id.0,
+                        "read_tool": TOOL_RESULT_READ_TOOL_NAME,
+                        "read_args": {
+                            "id": artifact.id.0,
+                            "offset": 0,
+                            "limit": limit.max_bytes
+                        },
+                        "original_bytes": artifact.original_bytes,
+                    }),
+                    limit.max_bytes,
+                ))
+            }
+        }
+    }
+}
+
+fn tool_output_model_bytes(output: &ToolOutput) -> usize {
+    match output {
+        ToolOutput::Text(s) => s.len(),
+        other => serde_json::to_string(other)
+            .map(|s| s.len())
+            .unwrap_or(usize::MAX),
+    }
+}
+
+fn tool_output_readback_body(output: &ToolOutput) -> String {
+    match output {
+        ToolOutput::Text(s) => s.clone(),
+        ToolOutput::Structured(value) => {
+            serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+        }
+        ToolOutput::Parts(parts) => serde_json::to_string_pretty(parts).unwrap_or_default(),
+        ToolOutput::Files(files) => serde_json::to_string_pretty(files).unwrap_or_default(),
+    }
+}
+
+fn clip_tool_output_inline(
+    output: ToolOutput,
+    max_bytes: usize,
+    original_bytes: usize,
+) -> ToolOutput {
+    match output {
+        ToolOutput::Text(s) => {
+            ToolOutput::Text(clip_string_with_marker(&s, max_bytes, original_bytes))
+        }
+        other => {
+            let body = tool_output_readback_body(&other);
+            fit_structured_tool_output(
+                json!({
+                    "truncated": true,
+                    "original_bytes": original_bytes,
+                    "content": body,
+                }),
+                max_bytes,
+            )
+        }
+    }
+}
+
+fn clip_string_with_marker(s: &str, max_bytes: usize, original_bytes: usize) -> String {
+    let marker = format!("\n[tool output truncated: original_bytes={original_bytes}]");
+    if marker.len() >= max_bytes {
+        let cut = marker.floor_char_boundary(max_bytes.min(marker.len()));
+        return marker[..cut].to_string();
+    }
+    let keep_bytes = max_bytes.saturating_sub(marker.len());
+    let cut = s.floor_char_boundary(keep_bytes.min(s.len()));
+    format!("{}{}", &s[..cut], marker)
+}
+
+fn fit_structured_tool_output(mut value: Value, max_bytes: usize) -> ToolOutput {
+    loop {
+        let output = ToolOutput::Structured(value.clone());
+        if tool_output_model_bytes(&output) <= max_bytes {
+            return output;
+        }
+
+        let Some(Value::String(content)) = value.get_mut("content") else {
+            return ToolOutput::Structured(json!({
+                "truncated": true,
+                "error": "tool output metadata exceeded configured max_bytes"
+            }));
+        };
+        if content.is_empty() {
+            return ToolOutput::Structured(json!({
+                "truncated": true,
+                "error": "tool output metadata exceeded configured max_bytes"
+            }));
+        }
+
+        let current_len = content.len();
+        let shrink_by = tool_output_model_bytes(&output)
+            .saturating_sub(max_bytes)
+            .saturating_add(32)
+            .min(current_len);
+        let new_len = content.floor_char_boundary(current_len - shrink_by);
+        content.truncate(new_len);
+    }
+}
+
+pub const TOOL_RESULT_READ_TOOL_NAME: &str = "tool_result_read";
+const TOOL_RESULT_READ_OUTPUT_ENVELOPE_BYTES: usize = 4096;
+const TOOL_RESULT_READ_JSON_ESCAPE_BYTES_PER_INPUT_BYTE: usize = 6;
+
+/// Read back a bounded slice from an oversized tool result stored by
+/// [`ConfigurableToolOutputTruncationStrategy`].
+#[derive(Clone)]
+pub struct ToolResultReadTool {
+    spec: ToolSpec,
+    store: Arc<dyn ToolOutputArtifactStore>,
+    max_read_bytes: usize,
+}
+
+impl ToolResultReadTool {
+    pub fn new(store: Arc<dyn ToolOutputArtifactStore>, max_read_bytes: usize) -> Self {
+        Self {
+            spec: ToolSpec::new(
+                TOOL_RESULT_READ_TOOL_NAME,
+                "Read a bounded UTF-8 byte slice from a stored oversized tool result.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string" },
+                        "offset": { "type": "integer", "minimum": 0 },
+                        "limit": { "type": "integer", "minimum": 1 }
+                    },
+                    "required": ["id", "offset", "limit"],
+                    "additionalProperties": false
+                }),
+            )
+            .with_annotations(ToolAnnotations {
+                read_only_hint: true,
+                idempotent_hint: true,
+                ..ToolAnnotations::default()
+            })
+            .with_output_limit(ToolOutputLimit::fail(
+                max_read_bytes
+                    .saturating_mul(TOOL_RESULT_READ_JSON_ESCAPE_BYTES_PER_INPUT_BYTE)
+                    .saturating_add(TOOL_RESULT_READ_OUTPUT_ENVELOPE_BYTES),
+            )),
+            store,
+            max_read_bytes,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct ToolResultReadInput {
+    id: String,
+    offset: usize,
+    limit: usize,
+}
+
+#[async_trait]
+impl Tool for ToolResultReadTool {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    async fn invoke(
+        &self,
+        request: ToolRequest,
+        _ctx: &mut ToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
+        let input: ToolResultReadInput = serde_json::from_value(request.input.clone())
+            .map_err(|error| ToolError::InvalidInput(format!("invalid tool input: {error}")))?;
+        if input.limit == 0 {
+            return Err(ToolError::InvalidInput(
+                "limit must be greater than 0".to_string(),
+            ));
+        }
+        if input.limit > self.max_read_bytes {
+            return Err(ToolError::InvalidInput(format!(
+                "limit {} exceeds maximum read size of {} bytes",
+                input.limit, self.max_read_bytes
+            )));
+        }
+        let slice = self
+            .store
+            .read(&ToolOutputArtifactId(input.id), input.offset, input.limit)
+            .await?;
+        Ok(ToolResult::new(ToolResultPart::success(
+            request.call_id,
+            ToolOutput::Structured(json!({
+                "id": slice.id.0,
+                "offset": slice.offset,
+                "next_offset": slice.next_offset,
+                "original_bytes": slice.original_bytes,
+                "eof": slice.eof,
+                "content": slice.content,
+            })),
+        )))
+    }
+}
+
+/// Convenience registry for safe tool-output readback.
+pub fn tool_result_readback_registry(
+    store: Arc<dyn ToolOutputArtifactStore>,
+    max_read_bytes: usize,
+) -> ToolRegistry {
+    ToolRegistry::new().with(ToolResultReadTool::new(store, max_read_bytes))
 }
 
 /// A description of an operation that requires permission before it can proceed.
@@ -2713,6 +3263,7 @@ pub enum CollisionPolicy {
 pub struct BasicToolExecutor {
     sources: Vec<Arc<dyn ToolSource>>,
     collision: CollisionPolicy,
+    output_truncation: Option<Arc<dyn ToolOutputTruncationStrategy>>,
 }
 
 impl BasicToolExecutor {
@@ -2721,6 +3272,7 @@ impl BasicToolExecutor {
         Self {
             sources: sources.into_iter().collect(),
             collision: CollisionPolicy::default(),
+            output_truncation: None,
         }
     }
 
@@ -2733,6 +3285,26 @@ impl BasicToolExecutor {
     /// multiple sources.
     pub fn with_collision_policy(mut self, policy: CollisionPolicy) -> Self {
         self.collision = policy;
+        self
+    }
+
+    /// Installs a central tool-output truncation strategy. The strategy runs
+    /// after every successful tool invocation and before the result is returned
+    /// to the agent loop.
+    pub fn with_output_truncation_strategy(
+        mut self,
+        strategy: impl ToolOutputTruncationStrategy + 'static,
+    ) -> Self {
+        self.output_truncation = Some(Arc::new(strategy));
+        self
+    }
+
+    /// Installs a pre-wrapped central tool-output truncation strategy.
+    pub fn with_output_truncation_strategy_arc(
+        mut self,
+        strategy: Arc<dyn ToolOutputTruncationStrategy>,
+    ) -> Self {
+        self.output_truncation = Some(strategy);
         self
     }
 
@@ -2796,8 +3368,19 @@ impl BasicToolExecutor {
             Err(error) => return ToolExecutionOutcome::Failed(error),
         }
 
+        let truncation_ctx = ToolOutputTruncationContext::from((&request, tool.spec().clone()));
         match tool.invoke(request, ctx).await {
-            Ok(result) => ToolExecutionOutcome::Completed(result),
+            Ok(mut result) => {
+                if let Some(strategy) = &self.output_truncation {
+                    match strategy.apply(truncation_ctx, result.result.output).await {
+                        Ok(output) => {
+                            result.result.output = output;
+                        }
+                        Err(error) => return ToolExecutionOutcome::Failed(error),
+                    }
+                }
+                ToolExecutionOutcome::Completed(result)
+            }
             Err(error) => ToolExecutionOutcome::Failed(error),
         }
     }
@@ -3363,6 +3946,271 @@ mod tests {
             ToolOutput::Text(text) => assert_eq!(text, "get_temp"),
             other => panic!("unexpected output: {other:?}"),
         }
+    }
+
+    #[derive(Clone)]
+    struct StaticOutputTool {
+        spec: ToolSpec,
+        output: ToolOutput,
+    }
+
+    impl StaticOutputTool {
+        fn new(name: &str, output: ToolOutput) -> Self {
+            Self {
+                spec: ToolSpec::new(name, format!("static {name}"), json!({"type": "object"})),
+                output,
+            }
+        }
+
+        fn with_output_limit(mut self, limit: ToolOutputLimit) -> Self {
+            self.spec = self.spec.with_output_limit(limit);
+            self
+        }
+    }
+
+    #[async_trait]
+    impl Tool for StaticOutputTool {
+        fn spec(&self) -> &ToolSpec {
+            &self.spec
+        }
+
+        async fn invoke(
+            &self,
+            request: ToolRequest,
+            _ctx: &mut ToolContext<'_>,
+        ) -> Result<ToolResult, ToolError> {
+            Ok(ToolResult::new(ToolResultPart::success(
+                request.call_id,
+                self.output.clone(),
+            )))
+        }
+    }
+
+    fn test_context() -> OwnedToolContext {
+        OwnedToolContext {
+            session_id: SessionId::new("s"),
+            turn_id: TurnId::new("t"),
+            metadata: MetadataMap::new(),
+            permissions: Arc::new(AllowAllPermissions),
+            resources: Arc::new(()),
+            cancellation: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn executor_stores_oversized_output_using_tool_metadata_limit() {
+        let store = Arc::new(InMemoryToolOutputArtifactStore::new());
+        let strategy = ConfigurableToolOutputTruncationStrategy::new(store.clone());
+        let tool = StaticOutputTool::new("big", ToolOutput::text("x".repeat(500)))
+            .with_output_limit(ToolOutputLimit::store_for_readback(300));
+        let executor = BasicToolExecutor::from_registry(ToolRegistry::new().with(tool))
+            .with_output_truncation_strategy(strategy);
+
+        let outcome = executor
+            .execute_owned(
+                ToolRequest::new(
+                    "call",
+                    "big",
+                    json!({}),
+                    SessionId::new("s"),
+                    TurnId::new("t"),
+                ),
+                test_context(),
+            )
+            .await;
+
+        let ToolExecutionOutcome::Completed(result) = outcome else {
+            panic!("expected completed outcome, got {outcome:?}");
+        };
+        let ToolOutput::Structured(envelope) = result.result.output else {
+            panic!("expected truncation envelope");
+        };
+        assert_eq!(envelope["truncated"], true);
+        assert_eq!(envelope["read_tool"], TOOL_RESULT_READ_TOOL_NAME);
+        let id = envelope["tool_result_id"].as_str().expect("tool_result_id");
+
+        let slice = store
+            .read(&ToolOutputArtifactId(id.to_string()), 0, 50)
+            .await
+            .expect("read artifact");
+        assert_eq!(slice.content, "x".repeat(50));
+        assert_eq!(slice.next_offset, 50);
+        assert!(!slice.eof);
+    }
+
+    #[tokio::test]
+    async fn tool_result_read_enforces_explicit_max_read_size() {
+        let store = Arc::new(InMemoryToolOutputArtifactStore::new());
+        let spec = ToolSpec::new("big", "big output", json!({"type": "object"}));
+        let request = ToolRequest::new(
+            "call",
+            "big",
+            json!({}),
+            SessionId::new("s"),
+            TurnId::new("t"),
+        );
+        let ctx = ToolOutputTruncationContext::from((&request, spec));
+        let artifact = store
+            .put(&ctx, "abcdef".to_string(), 6)
+            .await
+            .expect("store artifact");
+        let tool = ToolResultReadTool::new(store, 4);
+        let owned_ctx = test_context();
+        let mut tool_ctx = owned_ctx.borrowed();
+
+        let err = tool
+            .invoke(
+                ToolRequest::new(
+                    "read-call",
+                    TOOL_RESULT_READ_TOOL_NAME,
+                    json!({"id": artifact.id.0, "offset": 0, "limit": 5}),
+                    SessionId::new("s"),
+                    TurnId::new("t"),
+                ),
+                &mut tool_ctx,
+            )
+            .await
+            .expect_err("read past max must fail");
+        match err {
+            ToolError::InvalidInput(message) => assert!(message.contains("exceeds maximum")),
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_result_read_rejects_zero_limit() {
+        let store = Arc::new(InMemoryToolOutputArtifactStore::new());
+        let spec = ToolSpec::new("big", "big output", json!({"type": "object"}));
+        let request = ToolRequest::new(
+            "call",
+            "big",
+            json!({}),
+            SessionId::new("s"),
+            TurnId::new("t"),
+        );
+        let ctx = ToolOutputTruncationContext::from((&request, spec));
+        let artifact = store
+            .put(&ctx, "abcdef".to_string(), 6)
+            .await
+            .expect("store artifact");
+        let tool = ToolResultReadTool::new(store, 4);
+        let owned_ctx = test_context();
+        let mut tool_ctx = owned_ctx.borrowed();
+
+        let err = tool
+            .invoke(
+                ToolRequest::new(
+                    "read-call",
+                    TOOL_RESULT_READ_TOOL_NAME,
+                    json!({"id": artifact.id.0, "offset": 0, "limit": 0}),
+                    SessionId::new("s"),
+                    TurnId::new("t"),
+                ),
+                &mut tool_ctx,
+            )
+            .await
+            .expect_err("zero limit must fail");
+        match err {
+            ToolError::InvalidInput(message) => assert!(message.contains("greater than 0")),
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_result_read_executor_allows_full_content_limit_with_envelope() {
+        let store = Arc::new(InMemoryToolOutputArtifactStore::new());
+        let spec = ToolSpec::new("big", "big output", json!({"type": "object"}));
+        let request = ToolRequest::new(
+            "call",
+            "big",
+            json!({}),
+            SessionId::new("s"),
+            TurnId::new("t"),
+        );
+        let ctx = ToolOutputTruncationContext::from((&request, spec));
+        let artifact = store
+            .put(&ctx, "abcd".to_string(), 4)
+            .await
+            .expect("store artifact");
+        let executor = BasicToolExecutor::from_registry(
+            ToolRegistry::new().with(ToolResultReadTool::new(store.clone(), 4)),
+        )
+        .with_output_truncation_strategy(ConfigurableToolOutputTruncationStrategy::new(store));
+
+        let outcome = executor
+            .execute_owned(
+                ToolRequest::new(
+                    "read-call",
+                    TOOL_RESULT_READ_TOOL_NAME,
+                    json!({"id": artifact.id.0, "offset": 0, "limit": 4}),
+                    SessionId::new("s"),
+                    TurnId::new("t"),
+                ),
+                test_context(),
+            )
+            .await;
+
+        let ToolExecutionOutcome::Completed(result) = outcome else {
+            panic!("expected completed outcome, got {outcome:?}");
+        };
+        let ToolOutput::Structured(output) = result.result.output else {
+            panic!("expected structured readback output");
+        };
+        assert_eq!(output["content"], "abcd");
+        assert_eq!(output["eof"], true);
+    }
+
+    #[tokio::test]
+    async fn tool_result_read_executor_allows_json_escaped_full_content_limit() {
+        let store = Arc::new(InMemoryToolOutputArtifactStore::new());
+        let spec = ToolSpec::new("big", "big output", json!({"type": "object"}));
+        let request = ToolRequest::new(
+            "call",
+            "big",
+            json!({}),
+            SessionId::new("s"),
+            TurnId::new("t"),
+        );
+        let ctx = ToolOutputTruncationContext::from((&request, spec));
+        let content = "\0".repeat(4);
+        let artifact = store
+            .put(&ctx, content.clone(), content.len())
+            .await
+            .expect("store artifact");
+        let executor = BasicToolExecutor::from_registry(
+            ToolRegistry::new().with(ToolResultReadTool::new(store.clone(), 4)),
+        )
+        .with_output_truncation_strategy(ConfigurableToolOutputTruncationStrategy::new(store));
+
+        let outcome = executor
+            .execute_owned(
+                ToolRequest::new(
+                    "read-call",
+                    TOOL_RESULT_READ_TOOL_NAME,
+                    json!({"id": artifact.id.0, "offset": 0, "limit": 4}),
+                    SessionId::new("s"),
+                    TurnId::new("t"),
+                ),
+                test_context(),
+            )
+            .await;
+
+        let ToolExecutionOutcome::Completed(result) = outcome else {
+            panic!("expected completed outcome, got {outcome:?}");
+        };
+        let ToolOutput::Structured(output) = result.result.output else {
+            panic!("expected structured readback output");
+        };
+        assert_eq!(output["content"], content);
+        assert_eq!(output["eof"], true);
+    }
+
+    #[test]
+    fn inline_clip_respects_limit_when_marker_exceeds_budget() {
+        let clipped = clip_string_with_marker("abcdef", 8, 1000);
+
+        assert!(clipped.len() <= 8);
+        assert!(clipped.is_char_boundary(clipped.len()));
     }
 
     #[test]
