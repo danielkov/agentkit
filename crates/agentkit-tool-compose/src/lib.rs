@@ -225,17 +225,14 @@ impl ComposeTool {
             if catalog.is_empty() {
                 return description;
             }
-            description.push_str("\n\nTools accessible from inside the Lua script:\n");
+            description.push_str(
+                "\n\nReturn shapes of tools accessible via tool(name, input) (input schemas are \
+                 already provided by the top-level tool catalog):\n",
+            );
             for spec in catalog {
                 description.push_str("\n- ");
                 description.push_str(spec.name.0.as_str());
-                if !spec.description.is_empty() {
-                    description.push_str(" — ");
-                    description.push_str(spec.description.trim());
-                }
-                description.push_str("\n  input: ");
-                description.push_str(&Self::compact_schema(&spec.input_schema));
-                description.push_str("\n  output: ");
+                description.push_str(": ");
                 match spec.output_schema.as_ref() {
                     Some(schema) => description.push_str(&Self::compact_schema(schema)),
                     None => description.push_str("<undocumented>"),

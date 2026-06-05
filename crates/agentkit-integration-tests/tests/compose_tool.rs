@@ -241,9 +241,7 @@ async fn compose_tools_listing_excludes_compose_and_lists_children() {
         ToolSpec::new("reverse", "reverse input", json!({"type": "object"})),
         |request| Ok(ToolOutput::structured(request.input.clone())),
     );
-    let tools = agentkit_tool_compose::registry()
-        .with(echo)
-        .with(reverse);
+    let tools = agentkit_tool_compose::registry().with(echo).with(reverse);
     let agent = Agent::builder()
         .model(adapter)
         .add_tool_source(tools)

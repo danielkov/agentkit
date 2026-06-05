@@ -76,17 +76,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let model_name = config.model.clone();
     let adapter = OpenRouterAdapter::new(config)?;
 
-    // ComposeTool::wrap snapshots each child tool's input/output schema into
-    // the compose tool description, so the model sees the exact return shape
-    // of every tool it might call from Lua (e.g. fs_list_directory returns a
-    // bare array of {name, path, kind}, not an object with .entries). The
-    // wrapped tools stay individually exposed too — compose is an extra
-    // entry point, not a replacement.
+    // ComposeTool::wrap snapshots each child tool's output schema into the compose
+    // tool description, so the model sees the exact return shape of every tool it
+    // might call from Lua. Wrapped tools are exposed individually.
     let tool_source = agentkit_tool_compose::ComposeTool::wrap(
         agentkit_tool_fs::registry().merge(agentkit_tool_shell::registry()),
-    )
-    .with_config(
-        agentkit_tool_compose::ComposeConfig::new().with_max_instruction_count(12_000),
     );
 
     // Restrict the demo to the scratch directory. Anything outside falls
