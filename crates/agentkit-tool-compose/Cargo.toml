@@ -18,3 +18,8 @@ serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 
+[dev-dependencies]
+agentkit-tools-core = { path = "../agentkit-tools-core", features = ["schemars"] }
+agentkit-tools-derive = { path = "../agentkit-tools-derive" }
+schemars = { workspace = true, features = ["derive"] }
+

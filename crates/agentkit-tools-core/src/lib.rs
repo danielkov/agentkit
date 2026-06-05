@@ -266,9 +266,10 @@ pub struct ToolSpec {
     /// Provider APIs (Anthropic, OpenAI, Gemini) don't carry an output schema
     /// in their tool declarations, so this is **not** surfaced verbatim to the
     /// model. Hosts and composing tools may render it into the description, or
-    /// use it for validation. [`ComposeTool::with_catalog`] surfaces it both
-    /// in its compose tool description and through the Lua `tools()` helper so
-    /// composed scripts can target the correct return shape on the first try.
+    /// use it for validation. `ComposeTool::wrap` (in `agentkit-tool-compose`)
+    /// surfaces it both in its compose tool description and through the Lua
+    /// `tools()` helper so composed scripts can target the correct return
+    /// shape on the first try.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub output_schema: Option<Value>,
     /// Advisory behavioural hints (read-only, destructive, etc.).

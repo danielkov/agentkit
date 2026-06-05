@@ -14,7 +14,7 @@ use agentkit_core::{MetadataMap, ToolCallId, ToolOutput, ToolResultPart, TurnCan
 use agentkit_tools_core::{
     ApprovalRequest, PermissionCode, PermissionDenial, Tool, ToolAnnotations, ToolContext,
     ToolError, ToolExecutionOutcome, ToolExecutionScope, ToolInterruption, ToolName, ToolRegistry,
-    ToolRequest, ToolResult, ToolSpec,
+    ToolRequest, ToolResult, ToolSource, ToolSpec,
 };
 use async_trait::async_trait;
 use mlua::{HookTriggers, Lua, LuaSerdeExt, Value as LuaValue, VmState};
@@ -116,37 +116,81 @@ pub struct ComposeTool {
     spec: ToolSpec,
     config: ComposeConfig,
     states: Arc<Mutex<BTreeMap<ToolCallId, ComposeRunState>>>,
+    wrapped: Option<ToolRegistry>,
+    catalog_snapshot: Option<Vec<ToolSpec>>,
 }
 
 impl ComposeTool {
+    /// Builds a compose tool with no catalog snapshot. The tool description
+    /// stays generic; the model has to use `tools()` at runtime to discover
+    /// what's available. Prefer [`wrap`](Self::wrap) when possible — the
+    /// model writes correct scripts on the first try when it sees concrete
+    /// input/output schemas at planning time.
     pub fn new(config: ComposeConfig) -> Self {
-        Self::build(config, None)
+        Self::build(config, None, None)
     }
 
-    /// Builds a compose tool whose description enumerates every tool in
-    /// `catalog` permitted by `config` along with its input and output
-    /// schemas. The model sees those schemas at planning time and can write a
-    /// correct script on the first try instead of probing.
+    /// Wraps a registry of child tools. The resulting [`ToolSource`] still
+    /// advertises every child tool individually to the model AND adds the
+    /// `compose` entry whose description enumerates each child's
+    /// input/output schemas.
     ///
-    /// The snapshot is taken at construction; if the underlying registry can
-    /// change at runtime (e.g. MCP-backed sources), prefer calling this
-    /// builder after every catalog change or stick with [`new`](Self::new).
-    pub fn with_catalog<I>(config: ComposeConfig, catalog: I) -> Self
-    where
-        I: IntoIterator<Item = ToolSpec>,
-    {
-        let snapshot: Vec<ToolSpec> = catalog
-            .into_iter()
-            .filter(|spec| config.allows(&spec.name))
-            .collect();
-        Self::build(config, Some(snapshot))
+    /// ```rust
+    /// use agentkit_core::{ToolOutput, ToolResultPart};
+    /// use agentkit_tool_compose::{ComposeConfig, ComposeTool};
+    /// use agentkit_tools_core::{ToolError, ToolRegistry, ToolResult, ToolSource};
+    /// use agentkit_tools_derive::tool;
+    /// use schemars::JsonSchema;
+    /// use serde::Deserialize;
+    ///
+    /// #[derive(JsonSchema, Deserialize)]
+    /// struct EchoInput { message: String }
+    ///
+    /// /// Echo the input back as the tool result.
+    /// #[tool(read_only)]
+    /// async fn echo(input: EchoInput) -> Result<ToolResult, ToolError> {
+    ///     Ok(ToolResult::new(ToolResultPart::success(
+    ///         "call",
+    ///         ToolOutput::text(input.message),
+    ///     )))
+    /// }
+    ///
+    /// let tool_source = ComposeTool::wrap(ToolRegistry::new().with(echo))
+    ///     .with_config(ComposeConfig::new().with_max_instruction_count(12_000));
+    ///
+    /// // Model sees both `echo` and `compose`; compose's description
+    /// // enumerates echo's input/output schemas.
+    /// let names: Vec<String> = tool_source.specs().into_iter().map(|s| s.name.0).collect();
+    /// assert!(names.iter().any(|n| n == "compose"));
+    /// assert!(names.iter().any(|n| n == "echo"));
+    /// ```
+    pub fn wrap(registry: impl Into<ToolRegistry>) -> Self {
+        let registry = registry.into();
+        let snapshot = registry.specs();
+        Self::build(ComposeConfig::default(), Some(snapshot), Some(registry))
     }
 
-    fn build(config: ComposeConfig, catalog: Option<Vec<ToolSpec>>) -> Self {
+    /// Replaces the configuration and rebuilds the compose tool description so
+    /// it reflects the new permission filter.
+    pub fn with_config(self, config: ComposeConfig) -> Self {
+        Self::build(config, self.catalog_snapshot, self.wrapped)
+    }
+
+    fn build(
+        config: ComposeConfig,
+        catalog_snapshot: Option<Vec<ToolSpec>>,
+        wrapped: Option<ToolRegistry>,
+    ) -> Self {
+        let filtered: Option<Vec<ToolSpec>> = catalog_snapshot.as_ref().map(|snap| {
+            snap.iter()
+                .filter(|spec| config.allows(&spec.name))
+                .cloned()
+                .collect()
+        });
         Self {
             spec: ToolSpec::new(
                 COMPOSE_TOOL_NAME,
-                Self::compose_description(catalog.as_deref()),
+                Self::compose_description(filtered.as_deref()),
                 json!({
                     "type": "object",
                     "properties": {
@@ -165,6 +209,8 @@ impl ComposeTool {
             .with_annotations(ToolAnnotations::new()),
             config,
             states: Arc::new(Mutex::new(BTreeMap::new())),
+            wrapped,
+            catalog_snapshot,
         }
     }
 
@@ -210,6 +256,24 @@ impl ComposeTool {
             .into_iter()
             .filter(|spec| self.config.allows(&spec.name))
             .collect()
+    }
+}
+
+impl ToolSource for ComposeTool {
+    fn specs(&self) -> Vec<ToolSpec> {
+        let mut specs = Vec::new();
+        specs.push(self.spec.clone());
+        if let Some(reg) = &self.wrapped {
+            specs.extend(reg.specs());
+        }
+        specs
+    }
+
+    fn get(&self, name: &ToolName) -> Option<Arc<dyn Tool>> {
+        if name.0.as_str() == COMPOSE_TOOL_NAME {
+            return Some(Arc::new(self.clone()));
+        }
+        self.wrapped.as_ref().and_then(|reg| reg.get(name))
     }
 }
 

@@ -25,7 +25,7 @@ use agentkit_loop::{
 use agentkit_provider_openrouter::{OpenRouterAdapter, OpenRouterConfig};
 use agentkit_tools_core::{
     CommandPolicy, CompositePermissionChecker, PathPolicy, PermissionCode, PermissionDecision,
-    PermissionDenial, ToolRegistry,
+    PermissionDenial,
 };
 
 const SYSTEM_PROMPT: &str = "\
@@ -76,18 +76,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let model_name = config.model.clone();
     let adapter = OpenRouterAdapter::new(config)?;
 
-    // Snapshot the fs + shell catalog first so compose can render every visible
-    // tool's input/output schema into its own description. The model then sees
-    // exact return shapes (e.g. fs_list_directory returns an array, not an
-    // object with .entries) at planning time instead of guessing.
-    let mut tools = ToolRegistry::new();
-    merge_registry(&mut tools, agentkit_tool_fs::registry());
-    merge_registry(&mut tools, agentkit_tool_shell::registry());
-    let catalog_snapshot = tools.specs();
-    tools.register(agentkit_tool_compose::ComposeTool::with_catalog(
-        agentkit_tool_compose::ComposeConfig::default(),
-        catalog_snapshot,
-    ));
+    // ComposeTool::wrap snapshots each child tool's input/output schema into
+    // the compose tool description, so the model sees the exact return shape
+    // of every tool it might call from Lua (e.g. fs_list_directory returns a
+    // bare array of {name, path, kind}, not an object with .entries). The
+    // wrapped tools stay individually exposed too — compose is an extra
+    // entry point, not a replacement.
+    let tool_source = agentkit_tool_compose::ComposeTool::wrap(
+        agentkit_tool_fs::registry().merge(agentkit_tool_shell::registry()),
+    )
+    .with_config(
+        agentkit_tool_compose::ComposeConfig::new().with_max_instruction_count(12_000),
+    );
 
     // Restrict the demo to the scratch directory. Anything outside falls
     // through to the approval-required path (which would surface as a
@@ -122,7 +122,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let agent = Agent::builder()
         .model(adapter)
-        .add_tool_source(tools)
+        .add_tool_source(tool_source)
         .permissions(permissions)
         .transcript(vec![Item::text(ItemKind::System, SYSTEM_PROMPT)])
         .input(vec![Item::text(ItemKind::User, user_prompt)])
@@ -172,10 +172,10 @@ fn render_transcript(transcript: &[Item], cursor: &mut usize) {
     for item in &transcript[*cursor..] {
         for part in &item.parts {
             match part {
-                Part::Text(text) if matches!(item.kind, ItemKind::Assistant) => {
-                    if !text.text.trim().is_empty() {
-                        println!("\nassistant> {}", text.text.trim_end());
-                    }
+                Part::Text(text)
+                    if matches!(item.kind, ItemKind::Assistant) && !text.text.trim().is_empty() =>
+                {
+                    println!("\nassistant> {}", text.text.trim_end());
                 }
                 Part::ToolCall(call) => {
                     println!("\n[tool call] {} (id={})", call.name, call.id.0.as_str());
@@ -193,7 +193,11 @@ fn render_transcript(transcript: &[Item], cursor: &mut usize) {
                     }
                 }
                 Part::ToolResult(result) => {
-                    let label = if result.is_error { "tool error" } else { "tool result" };
+                    let label = if result.is_error {
+                        "tool error"
+                    } else {
+                        "tool result"
+                    };
                     println!("\n[{label}] call_id={}", result.call_id.0.as_str());
                     match &result.output {
                         ToolOutput::Text(text) => println!("{}", text.trim_end()),
@@ -206,7 +210,7 @@ fn render_transcript(transcript: &[Item], cursor: &mut usize) {
                         other => println!("<{other:?}>"),
                     }
                 }
-                _ => {}
+                _ => (),
             }
         }
     }
@@ -225,12 +229,6 @@ async fn prepare_scratch(workspace_root: &Path) -> Result<PathBuf, Box<dyn Error
         tokio::fs::write(scratch.join(name), body).await?;
     }
     Ok(scratch.canonicalize()?)
-}
-
-fn merge_registry(target: &mut ToolRegistry, source: ToolRegistry) {
-    for tool in source.tools() {
-        target.register_arc(tool);
-    }
 }
 
 fn print_banner(model: &str, scratch: &Path) {
