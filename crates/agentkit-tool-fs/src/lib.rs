@@ -423,6 +423,10 @@ impl Default for ReadFileTool {
                     "required": ["path"],
                     "additionalProperties": false
                 }),
+                output_schema: Some(json!({
+                    "type": "string",
+                    "description": "Raw file contents (possibly sliced to the requested line range)."
+                })),
                 annotations: ToolAnnotations {
                     read_only_hint: true,
                     idempotent_hint: true,
@@ -543,6 +547,15 @@ impl Default for WriteFileTool {
                     "required": ["path", "contents"],
                     "additionalProperties": false
                 }),
+                output_schema: Some(json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "bytes_written": { "type": "integer" },
+                        "created": { "type": "boolean", "description": "true if the file did not exist before this call" }
+                    },
+                    "required": ["path", "bytes_written", "created"]
+                })),
                 annotations: ToolAnnotations {
                     destructive_hint: true,
                     idempotent_hint: false,
@@ -670,6 +683,14 @@ impl Default for ReplaceInFileTool {
                     "required": ["path", "find", "replace"],
                     "additionalProperties": false
                 }),
+                output_schema: Some(json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "replacements": { "type": "integer" }
+                    },
+                    "required": ["path", "replacements"]
+                })),
                 annotations: ToolAnnotations {
                     destructive_hint: true,
                     idempotent_hint: false,
@@ -818,6 +839,15 @@ impl Default for MoveTool {
                     "required": ["from", "to"],
                     "additionalProperties": false
                 }),
+                output_schema: Some(json!({
+                    "type": "object",
+                    "properties": {
+                        "from": { "type": "string" },
+                        "to": { "type": "string" },
+                        "moved": { "type": "boolean", "const": true }
+                    },
+                    "required": ["from", "to", "moved"]
+                })),
                 annotations: ToolAnnotations {
                     destructive_hint: true,
                     idempotent_hint: false,
@@ -959,6 +989,15 @@ impl Default for DeleteTool {
                     "required": ["path"],
                     "additionalProperties": false
                 }),
+                output_schema: Some(json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "deleted": { "type": "boolean" },
+                        "missing": { "type": "boolean", "description": "true when missing_ok=true and the path did not exist" }
+                    },
+                    "required": ["path", "deleted"]
+                })),
                 annotations: ToolAnnotations {
                     destructive_hint: true,
                     idempotent_hint: false,
@@ -1076,6 +1115,19 @@ impl Default for ListDirectoryTool {
                     "required": ["path"],
                     "additionalProperties": false
                 }),
+                output_schema: Some(json!({
+                    "type": "array",
+                    "description": "Direct entries (non-recursive) in the requested directory.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": { "type": "string", "description": "Entry file name, without any leading directory." },
+                            "path": { "type": "string", "description": "Absolute path to the entry." },
+                            "kind": { "type": "string", "enum": ["file", "directory", "symlink"] }
+                        },
+                        "required": ["name", "path", "kind"]
+                    }
+                })),
                 annotations: ToolAnnotations {
                     read_only_hint: true,
                     idempotent_hint: true,
@@ -1200,6 +1252,14 @@ impl Default for CreateDirectoryTool {
                     "required": ["path"],
                     "additionalProperties": false
                 }),
+                output_schema: Some(json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "created": { "type": "boolean", "const": true }
+                    },
+                    "required": ["path", "created"]
+                })),
                 annotations: ToolAnnotations {
                     destructive_hint: true,
                     idempotent_hint: true,
@@ -1443,6 +1503,8 @@ mod tests {
             permissions: &AllowAll,
             resources,
             cancellation: None,
+            execution_scope: None,
+            approved_request: None,
         }
     }
 

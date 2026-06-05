@@ -11,7 +11,7 @@ use agentkit_reporting::{CompositeReporter, StdoutReporter};
 use agentkit_task_manager::{AsyncTaskManager, RoutingDecision, TaskEvent, TaskManager};
 use agentkit_tools_core::{
     CommandPolicy, CompositePermissionChecker, PathPolicy, PermissionCode, PermissionDecision,
-    PermissionDenial, ToolRegistry,
+    PermissionDenial,
 };
 
 const SYSTEM_PROMPT: &str = "\
@@ -37,9 +37,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let adapter = OpenRouterAdapter::new(config)?;
 
     // --- tools: filesystem + shell ---
-    let mut tools = ToolRegistry::new();
-    merge_registry(&mut tools, agentkit_tool_fs::registry());
-    merge_registry(&mut tools, agentkit_tool_shell::registry());
+    let tools = agentkit_tool_fs::registry().merge(agentkit_tool_shell::registry());
 
     // --- permissions ---
     let workspace_root = env::current_dir()?;
@@ -215,8 +213,3 @@ fn print_assistant_item(item: Item) {
     }
 }
 
-fn merge_registry(target: &mut ToolRegistry, source: ToolRegistry) {
-    for tool in source.tools() {
-        target.register_arc(tool);
-    }
-}

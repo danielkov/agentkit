@@ -385,6 +385,8 @@ async fn tool_adapter_propagates_call_through_running_service() {
         permissions: &AllowAll,
         resources: &(),
         cancellation: None,
+        execution_scope: None,
+        approved_request: None,
     };
 
     let result = adapter
@@ -429,6 +431,8 @@ async fn tool_adapter_error_responder_receives_typed_invocation_error() {
         permissions: &AllowAll,
         resources: &(),
         cancellation: None,
+        execution_scope: None,
+        approved_request: None,
     };
 
     let result = adapter

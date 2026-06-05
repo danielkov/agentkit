@@ -41,6 +41,7 @@ CRATES=(
   agentkit-mcp
   agentkit-tool-fs
   agentkit-tool-shell
+  agentkit-tool-compose
   agentkit-tool-skills
   agentkit-provider-openrouter
   agentkit-provider-openai

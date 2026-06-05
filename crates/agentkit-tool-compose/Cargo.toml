@@ -1,0 +1,25 @@
+[package]
+description = "Lua tool composition for agentkit."
+homepage.workspace = true
+name = "agentkit-tool-compose"
+readme = "README.md"
+repository.workspace = true
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+agentkit-core = { version = "0.7.0", path = "../agentkit-core" }
+agentkit-tools-core = { version = "0.7.0", path = "../agentkit-tools-core" }
+async-trait.workspace = true
+mlua.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+
+[dev-dependencies]
+agentkit-tools-core = { path = "../agentkit-tools-core", features = ["schemars"] }
+agentkit-tools-derive = { path = "../agentkit-tools-derive" }
+schemars = { workspace = true, features = ["derive"] }
+

@@ -261,6 +261,17 @@ pub struct ToolSpec {
     pub description: String,
     /// JSON Schema describing the expected input object.
     pub input_schema: Value,
+    /// JSON Schema describing the shape this tool returns.
+    ///
+    /// Provider APIs (Anthropic, OpenAI, Gemini) don't carry an output schema
+    /// in their tool declarations, so this is **not** surfaced verbatim to the
+    /// model. Hosts and composing tools may render it into the description, or
+    /// use it for validation. `ComposeTool::wrap` (in `agentkit-tool-compose`)
+    /// surfaces it both in its compose tool description and through the Lua
+    /// `tools()` helper so composed scripts can target the correct return
+    /// shape on the first try.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub output_schema: Option<Value>,
     /// Advisory behavioural hints (read-only, destructive, etc.).
     pub annotations: ToolAnnotations,
     /// Arbitrary key-value pairs for framework extensions.
@@ -324,9 +335,17 @@ impl ToolSpec {
             name: name.into(),
             description: description.into(),
             input_schema,
+            output_schema: None,
             annotations: ToolAnnotations::default(),
             metadata: MetadataMap::new(),
         }
+    }
+
+    /// Declares the JSON shape this tool returns. See
+    /// [`output_schema`](Self::output_schema) for distribution semantics.
+    pub fn with_output_schema(mut self, schema: Value) -> Self {
+        self.output_schema = Some(schema);
+        self
     }
 
     /// Replaces the tool annotations.
@@ -490,6 +509,62 @@ pub struct ToolContext<'a> {
     pub resources: &'a dyn ToolResources,
     /// Signal that the current turn has been cancelled by the user.
     pub cancellation: Option<TurnCancellation>,
+    /// Optional scope that lets advanced tools invoke other tools through the
+    /// same executor, permissions, resources, and cancellation path.
+    pub execution_scope: Option<ToolExecutionScope>,
+    /// Approval request currently being resumed, if this invocation is the
+    /// result of a host approval.
+    pub approved_request: Option<ApprovalRequest>,
+}
+
+/// Owned scope for nested tool execution.
+///
+/// This is intentionally executor-centric: tools that compose other tools
+/// must still go through the normal [`ToolExecutor`] path so lookup,
+/// permissions, approval interrupts, and output truncation remain centralized.
+#[derive(Clone)]
+pub struct ToolExecutionScope {
+    pub executor: Arc<dyn ToolExecutor>,
+    pub session_id: SessionId,
+    pub turn_id: TurnId,
+    pub permissions: Arc<dyn PermissionChecker>,
+    pub resources: Arc<dyn ToolResources>,
+    pub cancellation: Option<TurnCancellation>,
+}
+
+impl ToolExecutionScope {
+    /// Creates an owned tool context for a nested tool call.
+    pub fn nested_context(&self, metadata: MetadataMap) -> OwnedToolContext {
+        OwnedToolContext {
+            session_id: self.session_id.clone(),
+            turn_id: self.turn_id.clone(),
+            metadata,
+            permissions: self.permissions.clone(),
+            resources: self.resources.clone(),
+            cancellation: self.cancellation.clone(),
+            execution_scope: Some(self.clone()),
+            approved_request: None,
+        }
+    }
+
+    /// Invokes a nested tool through the same executor and execution context.
+    pub async fn execute_child(&self, request: ToolRequest) -> ToolExecutionOutcome {
+        let ctx = self.nested_context(request.metadata.clone());
+        self.executor.execute_owned(request, ctx).await
+    }
+
+    /// Invokes a nested tool after approval through the same executor and
+    /// execution context.
+    pub async fn execute_approved_child(
+        &self,
+        request: ToolRequest,
+        approval: &ApprovalRequest,
+    ) -> ToolExecutionOutcome {
+        let ctx = self.nested_context(request.metadata.clone());
+        self.executor
+            .execute_approved_owned(request, approval, ctx)
+            .await
+    }
 }
 
 /// Owned execution context that can outlive a single stack frame.
@@ -511,6 +586,10 @@ pub struct OwnedToolContext {
     pub resources: Arc<dyn ToolResources>,
     /// Cooperative cancellation signal for the invocation.
     pub cancellation: Option<TurnCancellation>,
+    /// Optional owned scope for nested tool execution.
+    pub execution_scope: Option<ToolExecutionScope>,
+    /// Approval request currently being resumed, if any.
+    pub approved_request: Option<ApprovalRequest>,
 }
 
 impl OwnedToolContext {
@@ -525,6 +604,8 @@ impl OwnedToolContext {
             permissions: self.permissions.as_ref(),
             resources: self.resources.as_ref(),
             cancellation: self.cancellation.clone(),
+            execution_scope: self.execution_scope.clone(),
+            approved_request: self.approved_request.clone(),
         }
     }
 }
@@ -2194,6 +2275,22 @@ pub trait Tool: Send + Sync {
         request: ToolRequest,
         ctx: &mut ToolContext<'_>,
     ) -> Result<ToolResult, ToolError>;
+
+    /// Executes the tool and may return an interruption directly.
+    ///
+    /// Most tools should implement only [`invoke`](Self::invoke). Advanced
+    /// tools that compose other tools can override this method to propagate
+    /// nested approval interrupts back to the loop.
+    async fn invoke_outcome(
+        &self,
+        request: ToolRequest,
+        ctx: &mut ToolContext<'_>,
+    ) -> ToolExecutionOutcome {
+        match self.invoke(request, ctx).await {
+            Ok(result) => ToolExecutionOutcome::Completed(result),
+            Err(error) => ToolExecutionOutcome::Failed(error),
+        }
+    }
 }
 
 /// A name-keyed collection of [`Tool`] implementations.
@@ -2659,6 +2756,7 @@ impl Tool for RewrittenTool {
             name: self.public_spec.name.clone(),
             description: inner_current.description,
             input_schema: inner_current.input_schema,
+            output_schema: inner_current.output_schema,
             annotations: inner_current.annotations,
             metadata: inner_current.metadata,
         })
@@ -2680,6 +2778,15 @@ impl Tool for RewrittenTool {
     ) -> Result<ToolResult, ToolError> {
         request.tool_name = self.inner_name.clone();
         self.inner.invoke(request, ctx).await
+    }
+
+    async fn invoke_outcome(
+        &self,
+        mut request: ToolRequest,
+        ctx: &mut ToolContext<'_>,
+    ) -> ToolExecutionOutcome {
+        request.tool_name = self.inner_name.clone();
+        self.inner.invoke_outcome(request, ctx).await
     }
 }
 
@@ -3032,6 +3139,8 @@ impl Invocable for ToolInvocableAdapter {
             permissions: self.permissions.as_ref(),
             resources: self.resources.as_ref(),
             cancellation: None,
+            execution_scope: None,
+            approved_request: None,
         };
 
         let result = self
@@ -3189,8 +3298,9 @@ pub trait ToolExecutor: Send + Sync {
         &self,
         request: ToolRequest,
         approved_request: &ApprovalRequest,
-        ctx: OwnedToolContext,
+        mut ctx: OwnedToolContext,
     ) -> ToolExecutionOutcome {
+        ctx.approved_request = Some(approved_request.clone());
         let mut borrowed = ctx.borrowed();
         self.execute_approved(request, approved_request, &mut borrowed)
             .await
@@ -3369,8 +3479,8 @@ impl BasicToolExecutor {
         }
 
         let truncation_ctx = ToolOutputTruncationContext::from((&request, tool.spec().clone()));
-        match tool.invoke(request, ctx).await {
-            Ok(mut result) => {
+        match tool.invoke_outcome(request, ctx).await {
+            ToolExecutionOutcome::Completed(mut result) => {
                 if let Some(strategy) = &self.output_truncation {
                     match strategy.apply(truncation_ctx, result.result.output).await {
                         Ok(output) => {
@@ -3381,7 +3491,7 @@ impl BasicToolExecutor {
                 }
                 ToolExecutionOutcome::Completed(result)
             }
-            Err(error) => ToolExecutionOutcome::Failed(error),
+            other => other,
         }
     }
 }
@@ -3413,8 +3523,12 @@ impl ToolExecutor for BasicToolExecutor {
         approved_request: &ApprovalRequest,
         ctx: &mut ToolContext<'_>,
     ) -> ToolExecutionOutcome {
-        self.execute_inner(request, Some(&approved_request.id), ctx)
-            .await
+        let previous = ctx.approved_request.replace(approved_request.clone());
+        let outcome = self
+            .execute_inner(request, Some(&approved_request.id), ctx)
+            .await;
+        ctx.approved_request = previous;
+        outcome
     }
 }
 
@@ -3696,6 +3810,7 @@ mod tests {
                     name: ToolName::new("hidden"),
                     description: "hidden".into(),
                     input_schema: json!({"type": "object"}),
+                    output_schema: None,
                     annotations: ToolAnnotations::default(),
                     metadata: MetadataMap::new(),
                 },
@@ -3767,6 +3882,7 @@ mod tests {
                     name: ToolName::new(name),
                     description: "panics on current_spec".into(),
                     input_schema: json!({"type": "object"}),
+                    output_schema: None,
                     annotations: ToolAnnotations::default(),
                     metadata: MetadataMap::new(),
                 },
@@ -3870,6 +3986,7 @@ mod tests {
                     name: ToolName::new(name),
                     description: format!("echo {name}"),
                     input_schema: json!({"type": "object"}),
+                    output_schema: None,
                     annotations: ToolAnnotations::default(),
                     metadata: MetadataMap::new(),
                 },
@@ -3931,6 +4048,8 @@ mod tests {
             permissions: Arc::new(AllowAllPermissions),
             resources: Arc::new(()),
             cancellation: None,
+            execution_scope: None,
+            approved_request: None,
         };
         let mut ctx = owned.borrowed();
         let request = ToolRequest {
@@ -3986,6 +4105,130 @@ mod tests {
         }
     }
 
+    struct ApprovedContextTool {
+        spec: ToolSpec,
+    }
+
+    impl ApprovedContextTool {
+        fn new() -> Self {
+            Self {
+                spec: ToolSpec::new(
+                    "approved_context",
+                    "approved context",
+                    json!({"type": "object"}),
+                ),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Tool for ApprovedContextTool {
+        fn spec(&self) -> &ToolSpec {
+            &self.spec
+        }
+
+        async fn invoke(
+            &self,
+            request: ToolRequest,
+            ctx: &mut ToolContext<'_>,
+        ) -> Result<ToolResult, ToolError> {
+            Ok(ToolResult::new(ToolResultPart::success(
+                request.call_id,
+                ToolOutput::structured(json!({
+                    "approved": ctx.approved_request.is_some()
+                })),
+            )))
+        }
+    }
+
+    struct ScopeChildTool {
+        spec: ToolSpec,
+    }
+
+    impl ScopeChildTool {
+        fn new() -> Self {
+            Self {
+                spec: ToolSpec::new("scope_child", "scope child", json!({"type": "object"})),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Tool for ScopeChildTool {
+        fn spec(&self) -> &ToolSpec {
+            &self.spec
+        }
+
+        async fn invoke(
+            &self,
+            request: ToolRequest,
+            _ctx: &mut ToolContext<'_>,
+        ) -> Result<ToolResult, ToolError> {
+            Ok(ToolResult::new(ToolResultPart::success(
+                request.call_id,
+                ToolOutput::structured(json!({ "child": request.input })),
+            )))
+        }
+    }
+
+    struct ScopeParentTool {
+        spec: ToolSpec,
+    }
+
+    impl ScopeParentTool {
+        fn new() -> Self {
+            Self {
+                spec: ToolSpec::new("scope_parent", "scope parent", json!({"type": "object"})),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Tool for ScopeParentTool {
+        fn spec(&self) -> &ToolSpec {
+            &self.spec
+        }
+
+        async fn invoke(
+            &self,
+            request: ToolRequest,
+            _ctx: &mut ToolContext<'_>,
+        ) -> Result<ToolResult, ToolError> {
+            Ok(ToolResult::new(ToolResultPart::success(
+                request.call_id,
+                ToolOutput::text("unused"),
+            )))
+        }
+
+        async fn invoke_outcome(
+            &self,
+            request: ToolRequest,
+            ctx: &mut ToolContext<'_>,
+        ) -> ToolExecutionOutcome {
+            let Some(scope) = ctx.execution_scope.clone() else {
+                return ToolExecutionOutcome::Failed(ToolError::Internal(
+                    "missing execution scope".into(),
+                ));
+            };
+            let child = ToolRequest::new(
+                "child-call",
+                "scope_child",
+                request.input.clone(),
+                request.session_id.clone(),
+                request.turn_id.clone(),
+            );
+            match scope.execute_child(child).await {
+                ToolExecutionOutcome::Completed(child_result) => {
+                    ToolExecutionOutcome::Completed(ToolResult::new(ToolResultPart::success(
+                        request.call_id,
+                        child_result.result.output,
+                    )))
+                }
+                other => other,
+            }
+        }
+    }
+
     fn test_context() -> OwnedToolContext {
         OwnedToolContext {
             session_id: SessionId::new("s"),
@@ -3994,7 +4237,109 @@ mod tests {
             permissions: Arc::new(AllowAllPermissions),
             resources: Arc::new(()),
             cancellation: None,
+            execution_scope: None,
+            approved_request: None,
         }
+    }
+
+    fn test_context_with_scope(executor: Arc<dyn ToolExecutor>) -> OwnedToolContext {
+        let session_id = SessionId::new("s");
+        let turn_id = TurnId::new("t");
+        let metadata = MetadataMap::new();
+        let permissions: Arc<dyn PermissionChecker> = Arc::new(AllowAllPermissions);
+        let resources: Arc<dyn ToolResources> = Arc::new(());
+        let scope = ToolExecutionScope {
+            executor,
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            permissions: permissions.clone(),
+            resources: resources.clone(),
+            cancellation: None,
+        };
+        OwnedToolContext {
+            session_id,
+            turn_id,
+            metadata,
+            permissions,
+            resources,
+            cancellation: None,
+            execution_scope: Some(scope),
+            approved_request: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn default_invoke_outcome_wraps_invoke_success() {
+        let executor = BasicToolExecutor::from_registry(ToolRegistry::new().with(
+            StaticOutputTool::new("plain", ToolOutput::structured(json!({"ok": true}))),
+        ));
+        let outcome = executor
+            .execute_owned(
+                ToolRequest::new("call", "plain", json!({}), "s", "t"),
+                test_context(),
+            )
+            .await;
+
+        let ToolExecutionOutcome::Completed(result) = outcome else {
+            panic!("expected completed outcome, got {outcome:?}");
+        };
+        assert_eq!(
+            result.result.output,
+            ToolOutput::structured(json!({"ok": true}))
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_approved_passes_approval_context_to_tool() {
+        let executor =
+            BasicToolExecutor::from_registry(ToolRegistry::new().with(ApprovedContextTool::new()));
+        let approval = ApprovalRequest {
+            task_id: None,
+            call_id: Some(ToolCallId::new("call")),
+            id: ApprovalId::new("approval"),
+            request_kind: "test.approval".into(),
+            reason: ApprovalReason::PolicyRequiresConfirmation,
+            summary: "approve".into(),
+            metadata: MetadataMap::new(),
+        };
+        let outcome = executor
+            .execute_approved_owned(
+                ToolRequest::new("call", "approved_context", json!({}), "s", "t"),
+                &approval,
+                test_context(),
+            )
+            .await;
+
+        let ToolExecutionOutcome::Completed(result) = outcome else {
+            panic!("expected completed outcome, got {outcome:?}");
+        };
+        assert_eq!(
+            result.result.output,
+            ToolOutput::structured(json!({"approved": true}))
+        );
+    }
+
+    #[tokio::test]
+    async fn execution_scope_invokes_child_through_executor() {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(BasicToolExecutor::from_registry(
+            ToolRegistry::new()
+                .with(ScopeParentTool::new())
+                .with(ScopeChildTool::new()),
+        ));
+        let outcome = executor
+            .execute_owned(
+                ToolRequest::new("parent-call", "scope_parent", json!({"value": 3}), "s", "t"),
+                test_context_with_scope(executor.clone()),
+            )
+            .await;
+
+        let ToolExecutionOutcome::Completed(result) = outcome else {
+            panic!("expected completed outcome, got {outcome:?}");
+        };
+        assert_eq!(
+            result.result.output,
+            ToolOutput::structured(json!({ "child": { "value": 3 } }))
+        );
     }
 
     #[tokio::test]

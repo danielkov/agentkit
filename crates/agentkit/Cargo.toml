@@ -27,6 +27,7 @@ agentkit-provider-openrouter = { version = "0.7.0", path = "../agentkit-provider
 agentkit-provider-vllm = { version = "0.7.0", path = "../agentkit-provider-vllm", optional = true }
 agentkit-reporting = { version = "0.7.0", path = "../agentkit-reporting", optional = true }
 agentkit-task-manager = { version = "0.7.0", path = "../agentkit-task-manager", optional = true }
+agentkit-tool-compose = { version = "0.7.0", path = "../agentkit-tool-compose", optional = true }
 agentkit-tool-fs = { version = "0.7.0", path = "../agentkit-tool-fs", optional = true }
 agentkit-tool-shell = { version = "0.7.0", path = "../agentkit-tool-shell", optional = true }
 agentkit-tool-skills = { version = "0.7.0", path = "../agentkit-tool-skills", optional = true }
@@ -53,5 +54,6 @@ provider-openrouter = ["dep:agentkit-provider-openrouter", "adapter-completions"
 provider-vllm = ["dep:agentkit-provider-vllm", "adapter-completions"]
 reporting = ["dep:agentkit-reporting", "loop"]
 tool-fs = ["dep:agentkit-tool-fs", "tools"]
+tool-compose = ["dep:agentkit-tool-compose", "tools"]
 tool-shell = ["dep:agentkit-tool-shell", "tools"]
 tool-skills = ["dep:agentkit-tool-skills", "tools"]

@@ -77,8 +77,8 @@ use agentkit_task_manager::{
 use agentkit_tools_core::ToolContext;
 use agentkit_tools_core::{
     AllowAllPermissions, ApprovalDecision, ApprovalRequest, BasicToolExecutor, OwnedToolContext,
-    PermissionChecker, ToolCatalogEvent, ToolError, ToolExecutor, ToolRequest, ToolResources,
-    ToolSource, ToolSpec,
+    PermissionChecker, ToolCatalogEvent, ToolError, ToolExecutionScope, ToolExecutor, ToolRequest,
+    ToolResources, ToolSource, ToolSpec,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -1456,14 +1456,26 @@ where
                         kind,
                     },
                     TaskStartContext {
-                        executor: tool_executor,
-                        tool_context: OwnedToolContext {
-                            session_id,
-                            turn_id,
-                            metadata,
-                            permissions,
-                            resources,
-                            cancellation,
+                        executor: tool_executor.clone(),
+                        tool_context: {
+                            let execution_scope = ToolExecutionScope {
+                                executor: tool_executor,
+                                session_id: session_id.clone(),
+                                turn_id: turn_id.clone(),
+                                permissions: permissions.clone(),
+                                resources: resources.clone(),
+                                cancellation: cancellation.clone(),
+                            };
+                            OwnedToolContext {
+                                session_id,
+                                turn_id,
+                                metadata,
+                                permissions,
+                                resources,
+                                cancellation,
+                                execution_scope: Some(execution_scope),
+                                approved_request: None,
+                            }
                         },
                     },
                 )
@@ -3028,6 +3040,7 @@ mod tests {
                         "required": ["value"],
                         "additionalProperties": false
                     }),
+                    output_schema: None,
                     annotations: ToolAnnotations::default(),
                     metadata: MetadataMap::new(),
                 },
@@ -3052,6 +3065,7 @@ mod tests {
                         "properties": {},
                         "additionalProperties": false
                     }),
+                    output_schema: None,
                     annotations: ToolAnnotations::default(),
                     metadata: MetadataMap::new(),
                 },
@@ -3250,6 +3264,7 @@ mod tests {
                     "properties": {},
                     "additionalProperties": false
                 }),
+                output_schema: None,
                 annotations: ToolAnnotations::default(),
                 metadata: MetadataMap::new(),
             }]
@@ -3301,6 +3316,7 @@ mod tests {
                         "properties": {},
                         "additionalProperties": false
                     }),
+                    output_schema: None,
                     annotations: ToolAnnotations::default(),
                     metadata: MetadataMap::new(),
                 },
