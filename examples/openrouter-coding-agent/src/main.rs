@@ -85,7 +85,7 @@ use agentkit_loop::{
 use agentkit_provider_openrouter::{OpenRouterAdapter, OpenRouterConfig};
 use agentkit_tools_core::{
     ApprovalDecision, ApprovalReason, ApprovalRequest, CommandPolicy, CompositePermissionChecker,
-    PathPolicy, PermissionCode, PermissionDecision, PermissionDenial, ToolRegistry,
+    PathPolicy, PermissionCode, PermissionDecision, PermissionDenial,
 };
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
@@ -733,9 +733,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model_name = config.model.clone();
     let adapter = OpenRouterAdapter::new(config)?;
 
-    let mut tools = ToolRegistry::new();
-    merge_registry(&mut tools, agentkit_tool_fs::registry());
-    merge_registry(&mut tools, agentkit_tool_shell::registry());
+    let tools = agentkit_tool_fs::registry().merge(agentkit_tool_shell::registry());
 
     let workspace_root = env::current_dir()?;
     let permissions = CompositePermissionChecker::new(PermissionDecision::Deny(PermissionDenial {
@@ -819,11 +817,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-fn merge_registry(target: &mut ToolRegistry, source: ToolRegistry) {
-    for tool in source.tools() {
-        target.register_arc(tool);
-    }
-}
 
 fn print_banner(model: &str, root: &Path, max_ctx: u64) {
     println!("openrouter-coding-agent  ({model})");
