@@ -2859,6 +2859,10 @@ fn tool_spec_from_tool(
             .map(|d| d.to_string())
             .unwrap_or_else(|| tool.name.to_string()),
         input_schema: Value::Object((*tool.input_schema).clone()),
+        output_schema: tool
+            .output_schema
+            .as_ref()
+            .map(|schema| Value::Object((**schema).clone())),
         annotations: tool_annotations_from_rmcp(tool.annotations.as_ref()),
         metadata: MetadataMap::new(),
     }

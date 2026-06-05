@@ -29,6 +29,7 @@
 //! | `provider-cerebras` | [`provider_cerebras`] | Cerebras Inference API [`loop_::ModelAdapter`] implementation |
 //! | `provider-openrouter` | [`provider_openrouter`] | OpenRouter [`loop_::ModelAdapter`] implementation |
 //! | `task-manager` | [`task_manager`] | Tool task scheduling: [`task_manager::SimpleTaskManager`], [`task_manager::AsyncTaskManager`] |
+//! | `tool-compose` | [`tool_compose`] | Lua tool composition tool (`compose`) |
 //! | `tool-fs` | [`tool_fs`] | Filesystem tools (read, write, edit, move, delete, list, mkdir) |
 //! | `tool-shell` | [`tool_shell`] | Shell execution tool (`shell_exec`) |
 //! | `tool-skills` | [`tool_skills`] | Progressive Agent Skills discovery and activation |
@@ -293,6 +294,17 @@ pub use agentkit_provider_mistral as provider_mistral;
 #[cfg(feature = "tool-fs")]
 pub use agentkit_tool_fs as tool_fs;
 
+/// Lua tool composition tool (`compose`).
+///
+/// Call [`tool_compose::registry()`] to get a [`tools::ToolRegistry`]
+/// containing the Compose tool. Compose runs sandboxed Lua scripts that can
+/// call the current tool catalog through a synchronous-looking `tool(...)`
+/// helper.
+///
+/// Requires the `tool-compose` feature.
+#[cfg(feature = "tool-compose")]
+pub use agentkit_tool_compose as tool_compose;
+
 /// Shell execution tool (`shell_exec`).
 ///
 /// Call [`tool_shell::registry()`] to get a [`tools::ToolRegistry`] containing
@@ -353,6 +365,8 @@ pub mod prelude {
     pub use crate::reporting::*;
     #[cfg(feature = "task-manager")]
     pub use crate::task_manager::*;
+    #[cfg(feature = "tool-compose")]
+    pub use crate::tool_compose::{ComposeConfig, ComposeTool, registry as compose_registry};
     #[cfg(feature = "tool-fs")]
     pub use crate::tool_fs::{
         CreateDirectoryTool, DeleteTool, FileSystemToolError, FileSystemToolPolicy,

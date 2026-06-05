@@ -127,6 +127,16 @@ impl Default for ShellExecTool {
                     "required": ["executable"],
                     "additionalProperties": false
                 }),
+                output_schema: Some(json!({
+                    "type": "object",
+                    "properties": {
+                        "stdout": { "type": "string" },
+                        "stderr": { "type": "string" },
+                        "success": { "type": "boolean" },
+                        "exit_code": { "type": ["integer", "null"], "description": "null when the process was terminated by a signal" }
+                    },
+                    "required": ["stdout", "stderr", "success"]
+                })),
                 annotations: ToolAnnotations {
                     destructive_hint: true,
                     needs_approval_hint: true,
@@ -340,6 +350,8 @@ mod tests {
             permissions: &AllowAll,
             resources: &(),
             cancellation: None,
+            execution_scope: None,
+            approved_request: None,
         };
 
         let result = executor
@@ -385,6 +397,8 @@ mod tests {
             permissions: &DenyCommands,
             resources: &(),
             cancellation: None,
+            execution_scope: None,
+            approved_request: None,
         };
 
         let result = executor

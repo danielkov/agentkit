@@ -281,6 +281,7 @@ impl SkillRegistry {
                 "required": ["name"],
                 "additionalProperties": false
             }),
+            output_schema: None,
             annotations: ToolAnnotations {
                 read_only_hint: true,
                 ..Default::default()
@@ -456,6 +457,7 @@ fn build_activate_skill_spec(skills: &BTreeMap<String, Skill>) -> ToolSpec {
             "required": ["name"],
             "additionalProperties": false
         }),
+        output_schema: None,
         annotations: ToolAnnotations {
             read_only_hint: true,
             ..Default::default()
@@ -890,6 +892,8 @@ mod tests {
             permissions: &noop_perms,
             resources: &(),
             cancellation: None,
+            execution_scope: None,
+            approved_request: None,
         };
 
         let result = tool.invoke(request, &mut ctx).await.unwrap();
@@ -951,6 +955,8 @@ mod tests {
             permissions: &noop_perms,
             resources: &(),
             cancellation: None,
+            execution_scope: None,
+            approved_request: None,
         };
 
         let result = tool.invoke(request, &mut ctx).await.unwrap();
@@ -1108,6 +1114,8 @@ mod tests {
             permissions: &noop_perms,
             resources: &(),
             cancellation: None,
+            execution_scope: None,
+            approved_request: None,
         };
 
         let first = tool
@@ -1280,6 +1288,8 @@ mod tests {
             permissions: &noop_perms,
             resources: &(),
             cancellation: None,
+            execution_scope: None,
+            approved_request: None,
         };
 
         // First read.

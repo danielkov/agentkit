@@ -61,6 +61,8 @@ fn ctx() -> OwnedToolContext {
         permissions: Arc::new(AllowAllPermissions),
         resources: Arc::new(()),
         cancellation: None,
+        execution_scope: None,
+        approved_request: None,
     }
 }
 

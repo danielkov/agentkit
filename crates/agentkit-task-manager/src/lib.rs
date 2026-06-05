@@ -922,6 +922,7 @@ mod tests {
                         "properties": {},
                         "additionalProperties": false
                     }),
+                    output_schema: None,
                     annotations: ToolAnnotations::default(),
                     metadata: MetadataMap::new(),
                 })
@@ -1019,6 +1020,8 @@ mod tests {
                 permissions: Arc::new(AllowAllPermissions),
                 resources: Arc::new(()),
                 cancellation,
+                execution_scope: None,
+                approved_request: None,
             },
         }
     }
