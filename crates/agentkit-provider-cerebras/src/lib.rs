@@ -50,6 +50,8 @@ use agentkit_loop::{
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use futures_util::future::{Either, select};
+use serde_json::Value;
+use tracing::Instrument;
 
 pub use crate::config::{
     CerebrasConfig, DEFAULT_BASE_URL, DEFAULT_VERSION_PATCH, OutputFormat, PartKindName,
@@ -171,6 +173,10 @@ impl ModelAdapter for CerebrasAdapter {
             _session_config: config,
         })
     }
+
+    fn provider_name(&self) -> Option<&str> {
+        Some("cerebras")
+    }
 }
 
 #[async_trait]
@@ -185,9 +191,34 @@ impl ModelSession for CerebrasSession {
         let config = self.config.clone();
         let rate_limit_slot = self.rate_limit_slot.clone();
 
+        // Span per the OTel GenAI semantic conventions for inference calls.
+        // Response-derived fields are recorded on the buffered path once the
+        // reply lands; the streaming path leaves them empty until the SSE
+        // translator is wired up to record id/model/usage from chunks.
+        let span = tracing::info_span!(
+            "chat",
+            "otel.name" = tracing::field::Empty,
+            "otel.kind" = "client",
+            "gen_ai.operation.name" = "chat",
+            "gen_ai.provider.name" = "cerebras",
+            "gen_ai.conversation.id" = %turn_request.session_id,
+            "gen_ai.request.model" = tracing::field::Empty,
+            "gen_ai.response.model" = tracing::field::Empty,
+            "gen_ai.response.id" = tracing::field::Empty,
+            "gen_ai.response.finish_reasons" = tracing::field::Empty,
+            "gen_ai.usage.input_tokens" = tracing::field::Empty,
+            "gen_ai.usage.output_tokens" = tracing::field::Empty,
+        );
+        let record_span = span.clone();
+
         let request_future = async move {
             let built = request::build_chat_body(&config, &turn_request)
                 .map_err(|e| LoopError::Provider(e.to_string()))?;
+
+            if let Some(model) = built.body.get("model").and_then(Value::as_str) {
+                record_span.record("gen_ai.request.model", model);
+                record_span.record("otel.name", format!("chat {model}").as_str());
+            }
 
             let url = format!("{}/chat/completions", config.base_url);
             let mut http = self.client.post(&url).bearer_auth(&config.api_key);
@@ -280,13 +311,40 @@ impl ModelSession for CerebrasSession {
                 let body_text = response.text().await.map_err(|error| {
                     LoopError::Provider(format!("failed to read Cerebras response body: {error}"))
                 })?;
+
+                // Record response-side semconv fields from the OpenAI-shaped
+                // body before handing off to the event builder.
+                if let Ok(raw) = serde_json::from_str::<Value>(&body_text) {
+                    if let Some(id) = raw.get("id").and_then(Value::as_str) {
+                        record_span.record("gen_ai.response.id", id);
+                    }
+                    if let Some(model) = raw.get("model").and_then(Value::as_str) {
+                        record_span.record("gen_ai.response.model", model);
+                    }
+                    if let Some(reason) = raw
+                        .pointer("/choices/0/finish_reason")
+                        .and_then(Value::as_str)
+                    {
+                        record_span.record("gen_ai.response.finish_reasons", reason);
+                    }
+                    if let Some(usage) = raw.get("usage") {
+                        if let Some(t) = usage.get("prompt_tokens").and_then(Value::as_u64) {
+                            record_span.record("gen_ai.usage.input_tokens", t);
+                        }
+                        if let Some(t) = usage.get("completion_tokens").and_then(Value::as_u64) {
+                            record_span.record("gen_ai.usage.output_tokens", t);
+                        }
+                    }
+                }
+
                 let events = response::build_turn_from_response(&body_text)
                     .map_err(|e| LoopError::Provider(e.to_string()))?;
                 Ok(CerebrasTurn {
                     inner: TurnInner::Buffered { events },
                 })
             }
-        };
+        }
+        .instrument(span);
 
         if let Some(cancellation) = cancellation {
             futures_util::pin_mut!(request_future);
