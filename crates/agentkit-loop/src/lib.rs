@@ -446,6 +446,16 @@ pub trait ModelAdapter: Send + Sync {
     ///
     /// Returns [`LoopError`] if the provider connection or initialisation fails.
     async fn start_session(&self, config: SessionConfig) -> Result<Self::Session, LoopError>;
+
+    /// Name of the underlying model provider, when known.
+    ///
+    /// Stamped onto agent telemetry spans as the `gen_ai.provider.name`
+    /// attribute from the OpenTelemetry GenAI semantic conventions. Use a
+    /// lowercase identifier (e.g. `openrouter`, `ollama`). The default
+    /// returns `None` for adapters without a meaningful provider identity.
+    fn provider_name(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// An active model session that can produce sequential turns.
@@ -1126,6 +1136,7 @@ where
             .unwrap_or_else(|| Arc::new(BasicToolExecutor::new(self.tool_sources.clone())));
         let driver = LoopDriver {
             session_id: session_id.clone(),
+            provider_name: self.model.provider_name().map(str::to_owned),
             default_cache,
             next_turn_cache: None,
             session: Some(session),
@@ -1383,6 +1394,7 @@ where
     S: ModelSession,
 {
     session_id: SessionId,
+    provider_name: Option<String>,
     default_cache: Option<PromptCacheRequest>,
     next_turn_cache: Option<PromptCacheRequest>,
     session: Option<S>,
@@ -1423,8 +1435,11 @@ where
     ) -> tracing::Span {
         tracing::info_span!(
             "agent.execute_tool",
+            "otel.name" = %format!("execute_tool {}", request.tool_name),
+            "gen_ai.operation.name" = "execute_tool",
             "gen_ai.tool.name" = %request.tool_name,
             "gen_ai.tool.call.id" = %request.call_id,
+            "gen_ai.conversation.id" = %self.session_id,
             session.id = %self.session_id,
             turn.id = %turn_id,
             launch_kind = launch_kind,
@@ -1827,6 +1842,12 @@ where
         name = "agent.turn",
         skip_all,
         fields(
+            otel.name = "invoke_agent",
+            gen_ai.operation.name = "invoke_agent",
+            gen_ai.conversation.id = %self.session_id,
+            gen_ai.provider.name = tracing::field::Empty,
+            gen_ai.usage.input_tokens = tracing::field::Empty,
+            gen_ai.usage.output_tokens = tracing::field::Empty,
             session.id = %self.session_id,
             turn.id = %turn_id,
             transcript.len = self.transcript.len(),
@@ -1839,6 +1860,9 @@ where
         turn_id: agentkit_core::TurnId,
         emit_started: bool,
     ) -> Result<LoopStep, LoopError> {
+        if let Some(provider) = &self.provider_name {
+            tracing::Span::current().record("gen_ai.provider.name", provider.as_str());
+        }
         let cancellation = self
             .cancellation
             .as_ref()
@@ -1947,6 +1971,14 @@ where
             "finish_reason",
             tracing::field::debug(&result.finish_reason),
         );
+        if let Some(tokens) = result
+            .usage
+            .as_ref()
+            .and_then(|usage| usage.tokens.as_ref())
+        {
+            tracing::Span::current().record("gen_ai.usage.input_tokens", tokens.input_tokens);
+            tracing::Span::current().record("gen_ai.usage.output_tokens", tokens.output_tokens);
+        }
         let now = Timestamp::now();
         let usage = result.usage.clone();
         let finish_reason = result.finish_reason.clone();
