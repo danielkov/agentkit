@@ -76,22 +76,25 @@ fn parse_args() -> Result<Args, String> {
             "--arms" => {
                 let arms = value()?
                     .split(',')
-                    .map(|raw| {
-                        Arm::parse(raw).ok_or_else(|| format!("unknown arm `{raw}`"))
-                    })
+                    .map(|raw| Arm::parse(raw).ok_or_else(|| format!("unknown arm `{raw}`")))
                     .collect::<Result<Vec<_>, _>>()?;
                 args.arms = Some(arms);
             }
             "--reps" => args.reps = value()?.parse().map_err(|e| format!("--reps: {e}"))?,
             "--max-requests" => {
-                args.max_requests = value()?.parse().map_err(|e| format!("--max-requests: {e}"))?;
+                args.max_requests = value()?
+                    .parse()
+                    .map_err(|e| format!("--max-requests: {e}"))?;
             }
             "--timeout-secs" => {
-                args.timeout_secs = value()?.parse().map_err(|e| format!("--timeout-secs: {e}"))?;
+                args.timeout_secs = value()?
+                    .parse()
+                    .map_err(|e| format!("--timeout-secs: {e}"))?;
             }
             "--tool-latency-ms" => {
-                args.tool_latency_ms =
-                    value()?.parse().map_err(|e| format!("--tool-latency-ms: {e}"))?;
+                args.tool_latency_ms = value()?
+                    .parse()
+                    .map_err(|e| format!("--tool-latency-ms: {e}"))?;
             }
             "--compose-max-nested" => {
                 args.compose_max_nested = value()?
@@ -247,8 +250,14 @@ impl std::fmt::Display for Stats {
 
 fn aggregate(records: &[&RunRecord]) -> Aggregate {
     let wall: Vec<f64> = records.iter().map(|r| r.wall_ms as f64 / 1000.0).collect();
-    let requests: Vec<f64> = records.iter().map(|r| r.metrics.model_requests as f64).collect();
-    let tool_calls: Vec<f64> = records.iter().map(|r| r.metrics.tool_calls as f64).collect();
+    let requests: Vec<f64> = records
+        .iter()
+        .map(|r| r.metrics.model_requests as f64)
+        .collect();
+    let tool_calls: Vec<f64> = records
+        .iter()
+        .map(|r| r.metrics.tool_calls as f64)
+        .collect();
     let tokens: Vec<f64> = records
         .iter()
         .map(|r| {
@@ -256,7 +265,10 @@ fn aggregate(records: &[&RunRecord]) -> Aggregate {
                 as f64
         })
         .collect();
-    let peak: Vec<f64> = records.iter().map(|r| r.metrics.peak_context_tokens as f64).collect();
+    let peak: Vec<f64> = records
+        .iter()
+        .map(|r| r.metrics.peak_context_tokens as f64)
+        .collect();
     let accuracy: Vec<f64> = records.iter().map(|r| r.accuracy).collect();
     let costs: Vec<f64> = records
         .iter()
@@ -275,7 +287,10 @@ fn aggregate(records: &[&RunRecord]) -> Aggregate {
         } else {
             compose_calls as f64 / total_calls as f64
         },
-        compose_used_runs: records.iter().filter(|r| r.metrics.compose_calls > 0).count(),
+        compose_used_runs: records
+            .iter()
+            .filter(|r| r.metrics.compose_calls > 0)
+            .count(),
         total_tokens: stats(&tokens),
         peak_context: stats(&peak),
         cost: if costs.len() == records.len() && !costs.is_empty() {
@@ -302,15 +317,15 @@ fn render_report(records: &[RunRecord]) -> String {
         .unwrap_or("unknown");
     let mut out = String::new();
     let _ = writeln!(out, "# compose-bench report\n");
-    let _ = writeln!(out, "Model: `{model}`. Token columns sum all requests in a run; peak ctx is the largest single request (input + cached + output). Cost is provider-reported (blank when OpenRouter omitted it).\n");
+    let _ = writeln!(
+        out,
+        "Model: `{model}`. Token columns sum all requests in a run; peak ctx is the largest single request (input + cached + output). Cost is provider-reported (blank when OpenRouter omitted it).\n"
+    );
     let _ = writeln!(
         out,
         "| scenario | arm | runs | wall s | model reqs | tool calls | compose share | total tokens | peak ctx | cost $ | accuracy |"
     );
-    let _ = writeln!(
-        out,
-        "|---|---|---|---|---|---|---|---|---|---|---|"
-    );
+    let _ = writeln!(out, "|---|---|---|---|---|---|---|---|---|---|---|");
     for ((scenario, arm), group) in &grouped {
         let agg = aggregate(group);
         let _ = writeln!(

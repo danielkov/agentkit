@@ -233,8 +233,7 @@ impl Scenario for CrmHygiene {
                 .iter()
                 .filter(|c| normalize_phone(&c.phone).is_some_and(|e| e != c.phone))
                 .count();
-            let expected_company_fills =
-                originals.iter().filter(|c| c.company.is_empty()).count();
+            let expected_company_fills = originals.iter().filter(|c| c.company.is_empty()).count();
 
             let mut correct = 0usize;
             let mut details = Vec::new();
@@ -245,7 +244,11 @@ impl Scenario for CrmHygiene {
                 } else if details.len() < 5 {
                     details.push(format!(
                         "{}: expected phone={} company={:?}, got phone={} company={:?}",
-                        current.id, expected.phone, expected.company, current.phone, current.company
+                        current.id,
+                        expected.phone,
+                        expected.company,
+                        current.phone,
+                        current.company
                     ));
                 }
             }
@@ -253,12 +256,16 @@ impl Scenario for CrmHygiene {
 
             let submitted = scorer_submission.lock().expect("submission lock").clone();
             let count = |key: &str| -> Option<u64> {
-                submitted.as_ref().and_then(|v| v.get(key)).and_then(Value::as_u64)
+                submitted
+                    .as_ref()
+                    .and_then(|v| v.get(key))
+                    .and_then(Value::as_u64)
             };
-            let counts_score = (u64::from(count("phones_fixed") == Some(expected_phone_fixes as u64))
-                + u64::from(count("companies_filled") == Some(expected_company_fills as u64)))
-                as f64
-                / 2.0;
+            let counts_score =
+                (u64::from(count("phones_fixed") == Some(expected_phone_fixes as u64))
+                    + u64::from(count("companies_filled") == Some(expected_company_fills as u64)))
+                    as f64
+                    / 2.0;
 
             let mut notes = vec![format!(
                 "state: {correct}/{} contacts in expected final state; expected {expected_phone_fixes} phone fixes, {expected_company_fills} company fills; submitted {submitted:?}",
@@ -296,7 +303,11 @@ mod tests {
         assert_eq!(phone_fixes, 18);
         assert_eq!(company_fills, 4);
         // Already-valid phones exist and normalize to themselves (must be untouched).
-        assert!(contacts.iter().any(|c| normalize_phone(&c.phone).as_deref() == Some(c.phone.as_str())));
+        assert!(
+            contacts
+                .iter()
+                .any(|c| normalize_phone(&c.phone).as_deref() == Some(c.phone.as_str()))
+        );
         // Every empty company is recoverable from the email domain.
         for contact in contacts.iter().filter(|c| c.company.is_empty()) {
             assert!(company_for_email(&contact.email).is_some());

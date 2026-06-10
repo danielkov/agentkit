@@ -63,7 +63,9 @@ fn expected_totals() -> BTreeMap<&'static str, u64> {
             continue;
         }
         let customer_index: u64 = order.customer_id[2..].parse().expect("customer index");
-        *totals.get_mut(customer_region(customer_index)).expect("region") += order.amount_cents;
+        *totals
+            .get_mut(customer_region(customer_index))
+            .expect("region") += order.amount_cents;
     }
     totals
 }
@@ -207,7 +209,10 @@ impl Scenario for RevenueReport {
             let mut hits = 0usize;
             let mut notes = vec![format!("expected={expected:?}")];
             for region in REGIONS {
-                let got = submitted.as_ref().and_then(|v| v.get(region)).and_then(Value::as_u64);
+                let got = submitted
+                    .as_ref()
+                    .and_then(|v| v.get(region))
+                    .and_then(Value::as_u64);
                 if got == Some(expected[region]) {
                     hits += 1;
                 } else {

@@ -29,7 +29,10 @@ fn file_body(i: u64) -> String {
         // 10 of 12 files carry the key to migrate.
         body.push_str(&format!("timeout_ms: {}\n", 1000 + i * 250));
         if i.is_multiple_of(3) {
-            body.push_str(&format!("fallback_timeout_ms_note: keep\nidle:\n  timeout_ms: {}\n", 500 + i * 100));
+            body.push_str(&format!(
+                "fallback_timeout_ms_note: keep\nidle:\n  timeout_ms: {}\n",
+                500 + i * 100
+            ));
         }
     }
     if i.is_multiple_of(4) {
@@ -117,23 +120,22 @@ impl Scenario for ConfigMigration {
             Arm::Granular | Arm::Compose => agentkit_tool_fs::registry().with(submit),
         };
 
-        let permissions = CompositePermissionChecker::new(PermissionDecision::Deny(
-            PermissionDenial {
+        let permissions =
+            CompositePermissionChecker::new(PermissionDecision::Deny(PermissionDenial {
                 code: PermissionCode::UnknownRequest,
                 message: "tool request is not covered by any benchmark policy".into(),
                 metadata: MetadataMap::new(),
-            },
-        ))
-        .with_policy(
-            PathPolicy::new()
-                .allow_root(scratch.clone())
-                .require_approval_outside_allowed(true),
-        )
-        .with_policy(
-            CommandPolicy::new()
-                .allow_cwd(scratch.clone())
-                .require_approval_for_unknown(true),
-        );
+            }))
+            .with_policy(
+                PathPolicy::new()
+                    .allow_root(scratch.clone())
+                    .require_approval_outside_allowed(true),
+            )
+            .with_policy(
+                CommandPolicy::new()
+                    .allow_cwd(scratch.clone())
+                    .require_approval_for_unknown(true),
+            );
 
         let user_prompt = format!(
             "In the directory `{scratch}` there are 12 `.cfg` files. Migrate them: every config \
@@ -168,7 +170,10 @@ impl Scenario for ConfigMigration {
 
             let submitted = scorer_submission.lock().expect("submission lock").clone();
             let count = |key: &str| -> Option<u64> {
-                submitted.as_ref().and_then(|v| v.get(key)).and_then(Value::as_u64)
+                submitted
+                    .as_ref()
+                    .and_then(|v| v.get(key))
+                    .and_then(Value::as_u64)
             };
             let counts_score = (u64::from(count("files_changed") == Some(expected_files_changed))
                 + u64::from(count("replacements") == Some(expected_replacements)))
@@ -209,7 +214,10 @@ mod tests {
             .collect();
         let (files_changed, replacements) = migration_stats(&files);
         assert_eq!(files_changed, 10);
-        assert!(replacements > files_changed, "nested keys add extra renames");
+        assert!(
+            replacements > files_changed,
+            "nested keys add extra renames"
+        );
         // Trap files keep connect_timeout_ms verbatim after the expected transform.
         let trapped = files
             .iter()

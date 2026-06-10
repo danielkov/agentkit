@@ -279,7 +279,10 @@ impl Scenario for SupportTriage {
                 accuracy: 0.6 * state_score + 0.4 * answer_score,
                 notes: vec![
                     format!("targets={targets:?}"),
-                    format!("state: {correct}/{} escalated, {wrongly_touched} wrongly touched", targets.len()),
+                    format!(
+                        "state: {correct}/{} escalated, {wrongly_touched} wrongly touched",
+                        targets.len()
+                    ),
                     format!("answer ids={submitted_ids:?} f1={answer_score:.2}"),
                 ],
             }
@@ -312,8 +315,20 @@ mod tests {
             vec!["T-1002", "T-1010", "T-1016", "T-1020", "T-1022", "T-1026"]
         );
         // Distractors exist on every axis of the predicate.
-        assert!(tickets.iter().any(|t| t.status == "closed" && t.body.contains("refund")));
-        assert!(tickets.iter().any(|t| t.status == "open" && t.age_days <= 7 && t.body.contains("refund")));
-        assert!(tickets.iter().any(|t| t.status == "open" && t.age_days > 7 && !t.body.contains("refund")));
+        assert!(
+            tickets
+                .iter()
+                .any(|t| t.status == "closed" && t.body.contains("refund"))
+        );
+        assert!(
+            tickets
+                .iter()
+                .any(|t| t.status == "open" && t.age_days <= 7 && t.body.contains("refund"))
+        );
+        assert!(
+            tickets
+                .iter()
+                .any(|t| t.status == "open" && t.age_days > 7 && !t.body.contains("refund"))
+        );
     }
 }

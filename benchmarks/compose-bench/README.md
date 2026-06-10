@@ -20,15 +20,15 @@ the `bash` arm's numbers.
 
 ### Arms
 
-| arm | tool surface |
-|---|---|
-| `granular` | scenario tools only |
-| `compose` | the same tools wrapped by `ComposeTool::wrap` — compose **and** the granular tools are both advertised |
-| `bash` | `shell_exec` only (file-backed scenario only) |
+| arm        | tool surface                                                                                           |
+| ---------- | ------------------------------------------------------------------------------------------------------ |
+| `granular` | scenario tools only                                                                                    |
+| `compose`  | the same tools wrapped by `ComposeTool::wrap` — compose **and** the granular tools are both advertised |
+| `bash`     | `shell_exec` only (file-backed scenario only)                                                          |
 
 The system prompt is identical in every arm and deliberately neutral ("be
 efficient"), never mentioning compose. In the `compose` arm the model is free
-to ignore compose entirely, so the *compose share* column measures genuine
+to ignore compose entirely, so the _compose share_ column measures genuine
 preference, not compliance.
 
 ### Scenarios
@@ -38,14 +38,14 @@ gets a fresh world. Ground truth is recomputed by the scorer from the same
 fixture code, and unit tests pin the interesting properties of each fixture
 (`cargo test -p compose-bench`).
 
-| scenario | shape | what makes it hard |
-|---|---|---|
-| `support-triage` | read + targeted writes | 3-field predicate; bodies only visible via `get_ticket`; distractors on every predicate axis |
-| `revenue-report` | read-only N+1 aggregation | amounts/statuses need `get_order`, regions need `get_customer`; refunded/pending and other-month noise |
-| `log-incident` | read-only investigation | sustained error burst vs background noise; correlate burst start with deploy times; owner lookup |
-| `crm-hygiene` | write-heavy normalization | 18 phone normalizations + 4 company backfills; already-valid records must be untouched |
-| `calendar-scheduling` | read-only constraint solve | 4 people x 5 days of availability reads, earliest common 60-min slot |
-| `config-migration` | file-backed migration (has `bash` arm) | rename `timeout_ms` -> `request_timeout_ms` incl. nested keys; `connect_timeout_ms` is a substring trap |
+| scenario              | shape                                  | what makes it hard                                                                                      |
+| --------------------- | -------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| `support-triage`      | read + targeted writes                 | 3-field predicate; bodies only visible via `get_ticket`; distractors on every predicate axis            |
+| `revenue-report`      | read-only N+1 aggregation              | amounts/statuses need `get_order`, regions need `get_customer`; refunded/pending and other-month noise  |
+| `log-incident`        | read-only investigation                | sustained error burst vs background noise; correlate burst start with deploy times; owner lookup        |
+| `crm-hygiene`         | write-heavy normalization              | 18 phone normalizations + 4 company backfills; already-valid records must be untouched                  |
+| `calendar-scheduling` | read-only constraint solve             | 4 people x 5 days of availability reads, earliest common 60-min slot                                    |
+| `config-migration`    | file-backed migration (has `bash` arm) | rename `timeout_ms` -> `request_timeout_ms` incl. nested keys; `connect_timeout_ms` is a substring trap |
 
 Every scenario ends with a `submit_result` call carrying a structured answer,
 so accuracy is scored mechanically (world-state assertions + answer checks
@@ -55,7 +55,7 @@ with partial credit), never by parsing prose.
 
 - **wall time** — end-to-end seconds
 - **model requests** — API round-trips (one `UsageUpdated` event per request)
-- **tool calls / compose share** — top-level calls; tools invoked *inside* a
+- **tool calls / compose share** — top-level calls; tools invoked _inside_ a
   compose script do not re-enter the loop and are intentionally not counted
 - **total tokens** — sum of input + cached input + output across all requests
   (what you pay for, modulo cache discounts)

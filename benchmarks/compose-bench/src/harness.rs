@@ -44,12 +44,9 @@ pub async fn run_once(
         .input(vec![Item::text(ItemKind::User, instance.user_prompt)]);
 
     builder = match arm {
-        Arm::Compose => builder.add_tool_source(
-            ComposeTool::wrap(instance.tools).with_config(
-                ComposeConfig::new()
-                    .with_max_nested_tool_calls(config.compose_max_nested_calls),
-            ),
-        ),
+        Arm::Compose => builder.add_tool_source(ComposeTool::wrap(instance.tools).with_config(
+            ComposeConfig::new().with_max_nested_tool_calls(config.compose_max_nested_calls),
+        )),
         Arm::Granular | Arm::Bash => builder.add_tool_source(instance.tools),
     };
     if let Some(permissions) = instance.permissions {
@@ -59,11 +56,9 @@ pub async fn run_once(
 
     let session_id = format!("compose-bench-{}-{}-{rep}", scenario.name(), arm.as_str());
     let mut driver = agent
-        .start(
-            SessionConfig::new(session_id).with_cache(
-                PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
-            ),
-        )
+        .start(SessionConfig::new(session_id).with_cache(
+            PromptCacheRequest::automatic().with_retention(PromptCacheRetention::Short),
+        ))
         .await?;
 
     let started = Instant::now();
@@ -120,7 +115,11 @@ pub async fn run_once(
         &driver.snapshot().transcript,
     )?;
 
-    let submitted = instance.submission.lock().expect("submission lock").is_some();
+    let submitted = instance
+        .submission
+        .lock()
+        .expect("submission lock")
+        .is_some();
     let score = (instance.scorer)();
     let metrics = metrics.lock().expect("metrics lock").clone();
 

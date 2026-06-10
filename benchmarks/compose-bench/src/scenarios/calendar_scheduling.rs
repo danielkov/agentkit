@@ -210,9 +210,7 @@ impl Scenario for CalendarScheduling {
                     .and_then(Value::as_str),
             );
             // Accept second-less variants like 2026-06-17T14:00Z.
-            let matches = |got: &str, want: &str| {
-                got == want || got == want.replace(":00Z", "Z")
-            };
+            let matches = |got: &str, want: &str| got == want || got == want.replace(":00Z", "Z");
             let mut accuracy = 0.0;
             if matches(&start, EXPECTED_START) {
                 accuracy += 0.5;

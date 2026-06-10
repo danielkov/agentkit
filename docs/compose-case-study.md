@@ -5,8 +5,8 @@ life-like agent tasks and ten models — the one-paragraph change that took its
 adoption from 0% to 95% of cells, and the task-shape × model-capability
 conditions under which composition actually pays.**
 
-*agentkit, June 2026. Reproduction: `benchmarks/compose-bench` in this
-repository.*
+_agentkit, June 2026. Reproduction: `benchmarks/compose-bench` in this
+repository._
 
 ---
 
@@ -28,13 +28,13 @@ plus `compose`, and (where reachable) a Bash-only reference.
 Three findings. First, **capability without adoption is worthless**: with a
 mechanics-only tool description, the model never chose `compose` unprompted,
 even though both surfaces were available. Rewriting the description to state
-*when* to use the tool and *why* it is cheaper — plus an eight-line example —
+_when_ to use the tool and _why_ it is cheaper — plus an eight-line example —
 flipped adoption to 6/6 scenarios with no change to prompts or the tool
 itself, and the fix generalized: across a ten-model sweep, 56 of 59 valid
 model×scenario cells used compose unprompted. Second, on the initial model
 (`claude-sonnet-4.5`) the thesis held across the board: `compose` reduced cost
 by **38–77%**, model round-trips by **25–43%**, and wall time by **6–57%**
-versus granular calling, while *raising* accuracy in the three scenarios where
+versus granular calling, while _raising_ accuracy in the three scenarios where
 the granular arm made transcription errors under load; on the file-based
 scenario it matched the Bash arm's cost within noise — shell-pipeline
 economics, delivered to a surface the shell cannot touch. Third, the
@@ -42,7 +42,7 @@ multi-model sweep showed the unconditional version of the thesis does **not**
 generalize: composition's value is conditional on task shape and model
 capability. For N+1 fan-out work it is universal (10/10 models cheaper, −72%
 mean cost, accuracy up); for frontier models it is broadly true; for mid-tier
-models it inverts into an *accuracy rescue at a cost premium*; and for
+models it inverts into an _accuracy rescue at a cost premium_; and for
 exploratory investigation tasks it is an anti-pattern (+107% mean cost).
 
 ---
@@ -53,7 +53,7 @@ exploratory investigation tasks it is an anti-pattern (+107% mean cost).
 
 Every tool call in a conventional agent loop costs one model round-trip: the
 model emits a call, the runtime executes it, the result is appended to the
-transcript, and the *entire growing context* is resubmitted for the next
+transcript, and the _entire growing context_ is resubmitted for the next
 decision. For a task that needs N tool interactions this costs:
 
 - N (or N/k, with k-way parallel calling) inference passes of increasing size,
@@ -63,7 +63,7 @@ decision. For a task that needs N tool interactions this costs:
 
 Practitioners have long observed that agents with shell access sidestep this
 tax instinctively: rather than calling a file-read tool 12 times, they write
-one `sed` loop. The shell is a *composition surface* — and models prefer it
+one `sed` loop. The shell is a _composition surface_ — and models prefer it
 when it is available.
 
 ### 1.2 The compose tool
@@ -107,15 +107,15 @@ round-trip count and per-request token figures.
 
 Per run we record:
 
-| metric | definition |
-|---|---|
-| wall time | end-to-end seconds for the run |
-| model requests | API round-trips (one `UsageUpdated` each) |
+| metric                     | definition                                                               |
+| -------------------------- | ------------------------------------------------------------------------ |
+| wall time                  | end-to-end seconds for the run                                           |
+| model requests             | API round-trips (one `UsageUpdated` each)                                |
 | tool calls / compose share | top-level calls; nested calls inside a Lua script intentionally excluded |
-| total tokens | Σ input + cached input + output across all requests |
-| peak context | largest single request — how full the window got |
-| cost | OpenRouter-reported USD (`usage.cost`) |
-| accuracy | 0–1 rubric, scored mechanically (§2.3) |
+| total tokens               | Σ input + cached input + output across all requests                      |
+| peak context               | largest single request — how full the window got                         |
+| cost                       | OpenRouter-reported USD (`usage.cost`)                                   |
+| accuracy                   | 0–1 rubric, scored mechanically (§2.3)                                   |
 
 Safety rails: a model-request cap (default 60) and a wall-clock timeout
 (default 600 s) bound runaway runs; permission prompts are auto-approved so no
@@ -124,18 +124,18 @@ script the model writes — are persisted per run.
 
 ### 2.2 Arms
 
-| arm | tool surface |
-|---|---|
-| `granular` | scenario tools only |
-| `compose` | the same registry wrapped by `ComposeTool::wrap` — compose **and** every granular tool remain individually visible |
-| `bash` | `shell_exec` only; file-backed scenario only |
+| arm        | tool surface                                                                                                       |
+| ---------- | ------------------------------------------------------------------------------------------------------------------ |
+| `granular` | scenario tools only                                                                                                |
+| `compose`  | the same registry wrapped by `ComposeTool::wrap` — compose **and** every granular tool remain individually visible |
+| `bash`     | `shell_exec` only; file-backed scenario only                                                                       |
 
 Two design decisions matter for validity:
 
 1. **The system prompt is identical in every arm** and neutral: it asks for
    efficiency and a final `submit_result` call, and never mentions compose.
    Whatever routes the model toward compose must therefore live in the tool
-   catalog itself. The compose arm measures *preference*, not compliance.
+   catalog itself. The compose arm measures _preference_, not compliance.
 2. **The compose arm does not remove the granular tools.** The model is free
    to ignore compose entirely — which, as §3 shows, is exactly what it did at
    first.
@@ -145,14 +145,14 @@ Two design decisions matter for validity:
 Six scenarios, each a deterministic in-memory world behind mock tools (fresh
 per run), shaped after real SaaS workflows:
 
-| scenario | shape | difficulty mechanism |
-|---|---|---|
-| support-triage | read + targeted writes | 3-field predicate (open ∧ >7 days ∧ body mentions refund); bodies only visible via `get_ticket`; distractors on every predicate axis |
-| revenue-report | read-only N+1 aggregation | 40 orders: list gives only ids; status/amount need `get_order`, region needs `get_customer`; refunded/pending/off-month noise |
-| log-incident | read-only investigation | sustained error burst vs per-service background noise; correlate burst onset with deploy timestamps; owner lookup |
-| crm-hygiene | write-heavy normalization | 18 phone E.164 rewrites + 4 company backfills across 24 contacts; already-valid records must remain untouched |
-| calendar-scheduling | read-only constraint solve | 4 people × 5 days of availability; earliest common 60-minute slot on a 30-minute boundary |
-| config-migration | file-backed migration (only `bash`-capable scenario) | rename `timeout_ms` → `request_timeout_ms` incl. nested keys; `connect_timeout_ms` present as a substring trap |
+| scenario            | shape                                                | difficulty mechanism                                                                                                                 |
+| ------------------- | ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| support-triage      | read + targeted writes                               | 3-field predicate (open ∧ >7 days ∧ body mentions refund); bodies only visible via `get_ticket`; distractors on every predicate axis |
+| revenue-report      | read-only N+1 aggregation                            | 40 orders: list gives only ids; status/amount need `get_order`, region needs `get_customer`; refunded/pending/off-month noise        |
+| log-incident        | read-only investigation                              | sustained error burst vs per-service background noise; correlate burst onset with deploy timestamps; owner lookup                    |
+| crm-hygiene         | write-heavy normalization                            | 18 phone E.164 rewrites + 4 company backfills across 24 contacts; already-valid records must remain untouched                        |
+| calendar-scheduling | read-only constraint solve                           | 4 people × 5 days of availability; earliest common 60-minute slot on a 30-minute boundary                                            |
+| config-migration    | file-backed migration (only `bash`-capable scenario) | rename `timeout_ms` → `request_timeout_ms` incl. nested keys; `connect_timeout_ms` present as a substring trap                       |
 
 Accuracy is never judged from prose. Every scenario ends with a
 `submit_result` tool call carrying a structured answer; the scorer combines
@@ -181,30 +181,30 @@ First run — log-incident, compose arm, original tool description:
 > "Run a sandboxed Lua script that composes available tools through
 > tool(name, input). The script sees a global `input` … and may call `tools()`
 > to enumerate the visible tool catalog at runtime. Return any Lua value to
-> make it the compose result." *(+ a list of child output schemas)*
+> make it the compose result." _(+ a list of child output schemas)_
 
 **Result: 9 tool calls, 0 through compose.** Accuracy 1.00, $0.052 — the task
 succeeded, but the composition surface was dead weight in the catalog.
 
 The transcript explains part of why. The model fired four `search_logs` calls
-*in a single assistant turn* — parallel tool calling — so 9 calls cost only 5
+_in a single assistant turn_ — parallel tool calling — so 9 calls cost only 5
 round-trips. The model already owns a composition mechanism it was trained on,
-and it used it. Compose's marginal value concentrates in *sequentially
-dependent* chains (call k+1 needs call k's output), which a short investigation
+and it used it. Compose's marginal value concentrates in _sequentially
+dependent_ chains (call k+1 needs call k's output), which a short investigation
 barely has.
 
 The deeper reason is distributional. Models are post-trained on enormous
-volumes of direct JSON tool calls, and on Bash as *the* canonical composition
+volumes of direct JSON tool calls, and on Bash as _the_ canonical composition
 surface. The thesis's premise — "agents prefer Bash because composition is
 efficient" — has the causality at least partly backwards: they prefer Bash
 because it is massively in-distribution. A novel Lua meta-tool has no such
-prior, and a model cannot *feel* token costs or round-trip latency, so
+prior, and a model cannot _feel_ token costs or round-trip latency, so
 efficiency alone never pulls it toward an unfamiliar tool. Selection is
 pattern-matching: "find which service spiked" matches `search_logs`; nothing
 in the task matches "run a sandboxed Lua script."
 
 Hypothesis for the fix: **the description sells mechanics and never the
-benefit.** It says what compose *is*, not when to reach for it or what it
+benefit.** It says what compose _is_, not when to reach for it or what it
 saves.
 
 ---
@@ -224,6 +224,7 @@ routing rule and a quantified benefit, and ends with a worked example:
 > conversation, so intermediate results never consume context.** …
 >
 > Example — scan every page, drill into matches, return only the summary:
+>
 > ```lua
 > local page, hits = 1, {}
 > repeat
@@ -253,33 +254,33 @@ no simulated tool latency.
 
 ### 5.1 Headline: compose vs granular
 
-| scenario | Δ wall | Δ model reqs | Δ total tokens | Δ cost | Δ accuracy |
-|---|---|---|---|---|---|
-| revenue-report | **−57%** | −33% | **−53%** | **−77%** | **+0.33** |
-| calendar-scheduling | −30% | −33% | −14% | −50% | 0.00 |
-| config-migration | −20% | −25% | −8% | −50% | +0.15 |
-| crm-hygiene | −19% | −33% | −11% | −38% | 0.00 |
-| log-incident | −10% | −43% | −17% | −58% | 0.00 |
-| support-triage | −6% | −33% | −7% | −41% | +0.14 |
+| scenario            | Δ wall   | Δ model reqs | Δ total tokens | Δ cost   | Δ accuracy |
+| ------------------- | -------- | ------------ | -------------- | -------- | ---------- |
+| revenue-report      | **−57%** | −33%         | **−53%**       | **−77%** | **+0.33**  |
+| calendar-scheduling | −30%     | −33%         | −14%           | −50%     | 0.00       |
+| config-migration    | −20%     | −25%         | −8%            | −50%     | +0.15      |
+| crm-hygiene         | −19%     | −33%         | −11%           | −38%     | 0.00       |
+| log-incident        | −10%     | −43%         | −17%           | −58%     | 0.00       |
+| support-triage      | −6%      | −33%         | −7%            | −41%     | +0.14      |
 
 Compose was chosen in **6/6 scenarios** and won on every metric in every
 scenario. Raw cells:
 
-| scenario | arm | wall s | reqs | tool calls (compose) | total tokens | peak ctx | cost $ | accuracy |
-|---|---|---|---|---|---|---|---|---|
-| support-triage | granular | 22.4 | 6 | 17 (0) | 17,868 | 4,382 | 0.0715 | 0.86 |
-| support-triage | compose | 21.1 | 4 | 3 (2) | 16,567 | 4,854 | 0.0419 | **1.00** |
-| revenue-report | granular | 42.3 | 6 | **63** (0) | 31,445 | 9,064 | 0.1435 | 0.67 |
-| revenue-report | compose | 18.0 | 4 | 3 (2) | 14,840 | 4,341 | 0.0336 | **1.00** |
-| log-incident | granular | 23.2 | 7 | 9 (0) | 22,830 | 4,424 | 0.0808 | 1.00 |
-| log-incident | compose | 20.9 | 4 | 4 (1) | 19,053 | 5,304 | 0.0336 | 1.00 |
-| crm-hygiene | granular | 30.2 | 6 | 24 (0) | 20,007 | 5,493 | 0.0887 | 1.00 |
-| crm-hygiene | compose | 24.4 | 4 | 3 (2) | 17,759 | 5,152 | 0.0553 | 1.00 |
-| calendar-scheduling | granular | 28.1 | 6 | 14 (0) | 15,829 | 4,067 | 0.0747 | 1.00 |
-| calendar-scheduling | compose | 19.6 | 4 | 3 (1) | 13,681 | 4,199 | 0.0374 | 1.00 |
-| config-migration | granular | 42.2 | 8 | 28 (0) | 40,248 | 7,407 | 0.1626 | 0.85 |
-| config-migration | compose | 33.8 | 6 | 5 (3) | 37,048 | 7,498 | 0.0806 | **1.00** |
-| config-migration | **bash** | 27.9 | 6 | 5 (—) | 19,891 | 5,186 | 0.0778 | 1.00 |
+| scenario            | arm      | wall s | reqs | tool calls (compose) | total tokens | peak ctx | cost $ | accuracy |
+| ------------------- | -------- | ------ | ---- | -------------------- | ------------ | -------- | ------ | -------- |
+| support-triage      | granular | 22.4   | 6    | 17 (0)               | 17,868       | 4,382    | 0.0715 | 0.86     |
+| support-triage      | compose  | 21.1   | 4    | 3 (2)                | 16,567       | 4,854    | 0.0419 | **1.00** |
+| revenue-report      | granular | 42.3   | 6    | **63** (0)           | 31,445       | 9,064    | 0.1435 | 0.67     |
+| revenue-report      | compose  | 18.0   | 4    | 3 (2)                | 14,840       | 4,341    | 0.0336 | **1.00** |
+| log-incident        | granular | 23.2   | 7    | 9 (0)                | 22,830       | 4,424    | 0.0808 | 1.00     |
+| log-incident        | compose  | 20.9   | 4    | 4 (1)                | 19,053       | 5,304    | 0.0336 | 1.00     |
+| crm-hygiene         | granular | 30.2   | 6    | 24 (0)               | 20,007       | 5,493    | 0.0887 | 1.00     |
+| crm-hygiene         | compose  | 24.4   | 4    | 3 (2)                | 17,759       | 5,152    | 0.0553 | 1.00     |
+| calendar-scheduling | granular | 28.1   | 6    | 14 (0)               | 15,829       | 4,067    | 0.0747 | 1.00     |
+| calendar-scheduling | compose  | 19.6   | 4    | 3 (1)                | 13,681       | 4,199    | 0.0374 | 1.00     |
+| config-migration    | granular | 42.2   | 8    | 28 (0)               | 40,248       | 7,407    | 0.1626 | 0.85     |
+| config-migration    | compose  | 33.8   | 6    | 5 (3)                | 37,048       | 7,498    | 0.0806 | **1.00** |
+| config-migration    | **bash** | 27.9   | 6    | 5 (—)                | 19,891       | 5,186    | 0.0778 | 1.00     |
 
 ### 5.2 The N+1 showcase: revenue-report
 
@@ -294,7 +295,7 @@ The compose arm's first script naively looped `get_customer` per order and
 
 > `tool execution failed: compose exceeded 64 nested tool calls`
 
-The model read the error and rewrote the script *with a customer cache*
+The model read the error and rewrote the script _with a customer cache_
 (memoizing `get_customer` by id), bringing the call count under budget, and
 returned exact totals: accuracy 1.00 at $0.034 — **4.3× cheaper, 2.3× faster,
 and correct**. The resource limit didn't just bound damage; it pushed the
@@ -304,7 +305,7 @@ in Appendix A.)
 ### 5.3 Accuracy: the under-reported benefit
 
 The pitch for composition is usually efficiency. The data says the stronger
-argument may be *correctness*. The granular arm lost points in exactly the
+argument may be _correctness_. The granular arm lost points in exactly the
 three scenarios with the highest call volume:
 
 - **revenue-report (0.67):** arithmetic over ~60 in-context tool results;
@@ -334,7 +335,7 @@ Compose landed within ~4% of Bash's cost — pipeline economics on a registry
 surface — while the granular arm paid double and still made an error. Bash
 retains an edge in tokens (its `sed`-style operations don't round-trip file
 contents through the script), which is the honest residual gap: compose
-matches Bash's *round-trip* economics, not always its *payload* economics.
+matches Bash's _round-trip_ economics, not always its _payload_ economics.
 
 ### 5.5 Judicious routing
 
@@ -344,7 +345,7 @@ including work where a direct call is clearer. That did not happen. Across
 all six compose-arm runs the pattern was consistent: loops, pagination, and
 fan-out went through compose; cheap singletons (`list_services`,
 `get_deploys`, `get_service_owners`, `submit_result`) stayed direct. The
-model treated compose as a *batch lane*, not a replacement interface.
+model treated compose as a _batch lane_, not a replacement interface.
 
 ---
 
@@ -362,7 +363,7 @@ through the same harness, prompts, and scenarios — one repetition per cell,
 
 Two configuration changes from Experiment 2. The compose nested-call budget
 was raised from the crate default (64) to 256 via `--compose-max-nested`, so
-that arms compare *composition* rather than error-recovery skill — a naive
+that arms compare _composition_ rather than error-recovery skill — a naive
 full-fan-out script for revenue-report needs 76 calls, and leaving the budget
 below that would have punished weaker models for a fixture-sized constant.
 And cells cut short by infrastructure rather than by the model — two
@@ -384,22 +385,22 @@ on support-triage.
 
 Per-model means across valid scenario pairs (compose arm vs granular arm):
 
-| model | adoption | Δ cost | accuracy granular → compose |
-|---|---|---|---|
-| claude-sonnet-4.6 | 5/6 | **−58%** | 0.94 → 1.00 |
-| kimi-k2.6 | 4/4 | **−50%** | 1.00 → 0.92 |
-| gpt-5.5 | 6/6 | **−19%** | 1.00 → 1.00 |
-| glm-5 | 5/6 | +13% | 0.94 → 1.00 |
-| gpt-5.4 | 6/6 | +17% | 0.57 → 0.80 |
-| deepseek-v4-pro | 5/6 | +19% | 1.00 → 0.97 |
-| gpt-5-mini | 6/6 | +53% | 1.00 → 0.85 |
-| gemini-3.1-pro-preview | 6/6 | +55% | 0.86 → 1.00 |
-| gpt-5.2 | 6/6 | +75% | 1.00 → 0.90 |
-| claude-haiku-4.5 | 6/6 | +118% | 0.83 → 1.00 |
+| model                  | adoption | Δ cost   | accuracy granular → compose |
+| ---------------------- | -------- | -------- | --------------------------- |
+| claude-sonnet-4.6      | 5/6      | **−58%** | 0.94 → 1.00                 |
+| kimi-k2.6              | 4/4      | **−50%** | 1.00 → 0.92                 |
+| gpt-5.5                | 6/6      | **−19%** | 1.00 → 1.00                 |
+| glm-5                  | 5/6      | +13%     | 0.94 → 1.00                 |
+| gpt-5.4                | 6/6      | +17%     | 0.57 → 0.80                 |
+| deepseek-v4-pro        | 5/6      | +19%     | 1.00 → 0.97                 |
+| gpt-5-mini             | 6/6      | +53%     | 1.00 → 0.85                 |
+| gemini-3.1-pro-preview | 6/6      | +55%     | 0.86 → 1.00                 |
+| gpt-5.2                | 6/6      | +75%     | 1.00 → 0.90                 |
+| claude-haiku-4.5       | 6/6      | +118%    | 0.83 → 1.00                 |
 
 The headline split: frontier models with strong code-generation (sonnet-4.6,
-gpt-5.5, kimi-k2.6) realize the cost thesis; mid-tier and small models *pay
-more* under compose — but look at the accuracy columns before reading that as
+gpt-5.5, kimi-k2.6) realize the cost thesis; mid-tier and small models _pay
+more_ under compose — but look at the accuracy columns before reading that as
 a loss. For haiku-4.5, gemini-3.1-pro, and gpt-5.4, the granular arm is the
 one failing tasks (0.83, 0.86, 0.57), and compose lifts all three to 0.80–1.00.
 For those models composition is not a cost optimization; it is an **accuracy
@@ -411,14 +412,14 @@ answer at 5.8× the price.
 
 The same data cut by scenario, across all models:
 
-| scenario | shape | mean Δ cost | mean Δ accuracy | compose cheaper |
-|---|---|---|---|---|
-| revenue-report | N+1 fan-out | **−72%** | +0.17 | **10/10** |
-| support-triage | sweep + targeted writes | −13% | +0.01 | 7/10 |
-| crm-hygiene | bulk mechanical writes | +23%¹ | +0.10 | 7/10 |
-| config-migration | one-shot file transform | +12% | −0.21² | 5/9 |
-| calendar-scheduling | constraint solve | +97% | **+0.22** | 4/9 |
-| log-incident | exploratory investigation | **+107%** | −0.10 | 5/10 |
+| scenario            | shape                     | mean Δ cost | mean Δ accuracy | compose cheaper |
+| ------------------- | ------------------------- | ----------- | --------------- | --------------- |
+| revenue-report      | N+1 fan-out               | **−72%**    | +0.17           | **10/10**       |
+| support-triage      | sweep + targeted writes   | −13%        | +0.01           | 7/10            |
+| crm-hygiene         | bulk mechanical writes    | +23%¹       | +0.10           | 7/10            |
+| config-migration    | one-shot file transform   | +12%        | −0.21²          | 5/9             |
+| calendar-scheduling | constraint solve          | +97%        | **+0.22**       | 4/9             |
+| log-incident        | exploratory investigation | **+107%**   | −0.10           | 5/10            |
 
 ¹ mean skewed by two iteration-loop outliers; the median model saves money.
 ² driven almost entirely by one family's Lua bugs (§6.5).
@@ -435,13 +436,13 @@ Three regimes:
   and calendar-scheduling compress into one nontrivial program. Strong
   models one-shot it and win; weak models either iterate scripts (paying
   the premium) or ship a buggy program (paying in accuracy). Composition
-  *concentrates* risk that granular calling spreads across observable steps.
+  _concentrates_ risk that granular calling spreads across observable steps.
 - **The exploration regime (anti-pattern).** log-incident is
   observe-then-act work: what to fetch next depends on what the data shows.
   Models that scripted it anyway paid +107% on average for −0.10 accuracy;
   gpt-5.2 spent 6.2× granular cost iterating scripts it did not need. The
   two strongest abstentions in the sweep (sonnet-4.6 and glm-5 declining
-  compose *for this scenario specifically*) were correct routing decisions.
+  compose _for this scenario specifically_) were correct routing decisions.
 
 ### 6.5 Family-specific failure modes
 
@@ -457,7 +458,7 @@ anything structural.
 
 **Small models turn one-shot composition into a debugging loop.** haiku-4.5
 and gpt-5-mini frequently needed 4–16 compose calls where frontier models
-needed 1–2, converting the round-trip savings into a round-trip *spend*. The
+needed 1–2, converting the round-trip savings into a round-trip _spend_. The
 loop usually converges to a correct answer (accuracy 1.00 for haiku
 everywhere granular also succeeded, plus the calendar rescue), so the failure
 mode is economic, not behavioral.
@@ -478,7 +479,7 @@ weights changed, no prompts changed. Tool descriptions are the routing layer
 of an agent system, and models route by pattern-matching task descriptions
 against tool descriptions. A description that only explains mechanics
 ("runs a sandboxed Lua script") gives the matcher nothing to bind to; the
-winning description names the *task shapes* that should trigger it
+winning description names the _task shapes_ that should trigger it
 ("iterating over list results, paginating, fetching details per item…") and
 states the payoff in the currency the loop actually spends (round-trips,
 context).
@@ -491,7 +492,7 @@ not decoration; it is the few-shot prompt that makes the surface usable.
 
 **Parallel tool calling is the real competitor, and it loses on dependencies
 and context.** Where calls are independent, parallel calling matches compose
-on round-trips. It cannot pipeline *dependent* chains (list → detail →
+on round-trips. It cannot pipeline _dependent_ chains (list → detail →
 write), and it cannot keep intermediates out of context — every parallel
 result lands in the transcript forever. The granular revenue run held all 63
 results in context and paid for it twice: in tokens (2.1×) and in a wrong
@@ -521,7 +522,7 @@ code-generation capability), not of composition per se.
 the thesis claimed: a cost/latency optimization (−19% to −58% mean cost at
 equal-or-better accuracy). For mid-tier models it is something the thesis
 never predicted: an accuracy prosthetic — haiku-4.5, gemini-3.1-pro, and
-gpt-5.4 all *paid more* under compose and got dramatically more correct
+gpt-5.4 all _paid more_ under compose and got dramatically more correct
 (+0.14 to +0.23 mean accuracy), because pushing iteration into an executed
 program rescued tasks their granular arms were failing outright. Same
 mechanism, opposite economics, both valuable.
@@ -548,10 +549,10 @@ These results are promising, not definitive:
    adoption gate during description iteration, then appeared in the matrix.
    Its post-fix numbers should be read as in-sample; the other five scenarios
    were untouched during tuning. (That log-incident ended up compose's
-   *worst* scenario argues against tuning having inflated it.)
+   _worst_ scenario argues against tuning having inflated it.)
 3. **Zero simulated tool latency.** Mock tools answer in microseconds. Real
    MCP servers add per-call network latency, which compose amortizes and
-   granular calling pays N times — so this configuration *understates*
+   granular calling pays N times — so this configuration _understates_
    compose's wall-time advantage. The harness has `--tool-latency-ms` to
    model it.
 4. **Wall time is provider-contaminated across models.** OpenRouter routes
@@ -601,13 +602,13 @@ multi-round repair loop.
 
 For **agent operators**: which benefit you are buying depends on your model
 tier. On frontier models, enabling compose is a straight cost cut. On
-mid-tier models, expect to *pay more* per task and get materially higher
+mid-tier models, expect to _pay more_ per task and get materially higher
 task completion — worth it where correctness dominates spend, wrong where it
 doesn't. Avoid routing exploratory/diagnostic work through composition on
 any tier.
 
-For **benchmark methodology**: measuring *preference* (both surfaces
-available, neutral prompt) rather than *compliance* (prompt mandates the
+For **benchmark methodology**: measuring _preference_ (both surfaces
+available, neutral prompt) rather than _compliance_ (prompt mandates the
 tool) is what surfaced the adoption failure — the most actionable finding in
 the study. A compliance-style benchmark would have skipped straight to the
 efficiency table and shipped a tool nobody's agent would actually use.
@@ -620,7 +621,7 @@ efficiency table and shipped a tool nobody's agent would actually use.
 - A prompted-compose arm to separate preference from capability ceiling.
 - Description ablations: routing rule alone vs example alone vs both, to
   attribute the adoption swing.
-- A *routing-guidance* ablation: §6.4 implies the description should also say
+- A _routing-guidance_ ablation: §6.4 implies the description should also say
   when **not** to compose ("for exploratory investigation, call tools
   directly") — testable the same way the adoption fix was.
 - Larger worlds (hundreds of items) where the granular arm's context growth

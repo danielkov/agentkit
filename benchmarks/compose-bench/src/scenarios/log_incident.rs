@@ -38,7 +38,10 @@ fn fixture_logs() -> Vec<LogEntry> {
                 ts: ts(8 + slot / 2, (slot % 2) * 30 + s as u64),
                 service,
                 level: "INFO",
-                message: format!("{service}: request handled in {}ms", 40 + slot * 3 + s as u64),
+                message: format!(
+                    "{service}: request handled in {}ms",
+                    40 + slot * 3 + s as u64
+                ),
             });
         }
     }
@@ -70,7 +73,11 @@ fn fixture_deploys(service: &str) -> Vec<Value> {
     let shas: &[(&str, &str)] = match service {
         "auth" => &[("c11ab90", "08:40"), ("d27e441", "12:15")],
         "checkout" => &[("77aa210", "09:30"), ("81b6c02", "15:20")],
-        "payments" => &[("4e0d9c1", "09:10"), (CULPRIT_SHA, "14:05"), ("b8123f7", "16:45")],
+        "payments" => &[
+            ("4e0d9c1", "09:10"),
+            (CULPRIT_SHA, "14:05"),
+            ("b8123f7", "16:45"),
+        ],
         "search" => &[("f00dbed", "10:55")],
         _ => &[],
     };
@@ -209,7 +216,8 @@ impl Scenario for LogIncident {
             }),
             move |input| {
                 let service = get_str(input, "service")?;
-                let owner = owner_email(service).ok_or_else(|| format!("unknown service {service}"))?;
+                let owner =
+                    owner_email(service).ok_or_else(|| format!("unknown service {service}"))?;
                 Ok(json!({ "service": service, "owner_email": owner }))
             },
         );

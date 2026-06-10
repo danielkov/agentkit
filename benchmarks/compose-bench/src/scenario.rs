@@ -235,10 +235,7 @@ pub fn f1(submitted: &[String], expected: &[String]) -> f64 {
     if submitted.is_empty() {
         return 0.0;
     }
-    let hits = submitted
-        .iter()
-        .filter(|id| expected.contains(id))
-        .count() as f64;
+    let hits = submitted.iter().filter(|id| expected.contains(id)).count() as f64;
     let precision = hits / submitted.len() as f64;
     let recall = hits / expected.len() as f64;
     if precision + recall == 0.0 {
