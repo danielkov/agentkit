@@ -13,10 +13,18 @@ pub trait Tool: Send + Sync {
         request: ToolRequest,
         ctx: &mut ToolContext<'_>,
     ) -> Result<ToolResult, ToolError>;
+
+    // Optional. Default delegates to `invoke` and folds `Result` into
+    // `ToolExecutionOutcome::Completed` / `::Failed`.
+    async fn invoke_outcome(
+        &self,
+        request: ToolRequest,
+        ctx: &mut ToolContext<'_>,
+    ) -> ToolExecutionOutcome { /* ... */ }
 }
 ```
 
-A tool has two concerns: description and execution. The `spec()` method returns the model-facing description. The `invoke()` method does the work.
+A tool has two concerns: description and execution. The `spec()` method returns the model-facing description. The `invoke()` method does the work. Tools that compose other tools (see `agentkit-tool-compose`) can override `invoke_outcome` instead, so a nested approval interruption propagates back to the loop as `ToolExecutionOutcome::Interrupted` rather than collapsing into an error.
 
 ### ToolSpec
 
@@ -25,10 +33,13 @@ pub struct ToolSpec {
     pub name: ToolName,
     pub description: String,
     pub input_schema: Value,
+    pub output_schema: Option<Value>,
     pub annotations: ToolAnnotations,
     pub metadata: MetadataMap,
 }
 ```
+
+`output_schema` is the JSON Schema describing what the tool returns. Provider tool-call APIs (Anthropic, OpenAI, Gemini) don't carry an output schema in their declarations, so it is **not** forwarded verbatim to the model. Hosts may render it into the description, and composing tools (e.g. `agentkit-tool-compose`) surface it so a generated script can target the correct return shape on the first try. Set it on a spec with `ToolSpec::with_output_schema(schema)`.
 
 `ToolAnnotations` carry behavioral hints:
 
@@ -77,10 +88,16 @@ pub struct ToolContext<'a> {
     pub permissions: &'a dyn PermissionChecker,
     pub resources: &'a dyn ToolResources,
     pub cancellation: Option<TurnCancellation>,
+    pub execution_scope: Option<ToolExecutionScope>,
+    pub approved_request: Option<ApprovalRequest>,
 }
 ```
 
 The context gives tools access to permissions, shared resources (like filesystem policy state), and cancellation. Tools don't reach into the loop — they get a narrow execution context.
+
+`execution_scope` is the owned handle a composing tool uses to invoke other tools through the same executor, permission checks, and cancellation token. It is `None` when no scope was installed (older host wiring, raw `Invocable` adapters). When present, `scope.execute_child(request)` and `scope.execute_approved_child(request, approval)` return `ToolExecutionOutcome` directly — so nested approval interrupts propagate out via `invoke_outcome` instead of being collapsed.
+
+`approved_request` is the `ApprovalRequest` currently being resumed when the invocation is the result of host approval. Tools that need to know "is this an approval resume?" can read it; the executor sets and restores it automatically across the `execute_approved` path.
 
 ## The registry
 

@@ -24,6 +24,8 @@ filesystem, plus a policy layer that can enforce rules like "read before write."
 | `fs_list_directory`   | List entries in a directory                      |
 | `fs_create_directory` | Create a directory (and parents)                 |
 
+Every tool declares a `ToolSpec::output_schema` describing the JSON it returns. Hosts and composing tools (e.g. `agentkit-tool-compose`) can read it via the tool's spec to drive validation or surface it to the model.
+
 ## Quick start
 
 Get a `ToolRegistry` containing all filesystem tools with a single call:

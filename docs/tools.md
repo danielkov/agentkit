@@ -145,10 +145,13 @@ pub struct ToolSpec {
     pub name: ToolName,
     pub description: String,
     pub input_schema: serde_json::Value,
+    pub output_schema: Option<serde_json::Value>,
     pub annotations: ToolAnnotations,
     pub metadata: MetadataMap,
 }
 ```
+
+`output_schema` declares the JSON shape the tool returns. Provider tool-call APIs do not carry an output schema in their declarations, so it is not surfaced verbatim to the model. Hosts and composing tools may render it into the description or use it for validation; `agentkit-tool-compose` surfaces it through its Lua `tools()` helper so generated scripts can target the right return shape. Set it with `ToolSpec::with_output_schema(schema)`.
 
 Recommended `ToolAnnotations` fields:
 
@@ -205,6 +208,16 @@ pub trait Tool: Send + Sync {
         request: ToolRequest,
         ctx: &mut ToolContext,
     ) -> Result<ToolResult, ToolError>;
+
+    // Optional. Default wraps `invoke`'s Result into
+    // ToolExecutionOutcome::Completed / ::Failed. Override only when a
+    // composing tool needs to propagate a nested `Interrupted` outcome
+    // (e.g. a child approval) up to the loop.
+    async fn invoke_outcome(
+        &self,
+        request: ToolRequest,
+        ctx: &mut ToolContext,
+    ) -> ToolExecutionOutcome { /* ... */ }
 }
 ```
 
@@ -256,10 +269,17 @@ pub struct ToolContext<'a> {
     pub turn_id: &'a TurnId,
     pub permissions: &'a dyn PermissionChecker,
     pub resources: &'a dyn ToolResources,
+    pub cancellation: Option<TurnCancellation>,
+    pub execution_scope: Option<ToolExecutionScope>,
+    pub approved_request: Option<ApprovalRequest>,
 }
 ```
 
 The important boundary is that tools do not reach directly into the loop. They get a narrow execution context.
+
+`execution_scope` is an owned scope (executor + session + turn + permissions + resources + cancellation) that lets a composing tool invoke other tools through the same execution path. Call `scope.execute_child(request)` for a normal nested call and `scope.execute_approved_child(request, approval)` to resume a child past a recorded approval. Both return `ToolExecutionOutcome`, so a nested approval interruption can propagate up through the parent's `invoke_outcome` instead of being collapsed into an error.
+
+`approved_request` is the `ApprovalRequest` currently being resumed when the invocation is the result of host approval. The `BasicToolExecutor` sets it on entry to `execute_approved` and restores the previous value on return.
 
 ## 6. Tool registry
 

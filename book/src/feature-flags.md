@@ -28,6 +28,7 @@ The umbrella crate `agentkit` re-exports subcrates behind feature flags.
 - `tool-fs` — `agentkit-tool-fs`
 - `tool-shell` — `agentkit-tool-shell`
 - `tool-skills` — `agentkit-tool-skills`
+- `tool-compose` — `agentkit-tool-compose`
 
 ## Typical combinations
 

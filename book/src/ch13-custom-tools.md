@@ -159,9 +159,21 @@ async fn invoke(&self, request: ToolRequest, ctx: &mut ToolContext<'_>) -> Resul
     // Access session identity
     let session_id = ctx.capability.session_id;
 
+    // Detect that the loop is resuming this call after a host approval
+    if let Some(approval) = ctx.approved_request.as_ref() {
+        // resume side of the work
+    }
+
+    // Invoke another tool through the same executor + permissions
+    if let Some(scope) = ctx.execution_scope.clone() {
+        let outcome = scope.execute_child(child_request).await;
+    }
+
     // ...
 }
 ```
+
+`execution_scope` is the supported entry point for tools that compose other tools (see `agentkit-tool-compose` and the `Composing other tools` section below). `approved_request` is `Some` only while the loop is resuming this call past a host approval; the executor restores the previous value on return.
 
 ## Adding preflight permission requests
 
@@ -250,6 +262,37 @@ Outer agent (orchestrator):
 The inner agent has its own transcript, tools, and session. It doesn't share state with the outer agent — this isolation prevents context pollution and makes the sub-agent's scope explicit.
 
 The [`openrouter-subagent-tool`](https://github.com/danielkov/agentkit/tree/main/examples/openrouter-subagent-tool) example shows a complete implementation of this pattern.
+
+### Composing other tools
+
+When a tool needs to invoke other tools — not a nested agent loop, just direct calls — go through `ctx.execution_scope` rather than holding a reference to the registry or executor yourself. The scope routes nested calls through the same `ToolExecutor`, permission checks, output truncation, and cancellation token as the parent call.
+
+```rust
+async fn invoke_outcome(
+    &self,
+    request: ToolRequest,
+    ctx: &mut ToolContext<'_>,
+) -> ToolExecutionOutcome {
+    let scope = match ctx.execution_scope.clone() {
+        Some(scope) => scope,
+        None => return ToolExecutionOutcome::Failed(
+            ToolError::Internal("missing execution scope".into()),
+        ),
+    };
+
+    let child = ToolRequest::new(/* ... */);
+    match scope.execute_child(child).await {
+        ToolExecutionOutcome::Completed(result) => /* ... */,
+        // Propagate child approval interrupts back to the loop.
+        ToolExecutionOutcome::Interrupted(i) => ToolExecutionOutcome::Interrupted(i),
+        ToolExecutionOutcome::Failed(e) => ToolExecutionOutcome::Failed(e),
+    }
+}
+```
+
+Override `invoke_outcome` (not just `invoke`) so a child tool's `ApprovalRequired` interruption travels back to the loop and the host can decide. After approval, the loop replays your tool with `ctx.approved_request = Some(...)` set — use `scope.execute_approved_child(request, approval)` to advance the specific child call past the recorded approval.
+
+The [`agentkit-tool-compose`](https://github.com/danielkov/agentkit/tree/main/crates/agentkit-tool-compose) crate is the canonical example: it exposes a `compose` tool that runs sandboxed Lua scripts, and each `tool(name, input)` call inside the script becomes one `scope.execute_child(...)` round.
 
 ### Tool registries from crates
 

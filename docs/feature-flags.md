@@ -70,6 +70,9 @@ The umbrella crate `agentkit` re-exports subcrates behind feature flags.
 - `tool-skills`
   - enables `agentkit-tool-skills`
   - implies `tools`
+- `tool-compose`
+  - enables `agentkit-tool-compose`
+  - implies `tools`
 
 ## Default flags
 

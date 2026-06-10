@@ -170,4 +170,4 @@ use agentkit::loop_::{Agent, ModelAdapter, SessionConfig};
 // let agent = Agent::builder().model(my_adapter).build()?;
 ```
 
-See the [book](https://danielkov.github.io/agentkit/) and the in-tree `examples/` directory for end-to-end programs covering streaming, MCP, compaction, parallel tools, session persistence, and subagents.
+See the [book](https://danielkov.github.io/agentkit/) and the in-tree `examples/` directory for end-to-end programs covering streaming, MCP, compaction, parallel tools, session persistence, subagents, and Lua-driven multi-tool composition (`openrouter-codemod`).

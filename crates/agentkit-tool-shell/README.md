@@ -11,7 +11,9 @@ Shell execution tool for running subprocesses inside an agentkit agent loop.
 
 This crate provides `ShellExecTool`, registered under the name `shell_exec`.
 When invoked it spawns a subprocess and returns structured JSON containing
-`stdout`, `stderr`, `success`, and `exit_code`.
+`stdout`, `stderr`, `success`, and `exit_code`. The shape is declared on the
+spec via `ToolSpec::output_schema` so hosts and composing tools can read it
+directly.
 
 Features:
 
