@@ -217,9 +217,24 @@ impl ComposeTool {
     fn compose_description(catalog: Option<&[ToolSpec]>) -> String {
         let mut description = String::from(
             "Run a sandboxed Lua script that composes available tools through tool(name, input). \
-             The script sees a global `input` (the JSON value passed alongside the script) and \
-             may call `tools()` to enumerate the visible tool catalog at runtime. Return any \
-             Lua value to make it the compose result.",
+             Prefer this tool whenever a task takes more than two tool calls: iterating over \
+             list results, paginating, fetching details per item, filtering or aggregating tool \
+             output, or chaining reads into writes. The whole script executes in a single \
+             round-trip — one compose call replaces N individual calls — and only the script's \
+             return value enters the conversation, so intermediate results never consume \
+             context. The script sees a global `input` (the JSON value passed alongside the \
+             script) and may call `tools()` to enumerate the visible tool catalog at runtime. \
+             Return any Lua value to make it the compose result.\n\n\
+             Example — scan every page, drill into matches, return only the summary:\n\
+             local page, hits = 1, {}\n\
+             repeat\n\
+             \x20 local r = tool('list_items', { page = page })\n\
+             \x20 for _, it in ipairs(r.items) do\n\
+             \x20   if it.status == 'open' then hits[#hits + 1] = tool('get_item', { id = it.id }) end\n\
+             \x20 end\n\
+             \x20 page = page + 1\n\
+             until page > r.total_pages\n\
+             return { count = #hits, items = hits }",
         );
         if let Some(catalog) = catalog {
             if catalog.is_empty() {
