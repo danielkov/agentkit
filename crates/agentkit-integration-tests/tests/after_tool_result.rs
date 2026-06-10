@@ -38,6 +38,8 @@ async fn after_tool_result_submit_interjects_user_message_into_next_turn() {
                         json!({}),
                     )),
                     ModelTurnEvent::Finished(ModelTurnResult {
+                        model: None,
+                        response_id: None,
                         finish_reason: FinishReason::ToolCall,
                         output_items: vec![Item::new(
                             ItemKind::Assistant,
@@ -57,6 +59,8 @@ async fn after_tool_result_submit_interjects_user_message_into_next_turn() {
                 input: Vec::new(),
                 tools: Vec::new(),
                 events: vec![ModelTurnEvent::Finished(ModelTurnResult {
+                    model: None,
+                    response_id: None,
                     finish_reason: FinishReason::Completed,
                     output_items: vec![Item::new(
                         ItemKind::Assistant,

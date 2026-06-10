@@ -25,6 +25,7 @@ serde.workspace = true
 serde_json.workspace = true
 sse-stream = "0.2"
 thiserror.workspace = true
+tracing.workspace = true
 tokio = { workspace = true, features = ["sync", "time"] }
 
 [dev-dependencies]

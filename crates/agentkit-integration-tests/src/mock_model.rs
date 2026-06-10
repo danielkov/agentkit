@@ -50,6 +50,8 @@ impl TurnScript {
             vec![Part::Text(TextPart::new(text.clone()))],
         );
         Self::new([ModelTurnEvent::Finished(ModelTurnResult {
+            model: None,
+            response_id: None,
             finish_reason: FinishReason::Completed,
             output_items: vec![item],
             usage: None,
@@ -64,6 +66,8 @@ impl TurnScript {
         Self::new([
             ModelTurnEvent::ToolCall(call),
             ModelTurnEvent::Finished(ModelTurnResult {
+                model: None,
+                response_id: None,
                 finish_reason: FinishReason::ToolCall,
                 output_items: vec![assistant],
                 usage: None,

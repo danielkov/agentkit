@@ -380,6 +380,16 @@ pub struct ModelTurnResult {
     pub usage: Option<Usage>,
     /// Provider-specific metadata about the turn.
     pub metadata: MetadataMap,
+    /// Model identifier reported by the provider for this turn, if known.
+    ///
+    /// Stamped onto inference telemetry spans as `gen_ai.response.model`.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Provider-assigned response identifier for this turn, if known.
+    ///
+    /// Stamped onto inference telemetry spans as `gen_ai.response.id`.
+    #[serde(default)]
+    pub response_id: Option<String>,
 }
 
 /// Streaming event emitted by a [`ModelTurn`] during generation.
@@ -486,6 +496,15 @@ pub trait ModelSession: Send {
         request: TurnRequest,
         cancellation: Option<TurnCancellation>,
     ) -> Result<Self::Turn, LoopError>;
+
+    /// Model identifier this session sends requests to, when known.
+    ///
+    /// Stamped onto inference telemetry spans as the `gen_ai.request.model`
+    /// attribute from the OpenTelemetry GenAI semantic conventions. The
+    /// default returns `None` for sessions without a fixed model.
+    fn model_name(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// A streaming model turn that yields events one at a time.
@@ -1440,6 +1459,7 @@ where
             "gen_ai.tool.name" = %request.tool_name,
             "gen_ai.tool.call.id" = %request.call_id,
             "gen_ai.conversation.id" = %self.session_id,
+            "error.type" = tracing::field::Empty,
             session.id = %self.session_id,
             turn.id = %turn_id,
             launch_kind = launch_kind,
@@ -1700,13 +1720,16 @@ where
                         TaskLaunchKind::Plain,
                         cancellation.clone(),
                     )
-                    .instrument(dispatch_span)
+                    .instrument(dispatch_span.clone())
                     .await?
                 {
                     TaskStartOutcome::Ready(resolution) => {
                         let resolution = *resolution;
                         match resolution {
                             TaskResolution::Item(item) => {
+                                if tool_result_is_error(&item) {
+                                    dispatch_span.record("error.type", "tool_error");
+                                }
                                 if let Some(active) = self.active_tool_round.as_mut() {
                                     active.foreground_progressed = true;
                                 }
@@ -1914,7 +1937,46 @@ where
             .session
             .as_mut()
             .ok_or_else(|| LoopError::InvalidState("model session is not available".into()))?;
-        let mut turn = match session.begin_turn(request, cancellation.clone()).await {
+
+        // Inference span per the OTel GenAI semantic conventions. It wraps the
+        // model request and the full event drain rather than just `begin_turn`,
+        // so attributes that streaming adapters only learn mid-stream (usage,
+        // stop reason, response identity) still land before the span closes.
+        // `otel.name` carries the dynamic `chat {model}` span name for
+        // OpenTelemetry bridges since tracing span names are static.
+        let chat_span = tracing::info_span!(
+            "chat",
+            "otel.name" = tracing::field::Empty,
+            "otel.kind" = "client",
+            "gen_ai.operation.name" = "chat",
+            "gen_ai.provider.name" = tracing::field::Empty,
+            "gen_ai.conversation.id" = %self.session_id,
+            "gen_ai.request.model" = tracing::field::Empty,
+            "gen_ai.response.model" = tracing::field::Empty,
+            "gen_ai.response.id" = tracing::field::Empty,
+            "gen_ai.response.finish_reasons" = tracing::field::Empty,
+            "gen_ai.usage.input_tokens" = tracing::field::Empty,
+            "gen_ai.usage.output_tokens" = tracing::field::Empty,
+        );
+        if let Some(provider) = &self.provider_name {
+            chat_span.record("gen_ai.provider.name", provider.as_str());
+        }
+        match session.model_name() {
+            Some(model) => {
+                chat_span.record("gen_ai.request.model", model);
+                chat_span.record("otel.name", format!("chat {model}").as_str());
+            }
+            None => {
+                chat_span.record("otel.name", "chat");
+            }
+        }
+
+        use tracing::Instrument;
+        let mut turn = match session
+            .begin_turn(request, cancellation.clone())
+            .instrument(chat_span.clone())
+            .await
+        {
             Ok(turn) => turn,
             Err(LoopError::Cancelled) => {
                 self.task_manager
@@ -1928,7 +1990,11 @@ where
         let mut saw_tool_call = false;
         let mut finished_result = None;
 
-        while let Some(event) = match turn.next_event(cancellation.clone()).await {
+        while let Some(event) = match turn
+            .next_event(cancellation.clone())
+            .instrument(chat_span.clone())
+            .await
+        {
             Ok(event) => event,
             Err(LoopError::Cancelled) => {
                 self.task_manager
@@ -1951,7 +2017,13 @@ where
             }
             match event {
                 ModelTurnEvent::Delta(delta) => self.emit(AgentEvent::ContentDelta(delta)),
-                ModelTurnEvent::Usage(usage) => self.emit(AgentEvent::UsageUpdated(usage)),
+                ModelTurnEvent::Usage(usage) => {
+                    if let Some(tokens) = &usage.tokens {
+                        chat_span.record("gen_ai.usage.input_tokens", tokens.input_tokens);
+                        chat_span.record("gen_ai.usage.output_tokens", tokens.output_tokens);
+                    }
+                    self.emit(AgentEvent::UsageUpdated(usage));
+                }
                 ModelTurnEvent::ToolCall(call) => {
                     saw_tool_call = true;
                     self.emit(AgentEvent::ToolCallRequested(call.clone()));
@@ -1966,6 +2038,25 @@ where
         let mut result = finished_result.ok_or_else(|| {
             LoopError::Provider("model turn ended without a Finished event".into())
         })?;
+        if let Some(model) = &result.model {
+            chat_span.record("gen_ai.response.model", model.as_str());
+        }
+        if let Some(id) = &result.response_id {
+            chat_span.record("gen_ai.response.id", id.as_str());
+        }
+        if let Some(tokens) = result
+            .usage
+            .as_ref()
+            .and_then(|usage| usage.tokens.as_ref())
+        {
+            chat_span.record("gen_ai.usage.input_tokens", tokens.input_tokens);
+            chat_span.record("gen_ai.usage.output_tokens", tokens.output_tokens);
+        }
+        chat_span.record(
+            "gen_ai.response.finish_reasons",
+            tracing::field::debug(&result.finish_reason),
+        );
+        drop(chat_span);
         tracing::Span::current().record("saw_tool_call", saw_tool_call);
         tracing::Span::current().record(
             "finish_reason",
@@ -2068,11 +2159,16 @@ where
                             .as_ref()
                             .map(CancellationHandle::checkpoint),
                     )
-                    .instrument(dispatch_span)
+                    .instrument(dispatch_span.clone())
                     .await?
                 {
                     TaskStartOutcome::Ready(resolution) => {
                         let resolution = *resolution;
+                        if let TaskResolution::Item(item) = &resolution
+                            && tool_result_is_error(item)
+                        {
+                            dispatch_span.record("error.type", "tool_error");
+                        }
                         if let Some(step) =
                             self.queue_resolution_interrupt(&pending.turn_id, resolution)
                         {
@@ -2476,6 +2572,12 @@ fn extract_tool_calls(items: &[Item]) -> Vec<ToolCallPart> {
     calls
 }
 
+fn tool_result_is_error(item: &Item) -> bool {
+    item.parts
+        .iter()
+        .any(|part| matches!(part, Part::ToolResult(result) if result.is_error))
+}
+
 /// Errors that can occur while driving the agent loop.
 #[derive(Debug, Error)]
 pub enum LoopError {
@@ -2711,6 +2813,8 @@ mod tests {
                     .unwrap_or_else(|| "missing".into());
 
                 VecDeque::from([ModelTurnEvent::Finished(ModelTurnResult {
+                    model: None,
+                    response_id: None,
                     finish_reason: FinishReason::Completed,
                     output_items: vec![Item {
                         id: None,
@@ -2736,6 +2840,8 @@ mod tests {
                         metadata: MetadataMap::new(),
                     }),
                     ModelTurnEvent::Finished(ModelTurnResult {
+                        model: None,
+                        response_id: None,
                         finish_reason: FinishReason::ToolCall,
                         output_items: vec![Item {
                             id: None,
@@ -2831,6 +2937,8 @@ mod tests {
 
             let events = if has_tool_result {
                 VecDeque::from([ModelTurnEvent::Finished(ModelTurnResult {
+                    model: None,
+                    response_id: None,
                     finish_reason: FinishReason::Completed,
                     output_items: vec![Item {
                         id: None,
@@ -2864,6 +2972,8 @@ mod tests {
                     ModelTurnEvent::ToolCall(foreground.clone()),
                     ModelTurnEvent::ToolCall(background.clone()),
                     ModelTurnEvent::Finished(ModelTurnResult {
+                        model: None,
+                        response_id: None,
                         finish_reason: FinishReason::ToolCall,
                         output_items: vec![Item {
                             id: None,
@@ -2902,6 +3012,8 @@ mod tests {
 
             let events = if tool_results >= 2 {
                 VecDeque::from([ModelTurnEvent::Finished(ModelTurnResult {
+                    model: None,
+                    response_id: None,
                     finish_reason: FinishReason::Completed,
                     output_items: vec![Item {
                         id: None,
@@ -2935,6 +3047,8 @@ mod tests {
                     ModelTurnEvent::ToolCall(first.clone()),
                     ModelTurnEvent::ToolCall(second.clone()),
                     ModelTurnEvent::Finished(ModelTurnResult {
+                        model: None,
+                        response_id: None,
                         finish_reason: FinishReason::ToolCall,
                         output_items: vec![Item {
                             id: None,
@@ -2982,6 +3096,8 @@ mod tests {
             } else {
                 self.emitted = true;
                 Ok(Some(ModelTurnEvent::Finished(ModelTurnResult {
+                    model: None,
+                    response_id: None,
                     finish_reason: FinishReason::Completed,
                     output_items: vec![Item {
                         id: None,
@@ -3013,6 +3129,8 @@ mod tests {
             } else {
                 self.emitted = true;
                 Ok(Some(ModelTurnEvent::Finished(ModelTurnResult {
+                    model: None,
+                    response_id: None,
                     finish_reason: FinishReason::Completed,
                     output_items: vec![Item {
                         id: None,

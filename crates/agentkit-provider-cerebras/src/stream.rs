@@ -74,6 +74,7 @@ pub(crate) struct EventTranslator {
     choices: BTreeMap<u32, ChoiceState>,
     terminal_usage: Option<Usage>,
     message_id: Option<String>,
+    model: Option<String>,
     finished: bool,
 }
 
@@ -83,6 +84,7 @@ impl EventTranslator {
             choices: BTreeMap::new(),
             terminal_usage: None,
             message_id: None,
+            model: None,
             finished: false,
         }
     }
@@ -133,6 +135,12 @@ impl EventTranslator {
             && self.message_id.is_none()
         {
             self.message_id = Some(id.to_string());
+        }
+
+        if let Some(model) = json.get("model").and_then(Value::as_str)
+            && self.model.is_none()
+        {
+            self.model = Some(model.to_string());
         }
 
         // Terminal usage frames arrive on the same envelope; the last chunk
@@ -288,6 +296,8 @@ impl EventTranslator {
                             m.insert("cerebras.error".into(), Value::String(e.to_string()));
                             m
                         },
+                        model: self.model.clone(),
+                        response_id: self.message_id.clone(),
                     }));
                     return events;
                 }
@@ -336,6 +346,8 @@ impl EventTranslator {
             output_items,
             usage: self.terminal_usage.clone(),
             metadata: MetadataMap::new(),
+            model: self.model.clone(),
+            response_id: self.message_id.clone(),
         }));
         events
     }

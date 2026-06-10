@@ -1737,16 +1737,38 @@ impl McpConnection {
                 params.with_arguments(value_to_json_object(arguments, "tools/call arguments")?);
         }
         let name_owned = name.to_string();
-        self.peer().call_tool(params).await.map_err(|error| {
-            rmcp_operation_error(
-                &self.server_id,
-                McpMethod::ToolsCall {
-                    name: name_owned,
-                    arguments: arguments_for_auth,
-                },
-                error,
-            )
-        })
+
+        // Wire-call span so tool latency on `agent.execute_tool` can be
+        // broken down into MCP round-trip vs dispatch overhead. Parents
+        // under the loop's execute_tool span via the tracing hierarchy.
+        let span = tracing::info_span!(
+            "mcp.call_tool",
+            "otel.name" = %format!("mcp.call_tool {name}"),
+            "mcp.server.id" = %self.server_id,
+            "mcp.tool.name" = %name,
+            "error.type" = tracing::field::Empty,
+        );
+        use tracing::Instrument;
+        let result = self.peer().call_tool(params).instrument(span.clone()).await;
+        match result {
+            Ok(result) => {
+                if result.is_error == Some(true) {
+                    span.record("error.type", "tool_error");
+                }
+                Ok(result)
+            }
+            Err(error) => {
+                span.record("error.type", "mcp_error");
+                Err(rmcp_operation_error(
+                    &self.server_id,
+                    McpMethod::ToolsCall {
+                        name: name_owned,
+                        arguments: arguments_for_auth,
+                    },
+                    error,
+                ))
+            }
+        }
     }
 
     /// Reads a resource from the MCP server by URI.

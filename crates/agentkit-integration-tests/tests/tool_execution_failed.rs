@@ -34,6 +34,8 @@ async fn tool_execution_failure_lands_as_synthetic_error_result() {
                         json!({}),
                     )),
                     ModelTurnEvent::Finished(ModelTurnResult {
+                        model: None,
+                        response_id: None,
                         finish_reason: FinishReason::ToolCall,
                         output_items: vec![Item::new(
                             ItemKind::Assistant,
@@ -53,6 +55,8 @@ async fn tool_execution_failure_lands_as_synthetic_error_result() {
                 input: Vec::new(),
                 tools: Vec::new(),
                 events: vec![ModelTurnEvent::Finished(ModelTurnResult {
+                    model: None,
+                    response_id: None,
                     finish_reason: FinishReason::Completed,
                     output_items: vec![Item::new(
                         ItemKind::Assistant,

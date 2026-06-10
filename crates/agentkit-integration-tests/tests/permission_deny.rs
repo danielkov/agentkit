@@ -122,6 +122,8 @@ async fn permission_deny_short_circuits_and_emits_synthetic_error() {
                         json!({}),
                     )),
                     ModelTurnEvent::Finished(ModelTurnResult {
+                        model: None,
+                        response_id: None,
                         finish_reason: FinishReason::ToolCall,
                         output_items: vec![Item::new(
                             ItemKind::Assistant,
@@ -140,6 +142,8 @@ async fn permission_deny_short_circuits_and_emits_synthetic_error() {
                 input: Vec::new(),
                 tools: Vec::new(),
                 events: vec![ModelTurnEvent::Finished(ModelTurnResult {
+                    model: None,
+                    response_id: None,
                     finish_reason: FinishReason::Completed,
                     output_items: vec![Item::new(
                         ItemKind::Assistant,

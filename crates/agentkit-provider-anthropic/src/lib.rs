@@ -47,8 +47,6 @@ use agentkit_loop::{
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use futures_util::future::{Either, select};
-use serde_json::Value;
-use tracing::Instrument;
 
 use crate::stream::{EventTranslator, SseDecoder};
 
@@ -157,34 +155,9 @@ impl ModelSession for AnthropicSession {
     ) -> Result<AnthropicTurn, LoopError> {
         let config = self.config.clone();
 
-        // Span per the OTel GenAI semantic conventions for inference calls.
-        // Response-derived fields are recorded on the buffered path once the
-        // reply lands; the streaming path leaves them empty until the SSE
-        // translator is wired up to record on `message_start` / `message_delta`.
-        let span = tracing::info_span!(
-            "chat",
-            "otel.name" = tracing::field::Empty,
-            "otel.kind" = "client",
-            "gen_ai.operation.name" = "chat",
-            "gen_ai.provider.name" = "anthropic",
-            "gen_ai.conversation.id" = %turn_request.session_id,
-            "gen_ai.request.model" = tracing::field::Empty,
-            "gen_ai.response.model" = tracing::field::Empty,
-            "gen_ai.response.id" = tracing::field::Empty,
-            "gen_ai.response.finish_reasons" = tracing::field::Empty,
-            "gen_ai.usage.input_tokens" = tracing::field::Empty,
-            "gen_ai.usage.output_tokens" = tracing::field::Empty,
-        );
-        let record_span = span.clone();
-
         let request_future = async move {
             let body = request::build_request_body(&config, &turn_request)
                 .map_err(|e| LoopError::Provider(e.to_string()))?;
-
-            if let Some(model) = body.get("model").and_then(Value::as_str) {
-                record_span.record("gen_ai.request.model", model);
-                record_span.record("otel.name", format!("chat {model}").as_str());
-            }
 
             let betas = collect_beta_flags(&config);
 
@@ -240,36 +213,13 @@ impl ModelSession for AnthropicSession {
                     LoopError::Provider(format!("failed to read Anthropic response body: {error}"))
                 })?;
 
-                // Record response-side semconv fields before handing off to
-                // the event builder.
-                if let Ok(raw) = serde_json::from_str::<Value>(&body_text) {
-                    if let Some(id) = raw.get("id").and_then(Value::as_str) {
-                        record_span.record("gen_ai.response.id", id);
-                    }
-                    if let Some(model) = raw.get("model").and_then(Value::as_str) {
-                        record_span.record("gen_ai.response.model", model);
-                    }
-                    if let Some(stop) = raw.get("stop_reason").and_then(Value::as_str) {
-                        record_span.record("gen_ai.response.finish_reasons", stop);
-                    }
-                    if let Some(usage) = raw.get("usage") {
-                        if let Some(t) = usage.get("input_tokens").and_then(Value::as_u64) {
-                            record_span.record("gen_ai.usage.input_tokens", t);
-                        }
-                        if let Some(t) = usage.get("output_tokens").and_then(Value::as_u64) {
-                            record_span.record("gen_ai.usage.output_tokens", t);
-                        }
-                    }
-                }
-
                 let events = response::build_turn_from_response(&body_text)
                     .map_err(|e| LoopError::Provider(e.to_string()))?;
                 Ok(AnthropicTurn {
                     inner: TurnInner::Buffered { events },
                 })
             }
-        }
-        .instrument(span);
+        };
 
         if let Some(cancellation) = cancellation {
             futures_util::pin_mut!(request_future);
@@ -282,6 +232,10 @@ impl ModelSession for AnthropicSession {
         } else {
             request_future.await
         }
+    }
+
+    fn model_name(&self) -> Option<&str> {
+        Some(&self.config.model)
     }
 }
 

@@ -28,6 +28,8 @@ async fn cancellation_during_tool_call_finishes_with_cancelled_reason() {
     adapter.enqueue(TurnScript::new([
         ModelTurnEvent::ToolCall(call),
         ModelTurnEvent::Finished(ModelTurnResult {
+            model: None,
+            response_id: None,
             finish_reason: FinishReason::ToolCall,
             output_items: vec![assistant],
             usage: None,

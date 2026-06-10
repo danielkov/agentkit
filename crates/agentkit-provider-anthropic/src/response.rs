@@ -74,6 +74,8 @@ pub(crate) fn build_turn_from_response(
             output_items: Vec::new(),
             usage,
             metadata: MetadataMap::new(),
+            model: model.map(str::to_owned),
+            response_id: message_id,
         }));
         return Ok(events);
     }
@@ -85,7 +87,7 @@ pub(crate) fn build_turn_from_response(
     }
 
     let item = Item {
-        id: message_id.map(Into::into),
+        id: message_id.clone().map(Into::into),
         kind: ItemKind::Assistant,
         parts,
         metadata,
@@ -99,6 +101,8 @@ pub(crate) fn build_turn_from_response(
         output_items: vec![item],
         usage,
         metadata: MetadataMap::new(),
+        model: model.map(str::to_owned),
+        response_id: message_id,
     }));
 
     Ok(events)

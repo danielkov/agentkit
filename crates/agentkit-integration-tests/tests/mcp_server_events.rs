@@ -44,6 +44,8 @@ async fn server_progress_notification_reaches_subscriber_during_agent_run() {
                     events: vec![
                         ModelTurnEvent::ToolCall(multiply.clone()),
                         ModelTurnEvent::Finished(ModelTurnResult {
+                            model: None,
+                            response_id: None,
                             finish_reason: FinishReason::ToolCall,
                             output_items: vec![Item::new(
                                 ItemKind::Assistant,
@@ -58,6 +60,8 @@ async fn server_progress_notification_reaches_subscriber_during_agent_run() {
                     input: Vec::new(),
                     tools: Vec::new(),
                     events: vec![ModelTurnEvent::Finished(ModelTurnResult {
+                        model: None,
+                        response_id: None,
                         finish_reason: FinishReason::Completed,
                         output_items: vec![Item::new(
                             ItemKind::Assistant,

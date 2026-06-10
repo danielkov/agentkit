@@ -64,6 +64,8 @@ pub(crate) struct EventTranslator {
     metadata: MetadataMap,
     /// Message id from `message_start`.
     message_id: Option<String>,
+    /// Model identifier from `message_start`.
+    model: Option<String>,
     /// Final stop reason from `message_delta`.
     stop_reason: Option<String>,
     /// True once a terminal event has been emitted; further SSE events are
@@ -79,6 +81,7 @@ impl EventTranslator {
             usage: None,
             metadata: MetadataMap::new(),
             message_id: None,
+            model: None,
             stop_reason: None,
             finished: false,
         }
@@ -126,6 +129,7 @@ impl EventTranslator {
             self.message_id = Some(id.to_string());
         }
         if let Some(model) = message.get("model").and_then(Value::as_str) {
+            self.model = Some(model.to_string());
             self.metadata
                 .insert("anthropic.model".into(), Value::String(model.into()));
         }
@@ -413,11 +417,12 @@ impl EventTranslator {
         self.committed_parts.sort_by_key(|(idx, _)| *idx);
         let parts: Vec<Part> = self.committed_parts.drain(..).map(|(_, p)| p).collect();
 
+        let response_id = self.message_id.take();
         let output_items = if parts.is_empty() {
             Vec::new()
         } else {
             vec![Item {
-                id: self.message_id.take().map(Into::into),
+                id: response_id.clone().map(Into::into),
                 kind: ItemKind::Assistant,
                 parts,
                 metadata: std::mem::take(&mut self.metadata),
@@ -432,6 +437,8 @@ impl EventTranslator {
             output_items,
             usage: self.usage.clone(),
             metadata: MetadataMap::new(),
+            model: self.model.take(),
+            response_id,
         })])
     }
 }

@@ -108,6 +108,8 @@ fn turn_with_tool_calls(calls: &[ToolCallPart]) -> TurnRecord {
         .collect();
     let assistant_parts: Vec<Part> = calls.iter().cloned().map(Part::ToolCall).collect();
     events.push(ModelTurnEvent::Finished(ModelTurnResult {
+        model: None,
+        response_id: None,
         finish_reason: FinishReason::ToolCall,
         output_items: vec![Item::new(ItemKind::Assistant, assistant_parts)],
         usage: None,
@@ -127,6 +129,8 @@ fn turn_text(text: &str) -> TurnRecord {
         input: Vec::new(),
         tools: Vec::new(),
         events: vec![ModelTurnEvent::Finished(ModelTurnResult {
+            model: None,
+            response_id: None,
             finish_reason: FinishReason::Completed,
             output_items: vec![item],
             usage: None,

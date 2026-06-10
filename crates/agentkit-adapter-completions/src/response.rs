@@ -42,6 +42,8 @@ pub(crate) fn build_turn_from_response<P: CompletionsProvider>(
     let message = choice.message;
     let mut parts = message_to_parts(&message)?;
     let finish_reason = map_finish_reason(choice.finish_reason.as_deref());
+    let response_model = response.model;
+    let response_id = response.id;
 
     for part in &parts {
         if let Part::ToolCall(call) = part {
@@ -51,7 +53,7 @@ pub(crate) fn build_turn_from_response<P: CompletionsProvider>(
 
     if !parts.is_empty() {
         let assistant_item = Item {
-            id: response.id.map(Into::into),
+            id: response_id.clone().map(Into::into),
             kind: ItemKind::Assistant,
             parts: std::mem::take(&mut parts),
             metadata: response_metadata,
@@ -71,6 +73,8 @@ pub(crate) fn build_turn_from_response<P: CompletionsProvider>(
             output_items: vec![assistant_item],
             usage,
             metadata: MetadataMap::new(),
+            model: response_model,
+            response_id,
         }));
     } else {
         events.push_back(ModelTurnEvent::Finished(ModelTurnResult {
@@ -78,6 +82,8 @@ pub(crate) fn build_turn_from_response<P: CompletionsProvider>(
             output_items: Vec::new(),
             usage,
             metadata: MetadataMap::new(),
+            model: response_model,
+            response_id,
         }));
     }
 

@@ -107,6 +107,8 @@ pub fn build_turn_from_response(body: &str) -> Result<VecDeque<ModelTurnEvent>, 
         output_items,
         usage,
         metadata: MetadataMap::new(),
+        model: raw.get("model").and_then(Value::as_str).map(str::to_owned),
+        response_id: raw.get("id").and_then(Value::as_str).map(str::to_owned),
     }));
 
     Ok(events)
