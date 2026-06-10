@@ -349,6 +349,10 @@ pub trait ModelAdapter {
         &self,
         config: SessionConfig,
     ) -> Result<Self::Session, LoopError>;
+
+    // Optional. Lowercase provider identifier used to populate
+    // `gen_ai.provider.name` on the `agent.turn` span. Defaults to `None`.
+    fn provider_name(&self) -> Option<&str> { None }
 }
 
 pub trait ModelSession {

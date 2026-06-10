@@ -11,6 +11,11 @@ The adapter boundary is the narrowest point in the architecture. Everything abov
 pub trait ModelAdapter: Send + Sync {
     type Session: ModelSession;
     async fn start_session(&self, config: SessionConfig) -> Result<Self::Session, LoopError>;
+
+    // Optional. Lowercase provider identifier (e.g. `openrouter`,
+    // `ollama`) stamped onto the `agent.turn` span as
+    // `gen_ai.provider.name`. Defaults to `None`.
+    fn provider_name(&self) -> Option<&str> { None }
 }
 
 #[async_trait]

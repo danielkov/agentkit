@@ -85,14 +85,15 @@ agentkit emits structured `tracing` data on **two independent layers** that you 
 
 The loop, provider adapters, and tool dispatch sites are annotated with `#[tracing::instrument]` and ad-hoc `info_span!` macros. These spans cover what the framework is doing right now — they are not user events. You see them whenever `tracing` is enabled, whether or not you wire up a reporter.
 
-| Span name            | Source crate    | Fields                                                                            |
-| -------------------- | --------------- | --------------------------------------------------------------------------------- |
-| `agent.turn`         | `agentkit_loop` | `session.id`, `turn.id`, `transcript.len`, `saw_tool_call`, `finish_reason`       |
-| `agent.execute_tool` | `agentkit_loop` | `gen_ai.tool.name`, `gen_ai.tool.call.id`, `session.id`, `turn.id`, `launch_kind` |
+| Span name            | Source crate                   | Fields                                                                                                                                                                                                                                                          |
+| -------------------- | ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `agent.turn`         | `agentkit_loop`                | `otel.name="invoke_agent"`, `gen_ai.operation.name="invoke_agent"`, `gen_ai.conversation.id`, `gen_ai.provider.name`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, `session.id`, `turn.id`, `transcript.len`, `saw_tool_call`, `finish_reason`     |
+| `agent.execute_tool` | `agentkit_loop`                | `otel.name="execute_tool {tool}"`, `gen_ai.operation.name="execute_tool"`, `gen_ai.tool.name`, `gen_ai.tool.call.id`, `gen_ai.conversation.id`, `session.id`, `turn.id`, `launch_kind`                                                                           |
+| `chat`               | `agentkit_adapter_completions` | `otel.name="chat {model}"`, `otel.kind="client"`, `gen_ai.operation.name="chat"`, `gen_ai.provider.name`, `gen_ai.conversation.id`, `gen_ai.request.model`, `gen_ai.response.model`, `gen_ai.response.id`, `gen_ai.response.finish_reasons`, token-usage fields  |
 
-Field naming follows the [OpenTelemetry GenAI semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/) where applicable, so spans exported to an OTel backend slot directly into existing GenAI dashboards.
+Field naming follows the [OpenTelemetry GenAI semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/), so spans exported to an OTel backend slot directly into existing GenAI dashboards. Static tracing span names (`agent.turn`, `agent.execute_tool`, `chat`) stay stable for log filtering; the `otel.name` field carries the dynamic semconv span name (`invoke_agent`, `execute_tool {tool}`, `chat {model}`) for OpenTelemetry bridges that key off it.
 
-`launch_kind` is `"plain"` for tool calls dispatched in a normal tool round, `"approved"` when the call resumes after a human-in-the-loop approval. Provider crates may add their own `chat` spans inside `agent.turn`; that is left to the adapter.
+`launch_kind` is `"plain"` for tool calls dispatched in a normal tool round, `"approved"` when the call resumes after a human-in-the-loop approval. `gen_ai.provider.name` is sourced from `ModelAdapter::provider_name()` and stamped onto `agent.turn`. The `chat` span ships with the completions adapter; Path-1 adapters (Anthropic, Cerebras) may emit their own equivalent.
 
 ### Layer 2: `TracingReporter`
 
