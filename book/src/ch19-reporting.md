@@ -88,12 +88,15 @@ The loop, provider adapters, and tool dispatch sites are annotated with `#[traci
 | Span name            | Source crate                   | Fields                                                                                                                                                                                                                                                          |
 | -------------------- | ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `agent.turn`         | `agentkit_loop`                | `otel.name="invoke_agent"`, `gen_ai.operation.name="invoke_agent"`, `gen_ai.conversation.id`, `gen_ai.provider.name`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, `session.id`, `turn.id`, `transcript.len`, `saw_tool_call`, `finish_reason`     |
-| `agent.execute_tool` | `agentkit_loop`                | `otel.name="execute_tool {tool}"`, `gen_ai.operation.name="execute_tool"`, `gen_ai.tool.name`, `gen_ai.tool.call.id`, `gen_ai.conversation.id`, `session.id`, `turn.id`, `launch_kind`                                                                           |
-| `chat`               | `agentkit_adapter_completions` | `otel.name="chat {model}"`, `otel.kind="client"`, `gen_ai.operation.name="chat"`, `gen_ai.provider.name`, `gen_ai.conversation.id`, `gen_ai.request.model`, `gen_ai.response.model`, `gen_ai.response.id`, `gen_ai.response.finish_reasons`, token-usage fields  |
+| `agent.execute_tool` | `agentkit_loop`                | `otel.name="execute_tool {tool}"`, `gen_ai.operation.name="execute_tool"`, `gen_ai.tool.name`, `gen_ai.tool.call.id`, `gen_ai.conversation.id`, `error.type` (on failed results), `session.id`, `turn.id`, `launch_kind`                                         |
+| `chat`               | `agentkit_loop`                | `otel.name="chat {model}"`, `otel.kind="client"`, `gen_ai.operation.name="chat"`, `gen_ai.provider.name`, `gen_ai.conversation.id`, `gen_ai.request.model`, `gen_ai.response.model`, `gen_ai.response.id`, `gen_ai.response.finish_reasons`, token-usage fields  |
+| `mcp.call_tool`      | `agentkit_mcp`                 | `otel.name="mcp.call_tool {tool}"`, `mcp.server.id`, `mcp.tool.name`, `error.type` (on protocol failures or `is_error` results)                                                                                                                                  |
 
 Field naming follows the [OpenTelemetry GenAI semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/), so spans exported to an OTel backend slot directly into existing GenAI dashboards. Static tracing span names (`agent.turn`, `agent.execute_tool`, `chat`) stay stable for log filtering; the `otel.name` field carries the dynamic semconv span name (`invoke_agent`, `execute_tool {tool}`, `chat {model}`) for OpenTelemetry bridges that key off it.
 
-`launch_kind` is `"plain"` for tool calls dispatched in a normal tool round, `"approved"` when the call resumes after a human-in-the-loop approval. `gen_ai.provider.name` is sourced from `ModelAdapter::provider_name()` and stamped onto `agent.turn`. The `chat` span ships with the completions adapter; Path-1 adapters (Anthropic, Cerebras) may emit their own equivalent.
+`launch_kind` is `"plain"` for tool calls dispatched in a normal tool round, `"approved"` when the call resumes after a human-in-the-loop approval. `gen_ai.provider.name` is sourced from `ModelAdapter::provider_name()` and `gen_ai.request.model` from `ModelSession::model_name()`.
+
+The `chat` span is emitted by the loop itself, wrapping `begin_turn` plus the full event drain, so every adapter — buffered or streaming — gets it without any adapter-side instrumentation. Because the span stays open until the `Finished` event, response attributes that streaming providers only deliver mid-stream (response id/model, usage, stop reason) are recorded from `ModelTurnEvent`s and the `ModelTurnResult` `model`/`response_id` fields. `mcp.call_tool` wraps the MCP server round-trip and parents under `agent.execute_tool`, separating wire time from dispatch overhead.
 
 ### Layer 2: `TracingReporter`
 
@@ -178,7 +181,7 @@ let subscriber = Registry::default()
 tracing::subscriber::set_global_default(subscriber)?;
 ```
 
-With this in place, the `agent.turn` and `agent.execute_tool` spans become OTel spans in your trace backend (Jaeger, Tempo, Honeycomb, Datadog, etc.) with the GenAI semantic-convention fields preserved as span attributes.
+With this in place, the `agent.turn`, `chat`, `agent.execute_tool`, and `mcp.call_tool` spans become OTel spans in your trace backend (Jaeger, Tempo, Honeycomb, Datadog, etc.) with the GenAI semantic-convention fields preserved as span attributes.
 
 ### Two layers, one filter
 

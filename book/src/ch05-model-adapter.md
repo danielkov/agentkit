@@ -13,7 +13,7 @@ pub trait ModelAdapter: Send + Sync {
     async fn start_session(&self, config: SessionConfig) -> Result<Self::Session, LoopError>;
 
     // Optional. Lowercase provider identifier (e.g. `openrouter`,
-    // `ollama`) stamped onto the `agent.turn` span as
+    // `ollama`) stamped onto the `agent.turn` and `chat` spans as
     // `gen_ai.provider.name`. Defaults to `None`.
     fn provider_name(&self) -> Option<&str> { None }
 }
@@ -26,6 +26,11 @@ pub trait ModelSession: Send {
         request: TurnRequest,
         cancellation: Option<TurnCancellation>,
     ) -> Result<Self::Turn, LoopError>;
+
+    // Optional. Model identifier the session sends requests to, stamped
+    // onto the loop's `chat` span as `gen_ai.request.model`. Defaults
+    // to `None`.
+    fn model_name(&self) -> Option<&str> { None }
 }
 
 #[async_trait]

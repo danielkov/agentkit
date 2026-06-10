@@ -351,7 +351,8 @@ pub trait ModelAdapter {
     ) -> Result<Self::Session, LoopError>;
 
     // Optional. Lowercase provider identifier used to populate
-    // `gen_ai.provider.name` on the `agent.turn` span. Defaults to `None`.
+    // `gen_ai.provider.name` on the `agent.turn` and `chat` spans.
+    // Defaults to `None`.
     fn provider_name(&self) -> Option<&str> { None }
 }
 
@@ -362,6 +363,10 @@ pub trait ModelSession {
         &mut self,
         request: TurnRequest,
     ) -> Result<Self::Turn, LoopError>;
+
+    // Optional. Model identifier used to populate `gen_ai.request.model`
+    // on the loop's `chat` span. Defaults to `None`.
+    fn model_name(&self) -> Option<&str> { None }
 }
 
 pub trait ModelTurn {

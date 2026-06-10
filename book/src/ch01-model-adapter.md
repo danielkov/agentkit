@@ -392,6 +392,10 @@ impl ModelSession for AcmeSession {
             output_items: vec![output_item],
             usage: None,
             metadata: MetadataMap::new(),
+            // Optional response identity for the loop's `chat` telemetry
+            // span (`gen_ai.response.model` / `gen_ai.response.id`).
+            model: None,
+            response_id: None,
         }));
 
         Ok(AcmeTurn { events })
