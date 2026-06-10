@@ -790,6 +790,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "compose-bench"
+version = "0.7.0"
+dependencies = [
+ "agentkit-core",
+ "agentkit-loop",
+ "agentkit-provider-openrouter",
+ "agentkit-tool-compose",
+ "agentkit-tool-fs",
+ "agentkit-tool-shell",
+ "agentkit-tools-core",
+ "async-trait",
+ "dotenvy",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "concurrent-queue"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

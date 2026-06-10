@@ -44,6 +44,7 @@ members = [
     "examples/mcp-reference-interop",
     "examples/mcp-dynamic-auth",
     "projects/how",
+    "benchmarks/compose-bench",
 ]
 resolver = "2"
 
