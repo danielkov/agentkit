@@ -35,6 +35,7 @@ use async_trait::async_trait;
 use futures_util::future::{Either, select};
 use serde::Serialize;
 use serde_json::Value;
+use tracing::Instrument;
 
 pub use crate::error::CompletionsError;
 
@@ -150,6 +151,10 @@ pub trait CompletionsProvider: Send + Sync + Clone {
 pub struct CompletionsAdapter<P: CompletionsProvider> {
     client: Http,
     provider: Arc<P>,
+    /// Lowercase provider name stamped onto telemetry spans as the
+    /// `gen_ai.provider.name` attribute from the OTel GenAI semantic
+    /// conventions.
+    provider_label: String,
 }
 
 impl<P: CompletionsProvider> CompletionsAdapter<P> {
@@ -164,6 +169,7 @@ impl<P: CompletionsProvider> CompletionsAdapter<P> {
 
         Ok(Self {
             client,
+            provider_label: provider.provider_name().to_lowercase(),
             provider: Arc::new(provider),
         })
     }
@@ -174,6 +180,7 @@ impl<P: CompletionsProvider> CompletionsAdapter<P> {
     pub fn with_client(provider: P, client: Http) -> Self {
         Self {
             client,
+            provider_label: provider.provider_name().to_lowercase(),
             provider: Arc::new(provider),
         }
     }
@@ -185,6 +192,7 @@ impl<P: CompletionsProvider> CompletionsAdapter<P> {
 pub struct CompletionsSession<P: CompletionsProvider> {
     client: Http,
     provider: Arc<P>,
+    provider_label: String,
     _session_config: SessionConfig,
 }
 
@@ -204,8 +212,13 @@ impl<P: CompletionsProvider + 'static> ModelAdapter for CompletionsAdapter<P> {
         Ok(CompletionsSession {
             client: self.client.clone(),
             provider: self.provider.clone(),
+            provider_label: self.provider_label.clone(),
             _session_config: config,
         })
+    }
+
+    fn provider_name(&self) -> Option<&str> {
+        Some(&self.provider_label)
     }
 }
 
@@ -221,9 +234,34 @@ impl<P: CompletionsProvider + 'static> ModelSession for CompletionsSession<P> {
         let provider = &self.provider;
         let provider_name = provider.provider_name().to_owned();
 
+        // Span per the OTel GenAI semantic conventions for inference calls.
+        // Response-derived fields are recorded once the provider replies;
+        // `otel.name` carries the dynamic `chat {model}` span name for
+        // OpenTelemetry bridges since tracing span names are static.
+        let span = tracing::info_span!(
+            "chat",
+            "otel.name" = tracing::field::Empty,
+            "otel.kind" = "client",
+            "gen_ai.operation.name" = "chat",
+            "gen_ai.provider.name" = %self.provider_label,
+            "gen_ai.conversation.id" = %turn_request.session_id,
+            "gen_ai.request.model" = tracing::field::Empty,
+            "gen_ai.response.model" = tracing::field::Empty,
+            "gen_ai.response.id" = tracing::field::Empty,
+            "gen_ai.response.finish_reasons" = tracing::field::Empty,
+            "gen_ai.usage.input_tokens" = tracing::field::Empty,
+            "gen_ai.usage.output_tokens" = tracing::field::Empty,
+        );
+
+        let record_span = span.clone();
         let request_future = async {
             let body = request::build_request_body(provider.as_ref(), &turn_request)
                 .map_err(|e| LoopError::Provider(e.to_string()))?;
+
+            if let Some(model) = body.get("model").and_then(Value::as_str) {
+                record_span.record("gen_ai.request.model", model);
+                record_span.record("otel.name", format!("chat {model}").as_str());
+            }
 
             let http = self
                 .client
@@ -251,11 +289,33 @@ impl<P: CompletionsProvider + 'static> ModelSession for CompletionsSession<P> {
                 )));
             }
 
-            let (events, _raw) = response::build_turn_from_response(provider.as_ref(), &body)
+            let (events, raw) = response::build_turn_from_response(provider.as_ref(), &body)
                 .map_err(|e| LoopError::Provider(e.to_string()))?;
 
+            if let Some(model) = raw.get("model").and_then(Value::as_str) {
+                record_span.record("gen_ai.response.model", model);
+            }
+            if let Some(id) = raw.get("id").and_then(Value::as_str) {
+                record_span.record("gen_ai.response.id", id);
+            }
+            if let Some(usage) = raw.get("usage") {
+                if let Some(tokens) = usage.get("prompt_tokens").and_then(Value::as_u64) {
+                    record_span.record("gen_ai.usage.input_tokens", tokens);
+                }
+                if let Some(tokens) = usage.get("completion_tokens").and_then(Value::as_u64) {
+                    record_span.record("gen_ai.usage.output_tokens", tokens);
+                }
+            }
+            if let Some(finish_reason) = raw
+                .pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str)
+            {
+                record_span.record("gen_ai.response.finish_reasons", finish_reason);
+            }
+
             Ok(CompletionsTurn { events })
-        };
+        }
+        .instrument(span);
 
         if let Some(cancellation) = cancellation {
             futures_util::pin_mut!(request_future);
