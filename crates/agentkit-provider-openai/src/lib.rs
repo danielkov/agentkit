@@ -78,6 +78,8 @@ pub struct OpenAIConfig {
     /// single turn. Omitted from the request when `None` so OpenAI's
     /// per-model default applies.
     pub parallel_tool_calls: Option<bool>,
+    /// Request SSE streaming responses. Defaults to `true`.
+    pub streaming: bool,
 }
 
 impl OpenAIConfig {
@@ -93,6 +95,7 @@ impl OpenAIConfig {
             frequency_penalty: None,
             presence_penalty: None,
             parallel_tool_calls: None,
+            streaming: true,
         }
     }
 
@@ -135,6 +138,12 @@ impl OpenAIConfig {
     /// Sets whether the model may emit multiple tool calls in a single turn.
     pub fn with_parallel_tool_calls(mut self, flag: bool) -> Self {
         self.parallel_tool_calls = Some(flag);
+        self
+    }
+
+    /// Toggles SSE streaming of model responses. Default: true.
+    pub fn with_streaming(mut self, flag: bool) -> Self {
+        self.streaming = flag;
         self
     }
 
@@ -185,6 +194,7 @@ pub struct OpenAIRequestConfig {
 pub struct OpenAIProvider {
     api_key: String,
     base_url: String,
+    streaming: bool,
     request_config: OpenAIRequestConfig,
 }
 
@@ -193,6 +203,7 @@ impl From<OpenAIConfig> for OpenAIProvider {
         Self {
             api_key: config.api_key,
             base_url: config.base_url,
+            streaming: config.streaming,
             request_config: OpenAIRequestConfig {
                 model: config.model,
                 temperature: config.temperature,
@@ -227,6 +238,19 @@ impl CompletionsProvider for OpenAIProvider {
             "User-Agent",
             concat!("agentkit-provider-openai/", env!("CARGO_PKG_VERSION")),
         )
+    }
+
+    fn streaming(&self) -> bool {
+        self.streaming
+    }
+
+    fn apply_stream_options(
+        &self,
+        body: &mut serde_json::Map<String, Value>,
+    ) -> Result<(), LoopError> {
+        body.entry("stream_options")
+            .or_insert_with(|| serde_json::json!({ "include_usage": true }));
+        Ok(())
     }
 
     fn apply_prompt_cache(

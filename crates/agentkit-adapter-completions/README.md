@@ -9,9 +9,10 @@
 
 Shared completion-style adapter plumbing for AgentKit model providers.
 
-This crate provides the common request and response translation layer used by
-providers that expose a completions-compatible API surface. It is primarily an
-internal integration crate for provider implementations such as:
+This crate provides the common request, buffered response, and SSE streaming
+translation layer used by providers that expose a completions-compatible API
+surface. It is primarily an internal integration crate for provider
+implementations such as:
 
 - `agentkit-provider-openai`
 - `agentkit-provider-openrouter`
@@ -22,3 +23,8 @@ internal integration crate for provider implementations such as:
 
 Applications will usually depend on a concrete provider crate instead of using
 this crate directly.
+
+The adapter normalizes streaming chat-completion chunks into `ModelTurnEvent`s:
+text and reasoning arrive as `Delta::AppendText`, tool-call arguments are
+accumulated until they parse as JSON, and whole image outputs delivered via
+`delta.images[]` are committed as media parts.

@@ -199,7 +199,7 @@ fn content_to_parts(content: &ResponseContent) -> Result<Vec<Part>, CompletionsE
     }
 }
 
-fn parse_tool_arguments(arguments: &str) -> Result<Value, CompletionsError> {
+pub(crate) fn parse_tool_arguments(arguments: &str) -> Result<Value, CompletionsError> {
     serde_json::from_str(arguments).map_err(|error| {
         CompletionsError::Protocol(format!(
             "invalid tool arguments JSON {arguments:?}: {error}"
@@ -207,7 +207,7 @@ fn parse_tool_arguments(arguments: &str) -> Result<Value, CompletionsError> {
     })
 }
 
-fn map_usage(usage: Option<ResponseUsage>) -> Option<Usage> {
+pub(crate) fn map_usage(usage: Option<ResponseUsage>) -> Option<Usage> {
     usage.map(|usage| Usage {
         tokens: Some(TokenUsage {
             input_tokens: usage.prompt_tokens.unwrap_or_default(),
@@ -230,7 +230,7 @@ fn map_usage(usage: Option<ResponseUsage>) -> Option<Usage> {
     })
 }
 
-fn map_finish_reason(reason: Option<&str>) -> FinishReason {
+pub(crate) fn map_finish_reason(reason: Option<&str>) -> FinishReason {
     match reason {
         Some("stop") => FinishReason::Completed,
         Some("tool_calls") => FinishReason::ToolCall,

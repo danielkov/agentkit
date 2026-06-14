@@ -109,12 +109,12 @@ MCP-enabled agent:
 - everything above
 - `mcp`
 
-OpenRouter-backed example host:
+OpenRouter-backed example host (streaming, prompt caching):
 
 - everything needed for the host
 - `provider-openrouter`
 
-OpenAI-compatible provider (e.g. Groq, Mistral, vLLM, Ollama):
+OpenAI-compatible provider (streaming; e.g. Groq, Mistral, vLLM, Ollama):
 
 - everything needed for the host
 - `provider-groq` / `provider-mistral` / `provider-vllm` / `provider-ollama`

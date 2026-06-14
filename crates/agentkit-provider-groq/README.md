@@ -13,6 +13,8 @@ This crate provides `GroqAdapter` and `GroqConfig` for connecting the agent
 loop to the [Groq](https://groq.com) chat completions API, which serves
 open-source models on custom LPU hardware. It handles request translation,
 response normalization, and usage reporting for Groq-backed sessions.
+Streaming is enabled by default; use `.with_streaming(false)` to force the
+buffered response path.
 
 ## Configuration
 

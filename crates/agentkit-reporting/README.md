@@ -134,7 +134,7 @@ std::thread::spawn(move || {
 is gated behind the `tracing` feature to keep the dependency opt-in:
 
 ```toml
-agentkit-reporting = { version = "0.7", features = ["tracing"] }
+agentkit-reporting = { version = "0.9.0", features = ["tracing"] }
 ```
 
 ```rust,ignore

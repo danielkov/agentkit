@@ -73,6 +73,8 @@ pub struct OllamaConfig {
     /// Whether the model is allowed to emit multiple tool calls in a
     /// single turn. Omitted from the request when `None`.
     pub parallel_tool_calls: Option<bool>,
+    /// Request SSE streaming responses. Defaults to `true`.
+    pub streaming: bool,
     /// Whether the loaded chat template enforces strict
     /// `user`/`assistant` role alternation. Set to `true` when running
     /// Mistral-/Mixtral-/Llama-template models locally; the adapter then
@@ -91,6 +93,7 @@ impl OllamaConfig {
             top_k: None,
             top_p: None,
             parallel_tool_calls: None,
+            streaming: true,
             strict_alternating_roles: false,
         }
     }
@@ -128,6 +131,12 @@ impl OllamaConfig {
     /// Sets whether the model may emit multiple tool calls in a single turn.
     pub fn with_parallel_tool_calls(mut self, flag: bool) -> Self {
         self.parallel_tool_calls = Some(flag);
+        self
+    }
+
+    /// Toggles SSE streaming of model responses. Default: true.
+    pub fn with_streaming(mut self, flag: bool) -> Self {
+        self.streaming = flag;
         self
     }
 
@@ -181,6 +190,7 @@ pub struct OllamaRequestConfig {
 #[derive(Clone, Debug)]
 pub struct OllamaProvider {
     base_url: String,
+    streaming: bool,
     strict_alternating_roles: bool,
     request_config: OllamaRequestConfig,
 }
@@ -189,6 +199,7 @@ impl From<OllamaConfig> for OllamaProvider {
     fn from(config: OllamaConfig) -> Self {
         Self {
             base_url: config.base_url,
+            streaming: config.streaming,
             strict_alternating_roles: config.strict_alternating_roles,
             request_config: OllamaRequestConfig {
                 model: config.model,
@@ -223,6 +234,10 @@ impl CompletionsProvider for OllamaProvider {
             "User-Agent",
             concat!("agentkit-provider-ollama/", env!("CARGO_PKG_VERSION")),
         )
+    }
+
+    fn streaming(&self) -> bool {
+        self.streaming
     }
 
     fn requires_alternating_roles(&self) -> bool {

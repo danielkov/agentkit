@@ -12,7 +12,8 @@ vLLM model adapter for the agentkit agent loop.
 This crate provides `VllmAdapter` and `VllmConfig` for connecting the agent
 loop to a [vLLM](https://docs.vllm.ai) server via its OpenAI-compatible chat
 completions endpoint. It handles request translation and response normalization
-for vLLM-backed sessions.
+for vLLM-backed sessions. Streaming is enabled by default; use
+`.with_streaming(false)` to force the buffered response path.
 
 An API key is optional — vLLM servers can run with or without authentication
 (controlled by the `--api-key` flag when starting the server).

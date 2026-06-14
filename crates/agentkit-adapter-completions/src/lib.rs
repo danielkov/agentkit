@@ -22,21 +22,25 @@ mod error;
 mod media;
 mod request;
 mod response;
+mod sse;
+mod stream;
 
 use std::collections::VecDeque;
 use std::sync::Arc;
 
 use agentkit_core::{MetadataMap, TurnCancellation, Usage};
-use agentkit_http::{Http, HttpError, HttpRequestBuilder, StatusCode};
+use agentkit_http::{BodyStream, Http, HttpError, HttpRequestBuilder, StatusCode};
 use agentkit_loop::{
     LoopError, ModelAdapter, ModelSession, ModelTurn, ModelTurnEvent, SessionConfig, TurnRequest,
 };
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use futures_util::future::{Either, select};
 use serde::Serialize;
 use serde_json::Value;
 
 pub use crate::error::CompletionsError;
+use crate::stream::{EventTranslator, PostprocessResponse, SseDecoder};
 
 /// Trait implemented by each provider to customise the generic chat completions adapter.
 ///
@@ -95,6 +99,22 @@ pub trait CompletionsProvider: Send + Sync + Clone {
         &self,
         _body: &mut serde_json::Map<String, Value>,
         _request: &TurnRequest,
+    ) -> Result<(), LoopError> {
+        Ok(())
+    }
+
+    /// Whether to request an SSE streaming response. Defaults to `true`.
+    fn streaming(&self) -> bool {
+        true
+    }
+
+    /// Hook to add provider-specific streaming options to the JSON request.
+    ///
+    /// Providers that support terminal usage frames can insert fields such as
+    /// `stream_options`; the default leaves the request unchanged.
+    fn apply_stream_options(
+        &self,
+        _body: &mut serde_json::Map<String, Value>,
     ) -> Result<(), LoopError> {
         Ok(())
     }
@@ -195,12 +215,44 @@ pub struct CompletionsSession<P: CompletionsProvider> {
     _session_config: SessionConfig,
 }
 
-/// A completed turn holding buffered events from a chat completion response.
-///
-/// All events are available immediately — successive calls to
-/// [`next_event`](ModelTurn::next_event) drain the internal queue.
+/// A turn from a chat completion response.
 pub struct CompletionsTurn {
-    events: VecDeque<ModelTurnEvent>,
+    inner: TurnInner,
+}
+
+enum TurnInner {
+    Buffered { events: VecDeque<ModelTurnEvent> },
+    Streaming(Box<StreamingState>),
+}
+
+struct StreamingState {
+    body: BodyStream,
+    decoder: SseDecoder,
+    translator: EventTranslator,
+    pending: VecDeque<ModelTurnEvent>,
+    eof: bool,
+    postprocess: PostprocessResponse,
+}
+
+impl CompletionsTurn {
+    fn buffered(events: VecDeque<ModelTurnEvent>) -> Self {
+        Self {
+            inner: TurnInner::Buffered { events },
+        }
+    }
+
+    fn streaming(body: BodyStream, postprocess: PostprocessResponse) -> Self {
+        Self {
+            inner: TurnInner::Streaming(Box::new(StreamingState {
+                body,
+                decoder: SseDecoder::new(),
+                translator: EventTranslator::new(),
+                pending: VecDeque::new(),
+                eof: false,
+                postprocess,
+            })),
+        }
+    }
 }
 
 #[async_trait]
@@ -241,7 +293,7 @@ impl<P: CompletionsProvider + 'static> ModelSession for CompletionsSession<P> {
         turn_request: TurnRequest,
         cancellation: Option<TurnCancellation>,
     ) -> Result<CompletionsTurn, LoopError> {
-        let provider = &self.provider;
+        let provider = self.provider.clone();
         let provider_name = provider.provider_name().to_owned();
 
         let request_future = async {
@@ -253,13 +305,27 @@ impl<P: CompletionsProvider + 'static> ModelSession for CompletionsSession<P> {
                 .post(provider.endpoint_url())
                 .header("Content-Type", "application/json");
 
-            let http = provider.preprocess_request(http);
+            let mut http = provider.preprocess_request(http);
+            if provider.streaming() {
+                http = http.header("Accept", "text/event-stream");
+            }
 
             let response = http.json(&body).send().await.map_err(|error| {
                 LoopError::Provider(format!("{provider_name} request failed: {error}"))
             })?;
 
             let status = response.status();
+            if provider.streaming() && status.is_success() {
+                let provider_for_postprocess = provider.clone();
+                let postprocess: PostprocessResponse = Arc::new(move |usage, metadata, raw| {
+                    provider_for_postprocess.postprocess_response(usage, metadata, raw);
+                });
+                return Ok(CompletionsTurn::streaming(
+                    response.bytes_stream(),
+                    postprocess,
+                ));
+            }
+
             let body = response.text().await.map_err(|error| {
                 LoopError::Provider(format!(
                     "failed to read {provider_name} response body: {error}"
@@ -277,7 +343,7 @@ impl<P: CompletionsProvider + 'static> ModelSession for CompletionsSession<P> {
             let (events, _raw) = response::build_turn_from_response(provider.as_ref(), &body)
                 .map_err(|e| LoopError::Provider(e.to_string()))?;
 
-            Ok(CompletionsTurn { events })
+            Ok(CompletionsTurn::buffered(events))
         };
 
         if let Some(cancellation) = cancellation {
@@ -310,6 +376,84 @@ impl ModelTurn for CompletionsTurn {
         {
             return Err(LoopError::Cancelled);
         }
-        Ok(self.events.pop_front())
+        match &mut self.inner {
+            TurnInner::Buffered { events } => Ok(events.pop_front()),
+            TurnInner::Streaming(state) => {
+                let StreamingState {
+                    body,
+                    decoder,
+                    translator,
+                    pending,
+                    eof,
+                    postprocess,
+                } = state.as_mut();
+                next_streaming_event(
+                    body,
+                    decoder,
+                    translator,
+                    pending,
+                    eof,
+                    postprocess,
+                    cancellation,
+                )
+                .await
+            }
+        }
+    }
+}
+
+async fn next_streaming_event(
+    body: &mut BodyStream,
+    decoder: &mut SseDecoder,
+    translator: &mut EventTranslator,
+    pending: &mut VecDeque<ModelTurnEvent>,
+    eof: &mut bool,
+    postprocess: &PostprocessResponse,
+    cancellation: Option<TurnCancellation>,
+) -> Result<Option<ModelTurnEvent>, LoopError> {
+    loop {
+        if let Some(event) = pending.pop_front() {
+            return Ok(Some(event));
+        }
+        if *eof || translator.is_done() {
+            return Ok(None);
+        }
+
+        let chunk = if let Some(cancellation) = cancellation.as_ref() {
+            let next = body.next();
+            futures_util::pin_mut!(next);
+            let cancelled = cancellation.cancelled();
+            futures_util::pin_mut!(cancelled);
+            match select(next, cancelled).await {
+                Either::Left((chunk, _)) => chunk,
+                Either::Right((_, _)) => return Err(LoopError::Cancelled),
+            }
+        } else {
+            body.next().await
+        };
+
+        match chunk {
+            Some(Ok(bytes)) => {
+                let text = std::str::from_utf8(&bytes).map_err(|e| {
+                    LoopError::Provider(format!("invalid UTF-8 in completions stream: {e}"))
+                })?;
+                for sse in decoder.feed(text) {
+                    for event in translator
+                        .handle(&sse, postprocess)
+                        .map_err(|e| LoopError::Provider(e.to_string()))?
+                    {
+                        pending.push_back(event);
+                    }
+                }
+            }
+            Some(Err(e)) => {
+                return Err(LoopError::Provider(format!(
+                    "completions stream body error: {e}"
+                )));
+            }
+            None => {
+                *eof = true;
+            }
+        }
     }
 }

@@ -33,7 +33,13 @@ pub(crate) fn build_request_body<P: CompletionsProvider>(
         serde_json::to_value(&messages).map_err(CompletionsError::Serialize)?,
     );
 
-    body.insert("stream".into(), Value::Bool(false));
+    let streaming = provider.streaming();
+    body.insert("stream".into(), Value::Bool(streaming));
+    if streaming {
+        provider
+            .apply_stream_options(&mut body)
+            .map_err(|error| CompletionsError::Protocol(error.to_string()))?;
+    }
 
     let tools = build_tools(&request.available_tools)?;
     if !tools.is_empty() {
@@ -459,17 +465,26 @@ mod tests {
     #[derive(Clone)]
     struct TestProvider {
         strict_alternation: bool,
+        streaming: bool,
     }
 
     impl TestProvider {
         fn lenient() -> Self {
             Self {
                 strict_alternation: false,
+                streaming: false,
             }
         }
         fn strict() -> Self {
             Self {
                 strict_alternation: true,
+                streaming: false,
+            }
+        }
+        fn streaming() -> Self {
+            Self {
+                strict_alternation: false,
+                streaming: true,
             }
         }
     }
@@ -496,6 +511,10 @@ mod tests {
             self.strict_alternation
         }
 
+        fn streaming(&self) -> bool {
+            self.streaming
+        }
+
         fn apply_prompt_cache(
             &self,
             body: &mut serde_json::Map<String, Value>,
@@ -504,6 +523,14 @@ mod tests {
             if request.cache.is_some() {
                 body.insert("cache_hook".into(), Value::Bool(true));
             }
+            Ok(())
+        }
+
+        fn apply_stream_options(
+            &self,
+            body: &mut serde_json::Map<String, Value>,
+        ) -> Result<(), LoopError> {
+            body.insert("stream_options_hook".into(), Value::Bool(true));
             Ok(())
         }
     }
@@ -533,6 +560,30 @@ mod tests {
         .unwrap();
 
         assert_eq!(body.get("cache_hook"), Some(&Value::Bool(true)));
+    }
+
+    #[test]
+    fn streaming_provider_sets_stream_true_and_applies_options() {
+        let body = build_request_body(
+            &TestProvider::streaming(),
+            &turn_request(vec![Item::text(ItemKind::User, "hi")], Vec::new()),
+        )
+        .unwrap();
+
+        assert_eq!(body.get("stream"), Some(&Value::Bool(true)));
+        assert_eq!(body.get("stream_options_hook"), Some(&Value::Bool(true)));
+    }
+
+    #[test]
+    fn buffered_provider_sets_stream_false() {
+        let body = build_request_body(
+            &TestProvider::lenient(),
+            &turn_request(vec![Item::text(ItemKind::User, "hi")], Vec::new()),
+        )
+        .unwrap();
+
+        assert_eq!(body.get("stream"), Some(&Value::Bool(false)));
+        assert!(body.get("stream_options_hook").is_none());
     }
 
     #[test]

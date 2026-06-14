@@ -82,6 +82,8 @@ pub struct OpenRouterConfig {
     /// single turn. Omitted from the request when `None` so the
     /// upstream's per-model default applies.
     pub parallel_tool_calls: Option<bool>,
+    /// Request SSE streaming responses. Defaults to `true`.
+    pub streaming: bool,
     /// Arbitrary extra fields merged into the request body.
     pub extra_body: MetadataMap,
 }
@@ -98,6 +100,7 @@ impl OpenRouterConfig {
             max_completion_tokens: None,
             temperature: None,
             parallel_tool_calls: None,
+            streaming: true,
             extra_body: MetadataMap::new(),
         }
     }
@@ -135,6 +138,12 @@ impl OpenRouterConfig {
     /// Sets whether the model may emit multiple tool calls in a single turn.
     pub fn with_parallel_tool_calls(mut self, flag: bool) -> Self {
         self.parallel_tool_calls = Some(flag);
+        self
+    }
+
+    /// Toggles SSE streaming of model responses. Default: true.
+    pub fn with_streaming(mut self, flag: bool) -> Self {
+        self.streaming = flag;
         self
     }
 
@@ -224,6 +233,7 @@ pub struct OpenRouterProvider {
     base_url: String,
     app_name: Option<String>,
     site_url: Option<String>,
+    streaming: bool,
     request_config: OpenRouterRequestConfig,
 }
 
@@ -234,6 +244,7 @@ impl From<OpenRouterConfig> for OpenRouterProvider {
             base_url: config.base_url,
             app_name: config.app_name,
             site_url: config.site_url,
+            streaming: config.streaming,
             request_config: OpenRouterRequestConfig {
                 model: config.model,
                 temperature: config.temperature,
@@ -275,6 +286,19 @@ impl CompletionsProvider for OpenRouterProvider {
             builder = builder.header("HTTP-Referer", site_url);
         }
         builder
+    }
+
+    fn streaming(&self) -> bool {
+        self.streaming
+    }
+
+    fn apply_stream_options(
+        &self,
+        body: &mut serde_json::Map<String, Value>,
+    ) -> Result<(), LoopError> {
+        body.entry("stream_options")
+            .or_insert_with(|| serde_json::json!({ "include_usage": true }));
+        Ok(())
     }
 
     fn apply_prompt_cache(

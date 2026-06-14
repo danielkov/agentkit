@@ -137,6 +137,11 @@ AppendBytes ───── Media(Audio)  (audio stream)
 ReplaceStructured ─── Structured (JSON output, replaced wholesale)
 ```
 
+Some OpenAI-compatible gateways return generated images as complete
+`delta.images[]` entries rather than partial byte streams. Adapters can surface
+those as immediate `BeginPart` / `CommitPart` media deltas while still storing
+the final `Part::Media` in the transcript.
+
 ## Tool call streaming
 
 Tool calls stream differently from text. The model emits the tool name upfront (usually in a non-streaming fashion) and then streams the JSON arguments incrementally:

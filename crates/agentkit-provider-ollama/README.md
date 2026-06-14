@@ -12,7 +12,8 @@ Ollama model adapter for the agentkit agent loop.
 This crate provides `OllamaAdapter` and `OllamaConfig` for connecting the
 agent loop to a local [Ollama](https://ollama.ai) instance via its
 OpenAI-compatible chat completions endpoint. It handles request translation and
-response normalization for Ollama-backed sessions.
+response normalization for Ollama-backed sessions. Streaming is enabled by
+default; use `.with_streaming(false)` to force the buffered response path.
 
 No API key is required — Ollama runs locally and does not authenticate requests
 by default. You need a running Ollama server (e.g. `ollama serve`) with your

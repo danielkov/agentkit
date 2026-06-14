@@ -14,7 +14,7 @@ Or add it to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-agentkit = "0.7"
+agentkit = "0.9.0"
 ```
 
 ## Minimal dependency set
@@ -25,14 +25,14 @@ To keep your build lean, disable defaults and pick only what you need:
 
 ```toml
 [dependencies]
-agentkit = { version = "0.7", default-features = false, features = ["core", "loop"] }
+agentkit = { version = "0.9.0", default-features = false, features = ["core", "loop"] }
 ```
 
 Provider adapters and MCP integration are opt-in features:
 
 ```toml
 [dependencies]
-agentkit = { version = "0.7", features = ["provider-anthropic", "mcp", "tool-fs", "tool-shell"] }
+agentkit = { version = "0.9.0", features = ["provider-anthropic", "mcp", "tool-fs", "tool-shell"] }
 ```
 
 See the [Feature flags reference](./feature-flags.md) for the full list.

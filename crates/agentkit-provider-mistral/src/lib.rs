@@ -72,6 +72,8 @@ pub struct MistralConfig {
     /// single turn. Omitted from the request when `None` so Mistral's
     /// per-model default applies.
     pub parallel_tool_calls: Option<bool>,
+    /// Request SSE streaming responses. Defaults to `true`.
+    pub streaming: bool,
     /// Whether to merge consecutive `user` messages before sending.
     /// Defaults to `true` because Mistral's chat templates enforce
     /// strict `user`/`assistant` alternation — the same behavior that
@@ -92,6 +94,7 @@ impl MistralConfig {
             max_tokens: None,
             top_p: None,
             parallel_tool_calls: None,
+            streaming: true,
             strict_alternating_roles: true,
         }
     }
@@ -123,6 +126,12 @@ impl MistralConfig {
     /// Sets whether the model may emit multiple tool calls in a single turn.
     pub fn with_parallel_tool_calls(mut self, flag: bool) -> Self {
         self.parallel_tool_calls = Some(flag);
+        self
+    }
+
+    /// Toggles SSE streaming of model responses. Default: true.
+    pub fn with_streaming(mut self, flag: bool) -> Self {
+        self.streaming = flag;
         self
     }
 
@@ -178,6 +187,7 @@ pub struct MistralRequestConfig {
 pub struct MistralProvider {
     api_key: String,
     base_url: String,
+    streaming: bool,
     strict_alternating_roles: bool,
     request_config: MistralRequestConfig,
 }
@@ -187,6 +197,7 @@ impl From<MistralConfig> for MistralProvider {
         Self {
             api_key: config.api_key,
             base_url: config.base_url,
+            streaming: config.streaming,
             strict_alternating_roles: config.strict_alternating_roles,
             request_config: MistralRequestConfig {
                 model: config.model,
@@ -220,6 +231,10 @@ impl CompletionsProvider for MistralProvider {
             "User-Agent",
             concat!("agentkit-provider-mistral/", env!("CARGO_PKG_VERSION")),
         )
+    }
+
+    fn streaming(&self) -> bool {
+        self.streaming
     }
 
     fn requires_alternating_roles(&self) -> bool {

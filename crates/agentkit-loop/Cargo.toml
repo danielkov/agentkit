@@ -10,10 +10,10 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-agentkit-capabilities = { version = "0.8.1", path = "../agentkit-capabilities" }
-agentkit-core = { version = "0.8.1", path = "../agentkit-core" }
-agentkit-task-manager = { version = "0.8.1", path = "../agentkit-task-manager" }
-agentkit-tools-core = { version = "0.8.1", path = "../agentkit-tools-core" }
+agentkit-capabilities = { version = "0.9.0", path = "../agentkit-capabilities" }
+agentkit-core = { version = "0.9.0", path = "../agentkit-core" }
+agentkit-task-manager = { version = "0.9.0", path = "../agentkit-task-manager" }
+agentkit-tools-core = { version = "0.9.0", path = "../agentkit-tools-core" }
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true

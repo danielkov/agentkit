@@ -72,6 +72,8 @@ pub struct VllmConfig {
     /// Whether the model is allowed to emit multiple tool calls in a
     /// single turn. Omitted from the request when `None`.
     pub parallel_tool_calls: Option<bool>,
+    /// Request SSE streaming responses. Defaults to `true`.
+    pub streaming: bool,
     /// Whether the loaded chat template enforces strict
     /// `user`/`assistant` role alternation. Set to `true` for
     /// Mistral-/Mixtral-/Llama-template models served via vLLM, which
@@ -92,6 +94,7 @@ impl VllmConfig {
             max_completion_tokens: None,
             top_p: None,
             parallel_tool_calls: None,
+            streaming: true,
             strict_alternating_roles: false,
         }
     }
@@ -129,6 +132,12 @@ impl VllmConfig {
     /// Sets whether the model may emit multiple tool calls in a single turn.
     pub fn with_parallel_tool_calls(mut self, flag: bool) -> Self {
         self.parallel_tool_calls = Some(flag);
+        self
+    }
+
+    /// Toggles SSE streaming of model responses. Default: true.
+    pub fn with_streaming(mut self, flag: bool) -> Self {
+        self.streaming = flag;
         self
     }
 
@@ -183,6 +192,7 @@ pub struct VllmRequestConfig {
 pub struct VllmProvider {
     base_url: String,
     api_key: Option<String>,
+    streaming: bool,
     strict_alternating_roles: bool,
     request_config: VllmRequestConfig,
 }
@@ -192,6 +202,7 @@ impl From<VllmConfig> for VllmProvider {
         Self {
             base_url: config.base_url,
             api_key: config.api_key,
+            streaming: config.streaming,
             strict_alternating_roles: config.strict_alternating_roles,
             request_config: VllmRequestConfig {
                 model: config.model,
@@ -229,6 +240,10 @@ impl CompletionsProvider for VllmProvider {
             Some(key) => builder.bearer_auth(key),
             None => builder,
         }
+    }
+
+    fn streaming(&self) -> bool {
+        self.streaming
     }
 
     fn requires_alternating_roles(&self) -> bool {

@@ -12,7 +12,8 @@ OpenAI model adapter for the agentkit agent loop.
 This crate provides `OpenAIAdapter` and `OpenAIConfig` for connecting the
 agent loop to the [OpenAI](https://platform.openai.com) chat completions API.
 It handles request translation, response normalization, usage reporting, and
-prompt cache integration for OpenAI-backed sessions.
+prompt cache integration for OpenAI-backed sessions. Streaming is enabled by
+default; use `.with_streaming(false)` to force the buffered response path.
 
 Applications that want an OpenAI-powered agent will usually use this crate
 through the umbrella `agentkit` crate's `provider-openai` feature, or depend on

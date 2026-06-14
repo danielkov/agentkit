@@ -13,6 +13,7 @@ This crate translates between agentkit transcript primitives and OpenRouter chat
 
 - session and turn adapters
 - tool declaration and tool-call decoding
+- SSE streaming of text, reasoning, tool calls, and generated image parts
 - multimodal user content mapping (images, audio)
 - usage and finish-reason normalization
 - environment-based configuration helpers
@@ -21,7 +22,7 @@ Use it when OpenRouter is the backing model provider for your agent runtime.
 
 ## Configuration
 
-Create a config with `OpenRouterConfig::new(api_key, model)` and chain `.with_*()` builders for optional parameters. Alternatively, `OpenRouterConfig::from_env()` reads from environment variables:
+Create a config with `OpenRouterConfig::new(api_key, model)` and chain `.with_*()` builders for optional parameters. Streaming is enabled by default; use `.with_streaming(false)` to force the buffered response path. Alternatively, `OpenRouterConfig::from_env()` reads from environment variables:
 
 | Variable                           | Required | Default                                         |
 | ---------------------------------- | -------- | ----------------------------------------------- |

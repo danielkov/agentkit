@@ -12,7 +12,8 @@ Mistral model adapter for the agentkit agent loop.
 This crate provides `MistralAdapter` and `MistralConfig` for connecting the
 agent loop to the [Mistral AI](https://mistral.ai) chat completions API. It
 handles request translation, response normalization, and usage reporting for
-Mistral-backed sessions.
+Mistral-backed sessions. Streaming is enabled by default; use
+`.with_streaming(false)` to force the buffered response path.
 
 Note: Mistral uses `max_tokens` instead of the `max_completion_tokens` field
 used by most other OpenAI-compatible APIs.

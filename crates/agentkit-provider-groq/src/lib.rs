@@ -69,6 +69,8 @@ pub struct GroqConfig {
     /// single turn. Omitted from the request when `None` so Groq's
     /// per-model default applies.
     pub parallel_tool_calls: Option<bool>,
+    /// Request SSE streaming responses. Defaults to `true`.
+    pub streaming: bool,
 }
 
 impl GroqConfig {
@@ -82,6 +84,7 @@ impl GroqConfig {
             max_completion_tokens: None,
             top_p: None,
             parallel_tool_calls: None,
+            streaming: true,
         }
     }
 
@@ -112,6 +115,12 @@ impl GroqConfig {
     /// Sets whether the model may emit multiple tool calls in a single turn.
     pub fn with_parallel_tool_calls(mut self, flag: bool) -> Self {
         self.parallel_tool_calls = Some(flag);
+        self
+    }
+
+    /// Toggles SSE streaming of model responses. Default: true.
+    pub fn with_streaming(mut self, flag: bool) -> Self {
+        self.streaming = flag;
         self
     }
 
@@ -156,6 +165,7 @@ pub struct GroqRequestConfig {
 pub struct GroqProvider {
     api_key: String,
     base_url: String,
+    streaming: bool,
     request_config: GroqRequestConfig,
 }
 
@@ -164,6 +174,7 @@ impl From<GroqConfig> for GroqProvider {
         Self {
             api_key: config.api_key,
             base_url: config.base_url,
+            streaming: config.streaming,
             request_config: GroqRequestConfig {
                 model: config.model,
                 temperature: config.temperature,
@@ -196,6 +207,10 @@ impl CompletionsProvider for GroqProvider {
             "User-Agent",
             concat!("agentkit-provider-groq/", env!("CARGO_PKG_VERSION")),
         )
+    }
+
+    fn streaming(&self) -> bool {
+        self.streaming
     }
 }
 

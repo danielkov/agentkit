@@ -34,7 +34,7 @@ The key properties this gives up-stack:
 - **Mid-turn user-message interjection** via `LoopInterrupt::AfterToolResult`. Messages typed during a turn are buffered in `Mode::Driving` and flushed into the transcript at the next tool-round boundary, without cancelling the turn.
 - **Tool-round cancellation** via `CancellationController`. `/cancel` and Ctrl-C both go through `AgentCommand::Cancel`; the agent interrupts the active turn.
 - **Context-window compaction** via a `TokenMeter`-backed trigger that fires at 80% of the configured context window.
-- **Streaming + non-streaming provider rendering.** The observer handles both `Delta::AppendText` (streaming) and `Delta::CommitPart` (one-shot) so the UI renders correctly on either path.
+- **OpenRouter streaming delta rendering.** The observer prints `Delta::AppendText` chunks as they arrive and falls back to `Delta::CommitPart` for buffered providers.
 
 ## Run
 

@@ -293,11 +293,11 @@ impl Renderer {
                     let _ = std::io::stdout().flush();
                 }
             }
-            // Non-streaming providers (e.g. OpenRouter today) deliver the
-            // finished part in one shot via CommitPart, without prior
-            // AppendText deltas.  Render here so the assistant reply is
-            // visible.  For streaming providers, AppendText has already
-            // printed the text, so we only close the line.
+            // Buffered providers deliver the finished part in one shot via
+            // CommitPart, without prior AppendText deltas. Render here so
+            // the assistant reply is visible. For streaming providers,
+            // AppendText has already printed the text, so we only close the
+            // line.
             AgentEvent::ContentDelta(Delta::CommitPart { part }) => match part {
                 agentkit_core::Part::Text(text) => {
                     if self.streaming_text {

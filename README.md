@@ -77,23 +77,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - `agentkit-http`
   - HTTP transport abstraction (`HttpClient`, `Http`, `HttpRequestBuilder`) with a default reqwest-backed implementation and an optional `reqwest-middleware` adapter
 - `agentkit-adapter-completions`
-  - generic chat completions adapter base for building provider crates
+  - generic chat completions adapter base with buffered and SSE streaming turns
 - `agentkit-provider-openrouter`
-  - OpenRouter adapter
+  - OpenRouter adapter with streaming, tool calls, multimodal content, and prompt caching
 - `agentkit-provider-openai`
-  - OpenAI adapter
+  - OpenAI adapter with streaming, tool calls, multimodal content, and prompt caching
 - `agentkit-provider-anthropic`
   - Anthropic Messages API adapter with streaming, prompt caching, extended thinking, and server-side tools (web search, web fetch, code execution)
 - `agentkit-provider-cerebras`
   - Cerebras Inference API adapter with streaming, reasoning, strict JSON schema, compression (msgpack/gzip), predicted outputs, service tiers, and Files + Batch API
 - `agentkit-provider-ollama`
-  - Ollama adapter
+  - Ollama adapter with streaming
 - `agentkit-provider-vllm`
-  - vLLM adapter
+  - vLLM adapter with streaming
 - `agentkit-provider-groq`
-  - Groq adapter
+  - Groq adapter with streaming
 - `agentkit-provider-mistral`
-  - Mistral adapter
+  - Mistral adapter with streaming
 - `agentkit`
   - umbrella crate with feature-gated re-exports
 
@@ -143,7 +143,7 @@ cargo run -p openrouter-agent-cli -- --mcp-mock \
   - minimal chat loop
   - now supports `Ctrl-C` turn cancellation
 - `openrouter-coding-agent`
-  - one-shot coding-oriented prompt runner with filesystem tools
+  - interactive coding-agent host with streaming delta rendering and filesystem tools
 - `openrouter-context-agent`
   - context loading from `AGENTS.md` and skills
 - `openrouter-mcp-tool`
