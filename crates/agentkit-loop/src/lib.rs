@@ -1882,6 +1882,7 @@ where
         &mut self,
         turn_id: agentkit_core::TurnId,
         emit_started: bool,
+        mutation_point: MutationPoint,
     ) -> Result<LoopStep, LoopError> {
         if let Some(provider) = &self.provider_name {
             tracing::Span::current().record("gen_ai.provider.name", provider.as_str());
@@ -1890,11 +1891,6 @@ where
             .cancellation
             .as_ref()
             .map(CancellationHandle::checkpoint);
-        let mutation_point = if self.pending_round_resume.is_some() {
-            MutationPoint::AfterToolResult
-        } else {
-            MutationPoint::AfterTurnEnded
-        };
         match self
             .run_mutators(mutation_point, Some(&turn_id), cancellation.clone())
             .await
@@ -1905,6 +1901,24 @@ where
             }
             Err(error) => return Err(error),
         }
+
+        // A mutator may have removed the freshly-submitted input (e.g. a
+        // compaction pass that summarised the latest user turn away), leaving
+        // the transcript ending in an assistant message or empty — nothing new
+        // for the model to respond to. Finish the turn rather than dispatch an
+        // assistant-prefill request, which most providers reject.
+        if !transcript_has_pending_input(&self.transcript) {
+            let turn_result = TurnResult {
+                turn_id,
+                finish_reason: FinishReason::Completed,
+                items: Vec::new(),
+                usage: None,
+                metadata: MetadataMap::new(),
+            };
+            self.emit(AgentEvent::TurnFinished(turn_result.clone()));
+            return Ok(LoopStep::Finished(turn_result));
+        }
+
         if emit_started {
             self.emit(AgentEvent::TurnStarted {
                 session_id: self.session_id.clone(),
@@ -2205,7 +2219,8 @@ where
         } else if let Some(step) = self.next_unresolved_approval_interrupt() {
             Ok(step)
         } else {
-            self.drive_turn(pending.turn_id, false).await
+            self.drive_turn(pending.turn_id, false, MutationPoint::AfterToolResult)
+                .await
         }
     }
 
@@ -2410,7 +2425,9 @@ where
         if let Some(turn_id) = self.pending_round_resume.take() {
             let drained: Vec<Item> = std::mem::take(&mut self.pending_input);
             self.extend_transcript(drained);
-            return self.drive_turn(turn_id, false).await;
+            return self
+                .drive_turn(turn_id, false, MutationPoint::AfterToolResult)
+                .await;
         }
 
         if self.pending_input.is_empty() && !had_loop_updates {
@@ -2426,7 +2443,8 @@ where
         self.next_turn_index += 1;
         let drained: Vec<Item> = std::mem::take(&mut self.pending_input);
         self.extend_transcript(drained);
-        self.drive_turn(turn_id, true).await
+        self.drive_turn(turn_id, true, MutationPoint::AfterTurnEnded)
+            .await
     }
 
     fn emit(&self, event: AgentEvent) {
@@ -2558,6 +2576,18 @@ fn interrupted_assistant_items() -> Vec<Item> {
         finish_reason: None,
         created_at: None,
     }]
+}
+
+/// Whether the transcript ends in something the model should respond to.
+///
+/// Only input-bearing trailing roles should drive inference. Passive transcript
+/// state (`System`, `Developer`, `Context`), an assistant tail, or an empty
+/// transcript has nothing new for the model to respond to.
+fn transcript_has_pending_input(transcript: &[Item]) -> bool {
+    matches!(
+        transcript.last().map(|item| item.kind),
+        Some(ItemKind::User | ItemKind::Tool | ItemKind::Notification)
+    )
 }
 
 fn extract_tool_calls(items: &[Item]) -> Vec<ToolCallPart> {
@@ -3374,6 +3404,24 @@ mod tests {
         }
     }
 
+    /// No-op mutator that records the [`MutationPoint`] it is invoked with at
+    /// each mutation site, so a test can assert which point the loop reports.
+    struct PointRecordingMutator {
+        points: StdArc<StdMutex<Vec<MutationPoint>>>,
+    }
+
+    #[async_trait]
+    impl LoopMutator for PointRecordingMutator {
+        async fn mutate(
+            &self,
+            _cursor: &mut TranscriptCursor<'_>,
+            ctx: LoopCtx<'_>,
+        ) -> Result<(), LoopError> {
+            self.points.lock().unwrap().push(ctx.point);
+            Ok(())
+        }
+    }
+
     struct RecordingObserver {
         events: StdArc<StdMutex<Vec<AgentEvent>>>,
     }
@@ -3604,6 +3652,217 @@ mod tests {
                 step => return step,
             }
         }
+    }
+
+    /// A mutator runs at the top of every `drive_turn`, and the loop labels
+    /// the site via [`MutationPoint`]. The first drive of a turn is
+    /// `AfterTurnEnded`; the continuation drive that follows a completed tool
+    /// round must be `AfterToolResult` (a tool result was just appended and an
+    /// inference call is imminent). This pins that the continuation reports the
+    /// correct point.
+    #[tokio::test]
+    async fn post_tool_continuation_reports_after_tool_result_mutation_point() {
+        let points = StdArc::new(StdMutex::new(Vec::<MutationPoint>::new()));
+        let tools = ToolRegistry::new().with(EchoTool::default());
+        let agent = Agent::builder()
+            .model(FakeAdapter)
+            .add_tool_source(tools)
+            .permissions(AllowAllPermissions)
+            .mutator(PointRecordingMutator {
+                points: points.clone(),
+            })
+            .build()
+            .unwrap();
+
+        let mut driver = agent
+            .start(SessionConfig {
+                session_id: SessionId::new("session-mutation-point"),
+                metadata: MetadataMap::new(),
+                cache: None,
+            })
+            .await
+            .unwrap();
+
+        driver
+            .submit_input(vec![Item::text(ItemKind::User, "ping")])
+            .unwrap();
+
+        // FakeSession: turn 1 emits a tool call, the continuation turn finishes.
+        let _ = run_until_finished(&mut driver).await;
+
+        let recorded = points.lock().unwrap().clone();
+        assert_eq!(
+            recorded.first(),
+            Some(&MutationPoint::AfterTurnEnded),
+            "first drive of a fresh turn must report AfterTurnEnded, got {recorded:?}"
+        );
+        assert!(
+            recorded.contains(&MutationPoint::AfterToolResult),
+            "post-tool continuation must report AfterToolResult, got {recorded:?}"
+        );
+    }
+
+    #[test]
+    fn pending_input_requires_input_bearing_tail_role() {
+        assert!(!transcript_has_pending_input(&[]));
+        assert!(!transcript_has_pending_input(&[Item::text(
+            ItemKind::System,
+            "system"
+        )]));
+        assert!(!transcript_has_pending_input(&[Item::text(
+            ItemKind::Developer,
+            "developer"
+        )]));
+        assert!(!transcript_has_pending_input(&[Item::text(
+            ItemKind::Context,
+            "context"
+        )]));
+        assert!(!transcript_has_pending_input(&[Item::text(
+            ItemKind::Assistant,
+            "assistant"
+        )]));
+
+        assert!(transcript_has_pending_input(&[Item::text(
+            ItemKind::User,
+            "user"
+        )]));
+        assert!(transcript_has_pending_input(&[Item::notification(
+            "background update"
+        )]));
+        assert!(transcript_has_pending_input(&[Item {
+            id: None,
+            kind: ItemKind::Tool,
+            parts: vec![Part::ToolResult(ToolResultPart {
+                call_id: ToolCallId::new("call-test"),
+                output: ToolOutput::Text("ok".into()),
+                is_error: false,
+                metadata: MetadataMap::new(),
+            })],
+            metadata: MetadataMap::new(),
+            usage: None,
+            finish_reason: None,
+            created_at: None,
+        }]));
+    }
+
+    /// Drops a trailing `User` item. Stands in for any mutator that removes the
+    /// freshly-submitted input during `drive_turn` — e.g. a compaction pass
+    /// that summarises the latest user turn away, or a normalisation step that
+    /// strips an empty user prompt — leaving the transcript ending in an
+    /// assistant message.
+    struct DropTrailingUserMutator;
+
+    #[async_trait]
+    impl LoopMutator for DropTrailingUserMutator {
+        async fn mutate(
+            &self,
+            cursor: &mut TranscriptCursor<'_>,
+            _ctx: LoopCtx<'_>,
+        ) -> Result<(), LoopError> {
+            if cursor.last().map(|item| item.kind) == Some(ItemKind::User) {
+                cursor.pop();
+            }
+            Ok(())
+        }
+    }
+
+    /// Mirrors the provider gram hit (Vertex/Bedrock via OpenRouter): a model
+    /// that rejects any request whose final message is an assistant message
+    /// ("assistant prefill — the conversation must end with a user message").
+    /// Records whether it was ever asked to begin such a turn.
+    struct RejectAssistantPrefillAdapter {
+        saw_assistant_tail: StdArc<AtomicBool>,
+    }
+
+    struct RejectAssistantPrefillSession {
+        saw_assistant_tail: StdArc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl ModelAdapter for RejectAssistantPrefillAdapter {
+        type Session = RejectAssistantPrefillSession;
+
+        async fn start_session(&self, _config: SessionConfig) -> Result<Self::Session, LoopError> {
+            Ok(RejectAssistantPrefillSession {
+                saw_assistant_tail: self.saw_assistant_tail.clone(),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl ModelSession for RejectAssistantPrefillSession {
+        type Turn = FakeTurn;
+
+        async fn begin_turn(
+            &mut self,
+            request: TurnRequest,
+            _cancellation: Option<TurnCancellation>,
+        ) -> Result<Self::Turn, LoopError> {
+            if request.transcript.last().map(|item| item.kind) == Some(ItemKind::Assistant) {
+                self.saw_assistant_tail.store(true, Ordering::SeqCst);
+                return Err(LoopError::Provider(
+                    "conversation must end with a user message".into(),
+                ));
+            }
+            Ok(FakeTurn {
+                events: VecDeque::from([ModelTurnEvent::Finished(ModelTurnResult {
+                    model: None,
+                    response_id: None,
+                    finish_reason: FinishReason::Completed,
+                    output_items: vec![Item::text(ItemKind::Assistant, "ok")],
+                    usage: None,
+                    metadata: MetadataMap::new(),
+                })]),
+            })
+        }
+    }
+
+    /// Reproduces the exact failure mode observed in gram: a mutator removes
+    /// the just-submitted user input during `drive_turn`, so the transcript
+    /// ends in an assistant message with nothing for the model to respond to.
+    /// The loop must NOT dispatch a model request in that state — there is no
+    /// valid trailing input to drive with — it should finish the turn instead.
+    /// The adapter stands in for a provider that rejects assistant prefill, so
+    /// any dispatch in this state would surface as a provider error.
+    #[tokio::test]
+    async fn drive_does_not_dispatch_without_valid_trailing_input() {
+        let saw_assistant_tail = StdArc::new(AtomicBool::new(false));
+        let agent = Agent::builder()
+            .model(RejectAssistantPrefillAdapter {
+                saw_assistant_tail: saw_assistant_tail.clone(),
+            })
+            .mutator(DropTrailingUserMutator)
+            // Prior conversation ending in an assistant message — e.g. a cold
+            // bootstrap that loaded a completed turn's history.
+            .transcript(vec![
+                Item::text(ItemKind::User, "kickoff"),
+                Item::text(ItemKind::Assistant, "prior reply"),
+            ])
+            .build()
+            .unwrap();
+
+        let mut driver = agent
+            .start(SessionConfig {
+                session_id: SessionId::new("session-no-valid-input"),
+                metadata: MetadataMap::new(),
+                cache: None,
+            })
+            .await
+            .unwrap();
+
+        driver
+            .submit_input(vec![Item::text(ItemKind::User, "follow up")])
+            .unwrap();
+
+        // The mutator strips the "follow up" user item, leaving [user, assistant].
+        let outcome = driver.next().await;
+
+        assert!(
+            !saw_assistant_tail.load(Ordering::SeqCst),
+            "loop dispatched a model turn whose transcript ends in an assistant \
+             message (outcome: {outcome:?}); with no valid trailing input the turn \
+             must finish instead of driving"
+        );
     }
 
     #[tokio::test]
