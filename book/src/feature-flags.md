@@ -35,13 +35,13 @@ The umbrella crate `agentkit` re-exports subcrates behind feature flags.
 **Minimal orchestration:**
 
 ```toml
-agentkit = { version = "0.9.0", features = ["core", "capabilities", "tools", "loop"] }
+agentkit = { version = "0.9.1", features = ["core", "capabilities", "tools", "loop"] }
 ```
 
 **Coding agent:**
 
 ```toml
-agentkit = { version = "0.9.0", features = [
+agentkit = { version = "0.9.1", features = [
     "core", "capabilities", "context", "tools",
     "loop", "tool-fs", "tool-shell", "reporting",
 ] }
@@ -50,7 +50,7 @@ agentkit = { version = "0.9.0", features = [
 **MCP-enabled agent:**
 
 ```toml
-agentkit = { version = "0.9.0", features = [
+agentkit = { version = "0.9.1", features = [
     "core", "capabilities", "context", "tools",
     "loop", "tool-fs", "tool-shell", "reporting", "mcp",
 ] }
@@ -59,7 +59,7 @@ agentkit = { version = "0.9.0", features = [
 **OpenRouter-backed example host (streaming, prompt caching):**
 
 ```toml
-agentkit = { version = "0.9.0", features = [
+agentkit = { version = "0.9.1", features = [
     "core", "capabilities", "tools", "loop",
     "reporting", "provider-openrouter",
 ] }
@@ -68,7 +68,7 @@ agentkit = { version = "0.9.0", features = [
 **OpenAI-compatible provider host (streaming):**
 
 ```toml
-agentkit = { version = "0.9.0", features = [
+agentkit = { version = "0.9.1", features = [
     "core", "capabilities", "tools", "loop",
     "reporting", "provider-groq",
 ] }
@@ -80,7 +80,7 @@ or `provider-openai` as needed.
 **Anthropic Messages API host (streaming, extended thinking, server tools):**
 
 ```toml
-agentkit = { version = "0.9.0", features = [
+agentkit = { version = "0.9.1", features = [
     "core", "capabilities", "tools", "loop",
     "reporting", "provider-anthropic",
 ] }
@@ -89,7 +89,7 @@ agentkit = { version = "0.9.0", features = [
 **Cerebras Inference host (streaming, reasoning, rate-limit snapshot):**
 
 ```toml
-agentkit = { version = "0.9.0", features = [
+agentkit = { version = "0.9.1", features = [
     "core", "capabilities", "tools", "loop",
     "reporting", "provider-cerebras",
 ] }
