@@ -402,6 +402,7 @@ impl Tool for ComposeTool {
             ToolExecutionOutcome::Interrupted(_) => Err(ToolError::Internal(
                 "compose produced an approval interrupt through invoke".into(),
             )),
+            ToolExecutionOutcome::FailedBeforeInvocation(error) => Err(error),
             ToolExecutionOutcome::Failed(error) => Err(error),
         }
     }
@@ -668,7 +669,8 @@ impl ComposeTool {
                                 ToolInterruption::ApprovalRequired(approval),
                             )))
                         }
-                        ToolExecutionOutcome::Failed(error) => {
+                        ToolExecutionOutcome::FailedBeforeInvocation(error)
+                        | ToolExecutionOutcome::Failed(error) => {
                             Err(mlua::Error::external(ComposeFailure(error)))
                         }
                     }

@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use agentkit_core::{Item, ItemKind, Part, ToolOutput, ToolResultPart};
 use agentkit_loop::{
-    Agent, AgentEvent, LoopInterrupt, LoopObserver, LoopStep, PromptCacheRequest,
+    Agent, AgentEvent, LoopInterrupt, LoopObserver, LoopStep, ObservedEvent, PromptCacheRequest,
     PromptCacheRetention, SessionConfig,
 };
 use agentkit_provider_openrouter::{OpenRouterAdapter, OpenRouterConfig};
@@ -91,7 +91,8 @@ impl RecordingObserver {
 }
 
 impl LoopObserver for RecordingObserver {
-    fn handle_event(&self, event: AgentEvent) {
+    fn handle_event(&self, event: ObservedEvent) {
+        let event = event.event;
         if let AgentEvent::ToolCallRequested(call) = event {
             self.tool_calls.lock().unwrap().push(call.name);
         }

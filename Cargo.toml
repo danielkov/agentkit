@@ -4,6 +4,7 @@ members = [
     "crates/agentkit-core",
     "crates/agentkit-context",
     "crates/agentkit-capabilities",
+    "crates/agentkit-acp",
     "crates/agentkit-tools-core",
     "crates/agentkit-tools-derive",
     "crates/agentkit-task-manager",
@@ -43,6 +44,7 @@ members = [
     "examples/openrouter-subagent-tool",
     "examples/mcp-reference-interop",
     "examples/mcp-dynamic-auth",
+    "examples/openrouter-acp-trio",
     "projects/how",
     "benchmarks/compose-bench",
 ]
@@ -54,7 +56,7 @@ homepage = "https://github.com/danielkov/agentkit"
 license = "MIT"
 repository = "https://github.com/danielkov/agentkit"
 rust-version = "1.92"
-version = "0.9.2"
+version = "0.10.0"
 
 [workspace.dependencies]
 async-trait = "0.1.89"

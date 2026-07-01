@@ -71,11 +71,11 @@ That means the simplest reporters implement:
 
 ```rust
 pub trait LoopObserver: Send + Sync {
-    fn handle_event(&self, event: AgentEvent);
+    fn handle_event(&self, event: ObservedEvent);
 }
 ```
 
-Observers take `&self` and keep mutable state behind interior mutability so the driver can share each one as `Arc<dyn LoopObserver>` across multiple sessions started from the same `Agent`.
+`ObservedEvent` carries the `session_id` plus the `AgentEvent`. Observers take `&self` and keep mutable state behind interior mutability so the driver can share each one as `Arc<dyn LoopObserver>` across multiple sessions started from the same `Agent`.
 
 This keeps event ordering deterministic and avoids async leakage into the loop.
 
@@ -153,7 +153,8 @@ Recommended format:
 
 - one line per `AgentEvent`
 - stable top-level envelope
-- include event type, timestamp, session ID, turn ID, and event payload
+- include event type, timestamp, turn ID, and event payload
+- include the observed session ID when the reporter is configured for shared-sink routing
 
 ### `UsageReporter`
 
@@ -217,13 +218,16 @@ Recommended helper:
 ```rust
 pub struct EventEnvelope<'a> {
     pub timestamp: SystemTime,
+    pub session_id: Option<&'a SessionId>,
     pub event: &'a AgentEvent,
 }
 ```
 
 This is useful because raw `AgentEvent` may not carry every transport concern a reporter wants.
 
-The helper envelope should remain thin. It should not redefine the event model.
+The helper envelope should remain thin. Optional routing fields, such as
+`session_id`, should be explicit reporter configuration so strict consumers can
+keep the original envelope shape.
 
 ## 3. Usage aggregation types
 

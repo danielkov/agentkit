@@ -205,17 +205,17 @@ Reporters observe deltas via the `LoopObserver` trait:
 
 ```rust
 pub trait LoopObserver: Send + Sync {
-    fn handle_event(&self, event: AgentEvent);
+    fn handle_event(&self, event: ObservedEvent);
 }
 ```
 
-When the driver receives a `Delta` from the model turn, it wraps it as `AgentEvent::ContentDelta(delta)` and dispatches it to all registered observers synchronously, in registration order.
+When the driver receives a `Delta` from the model turn, it wraps it as `AgentEvent::ContentDelta(delta)` inside a session-addressed `ObservedEvent` envelope and dispatches it to all registered observers synchronously, in registration order.
 
 This is how real-time text rendering works — the `StdoutReporter` receives `AppendText` deltas and writes each chunk to the terminal immediately:
 
 ```rust
-fn handle_event(&self, event: AgentEvent) {
-    if let AgentEvent::ContentDelta(Delta::AppendText { chunk, .. }) = &event {
+fn handle_event(&self, event: ObservedEvent) {
+    if let AgentEvent::ContentDelta(Delta::AppendText { chunk, .. }) = &event.event {
         print!("{}", chunk);
         std::io::stdout().flush().ok();
     }

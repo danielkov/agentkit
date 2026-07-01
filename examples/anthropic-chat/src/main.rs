@@ -31,8 +31,8 @@ use std::sync::{Arc, Mutex};
 
 use agentkit_core::{CancellationController, Delta, Item, ItemKind, Part, Usage};
 use agentkit_loop::{
-    Agent, AgentEvent, InputRequest, LoopInterrupt, LoopObserver, LoopStep, PromptCacheRequest,
-    PromptCacheRetention, SessionConfig,
+    Agent, AgentEvent, InputRequest, LoopInterrupt, LoopObserver, LoopStep, ObservedEvent,
+    PromptCacheRequest, PromptCacheRetention, SessionConfig,
 };
 use agentkit_provider_anthropic::{
     AnthropicAdapter, AnthropicConfig, CodeExecutionTool, ThinkingConfig, WebFetchTool,
@@ -425,7 +425,8 @@ impl StreamPrinterState {
 }
 
 impl LoopObserver for StreamPrinter {
-    fn handle_event(&self, event: AgentEvent) {
+    fn handle_event(&self, event: ObservedEvent) {
+        let event = event.event;
         let mut state = self.state.lock().unwrap();
         match event {
             AgentEvent::TurnStarted { .. } => {

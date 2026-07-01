@@ -57,9 +57,9 @@ Recommended initial crate:
 [dependencies]
 agent-client-protocol = "1.0.0"
 agent-client-protocol-tokio = { version = "0.11.1", optional = true }
-agentkit-core = { path = "../agentkit-core", version = "0.9.2" }
-agentkit-loop = { path = "../agentkit-loop", version = "0.9.2" }
-agentkit-tools-core = { path = "../agentkit-tools-core", version = "0.9.2" }
+agentkit-core = { path = "../agentkit-core", version = "0.10.0" }
+agentkit-loop = { path = "../agentkit-loop", version = "0.10.0" }
+agentkit-tools-core = { path = "../agentkit-tools-core", version = "0.10.0" }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -207,12 +207,6 @@ impl agentkit_loop::LoopObserver for AcpIntegration {
     }
 }
 
-impl agentkit_loop::TranscriptObserver for AcpIntegration {
-    fn on_transcript_event(&self, event: agentkit_loop::TranscriptEvent<'_>) {
-        // Proposed loop change: routes by event.session_id into per-session ACP state.
-    }
-}
-
 pub struct AcpIntegrationBuilder {
     // private
 }
@@ -243,7 +237,6 @@ let session = acp.bind_session(AcpSessionBinding::new(
 let agent = Agent::builder()
     .model(adapter)
     .observer(acp.clone())
-    .transcript_observer(acp.clone())
     .cancellation(session.cancellation_handle())
     .build()?;
 ```
@@ -363,8 +356,10 @@ Delta::AppendText for PartKind::Text     -> SessionUpdate::AgentMessageChunk
 Delta::AppendText for PartKind::Reasoning -> SessionUpdate::AgentThoughtChunk
 Delta::CommitPart                        -> finalize local reconstruction state
 AgentEvent::ToolCallRequested            -> SessionUpdate::ToolCall
-AgentEvent::ToolResultReceived           -> SessionUpdate::ToolCallUpdate
-AgentEvent::UsageUpdated                 -> SessionUpdate::UsageUpdate
+AgentEvent::ToolExecutionStarted         -> SessionUpdate::ToolCallUpdate { status = InProgress }
+AgentEvent::ToolExecutionProgress        -> SessionUpdate::ToolCallUpdate { status = InProgress }
+AgentEvent::ToolResultReceived           -> terminal SessionUpdate::ToolCallUpdate
+AgentEvent::UsageUpdated                 -> SessionUpdate::UsageUpdate only when context window size is known
 AgentEvent::Warning                      -> log or metadata update, not AgentThoughtChunk
 AgentEvent::RunFailed                    -> prompt error
 AgentEvent::TurnFinished                 -> PromptResponse stop_reason
@@ -375,8 +370,6 @@ Tool call mapping should preserve the agentkit `ToolCallId` as ACP `ToolCallId`.
 The observer must be stateful. `Delta::AppendText` only carries `part_id` and `chunk`; the observer must remember the earlier `Delta::BeginPart { part_id, kind }` to decide whether the chunk is assistant message text or reasoning. The observer may synthesize ACP `message_id`s per turn because agentkit deltas identify parts rather than ACP messages.
 
 `AgentEvent::ApprovalRequired` is informational on the observer stream. The runtime must not double-prompt from that event. Approval resolution is owned by `LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(...))`.
-
-For exact transcript reconstruction, pair the streaming observer with transcript observation. To let `AcpIntegration` implement the transcript observer as a shared object, transcript observer events need session context too. If transcript observation stays item-only, `agentkit-acp` can use it only through session-scoped adapter objects or host-provided transcript routing.
 
 ### Stop reasons
 
@@ -446,7 +439,6 @@ pub enum AcpApprovalDecision {
     RejectAlways { reason: Option<String> },
     PatchAndAllow {
         input: serde_json::Value,
-        remember: bool,
     },
 }
 ```
@@ -495,7 +487,8 @@ match decision {
     | AcpApprovalDecision::RejectAlways { reason } => {
         driver.resolve_approval_for(call_id, ApprovalDecision::Deny { reason })?;
     }
-    AcpApprovalDecision::PatchAndAllow { input, .. } => {
+    AcpApprovalDecision::PatchAndAllow { input } => {
+        send ToolCallUpdate { raw_input: input.clone() };
         driver.resolve_approval_for_with_patched_input(call_id, input)?;
     }
 }
@@ -511,11 +504,13 @@ Remembered decisions should be separate from the resolver:
 pub trait AcpApprovalMemory: Send + Sync + 'static {
     fn lookup(
         &self,
+        session_id: &agent_client_protocol::schema::v1::SessionId,
         request: &agentkit_tools_core::ApprovalRequest,
     ) -> Option<AcpApprovalDecision>;
 
     fn remember(
         &self,
+        session_id: &agent_client_protocol::schema::v1::SessionId,
         request: &agentkit_tools_core::ApprovalRequest,
         decision: &AcpApprovalDecision,
     );
@@ -529,12 +524,12 @@ memory lookup hit       -> apply remembered decision
 memory lookup miss      -> call resolver
 AllowAlways/RejectAlways -> remember after applying
 AllowOnce/RejectOnce     -> do not remember
-PatchAndAllow            -> remember only when remember == true
+PatchAndAllow            -> never remember patched input
 ```
 
 Initial implementations:
 
-- `NoApprovalMemory`
+- `NoopApprovalMemory`
 - `InMemoryApprovalMemory`
 
 Persistent trust stores should remain host-owned until the policy key shape is proven. A durable memory entry needs a stable key that includes at least request kind, tool name or call target, workspace root, and risk metadata.
@@ -572,8 +567,8 @@ fn handle_prompt(request: PromptRequest, cx: ConnectionTo<Client>) {
                 let decision = tokio::select! {
                     decision = resolve_with_memory(ctx, session.client.clone()) => decision?,
                     _ = session.cancellation.handle().cancelled_since(generation) => {
-                        driver.cancel_pending_approval_for(pending.request.call_id.clone())?;
-                        continue;
+                        driver.cancel_pending_approvals().await?;
+                        return Ok(PromptResponse::new(StopReason::Cancelled));
                     }
                 };
                 apply_approval_decision(&mut driver, &pending.request, decision)?;
@@ -595,7 +590,7 @@ ACP `session/cancel` should interrupt the session's `CancellationController`. Th
 
 Approval waits must be cancellation-aware. A pending `session/request_permission` round trip can block on the user; the runtime should race the resolver future against the session cancellation handle. If cancellation wins, stop waiting for the permission response and resume the driver so the loop can observe cancellation and finish with `FinishReason::Cancelled`.
 
-The `cancel_pending_approval_for` call in the pseudocode represents the Phase 0 loop support listed below; current loop behavior resurfaces unresolved approval interrupts, so ACP cancellation during a permission prompt needs explicit pending-approval cancellation semantics.
+The `cancel_pending_approvals` call in the pseudocode clears every unresolved approval interrupt for the cancelled turn and appends matching error tool results so the transcript remains provider-valid.
 
 In hybrid integrations, the host's turn arbiter decides what to do when ACP input arrives:
 
@@ -649,7 +644,7 @@ awaiting approval        -> route through approval resolver, not prompt input
 ### Phase 3: tool call UX
 
 - stream `ToolCallRequested` as ACP tool call creation
-- stream `ToolResultReceived` as ACP tool call updates
+- stream `ToolExecutionStarted`, `ToolExecutionProgress`, and `ToolResultReceived` as ACP tool call updates
 - include `raw_input`, `raw_output`, status, and text content
 - map common file-edit tool outputs to ACP diffs where possible
 
@@ -671,7 +666,7 @@ awaiting approval        -> route through approval resolver, not prompt input
 - `agentkit-acp` does not own session persistence. Hosts can already extract transcript state from `LoopDriver::snapshot` and persist it in their own storage layer.
 - Builder APIs should force an explicit approval resolver choice. A host should choose `ClientPermissionResolver`, `AutoDenyResolver`, `AutoApproveResolver`, or a custom resolver intentionally.
 - ACP reporting should be implemented through `AcpIntegration` as `LoopObserver` plus transcript observation. If this proves insufficient during implementation, the gap should be fixed in the observer events rather than by adding a separate reporting subsystem.
-- `agentkit-loop` should add an explicit tool-execution-started event so ACP can report `ToolCallStatus::InProgress` without guessing from approval or result timing.
+- `agentkit-loop` provides explicit tool execution start/progress events so ACP can report `ToolCallStatus::InProgress` without guessing from approval or result timing.
 
 ## Remaining design details
 

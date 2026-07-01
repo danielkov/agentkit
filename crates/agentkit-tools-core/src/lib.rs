@@ -3235,6 +3235,8 @@ pub enum ToolExecutionOutcome {
     Completed(ToolResult),
     /// The tool was interrupted and needs user input before it can continue.
     Interrupted(ToolInterruption),
+    /// Execution failed before the tool body was invoked.
+    FailedBeforeInvocation(ToolError),
     /// The tool failed with an error.
     Failed(ToolError),
 }
@@ -3451,7 +3453,9 @@ impl BasicToolExecutor {
         ctx: &mut ToolContext<'_>,
     ) -> ToolExecutionOutcome {
         let Some(tool) = self.lookup(&request.tool_name) else {
-            return ToolExecutionOutcome::Failed(ToolError::NotFound(request.tool_name));
+            return ToolExecutionOutcome::FailedBeforeInvocation(ToolError::NotFound(
+                request.tool_name,
+            ));
         };
 
         match tool.proposed_requests(&request) {
@@ -3460,9 +3464,9 @@ impl BasicToolExecutor {
                     match ctx.permissions.evaluate(permission_request.as_ref()) {
                         PermissionDecision::Allow => {}
                         PermissionDecision::Deny(denial) => {
-                            return ToolExecutionOutcome::Failed(ToolError::PermissionDenied(
-                                denial,
-                            ));
+                            return ToolExecutionOutcome::FailedBeforeInvocation(
+                                ToolError::PermissionDenied(denial),
+                            );
                         }
                         PermissionDecision::RequireApproval(mut req) => {
                             req.call_id = Some(request.call_id.clone());
@@ -3475,7 +3479,7 @@ impl BasicToolExecutor {
                     }
                 }
             }
-            Err(error) => return ToolExecutionOutcome::Failed(error),
+            Err(error) => return ToolExecutionOutcome::FailedBeforeInvocation(error),
         }
 
         let truncation_ctx = ToolOutputTruncationContext::from((&request, tool.spec().clone()));

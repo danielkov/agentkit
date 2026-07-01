@@ -36,6 +36,7 @@
 # Part IV: Integration and extensibility
 
 - [MCP integration](./ch17-mcp.md)
+- [ACP integration](./acp.md)
 - [Task management and parallelism](./ch18-task-management.md)
 - [Reporting and observability](./ch19-reporting.md)
 - [Provider adapters](./ch20-provider-adapters.md)

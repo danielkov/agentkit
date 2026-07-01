@@ -79,8 +79,8 @@ use agentkit_core::{
 };
 use agentkit_loop::{
     Agent, AgentEvent, InputRequest, LoopDriver, LoopError, LoopInterrupt, LoopObserver, LoopStep,
-    ModelAdapter, ModelSession, PendingApproval, PromptCacheRequest, PromptCacheRetention,
-    SessionConfig,
+    ModelAdapter, ModelSession, ObservedEvent, PendingApproval, PromptCacheRequest,
+    PromptCacheRetention, SessionConfig,
 };
 use agentkit_provider_openrouter::{OpenRouterAdapter, OpenRouterConfig};
 use agentkit_tools_core::{
@@ -225,7 +225,8 @@ struct MeterObserver {
 }
 
 impl LoopObserver for MeterObserver {
-    fn handle_event(&self, event: AgentEvent) {
+    fn handle_event(&self, event: ObservedEvent) {
+        let event = event.event;
         if let AgentEvent::UsageUpdated(usage) = event
             && let Some(tokens) = usage.tokens.as_ref()
         {
@@ -240,7 +241,8 @@ struct ChannelObserver {
 }
 
 impl LoopObserver for ChannelObserver {
-    fn handle_event(&self, event: AgentEvent) {
+    fn handle_event(&self, event: ObservedEvent) {
+        let event = event.event;
         // If the UI has gone away we simply drop events — the agent task
         // will notice via its own channel and shut down on the next tick.
         let _ = self.tx.send(UiEvent::Agent(event));

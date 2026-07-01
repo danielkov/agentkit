@@ -276,11 +276,11 @@ Recommended minimal contract:
 
 ```rust
 pub trait LoopObserver: Send + Sync {
-    fn handle_event(&self, event: AgentEvent);
+    fn handle_event(&self, event: ObservedEvent);
 }
 ```
 
-Observers take `&self` and hold mutable state behind interior mutability (`Mutex`, atomics, channels). The driver shares each observer as `Arc<dyn LoopObserver>` so a single configured agent can mint multiple sessions over its lifetime (e.g. an outer agent that uses an inner sub-agent for compaction).
+`ObservedEvent` carries the `session_id` plus the `AgentEvent`. Observers take `&self` and hold mutable state behind interior mutability (`Mutex`, atomics, channels). The driver shares each observer as `Arc<dyn LoopObserver>` so a single configured agent can mint multiple sessions over its lifetime (e.g. an outer agent that uses an inner sub-agent for compaction).
 
 V1 should make this synchronous.
 
@@ -308,6 +308,9 @@ Buffered or async fanout, if needed later, should be built as an adapter layer o
 ## AgentEvent
 
 `AgentEvent` should capture non-blocking state changes and observations.
+The enum is non-exhaustive: observers and replay tools should keep a wildcard
+arm so new stream events, such as tool execution lifecycle updates, do not
+break ingestion.
 
 Recommended categories:
 
@@ -317,7 +320,8 @@ Recommended categories:
 - `ContentDelta`
 - `ToolCallRequested`
 - `ToolExecutionStarted`
-- `ToolExecutionFinished`
+- `ToolExecutionProgress`
+- `ToolResultReceived`
 - `ApprovalRequired`
 - `ApprovalResolved`
 - `MutationStarted`

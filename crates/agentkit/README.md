@@ -25,24 +25,25 @@ Feature-gated umbrella crate for assembling agent applications from the agentkit
 
 ## Optional features
 
-| Feature               | Module                | Purpose                                                                                     |
-| --------------------- | --------------------- | ------------------------------------------------------------------------------------------- |
-| `compaction`          | `compaction`          | Transcript compaction triggers, strategies, and pipelines                                   |
-| `context`             | `context`             | `AGENTS.md` discovery and context loading                                                   |
-| `mcp`                 | `mcp`                 | Model Context Protocol server connections (stdio + Streamable HTTP)                         |
-| `task-manager`        | `task_manager`        | Foreground / background tool task scheduling                                                |
-| `adapter-completions` | `adapter_completions` | Generic chat completions adapter base for building provider crates                          |
-| `provider-anthropic`  | `provider_anthropic`  | Anthropic Messages API adapter (streaming, prompt caching, extended thinking, server tools) |
-| `provider-cerebras`   | `provider_cerebras`   | Cerebras Inference API adapter (streaming, reasoning, compression, Files + Batch)           |
-| `provider-openai`     | `provider_openai`     | OpenAI `/v1/chat/completions` adapter                                                       |
-| `provider-openrouter` | `provider_openrouter` | OpenRouter `/v1/chat/completions` adapter                                                   |
-| `provider-groq`       | `provider_groq`       | Groq adapter                                                                                |
-| `provider-mistral`    | `provider_mistral`    | Mistral adapter                                                                             |
-| `provider-ollama`     | `provider_ollama`     | Ollama adapter                                                                              |
-| `provider-vllm`       | `provider_vllm`       | vLLM adapter                                                                                |
-| `tool-fs`             | `tool_fs`             | Filesystem tools (read, write, edit, move, delete, list, mkdir)                             |
-| `tool-shell`          | `tool_shell`          | Shell execution tool (`shell_exec`)                                                         |
-| `tool-skills`         | `tool_skills`         | Progressive Agent Skills discovery and activation                                           |
+| Feature               | Module                | Purpose                                                                                        |
+| --------------------- | --------------------- | ---------------------------------------------------------------------------------------------- |
+| `compaction`          | `compaction`          | Transcript compaction triggers, strategies, and pipelines                                      |
+| `context`             | `context`             | `AGENTS.md` discovery and context loading                                                      |
+| `mcp`                 | `mcp`                 | Model Context Protocol server connections (stdio + Streamable HTTP)                            |
+| `acp`                 | `acp`                 | Agent Client Protocol integration: session binding, approval resolvers, headless stdio runtime |
+| `task-manager`        | `task_manager`        | Foreground / background tool task scheduling                                                   |
+| `adapter-completions` | `adapter_completions` | Generic chat completions adapter base for building provider crates                             |
+| `provider-anthropic`  | `provider_anthropic`  | Anthropic Messages API adapter (streaming, prompt caching, extended thinking, server tools)    |
+| `provider-cerebras`   | `provider_cerebras`   | Cerebras Inference API adapter (streaming, reasoning, compression, Files + Batch)              |
+| `provider-openai`     | `provider_openai`     | OpenAI `/v1/chat/completions` adapter                                                          |
+| `provider-openrouter` | `provider_openrouter` | OpenRouter `/v1/chat/completions` adapter                                                      |
+| `provider-groq`       | `provider_groq`       | Groq adapter                                                                                   |
+| `provider-mistral`    | `provider_mistral`    | Mistral adapter                                                                                |
+| `provider-ollama`     | `provider_ollama`     | Ollama adapter                                                                                 |
+| `provider-vllm`       | `provider_vllm`       | vLLM adapter                                                                                   |
+| `tool-fs`             | `tool_fs`             | Filesystem tools (read, write, edit, move, delete, list, mkdir)                                |
+| `tool-shell`          | `tool_shell`          | Shell execution tool (`shell_exec`)                                                            |
+| `tool-skills`         | `tool_skills`         | Progressive Agent Skills discovery and activation                                              |
 
 ## Quick start
 
@@ -50,7 +51,7 @@ Add agentkit with the features you need:
 
 ```toml
 [dependencies]
-agentkit = { version = "0.9.2", features = ["provider-openrouter", "tool-fs", "tool-shell"] }
+agentkit = { version = "0.10.0", features = ["provider-openrouter", "tool-fs", "tool-shell"] }
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -160,7 +161,7 @@ When implementing a custom adapter, only the default features are needed:
 
 ```toml
 [dependencies]
-agentkit = "0.9.2"
+agentkit = "0.10.0"
 ```
 
 ```rust,ignore

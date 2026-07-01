@@ -6,11 +6,11 @@ An agent that you can't observe is an agent you can't debug. This chapter covers
 
 ```rust
 pub trait LoopObserver: Send + Sync {
-    fn handle_event(&self, event: AgentEvent);
+    fn handle_event(&self, event: ObservedEvent);
 }
 ```
 
-Observers take `&self` and keep mutable state behind interior mutability (`Mutex`, atomics, channels). The driver shares each observer as `Arc<dyn LoopObserver>`, so a single configured `Agent` can mint multiple sessions and the same reporter sees them all.
+`ObservedEvent` is a session-addressed envelope: the `session_id` plus the `AgentEvent`. Observers take `&self` and keep mutable state behind interior mutability (`Mutex`, atomics, channels). The driver shares each observer as `Arc<dyn LoopObserver>`, so a single configured `Agent` can mint multiple sessions and the same reporter sees them all — and route per session when it needs to (this is what makes shared-sink consumers like the ACP integration possible).
 
 Observers are synchronous and called in deterministic order. This is a deliberate choice:
 
@@ -46,7 +46,7 @@ Human-readable terminal output. Handles streaming text deltas, tool lifecycle no
 
 ### JsonlReporter
 
-One structured JSON object per event, newline-delimited. Useful for audit logs, debugging, and external system ingestion. Uses a stable envelope format with event type, timestamp, session ID, turn ID, and payload.
+One structured JSON object per event, newline-delimited. Useful for audit logs, debugging, and external system ingestion. Uses a stable envelope format with event type, timestamp, turn ID, and payload. When the reporter is shared across sessions (a shared-sink setup), opt into `with_session_id(true)` to add the observed session id to each envelope — it is opt-in so strict consumers keep the original envelope shape.
 
 ### UsageReporter
 
@@ -102,13 +102,13 @@ The `chat` span is emitted by the loop itself, wrapping `begin_turn` plus the fu
 
 `TracingReporter` is a `LoopObserver` that converts each `AgentEvent` into a single `tracing` event:
 
-| Agent event                                                                                                                                          | Level   |
-| ---------------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
-| `RunStarted`, `TurnStarted`, `TurnFinished`, `ToolCallRequested`, `ToolResultReceived`, `ApprovalRequired`, `ApprovalResolved`, `ToolCatalogChanged` | `INFO`  |
-| `InputAccepted`, `UsageUpdated`, `MutationStarted`, `MutationFinished`                                                                               | `DEBUG` |
-| `ContentDelta`                                                                                                                                       | `TRACE` |
-| `Warning`                                                                                                                                            | `WARN`  |
-| `RunFailed`                                                                                                                                          | `ERROR` |
+| Agent event                                                                                                                                                                                           | Level   |
+| ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
+| `RunStarted`, `TurnStarted`, `TurnFinished`, `ToolCallRequested`, `ToolExecutionStarted`, `ToolExecutionProgress`, `ToolResultReceived`, `ApprovalRequired`, `ApprovalResolved`, `ToolCatalogChanged` | `INFO`  |
+| `InputAccepted`, `UsageUpdated`, `MutationStarted`, `MutationFinished`                                                                                                                                | `DEBUG` |
+| `ContentDelta`                                                                                                                                                                                        | `TRACE` |
+| `Warning`                                                                                                                                                                                             | `WARN`  |
+| `RunFailed`                                                                                                                                                                                           | `ERROR` |
 
 Reporter events are emitted under the `agentkit_reporting` target so they filter independently of the internal spans:
 
@@ -213,8 +213,8 @@ struct ToolCallCounter {
 }
 
 impl LoopObserver for ToolCallCounter {
-    fn handle_event(&self, event: AgentEvent) {
-        if matches!(event, AgentEvent::ToolCallRequested(_)) {
+    fn handle_event(&self, event: ObservedEvent) {
+        if matches!(event.event, AgentEvent::ToolCallRequested(_)) {
             self.count.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -231,9 +231,9 @@ struct AuditLogger {
 }
 
 impl LoopObserver for AuditLogger {
-    fn handle_event(&self, event: AgentEvent) {
+    fn handle_event(&self, event: ObservedEvent) {
         let mut writer = self.writer.lock().unwrap();
-        match &event {
+        match &event.event {
             AgentEvent::ToolCallRequested(call) => {
                 writeln!(writer, "TOOL_CALL: {} input={}", call.name,
                     serde_json::to_string(&call.input).unwrap_or_default()
@@ -252,18 +252,18 @@ impl LoopObserver for AuditLogger {
 
 ## AgentEvent categories
 
-| Category   | Events                                                          |
-| ---------- | --------------------------------------------------------------- |
-| Lifecycle  | `RunStarted`, `TurnStarted`, `TurnFinished`, `RunFailed`        |
-| Input      | `InputAccepted`                                                 |
-| Streaming  | `ContentDelta`                                                  |
-| Tools      | `ToolCallRequested`, `ToolResultReceived`, `ToolCatalogChanged` |
-| Approval   | `ApprovalRequired`, `ApprovalResolved`                          |
-| Mutators   | `MutationStarted`, `MutationFinished`                           |
-| Usage      | `UsageUpdated`                                                  |
-| Diagnostic | `Warning`                                                       |
+| Category   | Events                                                                                                           |
+| ---------- | ---------------------------------------------------------------------------------------------------------------- |
+| Lifecycle  | `RunStarted`, `TurnStarted`, `TurnFinished`, `RunFailed`                                                         |
+| Input      | `InputAccepted`                                                                                                  |
+| Streaming  | `ContentDelta`                                                                                                   |
+| Tools      | `ToolCallRequested`, `ToolExecutionStarted`, `ToolExecutionProgress`, `ToolResultReceived`, `ToolCatalogChanged` |
+| Approval   | `ApprovalRequired`, `ApprovalResolved`                                                                           |
+| Mutators   | `MutationStarted`, `MutationFinished`                                                                            |
+| Usage      | `UsageUpdated`                                                                                                   |
+| Diagnostic | `Warning`                                                                                                        |
 
-For loss-free transcript reconstruction, register a `TranscriptObserver` alongside `LoopObserver`. It fires once per `Item` appended, in transcript order — including the synthetic placeholder and the eventual real result for background-detached tools, both correlated through the matching `ToolResultReceived` events by `call_id`.
+For loss-free transcript reconstruction, register a `TranscriptObserver` alongside `LoopObserver`. It fires a session-addressed `TranscriptEvent` once per `Item` appended, in transcript order — including the synthetic placeholder and the eventual real result for background-detached tools, correlated by `call_id` through the matching `ToolExecutionProgress` (placeholder) and `ToolResultReceived` (terminal result) events.
 
 ### Event timeline for a typical turn
 

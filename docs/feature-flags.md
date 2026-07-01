@@ -27,6 +27,9 @@ The umbrella crate `agentkit` re-exports subcrates behind feature flags.
 - `mcp`
   - enables `agentkit-mcp`
   - implies `capabilities`, `tools`
+- `acp`
+  - enables `agentkit-acp`
+  - implies `loop`
 - `adapter-completions`
   - enables `agentkit-adapter-completions`
   - implies `loop`
@@ -108,6 +111,11 @@ MCP-enabled agent:
 
 - everything above
 - `mcp`
+
+ACP-exposed agent (editor-addressable over the Agent Client Protocol):
+
+- everything needed for the host
+- `acp`
 
 OpenRouter-backed example host (streaming, prompt caching):
 

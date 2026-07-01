@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use agentkit_loop::{AgentEvent, LoopObserver};
+use agentkit_loop::{AgentEvent, LoopObserver, ObservedEvent};
 use serde::Serialize;
 
 #[derive(Default, Clone, Serialize)]
@@ -33,7 +33,8 @@ pub struct MetricsState {
 pub struct MetricsObserver(pub Arc<Mutex<MetricsState>>);
 
 impl LoopObserver for MetricsObserver {
-    fn handle_event(&self, event: AgentEvent) {
+    fn handle_event(&self, event: ObservedEvent) {
+        let event = event.event;
         let mut state = self.0.lock().expect("metrics lock");
         match event {
             AgentEvent::UsageUpdated(usage) => {

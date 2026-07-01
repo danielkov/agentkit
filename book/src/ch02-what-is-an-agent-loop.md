@@ -138,11 +138,11 @@ Not everything requires host intervention. Streaming deltas, usage updates, tool
 
 ```rust
 pub trait LoopObserver: Send + Sync {
-    fn handle_event(&self, event: AgentEvent);
+    fn handle_event(&self, event: ObservedEvent);
 }
 ```
 
-Observers take `&self` and hold mutable state behind interior mutability so the driver can share each one as `Arc<dyn LoopObserver>` across multiple sessions.
+`ObservedEvent` is a session-addressed envelope — the `session_id` plus the `AgentEvent` — so one shared observer can route events from many concurrent sessions. Observers take `&self` and hold mutable state behind interior mutability so the driver can share each one as `Arc<dyn LoopObserver>` across multiple sessions.
 
 Observers are informational — they cannot stall the loop or alter its control flow. This keeps the driver's state machine simple: `next()` either returns a `LoopStep` or doesn't return yet. There is no interleaving of observer handling with loop logic.
 
@@ -158,9 +158,9 @@ Observers are informational — they cannot stall the loop or alter its control 
 For loss-free transcript reconstruction (persistence, replication, audit), register a `TranscriptObserver` alongside the operational `LoopObserver`. The two observe different things:
 
 - **`LoopObserver`** sees a stream of `AgentEvent`s. Content arrives as deltas — partial fragments that don't carry their parent-`Item` identity — interleaved with lifecycle and telemetry events. Useful for UIs and logging, but a consumer cannot reassemble the canonical transcript from this stream alone.
-- **`TranscriptObserver`** fires exactly once per `Item` appended, with the fully-formed `Item` ready to persist. Calls happen synchronously from the driver, in transcript order, at the single mutation point that owns the transcript — so what the observer sees is what the loop will send to the model on the next turn.
+- **`TranscriptObserver`** fires exactly once per `Item` appended, receiving a session-addressed `TranscriptEvent` with the fully-formed `Item` ready to persist. Calls happen synchronously from the driver, in transcript order, at the single mutation point that owns the transcript — so what the observer sees is what the loop will send to the model on the next turn.
 
-Mutator-driven rewrites (compaction, redaction, repair) do not fire `on_item_appended`; they are signalled separately by `AgentEvent::MutationFinished`, which a persistence layer can use to snapshot the post-mutation state.
+Mutator-driven rewrites (compaction, redaction, repair) do not fire `on_transcript_event`; they are signalled separately by `AgentEvent::MutationFinished`, which a persistence layer can use to snapshot the post-mutation state.
 
 ## The three-layer model
 

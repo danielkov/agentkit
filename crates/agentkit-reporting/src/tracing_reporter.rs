@@ -6,7 +6,7 @@
 //!
 //! This module is only available when the `tracing` feature is enabled.
 
-use agentkit_loop::{AgentEvent, LoopObserver};
+use agentkit_loop::{AgentEvent, LoopObserver, ObservedEvent};
 
 /// Reporter that emits [`tracing`] events for every [`AgentEvent`].
 ///
@@ -15,7 +15,7 @@ use agentkit_loop::{AgentEvent, LoopObserver};
 /// | Agent event | Tracing level |
 /// |---|---|
 /// | `RunStarted`, `TurnStarted`, `TurnFinished` | `INFO` |
-/// | `ToolCallRequested`, `ApprovalRequired/Resolved`, `AuthRequired/Resolved` | `INFO` |
+/// | `ToolCallRequested`, `ToolExecutionStarted/Progress`, `ApprovalRequired/Resolved`, `AuthRequired/Resolved` | `INFO` |
 /// | `InputAccepted`, `UsageUpdated`, `CompactionStarted/Finished` | `DEBUG` |
 /// | `ContentDelta` | `TRACE` |
 /// | `Warning` | `WARN` |
@@ -59,7 +59,8 @@ impl TracingReporter {
 }
 
 impl LoopObserver for TracingReporter {
-    fn handle_event(&self, event: AgentEvent) {
+    fn handle_event(&self, event: ObservedEvent) {
+        let event = event.event;
         match &event {
             AgentEvent::RunStarted { session_id } => {
                 tracing::info!(target: "agentkit_reporting", session_id = %session_id, "agent run started");
@@ -78,6 +79,17 @@ impl LoopObserver for TracingReporter {
             }
             AgentEvent::ToolCallRequested(call) => {
                 tracing::info!(target: "agentkit_reporting", tool = %call.name, "tool call requested");
+            }
+            AgentEvent::ToolExecutionStarted(call) => {
+                tracing::info!(target: "agentkit_reporting", tool = %call.name, call_id = %call.id, "tool execution started");
+            }
+            AgentEvent::ToolExecutionProgress(result) => {
+                tracing::info!(
+                    target: "agentkit_reporting",
+                    call_id = %result.call_id,
+                    is_error = result.is_error,
+                    "tool execution progress"
+                );
             }
             AgentEvent::ToolResultReceived(result) => {
                 tracing::info!(
@@ -160,6 +172,7 @@ impl LoopObserver for TracingReporter {
                     "turn finished"
                 );
             }
+            _ => {}
         }
     }
 }

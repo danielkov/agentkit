@@ -5,7 +5,7 @@
 //! capacity or on an explicit [`flush`](BufferedReporter::flush) call.
 //! Remaining events are flushed automatically on drop.
 
-use agentkit_loop::{AgentEvent, LoopObserver};
+use agentkit_loop::{LoopObserver, ObservedEvent};
 
 /// Reporter adapter that enqueues events for batch flushing.
 ///
@@ -23,7 +23,7 @@ use agentkit_loop::{AgentEvent, LoopObserver};
 /// ```
 pub struct BufferedReporter<T: LoopObserver> {
     inner: T,
-    buffer: std::sync::Mutex<Vec<AgentEvent>>,
+    buffer: std::sync::Mutex<Vec<ObservedEvent>>,
     capacity: usize,
 }
 
@@ -62,7 +62,7 @@ impl<T: LoopObserver> BufferedReporter<T> {
 }
 
 impl<T: LoopObserver> LoopObserver for BufferedReporter<T> {
-    fn handle_event(&self, event: AgentEvent) {
+    fn handle_event(&self, event: ObservedEvent) {
         let needs_flush = {
             let mut buffer = self.buffer.lock().unwrap_or_else(|e| e.into_inner());
             buffer.push(event);

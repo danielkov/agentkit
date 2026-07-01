@@ -4,11 +4,11 @@ The agent loop has no built-in storage backend. Persistence is intentionally a h
 
 ## The three primitives
 
-| Primitive                                     | Purpose                                                                                                              |
-| --------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
-| `AgentBuilder::transcript(items)`             | Restore prior transcript before the loop starts.                                                                     |
-| `TranscriptObserver::on_item_appended(&item)` | Mirror every newly-appended item to durable storage as the loop runs.                                                |
-| `LoopDriver::snapshot() -> LoopSnapshot`      | Read-only point-in-time view of `transcript` and `pending_input` for ad-hoc dumps, audit, or full-state checkpoints. |
+| Primitive                                        | Purpose                                                                                                                 |
+| ------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------- |
+| `AgentBuilder::transcript(items)`                | Restore prior transcript before the loop starts.                                                                        |
+| `TranscriptObserver::on_transcript_event(event)` | Mirror every newly-appended item to durable storage as the loop runs (`TranscriptEvent` carries `session_id` + `item`). |
+| `LoopDriver::snapshot() -> LoopSnapshot`         | Read-only point-in-time view of `transcript` and `pending_input` for ad-hoc dumps, audit, or full-state checkpoints.    |
 
 That is the whole protocol. Any storage backend — in-memory map, sqlite, Postgres, S3, Redis — implements the same shape:
 
@@ -18,9 +18,9 @@ That is the whole protocol. Any storage backend — in-memory map, sqlite, Postg
 
 ## Two important guarantees
 
-**Append-only ordering.** `on_item_appended` is called synchronously by the loop, in the exact order items land in the transcript. The observer is the single mutation point — every push to the transcript funnels through it. This means a strictly monotonic `seq` column on a sqlite `items` table reproduces the transcript byte-for-byte on reload.
+**Append-only ordering.** `on_transcript_event` is called synchronously by the loop, in the exact order items land in the transcript. The observer is the single mutation point — every push to the transcript funnels through it. This means a strictly monotonic `seq` column on a sqlite `items` table reproduces the transcript byte-for-byte on reload.
 
-**Mutators are out-of-band.** Mutator-driven transcript rewrites (compaction, redaction, repair) do **not** fire `on_item_appended`. They are signalled via `AgentEvent::MutationFinished { dirty: true, .. }`, observable through a `LoopObserver`. A mutation-aware persistor subscribes to both channels and replaces the stored transcript when it sees a dirty mutation finish. An agent without mutators (most coding agents that rely on the provider's prompt cache plus a long context window) can ignore this.
+**Mutators are out-of-band.** Mutator-driven transcript rewrites (compaction, redaction, repair) do **not** fire `on_transcript_event`. They are signalled via `AgentEvent::MutationFinished { dirty: true, .. }`, observable through a `LoopObserver`. A mutation-aware persistor subscribes to both channels and replaces the stored transcript when it sees a dirty mutation finish. An agent without mutators (most coding agents that rely on the provider's prompt cache plus a long context window) can ignore this.
 
 ## A complete sqlite implementation
 
@@ -49,8 +49,8 @@ struct SqliteTranscriptObserver {
 }
 
 impl TranscriptObserver for SqliteTranscriptObserver {
-    fn on_item_appended(&self, item: &Item) {
-        if let Err(error) = self.store.append(&self.session_id, item) {
+    fn on_transcript_event(&self, event: TranscriptEvent<'_>) {
+        if let Err(error) = self.store.append(&self.session_id, event.item) {
             eprintln!("[persistence] failed to append item: {error}");
         }
     }
@@ -78,7 +78,7 @@ That is the entire round-trip. Run the example twice with the same `--session` f
 
 Sqlite is the easiest to drop into a single-process CLI. For multi-process or distributed agents, swap the storage backend; the observer interface is unchanged:
 
-- **Postgres / MySQL** — same two-table schema, use a connection pool. `on_item_appended` runs on the loop's task; if your write latency is significant, queue items into a buffered channel and persist on a dedicated task to avoid stalling the loop.
+- **Postgres / MySQL** — same two-table schema, use a connection pool. `on_transcript_event` runs on the loop's task; if your write latency is significant, queue items into a buffered channel and persist on a dedicated task to avoid stalling the loop.
 - **Redis** — `RPUSH session:<id> <item-json>` and `LRANGE session:<id> 0 -1` for restore. Atomic, fast, no schema migrations.
 - **S3 / GCS** — write a JSONL blob per session, append-on-flush. Higher latency, but cheap and infinitely scalable for archival workloads. Use `LoopDriver::snapshot()` to take periodic full-state checkpoints rather than streaming each item.
 - **In-memory `HashMap<SessionId, Vec<Item>>`** — for tests and ephemeral demos. The observer is a one-liner.
@@ -87,7 +87,7 @@ Sqlite is the easiest to drop into a single-process CLI. For multi-process or di
 
 A `SessionStore` trait would force every backend to implement the same four or five methods. That is what Anthropic's claude-agent-sdk-python does — five methods plus a thirteen-test conformance harness — and it works because their SDK consumes session storage.
 
-agentkit doesn't consume the backend. The loop just calls `on_item_appended`. Restoration is the host's job. Picking your own shape (one table, three tables, a stream, a directory of JSON files) is the right default for a library that doesn't know how you want to query, archive, or share session state.
+agentkit doesn't consume the backend. The loop just calls `on_transcript_event`. Restoration is the host's job. Picking your own shape (one table, three tables, a stream, a directory of JSON files) is the right default for a library that doesn't know how you want to query, archive, or share session state.
 
 The integration test crate exercises the round-trip pattern internally; see `crates/agentkit-integration-tests` for the canonical worked tests.
 
@@ -95,8 +95,8 @@ The integration test crate exercises the round-trip pattern internally; see `cra
 
 If your agent registers any `LoopMutator`s (compaction, redaction, repair), the persistence flow extends:
 
-1. `TranscriptObserver::on_item_appended` continues to mirror new items as they arrive.
+1. `TranscriptObserver::on_transcript_event` continues to mirror new items as they arrive.
 2. A `LoopObserver` subscribes to `AgentEvent::MutationFinished { dirty: true, .. }` and uses it as a signal to replace the stored transcript.
-3. After a dirty mutation finish, call `LoopDriver::snapshot()` from the host's main task and replace the persisted transcript with `snapshot.transcript`. Subsequent `on_item_appended` calls resume appending from the new tail.
+3. After a dirty mutation finish, call `LoopDriver::snapshot()` from the host's main task and replace the persisted transcript with `snapshot.transcript`. Subsequent `on_transcript_event` calls resume appending from the new tail.
 
 The two channels exist precisely so persistence can stay simple in the no-mutator case (one observer) without sacrificing correctness when mutators are wired in (one observer plus one event listener).

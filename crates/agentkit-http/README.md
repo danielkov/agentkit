@@ -18,7 +18,7 @@ feature, which is **enabled by default**. Disable it to compile trait-only
 when you want to bring your own backend:
 
 ```toml
-agentkit-http = { version = "0.9.2", default-features = false }
+agentkit-http = { version = "0.10.0", default-features = false }
 ```
 
 A second optional feature, `reqwest-middleware-client`, layers

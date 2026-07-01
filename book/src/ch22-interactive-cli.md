@@ -226,8 +226,8 @@ The first Ctrl-C cancels the current turn. The model sees `FinishReason::Cancell
 The `StdoutReporter` renders `ContentDelta` events as they arrive. For a CLI, this means writing each text chunk to stdout immediately:
 
 ```rust
-fn handle_event(&self, event: AgentEvent) {
-    if let AgentEvent::ContentDelta(Delta::AppendText { chunk, .. }) = event {
+fn handle_event(&self, event: ObservedEvent) {
+    if let AgentEvent::ContentDelta(Delta::AppendText { chunk, .. }) = event.event {
         print!("{}", chunk);
         std::io::stdout().flush().ok();
     }

@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex};
 use agentkit_core::{CancellationController, Item, ItemKind, Part};
 use agentkit_loop::{
     Agent, InputRequest, LoopInterrupt, LoopStep, PromptCacheRequest, PromptCacheRetention,
-    SessionConfig, TranscriptObserver,
+    SessionConfig, TranscriptEvent, TranscriptObserver,
 };
 use agentkit_provider_openrouter::{OpenRouterAdapter, OpenRouterConfig};
 use rusqlite::{Connection, params};
@@ -256,12 +256,12 @@ impl SqliteSessionStore {
 
 /// `TranscriptObserver` impl that mirrors every appended item into sqlite.
 ///
-/// `on_item_appended` is called synchronously by the loop and is the single
-/// mutation point for the transcript — every push funnels through here. The
+/// `on_transcript_event` is called synchronously by the loop and is the single
+/// mutation point for the transcript -- every push funnels through here. The
 /// observer must NOT block (sqlite writes are fast and local; for remote
 /// stores, use a buffered channel and persist on a background task).
 ///
-/// Compaction-driven rewrites do **not** fire `on_item_appended`. A
+/// Compaction-driven rewrites do **not** fire `on_transcript_event`. A
 /// compaction-aware persistor would also subscribe to
 /// `AgentEvent::CompactionFinished` via a `LoopObserver` and replace the
 /// stored transcript when it sees that event. This example skips
@@ -272,8 +272,8 @@ struct SqliteTranscriptObserver {
 }
 
 impl TranscriptObserver for SqliteTranscriptObserver {
-    fn on_item_appended(&self, item: &Item) {
-        if let Err(error) = self.store.append(&self.session_id, item) {
+    fn on_transcript_event(&self, event: TranscriptEvent<'_>) {
+        if let Err(error) = self.store.append(&self.session_id, event.item) {
             eprintln!("[persistence] failed to append item: {error}");
         }
     }

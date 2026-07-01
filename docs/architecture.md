@@ -18,6 +18,10 @@
   - `AGENTS.md` and skills loading
 - `agentkit-mcp`
   - MCP transports, discovery, lifecycle, auth, replay, tool/resource/prompt adapters
+- `agentkit-acp`
+  - Agent Client Protocol integration: session binding, observer routing, prompt
+    conversion, approval resolvers, and a headless stdio runtime built on the
+    official `agent-client-protocol` SDK
 - `agentkit-reporting`
   - loop observers for stdout, JSONL, usage, transcripts, fanout
 - `agentkit-tool-fs`
@@ -109,6 +113,24 @@ MCP auth requests now carry typed operation data and can be resumed through:
 
 - loop auth resume for tool-path interruptions
 - `McpServerManager::resolve_auth_and_resume(...)` for non-tool MCP operations
+
+## ACP path
+
+ACP makes agent sessions addressable by external clients (editors, IDEs). The
+integration is split the same way as MCP:
+
+- protocol schema, JSON-RPC framing, and transports live in the upstream
+  `agent-client-protocol` SDK, re-exported by `agentkit-acp`
+- agentkit owns the glue: `AcpIntegration` implements `LoopObserver` and routes
+  session-addressed `ObservedEvent`s into per-session ACP `session/update`
+  notifications, `AcpInputPort` converts ACP prompts into input items,
+  per-session `CancellationController`s service `session/cancel`, and
+  `AcpApprovalResolver` bridges loop approval interrupts to ACP
+  `session/request_permission`
+
+Hybrid hosts wire those pieces into their own `AgentBuilder`; standalone agents
+use `AcpHeadlessRuntime`, which owns the session table and serves ACP over
+stdio or a custom transport.
 
 ## Mutator path
 

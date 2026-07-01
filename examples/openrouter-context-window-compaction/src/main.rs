@@ -21,8 +21,8 @@ use agentkit_compaction::{
 use agentkit_core::{Item, ItemKind, Part, SessionId};
 use agentkit_http::Http;
 use agentkit_loop::{
-    Agent, AgentEvent, InputRequest, LoopInterrupt, LoopObserver, LoopStep, PromptCacheRequest,
-    PromptCacheRetention, SessionConfig,
+    Agent, AgentEvent, InputRequest, LoopInterrupt, LoopObserver, LoopStep, ObservedEvent,
+    PromptCacheRequest, PromptCacheRetention, SessionConfig,
 };
 use agentkit_provider_openrouter::{OpenRouterAdapter, OpenRouterConfig};
 use agentkit_tools_core::{PermissionChecker, PermissionDecision};
@@ -58,7 +58,8 @@ const DEFAULT_PERCENTAGE: u32 = 60;
 struct DisplayObserver;
 
 impl LoopObserver for DisplayObserver {
-    fn handle_event(&self, event: AgentEvent) {
+    fn handle_event(&self, event: ObservedEvent) {
+        let event = event.event;
         match event {
             AgentEvent::TurnStarted { turn_id, .. } => {
                 println!("[turn] {turn_id} started");

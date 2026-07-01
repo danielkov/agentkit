@@ -83,14 +83,14 @@ method again to federate additional sources (MCP catalogs, plugin loaders,
 etc.).
 
 ```rust,no_run
-use agentkit_loop::{Agent, AgentEvent, LoopObserver};
+use agentkit_loop::{Agent, LoopObserver, ObservedEvent};
 use agentkit_tools_core::ToolRegistry;
 
 struct PrintObserver;
 
 impl LoopObserver for PrintObserver {
-    fn handle_event(&self, event: AgentEvent) {
-        println!("[event] {event:?}");
+    fn handle_event(&self, event: ObservedEvent) {
+        println!("[event] {:?}", event.event);
     }
 }
 

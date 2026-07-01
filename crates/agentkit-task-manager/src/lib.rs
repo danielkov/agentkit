@@ -14,6 +14,9 @@ use thiserror::Error;
 use tokio::sync::{Mutex, Notify, mpsc};
 use tokio::task::JoinHandle;
 
+pub const TOOL_RESULT_FAILURE_KIND_METADATA_KEY: &str = "agentkit.tool.failure_kind";
+pub const TOOL_RESULT_FAILURE_KIND_PERMISSION_DENIED: &str = "permission_denied";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TaskKind {
     Foreground,
@@ -834,6 +837,29 @@ fn map_outcome_to_resolution(
                 task_id,
                 tool_request: request,
                 approval,
+            })
+        }
+        ToolExecutionOutcome::FailedBeforeInvocation(error) => {
+            let mut metadata = request.metadata;
+            if matches!(error, ToolError::PermissionDenied(_)) {
+                metadata.insert(
+                    TOOL_RESULT_FAILURE_KIND_METADATA_KEY.into(),
+                    TOOL_RESULT_FAILURE_KIND_PERMISSION_DENIED.into(),
+                );
+            }
+            TaskResolution::Item(Item {
+                id: None,
+                kind: agentkit_core::ItemKind::Tool,
+                parts: vec![agentkit_core::Part::ToolResult(ToolResultPart {
+                    call_id: request.call_id,
+                    output: agentkit_core::ToolOutput::Text(error.to_string()),
+                    is_error: true,
+                    metadata,
+                })],
+                metadata: MetadataMap::new(),
+                usage: None,
+                finish_reason: None,
+                created_at: None,
             })
         }
         ToolExecutionOutcome::Failed(error) => TaskResolution::Item(Item {

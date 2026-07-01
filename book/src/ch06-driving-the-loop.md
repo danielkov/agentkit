@@ -252,13 +252,13 @@ While the driver processes a turn, non-blocking events are delivered to observer
 
 ```rust
 pub trait LoopObserver: Send + Sync {
-    fn handle_event(&self, event: AgentEvent);
+    fn handle_event(&self, event: ObservedEvent);
 }
 ```
 
-Observers take `&self` and store mutable state behind interior mutability (`Mutex`, atomics, channels). The driver shares each observer as `Arc<dyn LoopObserver>` so a single configured `Agent` can mint multiple sessions over its lifetime.
+`ObservedEvent` wraps the `AgentEvent` in a session-addressed envelope (`session_id` + `event`), so a single shared observer can route events from every session it watches. Observers take `&self` and store mutable state behind interior mutability (`Mutex`, atomics, channels). The driver shares each observer as `Arc<dyn LoopObserver>` so a single configured `Agent` can mint multiple sessions over its lifetime.
 
-The full event taxonomy:
+The full event taxonomy (`AgentEvent` is `#[non_exhaustive]` — keep a wildcard arm):
 
 | Event                      | When it fires                                                                          |
 | -------------------------- | -------------------------------------------------------------------------------------- |
@@ -267,7 +267,9 @@ The full event taxonomy:
 | `InputAccepted`            | The driver merges pending input into the transcript                                    |
 | `ContentDelta(Delta)`      | Model streams a delta                                                                  |
 | `ToolCallRequested`        | Model requests a tool call                                                             |
-| `ToolResultReceived`       | A tool result lands in the transcript (foreground or background)                       |
+| `ToolExecutionStarted`     | A tool call is about to execute, after policy and approval checks                      |
+| `ToolExecutionProgress`    | Non-terminal tool progress (e.g. background detachment placeholder)                    |
+| `ToolResultReceived`       | A terminal tool result lands in the transcript (foreground or background)              |
 | `ApprovalRequired`         | A tool requires approval                                                               |
 | `ApprovalResolved`         | An approval interrupt is resolved                                                      |
 | `ToolCatalogChanged`       | A federated tool source's catalog changed; the next request will see the new tool list |
@@ -280,7 +282,7 @@ The full event taxonomy:
 
 Observers are called inline, synchronously, in registration order. The loop task blocks briefly for each observer call. This is acceptable because observers should be fast — write to stderr, increment a counter, append to a buffer. Expensive processing should happen asynchronously behind a channel adapter.
 
-For loss-free transcript reconstruction (persistence, replication, audit), the driver also fans out to a separate `TranscriptObserver` channel that fires once per `Item` appended, in transcript order. `LoopObserver` alone is not sufficient for this — content deltas span partial parts and historically tool results were appended without an event at all. Mutator-driven rewrites do **not** fire `on_item_appended`; those are signaled by `AgentEvent::MutationFinished`. Register via `AgentBuilder::transcript_observer`.
+For loss-free transcript reconstruction (persistence, replication, audit), the driver also fans out to a separate `TranscriptObserver` channel that fires once per `Item` appended — a session-addressed `TranscriptEvent` carrying the item, in transcript order. `LoopObserver` alone is not sufficient for this — content deltas span partial parts and historically tool results were appended without an event at all. Mutator-driven rewrites do **not** fire `on_transcript_event`; those are signaled by `AgentEvent::MutationFinished`. Register via `AgentBuilder::transcript_observer`.
 
 ## Building the agent
 

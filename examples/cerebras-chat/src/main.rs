@@ -29,7 +29,8 @@ use agentkit_core::{
     ToolResultPart, Usage,
 };
 use agentkit_loop::{
-    Agent, AgentEvent, InputRequest, LoopInterrupt, LoopObserver, LoopStep, SessionConfig,
+    Agent, AgentEvent, InputRequest, LoopInterrupt, LoopObserver, LoopStep, ObservedEvent,
+    SessionConfig,
 };
 use agentkit_provider_cerebras::{
     CerebrasAdapter, CerebrasConfig, CompressionConfig, OutputFormat, Prediction, QueueThreshold,
@@ -1110,7 +1111,8 @@ impl StreamPrinterState {
 }
 
 impl LoopObserver for StreamPrinter {
-    fn handle_event(&self, event: AgentEvent) {
+    fn handle_event(&self, event: ObservedEvent) {
+        let event = event.event;
         let mut state = self.state.lock().unwrap();
         match event {
             AgentEvent::TurnStarted { .. } => {

@@ -75,6 +75,9 @@ The examples are meant to build up in complexity:
   - provider + loop + MCP tool adaptation
 - `openrouter-subagent-tool`
   - custom tool extension
+- `openrouter-acp-trio`
+  - three agents exposed as in-memory ACP endpoints, delegating to each other
+    over the Agent Client Protocol
 - `openrouter-compaction-agent`
   - structural, semantic, and hybrid compaction with a nested-loop compaction backend
 - `openrouter-agent-cli`

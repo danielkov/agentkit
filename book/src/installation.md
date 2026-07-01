@@ -14,7 +14,7 @@ Or add it to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-agentkit = "0.9.2"
+agentkit = "0.10.0"
 ```
 
 ## Minimal dependency set
@@ -25,14 +25,14 @@ To keep your build lean, disable defaults and pick only what you need:
 
 ```toml
 [dependencies]
-agentkit = { version = "0.9.2", default-features = false, features = ["core", "loop"] }
+agentkit = { version = "0.10.0", default-features = false, features = ["core", "loop"] }
 ```
 
 Provider adapters and MCP integration are opt-in features:
 
 ```toml
 [dependencies]
-agentkit = { version = "0.9.2", features = ["provider-anthropic", "mcp", "tool-fs", "tool-shell"] }
+agentkit = { version = "0.10.0", features = ["provider-anthropic", "mcp", "tool-fs", "tool-shell"] }
 ```
 
 See the [Feature flags reference](./feature-flags.md) for the full list.
@@ -97,6 +97,7 @@ The full set of bundled examples:
 - `openrouter-parallel-agent` — parallel/background tool execution
 - `openrouter-session-persistence` — resumable sessions
 - `openrouter-subagent-tool` — subagent-as-tool composition
+- `openrouter-acp-trio` — three agents exposed as in-memory ACP endpoints, calling each other over the Agent Client Protocol
 - `anthropic-chat` — streaming, server tools, extended thinking
 - `cerebras-chat`, `cerebras-batch` — Cerebras chat + batch
 - `mcp-dynamic-auth`, `mcp-reference-interop` — MCP transport + auth

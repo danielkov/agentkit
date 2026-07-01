@@ -12,7 +12,7 @@ use agentkit_core::{
     ToolResultPart,
 };
 use agentkit_loop::{
-    Agent, AgentEvent, LoopInterrupt, LoopObserver, LoopStep, PromptCacheRequest,
+    Agent, AgentEvent, LoopInterrupt, LoopObserver, LoopStep, ObservedEvent, PromptCacheRequest,
     PromptCacheRetention, SessionConfig,
 };
 use agentkit_provider_openrouter::{OpenRouterAdapter, OpenRouterConfig};
@@ -408,7 +408,8 @@ impl RecordingObserver {
 }
 
 impl LoopObserver for RecordingObserver {
-    fn handle_event(&self, event: AgentEvent) {
+    fn handle_event(&self, event: ObservedEvent) {
+        let event = event.event;
         if let AgentEvent::MutationFinished {
             dirty: true,
             metadata,

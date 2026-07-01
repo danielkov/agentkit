@@ -57,8 +57,8 @@ pub use tracing_reporter::TracingReporter;
 use std::io::{self, Write};
 use std::time::SystemTime;
 
-use agentkit_core::{Item, ItemKind, Part, TokenUsage, Usage};
-use agentkit_loop::{AgentEvent, LoopObserver, TurnResult};
+use agentkit_core::{Item, ItemKind, Part, SessionId, TokenUsage, Usage};
+use agentkit_loop::{AgentEvent, LoopObserver, ObservedEvent, TurnResult};
 use serde::Serialize;
 use thiserror::Error;
 
@@ -90,6 +90,9 @@ pub enum ReportError {
 pub struct EventEnvelope<'a> {
     /// When the event was observed.
     pub timestamp: SystemTime,
+    /// Session routing key for shared reporter sinks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<&'a SessionId>,
     /// The underlying agent event.
     pub event: &'a AgentEvent,
 }
@@ -149,10 +152,15 @@ impl CompositeReporter {
 }
 
 impl LoopObserver for CompositeReporter {
-    fn handle_event(&self, event: AgentEvent) {
-        for child in &self.children {
+    fn handle_event(&self, event: ObservedEvent) {
+        if self.children.is_empty() {
+            return;
+        }
+        let last = self.children.len() - 1;
+        for child in &self.children[..last] {
             child.handle_event(event.clone());
         }
+        self.children[last].handle_event(event);
     }
 }
 
@@ -183,6 +191,7 @@ impl LoopObserver for CompositeReporter {
 pub struct JsonlReporter<W> {
     writer: std::sync::Mutex<W>,
     flush_each_event: bool,
+    include_session_id: bool,
     errors: std::sync::Mutex<Vec<ReportError>>,
 }
 
@@ -195,6 +204,7 @@ where
         Self {
             writer: std::sync::Mutex::new(writer),
             flush_each_event: true,
+            include_session_id: false,
             errors: std::sync::Mutex::new(Vec::new()),
         }
     }
@@ -202,6 +212,15 @@ where
     /// Controls whether the writer is flushed after every event (builder pattern).
     pub fn with_flush_each_event(mut self, flush_each_event: bool) -> Self {
         self.flush_each_event = flush_each_event;
+        self
+    }
+
+    /// Controls whether each JSONL envelope includes the observed session id.
+    ///
+    /// This is opt-in to preserve the original JSONL envelope shape for
+    /// consumers that validate fields strictly.
+    pub fn with_session_id(mut self, include_session_id: bool) -> Self {
+        self.include_session_id = include_session_id;
         self
     }
 
@@ -229,11 +248,12 @@ impl<W> LoopObserver for JsonlReporter<W>
 where
     W: Write + Send,
 {
-    fn handle_event(&self, event: AgentEvent) {
+    fn handle_event(&self, event: ObservedEvent) {
         let result = (|| -> Result<(), ReportError> {
             let envelope = EventEnvelope {
                 timestamp: SystemTime::now(),
-                event: &event,
+                session_id: self.include_session_id.then_some(event.session_id.as_ref()),
+                event: &event.event,
             };
             let mut buf = serde_json::to_vec(&envelope)?;
             buf.push(b'\n');
@@ -353,7 +373,8 @@ impl UsageReporter {
 }
 
 impl LoopObserver for UsageReporter {
-    fn handle_event(&self, event: AgentEvent) {
+    fn handle_event(&self, event: ObservedEvent) {
+        let event = event.event;
         let mut summary = self.summary.lock().unwrap_or_else(|e| e.into_inner());
         summary.events_seen += 1;
         match event {
@@ -423,7 +444,8 @@ impl TranscriptReporter {
 }
 
 impl LoopObserver for TranscriptReporter {
-    fn handle_event(&self, event: AgentEvent) {
+    fn handle_event(&self, event: ObservedEvent) {
+        let event = event.event;
         let mut transcript = self.transcript.lock().unwrap_or_else(|e| e.into_inner());
         match event {
             AgentEvent::InputAccepted { items, .. } => {
@@ -500,7 +522,8 @@ impl<W> LoopObserver for StdoutReporter<W>
 where
     W: Write + Send,
 {
-    fn handle_event(&self, event: AgentEvent) {
+    fn handle_event(&self, event: ObservedEvent) {
+        let event = event.event;
         let result = (|| -> Result<(), ReportError> {
             let mut buf: Vec<u8> = Vec::new();
             write_stdout_event(&mut buf, &event, self.show_usage)?;
@@ -539,6 +562,16 @@ where
         }
         AgentEvent::ToolCallRequested(call) => {
             writeln!(writer, "[tool] call {} {}", call.name, call.input)?;
+        }
+        AgentEvent::ToolExecutionStarted(call) => {
+            writeln!(writer, "[tool] started {} {}", call.name, call.id)?;
+        }
+        AgentEvent::ToolExecutionProgress(result) => {
+            writeln!(
+                writer,
+                "[tool] progress call_id={} is_error={}",
+                result.call_id, result.is_error
+            )?;
         }
         AgentEvent::ToolResultReceived(result) => {
             writeln!(
@@ -621,6 +654,7 @@ where
                 writeln!(writer, "[usage] {}", format_usage(usage))?;
             }
         }
+        _ => {}
     }
 
     writer.flush()?;
@@ -709,7 +743,7 @@ mod tests {
     fn usage_reporter_accumulates_usage_events_and_turn_results() {
         let reporter = UsageReporter::new();
 
-        reporter.handle_event(AgentEvent::UsageUpdated(Usage {
+        reporter.handle_event(observed(AgentEvent::UsageUpdated(Usage {
             tokens: Some(TokenUsage {
                 input_tokens: 10,
                 output_tokens: 5,
@@ -719,9 +753,9 @@ mod tests {
             }),
             cost: None,
             metadata: MetadataMap::new(),
-        }));
+        })));
 
-        reporter.handle_event(AgentEvent::TurnFinished(TurnResult {
+        reporter.handle_event(observed(AgentEvent::TurnFinished(TurnResult {
             turn_id: "turn-1".into(),
             finish_reason: FinishReason::Completed,
             items: Vec::new(),
@@ -737,7 +771,7 @@ mod tests {
                 metadata: MetadataMap::new(),
             }),
             metadata: MetadataMap::new(),
-        }));
+        })));
 
         let summary = reporter.summary();
         assert_eq!(summary.events_seen, 2);
@@ -754,7 +788,7 @@ mod tests {
     fn transcript_reporter_tracks_inputs_and_outputs() {
         let reporter = TranscriptReporter::new();
 
-        reporter.handle_event(AgentEvent::InputAccepted {
+        reporter.handle_event(observed(AgentEvent::InputAccepted {
             session_id: SessionId::new("session-1"),
             items: vec![Item {
                 id: None,
@@ -768,9 +802,9 @@ mod tests {
                 finish_reason: None,
                 created_at: None,
             }],
-        });
+        }));
 
-        reporter.handle_event(AgentEvent::TurnFinished(TurnResult {
+        reporter.handle_event(observed(AgentEvent::TurnFinished(TurnResult {
             turn_id: "turn-1".into(),
             finish_reason: FinishReason::Completed,
             items: vec![Item {
@@ -787,7 +821,7 @@ mod tests {
             }],
             usage: None,
             metadata: MetadataMap::new(),
-        }));
+        })));
 
         assert_eq!(reporter.transcript().items.len(), 2);
         assert_eq!(reporter.transcript().items[0].kind, ItemKind::User);
@@ -797,13 +831,28 @@ mod tests {
     #[test]
     fn jsonl_reporter_serializes_event_envelopes() {
         let reporter = JsonlReporter::new(Vec::new());
-        reporter.handle_event(AgentEvent::RunStarted {
+        reporter.handle_event(observed(AgentEvent::RunStarted {
             session_id: SessionId::new("session-1"),
-        });
+        }));
 
         let output = String::from_utf8(reporter.into_inner()).unwrap();
         assert!(output.contains("\"RunStarted\""));
         assert!(output.contains("session-1"));
+        assert!(!output.contains("\"session_id\":\"s1\""));
+    }
+
+    #[test]
+    fn jsonl_reporter_can_include_observed_session_id() {
+        let reporter = JsonlReporter::new(Vec::new()).with_session_id(true);
+        reporter.handle_event(observed(AgentEvent::ContentDelta(
+            agentkit_core::Delta::AppendText {
+                part_id: "part-1".into(),
+                chunk: "hello".into(),
+            },
+        )));
+
+        let output = String::from_utf8(reporter.into_inner()).unwrap();
+        assert!(output.contains("\"session_id\":\"s1\""));
     }
 
     fn run_started_event() -> AgentEvent {
@@ -812,14 +861,21 @@ mod tests {
         }
     }
 
+    fn observed(event: AgentEvent) -> ObservedEvent {
+        ObservedEvent {
+            session_id: std::sync::Arc::new(SessionId::new("s1")),
+            event,
+        }
+    }
+
     #[test]
     fn buffered_reporter_flushes_at_capacity() {
         let reporter = BufferedReporter::new(UsageReporter::new(), 2);
-        reporter.handle_event(run_started_event());
+        reporter.handle_event(observed(run_started_event()));
         assert_eq!(reporter.pending(), 1);
         assert_eq!(reporter.inner().summary().events_seen, 0);
 
-        reporter.handle_event(run_started_event());
+        reporter.handle_event(observed(run_started_event()));
         assert_eq!(reporter.pending(), 0);
         assert_eq!(reporter.inner().summary().events_seen, 2);
     }
@@ -827,8 +883,8 @@ mod tests {
     #[test]
     fn buffered_reporter_manual_flush() {
         let reporter = BufferedReporter::new(UsageReporter::new(), 0);
-        reporter.handle_event(run_started_event());
-        reporter.handle_event(run_started_event());
+        reporter.handle_event(observed(run_started_event()));
+        reporter.handle_event(observed(run_started_event()));
         assert_eq!(reporter.pending(), 2);
 
         reporter.flush();
@@ -840,8 +896,8 @@ mod tests {
     fn buffered_reporter_flushes_on_drop() {
         let inner = {
             let reporter = BufferedReporter::new(UsageReporter::new(), 100);
-            reporter.handle_event(run_started_event());
-            reporter.handle_event(run_started_event());
+            reporter.handle_event(observed(run_started_event()));
+            reporter.handle_event(observed(run_started_event()));
             assert_eq!(reporter.inner().summary().events_seen, 0);
             // Drop will flush — but we can't inspect after drop.
             // Instead, verify flush works by checking pending before drop.
@@ -859,11 +915,12 @@ mod tests {
     #[test]
     fn channel_reporter_delivers_events() {
         let (reporter, rx) = ChannelReporter::pair();
-        reporter.handle_event(run_started_event());
-        reporter.handle_event(run_started_event());
+        reporter.handle_event(observed(run_started_event()));
+        reporter.handle_event(observed(run_started_event()));
 
         let events: Vec<_> = rx.try_iter().collect();
         assert_eq!(events.len(), 2);
+        assert_eq!(events[0].session_id.0, "s1");
     }
 
     #[test]
@@ -871,7 +928,7 @@ mod tests {
         let (reporter, rx) = ChannelReporter::pair();
         drop(rx);
         // Should not panic — errors are silently dropped.
-        reporter.handle_event(run_started_event());
+        reporter.handle_event(observed(run_started_event()));
     }
 
     #[test]
@@ -879,7 +936,7 @@ mod tests {
         let (reporter, rx) = ChannelReporter::pair();
         drop(rx);
 
-        let result = reporter.try_handle_event(&run_started_event());
+        let result = reporter.try_handle_event(&observed(run_started_event()));
         assert!(matches!(result, Err(ReportError::ChannelSend)));
     }
 
@@ -888,7 +945,7 @@ mod tests {
         let (reporter, rx) = ChannelReporter::pair();
         drop(rx);
         let policy = PolicyReporter::new(reporter, FailurePolicy::Ignore);
-        policy.handle_event(run_started_event());
+        policy.handle_event(observed(run_started_event()));
         assert!(policy.take_errors().is_empty());
     }
 
@@ -897,8 +954,8 @@ mod tests {
         let (reporter, rx) = ChannelReporter::pair();
         drop(rx);
         let policy = PolicyReporter::new(reporter, FailurePolicy::Accumulate);
-        policy.handle_event(run_started_event());
-        policy.handle_event(run_started_event());
+        policy.handle_event(observed(run_started_event()));
+        policy.handle_event(observed(run_started_event()));
 
         let errors = policy.take_errors();
         assert_eq!(errors.len(), 2);
@@ -911,6 +968,6 @@ mod tests {
         let (reporter, rx) = ChannelReporter::pair();
         drop(rx);
         let policy = PolicyReporter::new(reporter, FailurePolicy::FailFast);
-        policy.handle_event(run_started_event());
+        policy.handle_event(observed(run_started_event()));
     }
 }

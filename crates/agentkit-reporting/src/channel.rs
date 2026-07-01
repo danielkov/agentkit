@@ -7,7 +7,7 @@
 
 use std::sync::mpsc::{self, Receiver, Sender};
 
-use agentkit_loop::{AgentEvent, LoopObserver};
+use agentkit_loop::{LoopObserver, ObservedEvent};
 
 use crate::ReportError;
 use crate::policy::FallibleObserver;
@@ -35,12 +35,12 @@ use crate::policy::FallibleObserver;
 /// // `reporter` implements `LoopObserver` — hand it to the agent loop.
 /// ```
 pub struct ChannelReporter {
-    sender: std::sync::Mutex<Sender<AgentEvent>>,
+    sender: std::sync::Mutex<Sender<ObservedEvent>>,
 }
 
 impl ChannelReporter {
     /// Creates a `ChannelReporter` from an existing sender.
-    pub fn new(sender: Sender<AgentEvent>) -> Self {
+    pub fn new(sender: Sender<ObservedEvent>) -> Self {
         Self {
             sender: std::sync::Mutex::new(sender),
         }
@@ -48,14 +48,14 @@ impl ChannelReporter {
 
     /// Creates a `ChannelReporter` together with the receiving end of the
     /// channel.
-    pub fn pair() -> (Self, Receiver<AgentEvent>) {
+    pub fn pair() -> (Self, Receiver<ObservedEvent>) {
         let (sender, receiver) = mpsc::channel();
         (Self::new(sender), receiver)
     }
 }
 
 impl LoopObserver for ChannelReporter {
-    fn handle_event(&self, event: AgentEvent) {
+    fn handle_event(&self, event: ObservedEvent) {
         let _ = self
             .sender
             .lock()
@@ -65,7 +65,7 @@ impl LoopObserver for ChannelReporter {
 }
 
 impl FallibleObserver for ChannelReporter {
-    fn try_handle_event(&self, event: &AgentEvent) -> Result<(), ReportError> {
+    fn try_handle_event(&self, event: &ObservedEvent) -> Result<(), ReportError> {
         self.sender
             .lock()
             .unwrap_or_else(|e| e.into_inner())

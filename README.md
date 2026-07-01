@@ -62,6 +62,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   - `AGENTS.md` and skills loading
 - `agentkit-mcp`
   - MCP integration built on `rmcp`: stdio + Streamable HTTP transports, discovery, lifecycle, auth + replay, tool/resource/prompt adapters, sampling/elicitation/roots responders, and a server-event broadcast
+- `agentkit-acp`
+  - Agent Client Protocol integration built on the official `agent-client-protocol` SDK: session binding, observer routing, prompt conversion, approval resolvers, and a headless stdio runtime for standalone ACP agents
 - `agentkit-reporting`
   - loop observers and reporting adapters
 - `agentkit-compaction`
@@ -150,6 +152,8 @@ cargo run -p openrouter-agent-cli -- --mcp-mock \
   - MCP tool discovery and invocation
 - `openrouter-subagent-tool`
   - custom tool that runs a nested agent
+- `openrouter-acp-trio`
+  - three agents (orchestrator, worker, reviewer) exposed as in-memory ACP endpoints, delegating to each other over the Agent Client Protocol
 - `openrouter-compaction-agent`
   - structural, semantic, and hybrid compaction
   - semantic compaction uses a nested agent as the backend
@@ -337,6 +341,7 @@ Default flags:
 
 Optional flags:
 
+- `acp`
 - `compaction`
 - `context`
 - `mcp`
@@ -366,6 +371,7 @@ More detail is in [docs/feature-flags.md](./docs/feature-flags.md).
 - [docs/capabilities.md](./docs/capabilities.md)
 - [docs/context.md](./docs/context.md)
 - [docs/mcp.md](./docs/mcp.md)
+- [docs/acp.md](./docs/acp.md)
 - [docs/compaction.md](./docs/compaction.md)
 - [docs/reporting.md](./docs/reporting.md)
 - [docs/feature-flags.md](./docs/feature-flags.md)

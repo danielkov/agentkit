@@ -35,6 +35,7 @@ CRATES=(
   agentkit-tools-derive
   agentkit-task-manager
   agentkit-loop
+  agentkit-acp
   agentkit-compaction
   agentkit-adapter-completions
   agentkit-reporting

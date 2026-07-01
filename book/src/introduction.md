@@ -24,7 +24,7 @@ The book follows the dependency graph of a real agent system, bottom-up:
 
 **Part III: Context, compaction, and memory** covers how agents load project context and how to manage transcript growth through compaction strategies.
 
-**Part IV: Integration and extensibility** covers MCP server integration, async task management for parallel tool execution, reporting and observability, and provider adapter implementation.
+**Part IV: Integration and extensibility** covers MCP server integration, exposing agents to editors and other clients over the Agent Client Protocol (ACP), async task management for parallel tool execution, reporting and observability, and provider adapter implementation.
 
 **Part V: Building a coding agent** ties everything together by walking through the architecture of a complete coding agent — the kind of tool you use every day when you use Claude Code or Codex CLI.
 

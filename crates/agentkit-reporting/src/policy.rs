@@ -5,7 +5,7 @@
 //! [`LoopObserver`] that applies the chosen policy automatically.
 
 use crate::ReportError;
-use agentkit_loop::{AgentEvent, LoopObserver};
+use agentkit_loop::{LoopObserver, ObservedEvent};
 
 /// Policy that determines how reporter errors are handled.
 ///
@@ -35,7 +35,7 @@ pub trait FallibleObserver: Send + Sync {
     /// Process an event, returning an error if something goes wrong.
     /// Implementations store mutable state behind interior mutability so the
     /// wrapper can be shared as `Arc<dyn LoopObserver>`.
-    fn try_handle_event(&self, event: &AgentEvent) -> Result<(), ReportError>;
+    fn try_handle_event(&self, event: &ObservedEvent) -> Result<(), ReportError>;
 }
 
 /// Adapter that wraps a [`FallibleObserver`] and applies a [`FailurePolicy`].
@@ -88,7 +88,7 @@ impl<T: FallibleObserver> PolicyReporter<T> {
 }
 
 impl<T: FallibleObserver> LoopObserver for PolicyReporter<T> {
-    fn handle_event(&self, event: AgentEvent) {
+    fn handle_event(&self, event: ObservedEvent) {
         if let Err(e) = self.inner.try_handle_event(&event) {
             match self.policy {
                 FailurePolicy::Ignore => {}

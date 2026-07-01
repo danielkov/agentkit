@@ -420,7 +420,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            ToolExecutionOutcome::Failed(ToolError::PermissionDenied(_))
+            ToolExecutionOutcome::FailedBeforeInvocation(ToolError::PermissionDenied(_))
         ));
     }
 }

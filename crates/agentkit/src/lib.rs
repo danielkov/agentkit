@@ -24,6 +24,7 @@
 //! |---|---|---|
 //! | `compaction` | [`compaction`] | Transcript compaction triggers, strategies, and pipelines |
 //! | `context` | [`context`] | `AGENTS.md` discovery and context loading |
+//! | `acp` | [`acp`] | Agent Client Protocol (ACP) session binding and host integration |
 //! | `mcp` | [`mcp`] | Model Context Protocol (MCP) server connections |
 //! | `provider-anthropic` | [`provider_anthropic`] | Anthropic Messages API [`loop_::ModelAdapter`] implementation |
 //! | `provider-cerebras` | [`provider_cerebras`] | Cerebras Inference API [`loop_::ModelAdapter`] implementation |
@@ -202,6 +203,15 @@ pub use agentkit_context as context;
 /// Requires the `mcp` feature.
 #[cfg(feature = "mcp")]
 pub use agentkit_mcp as mcp;
+
+/// Agent Client Protocol (ACP) integration for hybrid hosts.
+///
+/// Exposes upstream ACP wire types plus agentkit session binding, observer
+/// routing, prompt conversion, cancellation, and approval resolver glue.
+///
+/// Requires the `acp` feature.
+#[cfg(feature = "acp")]
+pub use agentkit_acp as acp;
 
 /// Generic chat completions adapter base.
 ///

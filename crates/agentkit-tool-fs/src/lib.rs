@@ -1680,7 +1680,7 @@ mod tests {
             .await;
         assert!(matches!(
             denied_edit,
-            ToolExecutionOutcome::Failed(ToolError::PermissionDenied(_))
+            ToolExecutionOutcome::FailedBeforeInvocation(ToolError::PermissionDenied(_))
         ));
 
         let read = executor
