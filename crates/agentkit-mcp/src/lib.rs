@@ -3082,7 +3082,7 @@ impl McpToolAdapter {
         input: &Value,
     ) -> Result<CallToolResult, ToolError> {
         let Some(responder) = self.connection.handler_config().error_responder.clone() else {
-            return Err(ToolError::ExecutionFailed(err.to_string()));
+            return Err(tool_error_from_invocation(err));
         };
         let method = McpMethod::ToolsCall {
             name: self.tool_name.clone(),
@@ -3095,8 +3095,23 @@ impl McpToolAdapter {
         };
         match responder.handle(&err, ctx).await {
             ErrorResponderOutcome::SynthesizeResult(result) => Ok(result),
-            ErrorResponderOutcome::PassThrough => Err(ToolError::ExecutionFailed(err.to_string())),
+            ErrorResponderOutcome::PassThrough => Err(tool_error_from_invocation(err)),
         }
+    }
+}
+
+/// Maps a JSON-RPC invocation error that no [`McpErrorResponder`]
+/// synthesized into the [`ToolError`] vocabulary. Request-side faults —
+/// invalid params, invalid request, parse errors — surface as
+/// [`ToolError::InvalidInput`] so the model is told to fix its arguments
+/// rather than that the tool broke; server-side and unrecognized codes stay
+/// [`ToolError::ExecutionFailed`].
+fn tool_error_from_invocation(error: McpInvocationError) -> ToolError {
+    match &error {
+        McpInvocationError::InvalidParams { .. }
+        | McpInvocationError::InvalidRequest { .. }
+        | McpInvocationError::ParseError { .. } => ToolError::InvalidInput(error.to_string()),
+        _ => ToolError::ExecutionFailed(error.to_string()),
     }
 }
 
@@ -3749,5 +3764,90 @@ impl From<&str> for McpServerId {
 impl From<String> for McpServerId {
     fn from(value: String) -> Self {
         Self::new(value)
+    }
+}
+
+#[cfg(test)]
+mod error_mapping_tests {
+    use super::*;
+
+    #[test]
+    fn transport_class_errors_map_to_unavailable() {
+        for error in [
+            McpError::Transport("connection reset".into()),
+            McpError::Timeout {
+                operation: "tools/call",
+                duration: Duration::from_secs(5),
+            },
+            McpError::Io(std::io::Error::other("broken pipe")),
+        ] {
+            assert!(
+                matches!(tool_error_from_mcp(error), ToolError::Unavailable(_)),
+                "transport-class errors must surface as Unavailable"
+            );
+        }
+    }
+
+    #[test]
+    fn non_transport_errors_stay_execution_failed() {
+        for error in [
+            McpError::Protocol("bad frame".into()),
+            McpError::Invocation(McpInvocationError::InternalError {
+                message: "server exploded".into(),
+                data: None,
+            }),
+        ] {
+            assert!(matches!(
+                tool_error_from_mcp(error),
+                ToolError::ExecutionFailed(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn request_side_invocation_errors_map_to_invalid_input() {
+        for error in [
+            McpInvocationError::InvalidParams {
+                message: "missing field `id`".into(),
+                data: None,
+            },
+            McpInvocationError::InvalidRequest {
+                message: "not a request".into(),
+                data: None,
+            },
+            McpInvocationError::ParseError {
+                message: "bad json".into(),
+                data: None,
+            },
+        ] {
+            assert!(matches!(
+                tool_error_from_invocation(error),
+                ToolError::InvalidInput(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn server_side_invocation_errors_stay_execution_failed() {
+        for error in [
+            McpInvocationError::InternalError {
+                message: "boom".into(),
+                data: None,
+            },
+            McpInvocationError::MethodNotFound {
+                message: "tools/call".into(),
+                data: None,
+            },
+            McpInvocationError::Other {
+                code: -32099,
+                message: "custom".into(),
+                data: None,
+            },
+        ] {
+            assert!(matches!(
+                tool_error_from_invocation(error),
+                ToolError::ExecutionFailed(_)
+            ));
+        }
     }
 }
