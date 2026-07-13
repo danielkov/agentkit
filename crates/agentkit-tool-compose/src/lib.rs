@@ -7,8 +7,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 
 use agentkit_core::{MetadataMap, ToolCallId, ToolOutput, ToolResultPart, TurnCancellation};
 use agentkit_tools_core::{
@@ -117,6 +117,29 @@ pub struct ComposeTool {
     config: ComposeConfig,
     states: Arc<Mutex<BTreeMap<ToolCallId, ComposeRunState>>>,
     sources: Vec<Arc<dyn ToolSource>>,
+    spec_cache: Arc<ComposeSpecCache>,
+}
+
+/// Memoizes the rendered compose spec between catalog changes.
+///
+/// The compose description enumerates every child's output schema, so
+/// rebuilding it on each `specs()` call (once per model step) is wasted work
+/// for static catalogs. The cache is invalidated when a child source reports
+/// catalog events through [`ToolSource::drain_catalog_events`] — the same
+/// signal the agent loop uses to refresh the model-visible catalog, so the
+/// cached spec can never be staler than what the model already sees.
+struct ComposeSpecCache {
+    dirty: AtomicBool,
+    spec: StdMutex<Option<ToolSpec>>,
+}
+
+impl ComposeSpecCache {
+    fn empty() -> Self {
+        Self {
+            dirty: AtomicBool::new(false),
+            spec: StdMutex::new(None),
+        }
+    }
 }
 
 impl ComposeTool {
@@ -169,9 +192,17 @@ impl ComposeTool {
     }
 
     /// Adds another child source to this compose source.
+    ///
+    /// To make a source's tools dispatchable through `tool(name, input)`
+    /// without advertising them individually to the model (and without
+    /// enumerating their schemas in the compose description), wrap it with
+    /// [`ToolSource::unadvertised`] first.
     pub fn with_source(mut self, source: impl ToolSource + 'static) -> Self {
         self.sources.push(Arc::new(source));
-        self.spec = self.compose_spec();
+        // Fresh cache: clones of the pre-`with_source` tool must not share
+        // a slot with the extended catalog.
+        self.spec_cache = Arc::new(ComposeSpecCache::empty());
+        self.spec = self.cached_compose_spec();
         self
     }
 
@@ -187,8 +218,9 @@ impl ComposeTool {
             config,
             states: Arc::new(Mutex::new(BTreeMap::new())),
             sources,
+            spec_cache: Arc::new(ComposeSpecCache::empty()),
         };
-        tool.spec = tool.compose_spec();
+        tool.spec = tool.cached_compose_spec();
         tool
     }
 
@@ -223,6 +255,21 @@ impl ComposeTool {
     fn compose_spec(&self) -> ToolSpec {
         let catalog = self.child_specs();
         Self::base_spec(&self.config, Some(&catalog))
+    }
+
+    /// Returns the compose spec, recomputing it only when a child source
+    /// has reported catalog changes since the last call (see
+    /// [`ComposeSpecCache`]).
+    fn cached_compose_spec(&self) -> ToolSpec {
+        let mut slot = self
+            .spec_cache
+            .spec
+            .lock()
+            .expect("compose spec cache poisoned");
+        if self.spec_cache.dirty.swap(false, Ordering::AcqRel) || slot.is_none() {
+            *slot = Some(self.compose_spec());
+        }
+        slot.clone().expect("compose spec cache filled above")
     }
 
     fn child_specs(&self) -> Vec<ToolSpec> {
@@ -299,7 +346,7 @@ impl ToolSource for ComposeTool {
     fn specs(&self) -> Vec<ToolSpec> {
         let mut seen = BTreeSet::new();
         let mut specs = Vec::new();
-        let compose_spec = self.compose_spec();
+        let compose_spec = self.cached_compose_spec();
         seen.insert(compose_spec.name.clone());
         specs.push(compose_spec);
         for spec in self.child_specs() {
@@ -324,6 +371,7 @@ impl ToolSource for ComposeTool {
             .flat_map(|source| source.drain_catalog_events())
             .collect();
         if !events.is_empty() {
+            self.spec_cache.dirty.store(true, Ordering::Release);
             let mut event = ToolCatalogEvent::new(COMPOSE_TOOL_NAME);
             event.changed.push(COMPOSE_TOOL_NAME.into());
             events.push(event);
@@ -389,7 +437,7 @@ impl Tool for ComposeTool {
     }
 
     fn current_spec(&self) -> Option<ToolSpec> {
-        Some(self.compose_spec())
+        Some(self.cached_compose_spec())
     }
 
     async fn invoke(
@@ -1251,5 +1299,114 @@ mod tests {
 
         // Two compose runs, each making two nested calls.
         assert_eq!(child_calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn unadvertised_children_dispatch_without_advertisement() {
+        let child = EchoTool::new();
+        let child_calls = child.calls.clone();
+        let compose = ComposeTool::new(ComposeConfig::default())
+            .with_source(ToolRegistry::new().with(child).unadvertised());
+
+        let specs = ToolSource::specs(&compose);
+        let names: Vec<_> = specs.iter().map(|s| s.name.0.as_str()).collect();
+        assert_eq!(names, vec![COMPOSE_TOOL_NAME]);
+        assert!(
+            !specs[0].description.contains("echo"),
+            "hidden child must not be enumerated in the compose description"
+        );
+        assert!(
+            ToolSource::get(&compose, &ToolName::new("echo")).is_some(),
+            "hidden child stays resolvable for dispatch"
+        );
+
+        let executor: Arc<dyn ToolExecutor> = Arc::new(BasicToolExecutor::new([
+            Arc::new(compose) as Arc<dyn ToolSource>
+        ]));
+        let owned = owned_context(executor.clone(), Arc::new(AllowAllPermissions));
+        let mut ctx = owned.borrowed();
+        let outcome = executor
+            .execute(
+                request("return tool('echo', { value = 7 })", Value::Null),
+                &mut ctx,
+            )
+            .await;
+        match outcome {
+            ToolExecutionOutcome::Completed(result) => assert_eq!(
+                result.result.output,
+                ToolOutput::structured(json!({ "value": 7 }))
+            ),
+            other => panic!("unexpected outcome: {other:?}"),
+        }
+        assert_eq!(child_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// A dynamic source whose advertised description can change at runtime
+    /// and whose pending catalog events are surfaced through
+    /// `drain_catalog_events`.
+    struct MutableSource {
+        spec: StdMutex<ToolSpec>,
+        pending_event: AtomicBool,
+        specs_calls: Arc<AtomicUsize>,
+    }
+
+    impl ToolSource for MutableSource {
+        fn specs(&self) -> Vec<ToolSpec> {
+            self.specs_calls.fetch_add(1, Ordering::SeqCst);
+            vec![self.spec.lock().expect("spec lock").clone()]
+        }
+
+        fn get(&self, _name: &ToolName) -> Option<Arc<dyn Tool>> {
+            None
+        }
+
+        fn drain_catalog_events(&self) -> Vec<ToolCatalogEvent> {
+            if self.pending_event.swap(false, Ordering::AcqRel) {
+                let mut event = ToolCatalogEvent::new("mutable");
+                event.changed.push("echo".into());
+                vec![event]
+            } else {
+                Vec::new()
+            }
+        }
+    }
+
+    #[test]
+    fn compose_spec_is_cached_until_catalog_events() {
+        let specs_calls = Arc::new(AtomicUsize::new(0));
+        let source = Arc::new(MutableSource {
+            spec: StdMutex::new(
+                ToolSpec::new("echo", "echo input", json!({"type": "object"}))
+                    .with_output_schema(json!({"type": "string"})),
+            ),
+            pending_event: AtomicBool::new(false),
+            specs_calls: specs_calls.clone(),
+        });
+        let compose = ComposeTool::new(ComposeConfig::default()).with_source(source.clone());
+
+        let baseline = specs_calls.load(Ordering::SeqCst);
+        let first = ToolSource::specs(&compose);
+        // One walk for the live child list only — the compose description is
+        // served from cache, not re-rendered from another source.specs() pass.
+        assert_eq!(specs_calls.load(Ordering::SeqCst), baseline + 1);
+        let second = ToolSource::specs(&compose);
+        assert_eq!(specs_calls.load(Ordering::SeqCst), baseline + 2);
+        assert_eq!(first[0].description, second[0].description);
+
+        // Change the child's output schema without an event: the cached
+        // compose description intentionally stays as-is (the model's catalog
+        // would not refresh either).
+        *source.spec.lock().expect("spec lock") =
+            ToolSpec::new("echo", "echo input", json!({"type": "object"}))
+                .with_output_schema(json!({"type": "number"}));
+        let stale = ToolSource::specs(&compose);
+        assert!(stale[0].description.contains("\"string\""));
+
+        // After the source reports a catalog event, the description refreshes.
+        source.pending_event.store(true, Ordering::Release);
+        let events = ToolSource::drain_catalog_events(&compose);
+        assert!(!events.is_empty());
+        let fresh = ToolSource::specs(&compose);
+        assert!(fresh[0].description.contains("\"number\""));
     }
 }
