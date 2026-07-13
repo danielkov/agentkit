@@ -2453,6 +2453,23 @@ pub trait ToolSource: Send + Sync {
     {
         Renamed::new(self, mapping)
     }
+
+    /// Wraps this source so its tools stay resolvable by name but are never
+    /// advertised: `specs()` is empty and catalog events are swallowed, while
+    /// `get()` passes through. Use this for dispatch-only catalogs — e.g.
+    /// children of a composition tool that the model should invoke through a
+    /// script rather than see individually.
+    ///
+    /// Contrast with [`filtered`](Self::filtered), which hides tools from
+    /// both advertisement *and* dispatch.
+    ///
+    /// To wrap an `Arc<dyn ToolSource>` instead, use [`Unadvertised::new`].
+    fn unadvertised(self) -> Unadvertised<Self>
+    where
+        Self: Sized,
+    {
+        Unadvertised::new(self)
+    }
 }
 
 impl ToolSource for ToolRegistry {
@@ -2591,6 +2608,43 @@ where
                 event
             })
             .collect()
+    }
+}
+
+/// A [`ToolSource`] wrapper that dispatches tools without advertising them.
+/// `specs()` is always empty and the inner source's catalog events are
+/// drained but not forwarded; `get()` delegates unchanged, so every inner
+/// tool remains invocable by exact name.
+///
+/// Constructed via [`ToolSource::unadvertised`] or directly.
+pub struct Unadvertised<S> {
+    inner: S,
+}
+
+impl<S> Unadvertised<S> {
+    /// Creates a new dispatch-only wrapper.
+    pub fn new(inner: S) -> Self {
+        Self { inner }
+    }
+}
+
+impl<S> ToolSource for Unadvertised<S>
+where
+    S: ToolSource,
+{
+    fn specs(&self) -> Vec<ToolSpec> {
+        Vec::new()
+    }
+
+    fn get(&self, name: &ToolName) -> Option<Arc<dyn Tool>> {
+        self.inner.get(name)
+    }
+
+    fn drain_catalog_events(&self) -> Vec<ToolCatalogEvent> {
+        // Drain the inner source so dynamic catalogs don't accumulate
+        // unread events, but advertise nothing downstream.
+        let _ = self.inner.drain_catalog_events();
+        Vec::new()
     }
 }
 
@@ -4571,6 +4625,16 @@ mod tests {
 
         assert!(source.get(&ToolName::new("safe")).is_some());
         assert!(source.get(&ToolName::new("danger_drop")).is_none());
+    }
+
+    #[test]
+    fn unadvertised_dispatches_without_advertising() {
+        let source = registry_with(&["hidden_a", "hidden_b"]).unadvertised();
+        assert!(source.specs().is_empty());
+        assert!(source.get(&ToolName::new("hidden_a")).is_some());
+        assert!(source.get(&ToolName::new("hidden_b")).is_some());
+        assert!(source.get(&ToolName::new("missing")).is_none());
+        assert!(source.drain_catalog_events().is_empty());
     }
 
     #[test]

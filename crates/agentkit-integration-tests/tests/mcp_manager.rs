@@ -148,6 +148,143 @@ async fn connect_all_settled_keeps_successes_and_reports_each_failure() {
 }
 
 #[tokio::test]
+async fn connect_servers_settled_targets_requested_servers_idempotently() {
+    let alpha = spawn_http_mcp(vec![simple_tool("only_alpha", "alpha-only tool.")]).await;
+    let beta = spawn_http_mcp(vec![simple_tool("only_beta", "beta-only tool.")]).await;
+
+    let mut manager = McpServerManager::new()
+        .with_server(McpServerConfig::streamable_http("alpha", &alpha.url))
+        .with_server(McpServerConfig::streamable_http("beta", &beta.url));
+    let source = manager.source();
+
+    // Only requested servers are attempted; unknown ids settle as failures.
+    let settled = manager.connect_servers_settled(["alpha", "missing"]).await;
+    assert_eq!(settled.connected().len(), 1);
+    assert_eq!(settled.failed().len(), 1);
+    assert_eq!(settled.failed()[0].server_id, McpServerId::new("missing"));
+    assert!(matches!(
+        settled.failed()[0].error,
+        McpError::UnknownServer(_)
+    ));
+    assert!(
+        manager
+            .connected_server(&McpServerId::new("beta"))
+            .is_none()
+    );
+    assert_tool_names(&source, &["mcp_alpha_only_alpha"]);
+
+    let alpha_handle = manager
+        .connected_server(&McpServerId::new("alpha"))
+        .expect("alpha connected");
+    assert_eq!(
+        alpha_handle.tool_names(),
+        vec![agentkit_tools_core::ToolName::new("mcp_alpha_only_alpha")]
+    );
+    let first_alpha = alpha_handle.connection();
+
+    // Re-requesting a connected server is idempotent (same live connection,
+    // no re-handshake); duplicates are attempted once.
+    let settled = manager
+        .connect_servers_settled(["alpha", "alpha", "beta"])
+        .await;
+    assert_eq!(settled.connected().len(), 2);
+    assert!(!settled.has_failures());
+    let second_alpha = manager
+        .connected_server(&McpServerId::new("alpha"))
+        .expect("alpha connected")
+        .connection();
+    assert!(
+        std::sync::Arc::ptr_eq(&first_alpha, &second_alpha),
+        "already-connected server must keep its live connection"
+    );
+    assert_tool_names(&source, &["mcp_alpha_only_alpha", "mcp_beta_only_beta"]);
+}
+
+#[tokio::test]
+async fn unregister_server_removes_registration_and_tools() {
+    let alpha = spawn_http_mcp(vec![simple_tool("only_alpha", "alpha-only tool.")]).await;
+
+    let mut manager =
+        McpServerManager::new().with_server(McpServerConfig::streamable_http("alpha", &alpha.url));
+    let source = manager.source();
+    manager.connect_all().await.expect("connect_all succeeds");
+    assert_tool_names(&source, &["mcp_alpha_only_alpha"]);
+
+    manager
+        .unregister_server(&McpServerId::new("alpha"))
+        .await
+        .expect("unregister succeeds");
+    assert!(
+        manager
+            .connected_server(&McpServerId::new("alpha"))
+            .is_none()
+    );
+    assert_tool_names(&source, &[]);
+
+    // Gone for good: direct reconnects error and bulk connects no longer
+    // resurrect the config.
+    assert!(matches!(
+        manager.connect_server(&McpServerId::new("alpha")).await,
+        Err(McpError::UnknownServer(_))
+    ));
+    let settled = manager.connect_all_settled().await;
+    assert!(settled.connected().is_empty());
+    assert!(!settled.has_failures());
+
+    // Unregistering an id the manager has never heard of reports it.
+    assert!(matches!(
+        manager.unregister_server(&McpServerId::new("alpha")).await,
+        Err(McpError::UnknownServer(_))
+    ));
+}
+
+#[tokio::test]
+async fn disconnect_against_dead_server_cleans_catalog() {
+    let mut alpha = spawn_http_mcp(vec![simple_tool("only_alpha", "alpha-only tool.")]).await;
+
+    let mut manager =
+        McpServerManager::new().with_server(McpServerConfig::streamable_http("alpha", &alpha.url));
+    let source = manager.source();
+    manager.connect_all().await.expect("connect_all succeeds");
+    assert_tool_names(&source, &["mcp_alpha_only_alpha"]);
+
+    let mut events = manager.subscribe_catalog_events();
+
+    // Kill the server before disconnecting. rmcp swallows the failed
+    // session DELETE (close only errors when its service task panicked),
+    // so `result` may be Ok or Err — the contract under test is that
+    // manager state, catalog, and lifecycle events are identical to a
+    // clean disconnect either way.
+    alpha.shutdown();
+    let _advisory = manager.disconnect_server(&McpServerId::new("alpha")).await;
+    assert!(
+        manager
+            .connected_server(&McpServerId::new("alpha"))
+            .is_none()
+    );
+    assert_tool_names(&source, &[]);
+    let mut saw_disconnected = false;
+    while let Ok(event) = events.try_recv() {
+        if matches!(&event, McpCatalogEvent::ServerDisconnected { server_id }
+            if *server_id == McpServerId::new("alpha"))
+        {
+            saw_disconnected = true;
+        }
+    }
+    assert!(
+        saw_disconnected,
+        "ServerDisconnected must be emitted even when close fails"
+    );
+
+    // The config survives, so a retry is a reconnect attempt (which fails
+    // against the dead server) — not an UnknownServer contract violation.
+    assert!(!matches!(
+        manager.connect_server(&McpServerId::new("alpha")).await,
+        Err(McpError::UnknownServer(_))
+    ));
+}
+
+#[tokio::test]
 async fn connect_all_settled_times_out_slow_discovery_per_server() {
     let fast = spawn_http_mcp(vec![simple_tool("fast_tool", "Fast tool.")]).await;
     let slow = spawn_http_mcp(vec![simple_tool("slow_tool", "Slow tool.")]).await;

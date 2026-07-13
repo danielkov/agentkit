@@ -23,7 +23,7 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use agentkit_core::{Item, TurnCancellation};
+use agentkit_core::{Item, MetadataMap, Part, ToolOutput, TurnCancellation};
 use agentkit_loop::{
     LoopError, ModelAdapter, ModelSession, ModelTurn, ModelTurnEvent, SessionConfig, TurnRequest,
 };
@@ -288,22 +288,103 @@ pub fn assert_recording(observed: &SessionRecording, path: impl AsRef<Path>) {
 /// Strips non-deterministic fields the loop populates so snapshot comparisons
 /// stay stable. Currently zeroes [`Item::created_at`] across every Item.
 fn normalise_recording(recording: &mut SessionRecording) {
-    for item in &mut recording.initial_items {
-        item.created_at = None;
-    }
+    recording.initial_items.iter_mut().for_each(normalise_item);
     for turn in &mut recording.turns {
-        for item in &mut turn.input {
-            item.created_at = None;
+        turn.input.iter_mut().for_each(normalise_item);
+        for spec in &mut turn.tools {
+            canonicalise_json(&mut spec.input_schema);
+            if let Some(schema) = &mut spec.output_schema {
+                canonicalise_json(schema);
+            }
+            canonicalise_metadata(&mut spec.metadata);
         }
         for event in &mut turn.events {
-            if let ModelTurnEvent::Finished(result) = event {
-                for item in &mut result.output_items {
-                    item.created_at = None;
+            match event {
+                ModelTurnEvent::ToolCall(part) => {
+                    canonicalise_json(&mut part.input);
+                    canonicalise_metadata(&mut part.metadata);
                 }
+                ModelTurnEvent::Finished(result) => {
+                    result.output_items.iter_mut().for_each(normalise_item);
+                    canonicalise_metadata(&mut result.metadata);
+                }
+                ModelTurnEvent::Delta(_) | ModelTurnEvent::Usage(_) => {}
             }
         }
     }
-    for item in &mut recording.final_transcript {
-        item.created_at = None;
+    recording
+        .final_transcript
+        .iter_mut()
+        .for_each(normalise_item);
+}
+
+fn normalise_item(item: &mut Item) {
+    item.created_at = None;
+    item.parts.iter_mut().for_each(canonicalise_part);
+    canonicalise_metadata(&mut item.metadata);
+}
+
+fn canonicalise_part(part: &mut Part) {
+    match part {
+        Part::Text(part) => canonicalise_metadata(&mut part.metadata),
+        Part::Media(part) => canonicalise_metadata(&mut part.metadata),
+        Part::File(part) => canonicalise_metadata(&mut part.metadata),
+        Part::Reasoning(part) => canonicalise_metadata(&mut part.metadata),
+        Part::Structured(part) => {
+            canonicalise_json(&mut part.value);
+            if let Some(schema) = &mut part.schema {
+                canonicalise_json(schema);
+            }
+            canonicalise_metadata(&mut part.metadata);
+        }
+        Part::ToolCall(part) => {
+            canonicalise_json(&mut part.input);
+            canonicalise_metadata(&mut part.metadata);
+        }
+        Part::ToolResult(part) => {
+            canonicalise_output(&mut part.output);
+            canonicalise_metadata(&mut part.metadata);
+        }
+        Part::Custom(part) => {
+            if let Some(value) = &mut part.value {
+                canonicalise_json(value);
+            }
+            canonicalise_metadata(&mut part.metadata);
+        }
+    }
+}
+
+fn canonicalise_output(output: &mut ToolOutput) {
+    match output {
+        ToolOutput::Text(_) => {}
+        ToolOutput::Structured(value) => canonicalise_json(value),
+        ToolOutput::Parts(parts) => parts.iter_mut().for_each(canonicalise_part),
+        ToolOutput::Files(files) => files
+            .iter_mut()
+            .for_each(|file| canonicalise_metadata(&mut file.metadata)),
+    }
+}
+
+fn canonicalise_metadata(metadata: &mut MetadataMap) {
+    metadata.values_mut().for_each(canonicalise_json);
+}
+
+/// Recursively sorts JSON object keys so recordings compare identically
+/// whether or not some crate in the build graph enables serde_json's
+/// `preserve_order` feature (agent-client-protocol does, so workspace-wide
+/// builds serialize maps in insertion order while narrower builds sort them).
+fn canonicalise_json(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut entries: Vec<(String, serde_json::Value)> =
+                std::mem::take(map).into_iter().collect();
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            for (_, nested) in &mut entries {
+                canonicalise_json(nested);
+            }
+            map.extend(entries);
+        }
+        serde_json::Value::Array(values) => values.iter_mut().for_each(canonicalise_json),
+        _ => {}
     }
 }

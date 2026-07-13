@@ -177,6 +177,19 @@ impl HttpServerHandle {
         tools.len() != before
     }
 
+    /// Kills the server immediately, freeing the port. Subsequent client
+    /// requests — including the session `DELETE` a graceful close issues —
+    /// fail at the transport level. Useful for exercising close/disconnect
+    /// error paths against a server that has gone away.
+    pub fn shutdown(&mut self) {
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+        if let Some(handle) = self.join.take() {
+            handle.abort();
+        }
+    }
+
     /// Emits `notifications/tools/list_changed` on the live MCP session.
     /// Returns an error if the client hasn't completed the handshake yet
     /// (no peer has been stashed) or the underlying notify fails.
