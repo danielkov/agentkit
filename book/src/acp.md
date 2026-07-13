@@ -170,7 +170,7 @@ On the umbrella crate, ACP is behind the `acp` feature (implies `loop`):
 
 ```toml
 [dependencies]
-agentkit = { version = "0.10.1", features = ["acp"] }
+agentkit = { version = "0.10.2", features = ["acp"] }
 ```
 
 The `agentkit-acp` crate itself has a default `stdio` feature (pulls in `agent-client-protocol-tokio` for `serve_stdio`) and an `unstable-acp` feature that forwards to the upstream SDK's unstable protocol surface.
