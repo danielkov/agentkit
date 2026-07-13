@@ -1678,9 +1678,13 @@ mod tests {
                 &mut ctx,
             )
             .await;
+        // The read-before-write policy is enforced inside the tool body (it
+        // needs resource state), so a denial is a plain `Failed`, not
+        // `FailedBeforeInvocation` — that classification is reserved for
+        // checker denials that stop the tool from ever starting.
         assert!(matches!(
             denied_edit,
-            ToolExecutionOutcome::FailedBeforeInvocation(ToolError::PermissionDenied(_))
+            ToolExecutionOutcome::Failed(ToolError::PermissionDenied(_))
         ));
 
         let read = executor
