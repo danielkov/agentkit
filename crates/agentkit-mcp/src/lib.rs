@@ -2114,6 +2114,18 @@ impl McpServerHandle {
         &self.namespace
     }
 
+    /// Returns the agentkit-namespaced name of every tool this server
+    /// advertised at discovery time, without building adapters or cloning
+    /// schemas. Cheaper than [`Self::tool_registry`] when only the names
+    /// are needed.
+    pub fn tool_names(&self) -> Vec<ToolName> {
+        self.snapshot
+            .tools
+            .iter()
+            .map(|tool| ToolName::new(self.namespace.apply(self.server_id(), &tool.name)))
+            .collect()
+    }
+
     /// Builds a [`ToolRegistry`] containing an [`McpToolAdapter`] for each tool.
     pub fn tool_registry(&self) -> ToolRegistry {
         self.snapshot
@@ -2423,12 +2435,23 @@ impl McpServerManager {
             snapshot,
             namespace: self.namespace.clone(),
         };
-        self.connections.insert(server_id.clone(), handle.clone());
+        self.install_connection(server_id.clone(), handle.clone())
+            .await;
         self.register_server_tools(server_id, &handle.snapshot);
         self.emit_catalog_event(McpCatalogEvent::ServerConnected {
             server_id: server_id.clone(),
         });
         Ok(handle)
+    }
+
+    /// Installs a freshly connected handle, gracefully closing any previous
+    /// connection it replaces so transports (and, for Streamable HTTP,
+    /// server-side sessions) are not leaked. Close failures on the replaced
+    /// connection are ignored — it is being discarded either way.
+    async fn install_connection(&mut self, server_id: McpServerId, handle: McpServerHandle) {
+        if let Some(previous) = self.connections.insert(server_id, handle) {
+            let _ = previous.connection.close().await;
+        }
     }
 
     /// Connects all registered servers concurrently.
@@ -2478,7 +2501,7 @@ impl McpServerManager {
             Vec::with_capacity(results.len());
         for (server_id, handle) in results {
             connected.push((server_id.clone(), handle.snapshot.clone()));
-            self.connections.insert(server_id, handle.clone());
+            self.install_connection(server_id, handle.clone()).await;
             handles.push(handle);
         }
         for (server_id, snapshot) in &connected {
@@ -2494,27 +2517,71 @@ impl McpServerManager {
     /// connection attempt to settle.
     ///
     /// Unlike [`Self::connect_all`], this method does not fail fast. Every
-    /// server is attempted in parallel; successful connections are installed
-    /// into the manager and tool catalog, while each failed connection is
-    /// returned with its [`McpServerId`] and [`McpError`].
+    /// unconnected server is attempted in parallel; successful connections
+    /// are installed into the manager and tool catalog, while each failed
+    /// connection is returned with its [`McpServerId`] and [`McpError`].
+    ///
+    /// Already-connected servers are not re-handshaken: their existing
+    /// handles are left untouched and returned as connected.
     pub async fn connect_all_settled(&mut self) -> McpConnectAllSettled {
-        let plans: Vec<(
+        let server_ids: Vec<McpServerId> = self.configs.keys().cloned().collect();
+        self.connect_servers_settled(server_ids).await
+    }
+
+    /// Connects the given registered servers concurrently and waits for
+    /// every connection attempt to settle.
+    ///
+    /// The settled semantics match [`Self::connect_all_settled`], scoped to
+    /// `server_ids`. The call is idempotent per server:
+    ///
+    /// - already-connected servers are not re-handshaken; their existing
+    ///   handles are returned as connected,
+    /// - unregistered identifiers settle as failures with
+    ///   [`McpError::UnknownServer`],
+    /// - duplicate identifiers are attempted once.
+    ///
+    /// This is the building block for lazy, on-demand connection strategies:
+    /// connect exactly the servers a turn needs, in parallel, without
+    /// touching (or resurrecting) anything else the manager knows about.
+    pub async fn connect_servers_settled<I, T>(&mut self, server_ids: I) -> McpConnectAllSettled
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<McpServerId>,
+    {
+        let mut connected = Vec::new();
+        let mut failures = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut plans: Vec<(
             McpServerId,
             McpServerConfig,
             McpServerOptions,
             Option<MetadataMap>,
-        )> = self
-            .configs
-            .iter()
-            .map(|(id, cfg)| {
-                (
-                    id.clone(),
-                    cfg.clone(),
-                    self.options.get(id).cloned().unwrap_or_default(),
-                    self.auth.get(id).cloned(),
-                )
-            })
-            .collect();
+        )> = Vec::new();
+
+        for server_id in server_ids {
+            let server_id: McpServerId = server_id.into();
+            if !seen.insert(server_id.clone()) {
+                continue;
+            }
+            if let Some(existing) = self.connections.get(&server_id) {
+                connected.push(existing.clone());
+                continue;
+            }
+            let Some(config) = self.configs.get(&server_id).cloned() else {
+                failures.push(McpServerConnectionError {
+                    error: McpError::UnknownServer(server_id.to_string()),
+                    server_id,
+                });
+                continue;
+            };
+            plans.push((
+                server_id.clone(),
+                config,
+                self.options.get(&server_id).cloned().unwrap_or_default(),
+                self.auth.get(&server_id).cloned(),
+            ));
+        }
+
         let handler_config = self.handler_config.clone();
         let namespace = self.namespace.clone();
 
@@ -2543,15 +2610,13 @@ impl McpServerManager {
         });
 
         let results = join_all(futures).await;
-        let mut connected = Vec::new();
-        let mut failures = Vec::new();
         let mut connected_snapshots = Vec::new();
 
         for (server_id, result) in results {
             match result {
                 Ok(handle) => {
                     connected_snapshots.push((server_id.clone(), handle.snapshot.clone()));
-                    self.connections.insert(server_id, handle.clone());
+                    self.install_connection(server_id, handle.clone()).await;
                     connected.push(handle);
                 }
                 Err(error) => {
@@ -2656,16 +2721,43 @@ impl McpServerManager {
     }
 
     /// Disconnects a server and removes it from active connections.
+    ///
+    /// The server's tools are always removed from the catalog and
+    /// [`McpCatalogEvent::ServerDisconnected`] is always emitted, even when
+    /// closing the underlying connection fails — the returned error is
+    /// advisory. After this method returns the manager no longer tracks the
+    /// connection, and the server (whose config stays registered) can be
+    /// reconnected via [`Self::connect_server`].
     pub async fn disconnect_server(&mut self, server_id: &McpServerId) -> Result<(), McpError> {
         let Some(handle) = self.connections.remove(server_id) else {
             return Err(McpError::UnknownServer(server_id.to_string()));
         };
-        handle.connection.close().await?;
+        let close_result = handle.connection.close().await;
         self.unregister_server_tools(server_id);
         self.emit_catalog_event(McpCatalogEvent::ServerDisconnected {
             server_id: server_id.clone(),
         });
-        Ok(())
+        close_result
+    }
+
+    /// Removes a server's registration entirely: its config, options, and
+    /// stored credentials. If the server is currently connected it is
+    /// disconnected first (tools unregistered,
+    /// [`McpCatalogEvent::ServerDisconnected`] emitted), and any close error
+    /// is returned as advisory after the removal has completed.
+    ///
+    /// Unlike [`Self::disconnect_server`], the server cannot be reconnected
+    /// afterwards without registering it again, and bulk operations such as
+    /// [`Self::connect_all_settled`] no longer attempt it.
+    pub async fn unregister_server(&mut self, server_id: &McpServerId) -> Result<(), McpError> {
+        let was_registered = self.configs.remove(server_id).is_some();
+        self.options.remove(server_id);
+        self.auth.remove(server_id);
+        match self.disconnect_server(server_id).await {
+            // Registered but not connected: nothing to close.
+            Err(McpError::UnknownServer(_)) if was_registered => Ok(()),
+            result => result,
+        }
     }
 
     /// Stores or clears authentication credentials for a server.
@@ -3008,6 +3100,22 @@ impl McpToolAdapter {
     }
 }
 
+/// Maps a non-invocation [`McpError`] onto the [`ToolError`] vocabulary.
+///
+/// I/O, transport, and timeout failures mean the connection itself is
+/// unhealthy rather than that the call was invalid, so they surface as
+/// [`ToolError::Unavailable`] — callers can match on the variant to trigger
+/// reconnects without string-inspection. JSON-RPC application errors and
+/// everything else remain [`ToolError::ExecutionFailed`].
+fn tool_error_from_mcp(error: McpError) -> ToolError {
+    match &error {
+        McpError::Io(_) | McpError::Transport(_) | McpError::Timeout { .. } => {
+            ToolError::Unavailable(error.to_string())
+        }
+        _ => ToolError::ExecutionFailed(error.to_string()),
+    }
+}
+
 #[async_trait]
 impl Tool for McpToolAdapter {
     fn spec(&self) -> &ToolSpec {
@@ -3072,11 +3180,11 @@ impl Tool for McpToolAdapter {
                     Err(McpError::Invocation(err)) => {
                         self.handle_invocation_error(err, &input).await?
                     }
-                    Err(other) => return Err(ToolError::ExecutionFailed(other.to_string())),
+                    Err(other) => return Err(tool_error_from_mcp(other)),
                 }
             }
             Err(McpError::Invocation(err)) => self.handle_invocation_error(err, &input).await?,
-            Err(other) => return Err(ToolError::ExecutionFailed(other.to_string())),
+            Err(other) => return Err(tool_error_from_mcp(other)),
         };
 
         let is_error = result.is_error.unwrap_or(false);
