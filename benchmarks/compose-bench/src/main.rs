@@ -23,7 +23,8 @@
 //!
 //! Flags: `--scenarios a,b`, `--arms granular,compose,bash`, `--reps N`,
 //! `--max-requests N`, `--timeout-secs N`, `--tool-latency-ms N`,
-//! `--compose-max-nested N`, `--out DIR`.
+//! `--compose-max-nested N`, `--result-encoding json|toon`,
+//! `--concurrency N`, `--out DIR`.
 
 mod harness;
 mod metrics;
@@ -35,11 +36,13 @@ use std::error::Error;
 use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
+use agentkit_tool_compose::ResultEncoding;
 use harness::BenchConfig;
 use metrics::RunRecord;
-use scenario::Arm;
+use scenario::{Arm, Scenario};
 
 struct Args {
     scenarios: Option<Vec<String>>,
@@ -49,6 +52,8 @@ struct Args {
     timeout_secs: u64,
     tool_latency_ms: u64,
     compose_max_nested: usize,
+    result_encoding: ResultEncoding,
+    concurrency: usize,
     out: PathBuf,
 }
 
@@ -61,6 +66,8 @@ fn parse_args() -> Result<Args, String> {
         timeout_secs: 600,
         tool_latency_ms: 0,
         compose_max_nested: 256,
+        result_encoding: ResultEncoding::Json,
+        concurrency: 1,
         out: PathBuf::from("target/compose-bench-results"),
     };
     let mut iter = std::env::args().skip(1);
@@ -101,6 +108,19 @@ fn parse_args() -> Result<Args, String> {
                     .parse()
                     .map_err(|e| format!("--compose-max-nested: {e}"))?;
             }
+            "--result-encoding" => {
+                args.result_encoding = match value()?.as_str() {
+                    "json" => ResultEncoding::Json,
+                    "toon" => ResultEncoding::Toon,
+                    other => return Err(format!("unknown result encoding `{other}`")),
+                };
+            }
+            "--concurrency" => {
+                args.concurrency = value()?
+                    .parse::<usize>()
+                    .map_err(|e| format!("--concurrency: {e}"))?
+                    .max(1);
+            }
             "--out" => args.out = PathBuf::from(value()?),
             other => return Err(format!("unknown flag `{other}`")),
         }
@@ -118,14 +138,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     scenario::set_tool_latency(Duration::from_millis(args.tool_latency_ms));
     std::fs::create_dir_all(&args.out)?;
-    let config = BenchConfig {
+    let config = Arc::new(BenchConfig {
         max_model_requests: args.max_requests,
         timeout: Duration::from_secs(args.timeout_secs),
         out_dir: args.out.clone(),
         compose_max_nested_calls: args.compose_max_nested,
-    };
+        result_encoding: args.result_encoding,
+    });
 
-    let scenarios = scenarios::all();
+    let scenarios: Vec<Arc<dyn Scenario>> = scenarios::all().into_iter().map(Arc::from).collect();
     let selected: Vec<_> = scenarios
         .iter()
         .filter(|s| {
@@ -153,6 +174,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .open(&runs_path)?;
     let mut records: Vec<RunRecord> = Vec::new();
 
+    // Runs are independent (each gets a fresh world from `Scenario::setup`),
+    // so they fan out across a semaphore-bounded task set. `--concurrency 1`
+    // (the default) preserves the old one-at-a-time behaviour.
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(args.concurrency));
+    let mut pending = tokio::task::JoinSet::new();
     for scenario in &selected {
         let arms: Vec<Arm> = scenario
             .arms()
@@ -161,42 +187,58 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .collect();
         for arm in arms {
             for rep in 1..=args.reps {
+                let scenario = Arc::clone(scenario);
+                let config = Arc::clone(&config);
+                let semaphore = Arc::clone(&semaphore);
+                let reps = args.reps;
+                pending.spawn(async move {
+                    let _permit = semaphore.acquire_owned().await.expect("semaphore closed");
+                    println!(
+                        "=== {} / {} / rep {rep}/{reps} started ===",
+                        scenario.name(),
+                        arm.as_str(),
+                    );
+                    let outcome = harness::run_once(scenario.as_ref(), arm, rep, &config).await;
+                    (scenario.name(), arm, rep, outcome)
+                });
+            }
+        }
+    }
+    while let Some(joined) = pending.join_next().await {
+        let (name, arm, rep, outcome) = joined?;
+        match outcome {
+            Ok(record) => {
                 println!(
-                    "=== {} / {} / rep {rep}/{} ===",
-                    scenario.name(),
+                    "{name} / {} / rep {rep}: wall={:.1}s requests={} tool_calls={} (compose={}, failed={}) tokens(in/out)={}/{} peak_ctx={} cost={} accuracy={:.2}{}",
                     arm.as_str(),
-                    args.reps
+                    record.wall_ms as f64 / 1000.0,
+                    record.metrics.model_requests,
+                    record.metrics.tool_calls,
+                    record.metrics.compose_calls,
+                    record.metrics.compose_failures,
+                    record.metrics.input_tokens + record.metrics.cached_input_tokens,
+                    record.metrics.output_tokens,
+                    record.metrics.peak_context_tokens,
+                    if record.metrics.cost_reported {
+                        format!("${:.4}", record.metrics.cost_usd)
+                    } else {
+                        "n/a".into()
+                    },
+                    record.accuracy,
+                    record
+                        .failure
+                        .as_deref()
+                        .map(|f| format!(" [{f}]"))
+                        .unwrap_or_default(),
                 );
-                match harness::run_once(scenario.as_ref(), arm, rep, &config).await {
-                    Ok(record) => {
-                        println!(
-                            "    wall={:.1}s requests={} tool_calls={} (compose={}) tokens(in/out)={}/{} peak_ctx={} cost={} accuracy={:.2}{}",
-                            record.wall_ms as f64 / 1000.0,
-                            record.metrics.model_requests,
-                            record.metrics.tool_calls,
-                            record.metrics.compose_calls,
-                            record.metrics.input_tokens + record.metrics.cached_input_tokens,
-                            record.metrics.output_tokens,
-                            record.metrics.peak_context_tokens,
-                            if record.metrics.cost_reported {
-                                format!("${:.4}", record.metrics.cost_usd)
-                            } else {
-                                "n/a".into()
-                            },
-                            record.accuracy,
-                            record
-                                .failure
-                                .as_deref()
-                                .map(|f| format!(" [{f}]"))
-                                .unwrap_or_default(),
-                        );
-                        writeln!(runs_file, "{}", serde_json::to_string(&record)?)?;
-                        records.push(record);
-                    }
-                    Err(error) => {
-                        eprintln!("    run failed before metrics could be collected: {error}");
-                    }
-                }
+                writeln!(runs_file, "{}", serde_json::to_string(&record)?)?;
+                records.push(record);
+            }
+            Err(error) => {
+                eprintln!(
+                    "{name} / {} / rep {rep}: run failed before metrics could be collected: {error}",
+                    arm.as_str(),
+                );
             }
         }
     }
@@ -217,6 +259,7 @@ struct Aggregate {
     tool_calls: Stats,
     compose_share: f64,
     compose_used_runs: usize,
+    compose_failures: Stats,
     total_tokens: Stats,
     peak_context: Stats,
     cost: Option<Stats>,
@@ -291,6 +334,12 @@ fn aggregate(records: &[&RunRecord]) -> Aggregate {
             .iter()
             .filter(|r| r.metrics.compose_calls > 0)
             .count(),
+        compose_failures: stats(
+            &records
+                .iter()
+                .map(|r| r.metrics.compose_failures as f64)
+                .collect::<Vec<_>>(),
+        ),
         total_tokens: stats(&tokens),
         peak_context: stats(&peak),
         cost: if costs.len() == records.len() && !costs.is_empty() {
@@ -323,14 +372,14 @@ fn render_report(records: &[RunRecord]) -> String {
     );
     let _ = writeln!(
         out,
-        "| scenario | arm | runs | wall s | model reqs | tool calls | compose share | total tokens | peak ctx | cost $ | accuracy |"
+        "| scenario | arm | runs | wall s | model reqs | tool calls | compose share | compose fails | total tokens | peak ctx | cost $ | accuracy |"
     );
-    let _ = writeln!(out, "|---|---|---|---|---|---|---|---|---|---|---|");
+    let _ = writeln!(out, "|---|---|---|---|---|---|---|---|---|---|---|---|");
     for ((scenario, arm), group) in &grouped {
         let agg = aggregate(group);
         let _ = writeln!(
             out,
-            "| {scenario} | {arm} | {} | {} | {} | {} | {:.0}% ({}/{} runs) | {} | {} | {} | {:.2}±{:.2} |",
+            "| {scenario} | {arm} | {} | {} | {} | {} | {:.0}% ({}/{} runs) | {} | {} | {} | {} | {:.2}±{:.2} |",
             agg.runs,
             agg.wall_s,
             agg.requests,
@@ -338,6 +387,7 @@ fn render_report(records: &[RunRecord]) -> String {
             agg.compose_share * 100.0,
             agg.compose_used_runs,
             agg.runs,
+            agg.compose_failures,
             agg.total_tokens,
             agg.peak_context,
             agg.cost
@@ -348,45 +398,48 @@ fn render_report(records: &[RunRecord]) -> String {
         );
     }
 
-    // Per-scenario deltas: compose vs granular.
-    let _ = writeln!(out, "\n## compose vs granular (per scenario)\n");
+    // Per-scenario deltas: each composition arm vs granular.
+    let _ = writeln!(out, "\n## composition arms vs granular (per scenario)\n");
     let _ = writeln!(
         out,
-        "| scenario | Δ wall | Δ model reqs | Δ total tokens | Δ cost | Δ accuracy |"
+        "| scenario | arm | Δ wall | Δ model reqs | Δ total tokens | Δ cost | Δ accuracy |"
     );
-    let _ = writeln!(out, "|---|---|---|---|---|---|");
+    let _ = writeln!(out, "|---|---|---|---|---|---|---|");
     let scenario_names: Vec<String> = {
         let mut names: Vec<String> = grouped.keys().map(|(s, _)| s.clone()).collect();
         names.dedup();
         names
     };
     for scenario in scenario_names {
-        let granular = grouped.get(&(scenario.clone(), "granular".into()));
-        let compose = grouped.get(&(scenario.clone(), "compose".into()));
-        let (Some(granular), Some(compose)) = (granular, compose) else {
+        let Some(granular) = grouped.get(&(scenario.clone(), "granular".into())) else {
             continue;
         };
         let g = aggregate(granular);
-        let c = aggregate(compose);
-        let pct = |new: f64, old: f64| -> String {
-            if old == 0.0 {
-                "—".into()
-            } else {
-                format!("{:+.0}%", (new - old) / old * 100.0)
-            }
-        };
-        let cost_delta = match (&c.cost, &g.cost) {
-            (Some(c), Some(g)) => pct(c.mean, g.mean),
-            _ => "—".into(),
-        };
-        let _ = writeln!(
-            out,
-            "| {scenario} | {} | {} | {} | {cost_delta} | {:+.2} |",
-            pct(c.wall_s.mean, g.wall_s.mean),
-            pct(c.requests.mean, g.requests.mean),
-            pct(c.total_tokens.mean, g.total_tokens.mean),
-            c.accuracy.mean - g.accuracy.mean,
-        );
+        for arm in ["compose", "runlet"] {
+            let Some(composed) = grouped.get(&(scenario.clone(), arm.into())) else {
+                continue;
+            };
+            let c = aggregate(composed);
+            let pct = |new: f64, old: f64| -> String {
+                if old == 0.0 {
+                    "—".into()
+                } else {
+                    format!("{:+.0}%", (new - old) / old * 100.0)
+                }
+            };
+            let cost_delta = match (&c.cost, &g.cost) {
+                (Some(c), Some(g)) => pct(c.mean, g.mean),
+                _ => "—".into(),
+            };
+            let _ = writeln!(
+                out,
+                "| {scenario} | {arm} | {} | {} | {} | {cost_delta} | {:+.2} |",
+                pct(c.wall_s.mean, g.wall_s.mean),
+                pct(c.requests.mean, g.requests.mean),
+                pct(c.total_tokens.mean, g.total_tokens.mean),
+                c.accuracy.mean - g.accuracy.mean,
+            );
+        }
     }
     out
 }

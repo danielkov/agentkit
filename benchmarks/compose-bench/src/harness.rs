@@ -10,7 +10,7 @@ use agentkit_loop::{
     Agent, LoopInterrupt, LoopStep, PromptCacheRequest, PromptCacheRetention, SessionConfig,
 };
 use agentkit_provider_openrouter::{OpenRouterAdapter, OpenRouterConfig};
-use agentkit_tool_compose::{ComposeConfig, ComposeTool};
+use agentkit_tool_compose::{ComposeConfig, ComposeTool, ResultEncoding, RunletBackend};
 
 use crate::metrics::{MetricsObserver, MetricsState, RunRecord};
 use crate::scenario::{Arm, BenchError, SYSTEM_PROMPT, Scenario};
@@ -23,6 +23,9 @@ pub struct BenchConfig {
     /// is smaller than a naive full-fan-out script for some scenarios; the
     /// benchmark raises it so arms compare composition, not self-repair skill.
     pub compose_max_nested_calls: usize,
+    /// Encoding of the final compose result in the transcript, applied to
+    /// both composition arms so they stay comparable.
+    pub result_encoding: ResultEncoding,
 }
 
 pub async fn run_once(
@@ -43,10 +46,18 @@ pub async fn run_once(
         .transcript(vec![Item::text(ItemKind::System, SYSTEM_PROMPT)])
         .input(vec![Item::text(ItemKind::User, instance.user_prompt)]);
 
+    let compose_config = ComposeConfig::new()
+        .with_max_nested_tool_calls(config.compose_max_nested_calls)
+        .with_result_encoding(config.result_encoding);
     builder = match arm {
-        Arm::Compose => builder.add_tool_source(ComposeTool::wrap(instance.tools).with_config(
-            ComposeConfig::new().with_max_nested_tool_calls(config.compose_max_nested_calls),
-        )),
+        Arm::Compose => {
+            builder.add_tool_source(ComposeTool::wrap(instance.tools).with_config(compose_config))
+        }
+        Arm::RunletCompose => builder.add_tool_source(
+            ComposeTool::wrap(instance.tools)
+                .with_config(compose_config)
+                .with_backend(RunletBackend),
+        ),
         Arm::Granular | Arm::Bash => builder.add_tool_source(instance.tools),
     };
     if let Some(permissions) = instance.permissions {

@@ -71,8 +71,9 @@ use agentkit_core::{
 };
 use agentkit_task_manager::{
     PendingLoopUpdates, SimpleTaskManager, TOOL_RESULT_FAILURE_KIND_METADATA_KEY,
-    TOOL_RESULT_FAILURE_KIND_PERMISSION_DENIED, TaskApproval, TaskLaunchKind, TaskLaunchRequest,
-    TaskManager, TaskResolution, TaskStartContext, TaskStartOutcome, TurnTaskUpdate,
+    TOOL_RESULT_FAILURE_KIND_PERMISSION_DENIED, TOOL_RESULT_NOT_STARTED_METADATA_KEY, TaskApproval,
+    TaskLaunchKind, TaskLaunchRequest, TaskManager, TaskResolution, TaskStartContext,
+    TaskStartOutcome, TurnTaskUpdate,
 };
 #[cfg(test)]
 use agentkit_tools_core::ToolContext;
@@ -1816,7 +1817,7 @@ where
                         let resolution = *resolution;
                         match resolution {
                             TaskResolution::Item(item) => {
-                                if !tool_result_is_permission_denied(&item) {
+                                if !tool_result_not_started(&item) {
                                     self.emit(AgentEvent::ToolExecutionStarted(call.clone()));
                                 }
                                 if tool_result_is_error(&item) {
@@ -2818,16 +2819,16 @@ fn tool_result_is_error(item: &Item) -> bool {
         .any(|part| matches!(part, Part::ToolResult(result) if result.is_error))
 }
 
-fn tool_result_is_permission_denied(item: &Item) -> bool {
+fn tool_result_not_started(item: &Item) -> bool {
     item.parts.iter().any(|part| {
         matches!(
             part,
             Part::ToolResult(result)
                 if result
                     .metadata
-                    .get(TOOL_RESULT_FAILURE_KIND_METADATA_KEY)
-                    .and_then(Value::as_str)
-                    == Some(TOOL_RESULT_FAILURE_KIND_PERMISSION_DENIED)
+                    .get(TOOL_RESULT_NOT_STARTED_METADATA_KEY)
+                    .and_then(Value::as_bool)
+                    == Some(true)
         )
     })
 }
@@ -4403,6 +4404,8 @@ mod tests {
             event,
             AgentEvent::ToolExecutionStarted(call) if call.name == "run_then_deny"
         )));
+        // A mid-execution denial is still a permission denial (failure_kind),
+        // but the tool DID start, so it must not carry the not-started marker.
         assert!(events.iter().any(|event| matches!(
             event,
             AgentEvent::ToolResultReceived(result)
@@ -4410,6 +4413,11 @@ mod tests {
                     && result
                         .metadata
                         .get(TOOL_RESULT_FAILURE_KIND_METADATA_KEY)
+                        .and_then(Value::as_str)
+                        == Some(TOOL_RESULT_FAILURE_KIND_PERMISSION_DENIED)
+                    && result
+                        .metadata
+                        .get(TOOL_RESULT_NOT_STARTED_METADATA_KEY)
                         .is_none()
         )));
     }

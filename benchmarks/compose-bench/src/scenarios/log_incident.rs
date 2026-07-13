@@ -118,7 +118,8 @@ impl Scenario for LogIncident {
             json!({ "type": "object", "additionalProperties": false }),
             json!({ "type": "array", "items": { "type": "string" } }),
             move |_input| Ok(json!(SERVICES)),
-        );
+        )
+        .read_only();
 
         let search_data = logs;
         let search_logs = FnTool::new(
@@ -167,7 +168,10 @@ impl Scenario for LogIncident {
                     .collect();
                 Ok(paginate(items, page, 20))
             },
-        );
+        )
+        .read_only()
+        // First call per run fails with a transient 503 (see FnTool::flaky).
+        .flaky(1);
 
         let get_deploys = FnTool::new(
             "get_deploys",
@@ -196,7 +200,8 @@ impl Scenario for LogIncident {
                 }
                 Ok(Value::Array(fixture_deploys(service)))
             },
-        );
+        )
+        .read_only();
 
         let get_service_owners = FnTool::new(
             "get_service_owners",
@@ -220,7 +225,8 @@ impl Scenario for LogIncident {
                     owner_email(service).ok_or_else(|| format!("unknown service {service}"))?;
                 Ok(json!({ "service": service, "owner_email": owner }))
             },
-        );
+        )
+        .read_only();
 
         let (submit, submission) = submit_result_tool(json!({
             "type": "object",

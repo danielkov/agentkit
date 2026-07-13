@@ -16,6 +16,11 @@ use tokio::task::JoinHandle;
 
 pub const TOOL_RESULT_FAILURE_KIND_METADATA_KEY: &str = "agentkit.tool.failure_kind";
 pub const TOOL_RESULT_FAILURE_KIND_PERMISSION_DENIED: &str = "permission_denied";
+/// Marks a synthetic error result whose tool never began executing (failed
+/// lookup, proposed-request error, or permission-checker denial). Distinct
+/// from [`TOOL_RESULT_FAILURE_KIND_METADATA_KEY`]: a tool can fail with a
+/// permission denial mid-execution, in which case it *did* start.
+pub const TOOL_RESULT_NOT_STARTED_METADATA_KEY: &str = "agentkit.tool.not_started";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TaskKind {
@@ -841,6 +846,7 @@ fn map_outcome_to_resolution(
         }
         ToolExecutionOutcome::FailedBeforeInvocation(error) => {
             let mut metadata = request.metadata;
+            metadata.insert(TOOL_RESULT_NOT_STARTED_METADATA_KEY.into(), true.into());
             if matches!(error, ToolError::PermissionDenied(_)) {
                 metadata.insert(
                     TOOL_RESULT_FAILURE_KIND_METADATA_KEY.into(),
@@ -862,20 +868,29 @@ fn map_outcome_to_resolution(
                 created_at: None,
             })
         }
-        ToolExecutionOutcome::Failed(error) => TaskResolution::Item(Item {
-            id: None,
-            kind: agentkit_core::ItemKind::Tool,
-            parts: vec![agentkit_core::Part::ToolResult(ToolResultPart {
-                call_id: request.call_id,
-                output: agentkit_core::ToolOutput::Text(error.to_string()),
-                is_error: true,
-                metadata: request.metadata,
-            })],
-            metadata: MetadataMap::new(),
-            usage: None,
-            finish_reason: None,
-            created_at: None,
-        }),
+        ToolExecutionOutcome::Failed(error) => {
+            let mut metadata = request.metadata;
+            if matches!(error, ToolError::PermissionDenied(_)) {
+                metadata.insert(
+                    TOOL_RESULT_FAILURE_KIND_METADATA_KEY.into(),
+                    TOOL_RESULT_FAILURE_KIND_PERMISSION_DENIED.into(),
+                );
+            }
+            TaskResolution::Item(Item {
+                id: None,
+                kind: agentkit_core::ItemKind::Tool,
+                parts: vec![agentkit_core::Part::ToolResult(ToolResultPart {
+                    call_id: request.call_id,
+                    output: agentkit_core::ToolOutput::Text(error.to_string()),
+                    is_error: true,
+                    metadata,
+                })],
+                metadata: MetadataMap::new(),
+                usage: None,
+                finish_reason: None,
+                created_at: None,
+            })
+        }
     }
 }
 

@@ -5,6 +5,7 @@
 //! world's final state plus whatever the agent submitted via `submit_result`.
 
 use std::error::Error;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -25,6 +26,8 @@ pub enum Arm {
     Granular,
     /// Scenario tools plus the `compose` Lua tool wrapping them.
     Compose,
+    /// Scenario tools plus the `compose` tool running the Runlet backend.
+    RunletCompose,
     /// `shell_exec` only (file-backed scenarios); the Bash-pipeline reference.
     Bash,
 }
@@ -34,6 +37,7 @@ impl Arm {
         match self {
             Arm::Granular => "granular",
             Arm::Compose => "compose",
+            Arm::RunletCompose => "runlet",
             Arm::Bash => "bash",
         }
     }
@@ -42,6 +46,7 @@ impl Arm {
         match value {
             "granular" => Some(Arm::Granular),
             "compose" => Some(Arm::Compose),
+            "runlet" => Some(Arm::RunletCompose),
             "bash" => Some(Arm::Bash),
             _ => None,
         }
@@ -72,7 +77,7 @@ pub trait Scenario: Send + Sync {
     /// Arms this scenario supports. `Bash` only makes sense where the world is
     /// reachable from a shell (i.e. file-backed scenarios).
     fn arms(&self) -> Vec<Arm> {
-        vec![Arm::Granular, Arm::Compose]
+        vec![Arm::Granular, Arm::Compose, Arm::RunletCompose]
     }
 
     /// Builds a fresh world + tool registry. Must be deterministic.
@@ -100,11 +105,22 @@ fn tool_latency() -> Duration {
     TOOL_LATENCY.get().copied().unwrap_or(Duration::ZERO)
 }
 
+/// Error message every flaky tool fails with, shaped like a real transient
+/// upstream failure so arms can recognise retryability from the text alone.
+pub const TRANSIENT_FAILURE_MESSAGE: &str =
+    "503 service unavailable: transient upstream error, retry";
+
 /// A scenario tool backed by a synchronous closure over the shared world.
 pub struct FnTool {
     spec: ToolSpec,
     #[allow(clippy::type_complexity)]
     handler: Box<dyn Fn(&Value) -> Result<Value, String> + Send + Sync>,
+    /// How many upcoming invocations still fail transiently. Scenarios build a
+    /// fresh `FnTool` per run (`Scenario::setup` is called once per rep), so a
+    /// plain per-instance counter resets naturally between reps.
+    flaky_remaining: AtomicUsize,
+    /// Extra per-call latency on top of the global [`set_tool_latency`] value.
+    extra_latency: Duration,
 }
 
 impl FnTool {
@@ -119,7 +135,47 @@ impl FnTool {
             spec: ToolSpec::new(ToolName::new(name), description, input_schema)
                 .with_output_schema(output_schema),
             handler: Box::new(handler),
+            flaky_remaining: AtomicUsize::new(0),
+            extra_latency: Duration::ZERO,
         }
+    }
+
+    /// Marks the tool as a pure read, matching how production tools annotate
+    /// themselves. Composition backends rely on this to keep reads lazy while
+    /// treating unannotated tools as effectful.
+    pub fn read_only(mut self) -> Self {
+        self.spec.annotations = self.spec.annotations.clone().with_read_only(true);
+        self
+    }
+
+    /// The first `n` invocations of this tool fail with a transient
+    /// 503-shaped error ([`TRANSIENT_FAILURE_MESSAGE`]), like a real remote
+    /// API hiccup. Deterministic: fails exactly `n` times per scenario run,
+    /// then succeeds forever, so scenario data and correct answers are
+    /// unaffected.
+    ///
+    /// The failure is raised as [`ToolError::Unavailable`] from `invoke`
+    /// rather than through the handler's `Err(String)` path on purpose: a
+    /// handler error becomes a *completed* result with `is_error = true`,
+    /// which the compose child dispatcher flattens into a plain value
+    /// (`is_error` is dropped), so compose scripts would silently receive the
+    /// error text as data. A `ToolError` instead surfaces as a failed child
+    /// call in both compose backends and as an `is_error` tool result to the
+    /// model in the granular arm. `Unavailable` is also the one variant the
+    /// runlet backend maps to `retryable = true`, matching 503 semantics.
+    pub fn flaky(mut self, n: usize) -> Self {
+        self.flaky_remaining = AtomicUsize::new(n);
+        self
+    }
+
+    /// Adds fixed per-call latency to this tool, on top of the global
+    /// [`set_tool_latency`] value. Handlers run inside the async `invoke` on
+    /// the tokio runtime (blocking the thread would stall other tool tasks),
+    /// so this uses `tokio::time::sleep`, mirroring the global latency knob.
+    #[allow(dead_code)] // Builder API for scenarios; none opts in yet.
+    pub fn latency_ms(mut self, ms: u64) -> Self {
+        self.extra_latency = Duration::from_millis(ms);
+        self
     }
 }
 
@@ -134,9 +190,16 @@ impl Tool for FnTool {
         request: ToolRequest,
         _ctx: &mut ToolContext<'_>,
     ) -> Result<ToolResult, ToolError> {
-        let latency = tool_latency();
+        let latency = tool_latency() + self.extra_latency;
         if !latency.is_zero() {
             tokio::time::sleep(latency).await;
+        }
+        if self
+            .flaky_remaining
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(ToolError::Unavailable(TRANSIENT_FAILURE_MESSAGE.into()));
         }
         match (self.handler)(&request.input) {
             Ok(output) => Ok(ToolResult::new(ToolResultPart::success(
@@ -242,5 +305,84 @@ pub fn f1(submitted: &[String], expected: &[String]) -> f64 {
         0.0
     } else {
         2.0 * precision * recall / (precision + recall)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use agentkit_core::{MetadataMap, SessionId, ToolCallId, TurnId};
+    use agentkit_tools_core::{AllowAllPermissions, OwnedToolContext};
+
+    use super::*;
+
+    fn probe_tool() -> FnTool {
+        FnTool::new(
+            "probe",
+            "test tool",
+            json!({ "type": "object" }),
+            json!({ "type": "object" }),
+            |_input| Ok(json!({ "ok": true })),
+        )
+        .read_only()
+    }
+
+    fn request(call: &str) -> ToolRequest {
+        ToolRequest {
+            call_id: ToolCallId::new(call),
+            tool_name: ToolName::new("probe"),
+            input: json!({}),
+            session_id: SessionId::new("s"),
+            turn_id: TurnId::new("t"),
+            metadata: MetadataMap::new(),
+        }
+    }
+
+    fn test_context() -> OwnedToolContext {
+        OwnedToolContext {
+            session_id: SessionId::new("s"),
+            turn_id: TurnId::new("t"),
+            metadata: MetadataMap::new(),
+            permissions: Arc::new(AllowAllPermissions),
+            resources: Arc::new(()),
+            cancellation: None,
+            execution_scope: None,
+            approved_request: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn flaky_fails_first_call_then_succeeds() {
+        let tool = probe_tool().flaky(1);
+        let owned = test_context();
+
+        let error = tool
+            .invoke(request("c1"), &mut owned.borrowed())
+            .await
+            .expect_err("first call must fail transiently");
+        assert!(matches!(error, ToolError::Unavailable(_)));
+        assert!(error.to_string().contains(TRANSIENT_FAILURE_MESSAGE));
+
+        let result = tool
+            .invoke(request("c2"), &mut owned.borrowed())
+            .await
+            .expect("second call must succeed");
+        assert!(!result.result.is_error);
+
+        let result = tool
+            .invoke(request("c3"), &mut owned.borrowed())
+            .await
+            .expect("later calls keep succeeding");
+        assert!(!result.result.is_error);
+    }
+
+    #[tokio::test]
+    async fn non_flaky_tool_never_fails() {
+        let tool = probe_tool();
+        let owned = test_context();
+        let result = tool
+            .invoke(request("c1"), &mut owned.borrowed())
+            .await
+            .expect("call must succeed");
+        assert!(!result.result.is_error);
     }
 }

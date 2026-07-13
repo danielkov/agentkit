@@ -116,7 +116,8 @@ impl Scenario for CalendarScheduling {
                         .collect(),
                 ))
             },
-        );
+        )
+        .read_only();
 
         let get_availability = FnTool::new(
             "get_availability",
@@ -163,7 +164,10 @@ impl Scenario for CalendarScheduling {
                     .collect();
                 Ok(json!({ "user_id": user_id, "date": date, "busy": busy }))
             },
-        );
+        )
+        .read_only()
+        // First call per run fails with a transient 503 (see FnTool::flaky).
+        .flaky(1);
 
         let (submit, submission) = submit_result_tool(json!({
             "type": "object",

@@ -6,7 +6,7 @@
 //! top-level tool calls only; tools invoked *inside* a compose script do not
 //! re-enter the loop and are therefore not counted here.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use agentkit_loop::{AgentEvent, LoopObserver, ObservedEvent};
@@ -17,6 +17,13 @@ pub struct MetricsState {
     pub model_requests: u64,
     pub tool_calls: u64,
     pub compose_calls: u64,
+    /// Compose calls that returned an error to the model (script rejected by
+    /// the backend, runtime failure, budget exceeded). Each one costs a repair
+    /// round-trip, so this isolates language-fluency friction from the
+    /// composition mechanism itself.
+    pub compose_failures: u64,
+    #[serde(skip)]
+    compose_call_ids: BTreeSet<String>,
     pub tool_call_names: BTreeMap<String, u64>,
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -58,11 +65,17 @@ impl LoopObserver for MetricsObserver {
                 state.tool_calls += 1;
                 if call.name == agentkit_tool_compose::COMPOSE_TOOL_NAME {
                     state.compose_calls += 1;
+                    state.compose_call_ids.insert(call.id.0.clone());
                 }
                 *state
                     .tool_call_names
                     .entry(call.name.to_string())
                     .or_default() += 1;
+            }
+            AgentEvent::ToolResultReceived(result) => {
+                if result.is_error && state.compose_call_ids.contains(result.call_id.0.as_str()) {
+                    state.compose_failures += 1;
+                }
             }
             _ => {}
         }

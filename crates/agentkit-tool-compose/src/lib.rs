@@ -1,26 +1,37 @@
-//! Lua tool composition for agentkit.
+//! Tool composition for agentkit.
 //!
-//! This crate provides [`ComposeTool`], a tool that runs a sandboxed Lua script
-//! and lets that script call the current AgentKit tool catalog through a
-//! synchronous-looking `tool(name, input)` helper.
+//! This crate provides [`ComposeTool`], a tool that runs a script in a
+//! pluggable execution backend and lets that script call the current AgentKit
+//! tool catalog. The default backend is sandboxed Lua ([`LuaBackend`]); the
+//! optional `runlet` feature adds [`RunletBackend`], which executes
+//! [Runlet](https://github.com/danielkov/runlet) programs instead. The
+//! optional `toon` feature adds [`ResultEncoding::Toon`] for compact compose
+//! results.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::error::Error;
-use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
-use agentkit_core::{MetadataMap, ToolCallId, ToolOutput, ToolResultPart, TurnCancellation};
+use agentkit_core::{
+    MetadataMap, SessionId, ToolCallId, ToolOutput, ToolResultPart, TurnCancellation, TurnId,
+};
 use agentkit_tools_core::{
     ApprovalRequest, PermissionCode, PermissionDenial, Tool, ToolAnnotations, ToolCatalogEvent,
     ToolContext, ToolError, ToolExecutionOutcome, ToolExecutionScope, ToolInterruption, ToolName,
     ToolRegistry, ToolRequest, ToolResult, ToolSource, ToolSpec,
 };
 use async_trait::async_trait;
-use mlua::{HookTriggers, Lua, LuaSerdeExt, Value as LuaValue, VmState};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
+
+mod lua;
+#[cfg(feature = "runlet")]
+mod runlet_backend;
+
+pub use lua::LuaBackend;
+#[cfg(feature = "runlet")]
+pub use runlet_backend::RunletBackend;
 
 pub const COMPOSE_TOOL_NAME: &str = "compose";
 
@@ -38,15 +49,36 @@ pub fn registry_with_config(config: ComposeConfig) -> ToolRegistry {
     ToolRegistry::new().with(ComposeTool::new(config))
 }
 
+/// How the final compose result is encoded for the model transcript.
+///
+/// Intermediate (nested) tool results never enter the transcript either way;
+/// this only affects the value the script returns.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ResultEncoding {
+    /// Compact JSON as a structured tool output.
+    #[default]
+    Json,
+    /// TOON (Token-Oriented Object Notation) text. Uniform object lists
+    /// render as a header plus one row per element, which is substantially
+    /// smaller than JSON for the list-shaped values compose scripts tend to
+    /// return. Falls back to JSON if the value cannot be TOON-encoded.
+    #[cfg(feature = "toon")]
+    Toon,
+}
+
 /// Configuration for [`ComposeTool`].
 #[derive(Clone, Debug)]
 pub struct ComposeConfig {
     pub max_script_bytes: usize,
     pub max_nested_tool_calls: usize,
     pub max_result_bytes: usize,
+    /// Backend-specific execution budget. The Lua backend enforces this as a
+    /// VM instruction count; the Runlet backend ignores it because Runlet
+    /// programs terminate structurally.
     pub max_instruction_count: u64,
     pub allow_recursive_compose: bool,
     pub allowed_tools: Option<BTreeSet<ToolName>>,
+    pub result_encoding: ResultEncoding,
 }
 
 impl Default for ComposeConfig {
@@ -58,6 +90,7 @@ impl Default for ComposeConfig {
             max_instruction_count: 1_000_000,
             allow_recursive_compose: false,
             allowed_tools: None,
+            result_encoding: ResultEncoding::default(),
         }
     }
 }
@@ -92,6 +125,11 @@ impl ComposeConfig {
         self
     }
 
+    pub fn with_result_encoding(mut self, value: ResultEncoding) -> Self {
+        self.result_encoding = value;
+        self
+    }
+
     pub fn with_allowed_tools<I>(mut self, names: I) -> Self
     where
         I: IntoIterator<Item = ToolName>,
@@ -110,11 +148,300 @@ impl ComposeConfig {
     }
 }
 
-/// Tool that executes sandboxed Lua scripts over the current tool catalog.
+/// Terminal outcome of a compose backend run that did not complete.
+pub enum ComposeOutcome {
+    Interrupted(ToolInterruption),
+    Failed(ToolError),
+}
+
+/// Identifies a nested call for replay across approval interrupts.
+///
+/// Backends that dispatch sequentially use [`CallKey::Sequential`]: the
+/// dispatcher keys the call by its ordinal in the run and enforces that fresh
+/// calls append in order. Backends that dispatch concurrently supply a stable
+/// content-addressed key via [`CallKey::Operation`] so replay is independent
+/// of scheduling order.
+#[derive(Clone, Debug)]
+pub enum CallKey {
+    Sequential,
+    Operation(String),
+}
+
+/// Error surface of [`ChildDispatcher::call`].
+#[derive(Debug)]
+pub enum DispatchError {
+    /// The child requires approval; the compose run must surface the
+    /// interruption and can be resumed once the approval is granted.
+    Interrupted(ToolInterruption),
+    Failed(ToolError),
+}
+
+#[derive(Clone, Debug, Default)]
+struct ComposeRunState {
+    records: BTreeMap<String, ChildRecord>,
+    sequential_len: usize,
+    pending: BTreeMap<String, PendingChild>,
+}
+
+#[derive(Clone, Debug)]
+struct ChildRecord {
+    name: ToolName,
+    input: Value,
+    output: Value,
+}
+
+#[derive(Clone, Debug)]
+struct PendingChild {
+    name: ToolName,
+    input: Value,
+    approval_id: String,
+}
+
+/// Executes nested tool calls on behalf of a compose backend.
+///
+/// Owns everything that is backend-agnostic about a compose run: the nested
+/// call budget, the allowlist, cancellation checks, replay of already
+/// completed children after an approval interrupt, and pending-approval
+/// bookkeeping.
+#[derive(Clone)]
+pub struct ChildDispatcher {
+    config: ComposeConfig,
+    states: Arc<Mutex<BTreeMap<ToolCallId, ComposeRunState>>>,
+    scope: ToolExecutionScope,
+    parent_call_id: ToolCallId,
+    session_id: SessionId,
+    turn_id: TurnId,
+    approved_request: Option<ApprovalRequest>,
+    call_counter: Arc<AtomicUsize>,
+    cancellation: Option<TurnCancellation>,
+}
+
+impl ChildDispatcher {
+    pub fn is_cancelled(&self) -> bool {
+        self.cancellation
+            .as_ref()
+            .is_some_and(|cancellation| cancellation.is_cancelled())
+    }
+
+    /// Dispatches one nested tool call, replaying it from a previous attempt
+    /// of this compose run when the same call already completed before an
+    /// approval interrupt.
+    pub async fn call(
+        &self,
+        key: CallKey,
+        tool_name: ToolName,
+        child_input: Value,
+    ) -> Result<Value, DispatchError> {
+        if self.is_cancelled() {
+            return Err(DispatchError::Failed(ToolError::Cancelled));
+        }
+        let ordinal = self.call_counter.fetch_add(1, Ordering::SeqCst);
+        if ordinal >= self.config.max_nested_tool_calls {
+            return Err(DispatchError::Failed(ToolError::ExecutionFailed(format!(
+                "compose exceeded {} nested tool calls",
+                self.config.max_nested_tool_calls
+            ))));
+        }
+        if !self.config.allows(&tool_name) {
+            return Err(DispatchError::Failed(ToolError::PermissionDenied(
+                PermissionDenial {
+                    code: PermissionCode::CustomPolicyDenied,
+                    message: format!("compose cannot call tool {}", tool_name.0),
+                    metadata: MetadataMap::new(),
+                },
+            )));
+        }
+
+        let (record_key, sequential) = match &key {
+            CallKey::Sequential => (format!("seq:{ordinal}"), true),
+            CallKey::Operation(id) => (format!("op:{id}"), false),
+        };
+
+        let replayed = {
+            let states = self.states.lock().await;
+            states
+                .get(&self.parent_call_id)
+                .and_then(|state| state.records.get(&record_key))
+                .map(|record| {
+                    (
+                        record.name.clone(),
+                        record.input.clone(),
+                        record.output.clone(),
+                    )
+                })
+        };
+        if let Some((recorded_name, recorded_input, recorded_output)) = replayed {
+            if recorded_name == tool_name && recorded_input == child_input {
+                return Ok(recorded_output);
+            }
+            return Err(DispatchError::Failed(ToolError::ExecutionFailed(format!(
+                "compose replay diverged at nested tool call {record_key}"
+            ))));
+        }
+
+        let child_suffix = match &key {
+            CallKey::Sequential => ordinal.to_string(),
+            CallKey::Operation(id) => id.chars().take(12).collect(),
+        };
+        let child_call_id = ToolCallId::new(format!(
+            "{}:compose:{child_suffix}",
+            self.parent_call_id.0.as_str()
+        ));
+        let child_request = ToolRequest {
+            call_id: child_call_id.clone(),
+            tool_name: tool_name.clone(),
+            input: child_input.clone(),
+            session_id: self.session_id.clone(),
+            turn_id: self.turn_id.clone(),
+            metadata: MetadataMap::new(),
+        };
+
+        let is_approved_pending = {
+            let states = self.states.lock().await;
+            let pending = states
+                .get(&self.parent_call_id)
+                .and_then(|state| state.pending.get(&record_key));
+            pending.is_some_and(|pending| {
+                pending.name == tool_name
+                    && pending.input == child_input
+                    && self
+                        .approved_request
+                        .as_ref()
+                        .is_some_and(|approval| approval.id.0 == pending.approval_id)
+            })
+        };
+
+        let outcome = if is_approved_pending {
+            let approval = self.approved_request.as_ref().ok_or_else(|| {
+                DispatchError::Failed(ToolError::Internal(
+                    "missing compose approval request".into(),
+                ))
+            })?;
+            self.scope
+                .execute_approved_child(child_request, approval)
+                .await
+        } else {
+            self.scope.execute_child(child_request).await
+        };
+
+        match outcome {
+            ToolExecutionOutcome::Completed(result) => {
+                let output =
+                    tool_output_to_json(result.result.output).map_err(DispatchError::Failed)?;
+                {
+                    let mut states = self.states.lock().await;
+                    let run_state = states.entry(self.parent_call_id.clone()).or_default();
+                    if sequential {
+                        if run_state.sequential_len != ordinal {
+                            return Err(DispatchError::Failed(ToolError::ExecutionFailed(
+                                format!("compose replay cannot append nested tool call {ordinal}"),
+                            )));
+                        }
+                        run_state.sequential_len += 1;
+                    }
+                    run_state.records.insert(
+                        record_key.clone(),
+                        ChildRecord {
+                            name: tool_name,
+                            input: child_input,
+                            output: output.clone(),
+                        },
+                    );
+                    run_state.pending.remove(&record_key);
+                }
+                Ok(output)
+            }
+            ToolExecutionOutcome::Interrupted(ToolInterruption::ApprovalRequired(mut approval)) => {
+                approval.metadata.insert(
+                    COMPOSE_CHILD_CALL_ID_METADATA_KEY.into(),
+                    Value::String(child_call_id.0.clone()),
+                );
+                {
+                    let mut states = self.states.lock().await;
+                    let run_state = states.entry(self.parent_call_id.clone()).or_default();
+                    run_state.pending.insert(
+                        record_key,
+                        PendingChild {
+                            name: tool_name,
+                            input: child_input,
+                            approval_id: approval.id.0.clone(),
+                        },
+                    );
+                }
+                Err(DispatchError::Interrupted(
+                    ToolInterruption::ApprovalRequired(approval),
+                ))
+            }
+            ToolExecutionOutcome::FailedBeforeInvocation(error)
+            | ToolExecutionOutcome::Failed(error) => Err(DispatchError::Failed(error)),
+        }
+    }
+}
+
+/// One compose execution handed to a backend.
+pub struct BackendRun {
+    pub script: String,
+    pub input: Value,
+    pub visible_specs: Vec<ToolSpec>,
+    pub dispatcher: ChildDispatcher,
+    pub config: ComposeConfig,
+    pub cancellation: Option<TurnCancellation>,
+}
+
+/// A script execution engine for [`ComposeTool`].
+#[async_trait]
+pub trait ComposeBackend: Send + Sync {
+    /// Short engine name, e.g. `"lua"` or `"runlet"`.
+    fn name(&self) -> &'static str;
+
+    /// Full compose tool description, including language guidance and the
+    /// rendered child catalog shapes (see [`render_catalog_shapes`]).
+    fn description(&self, catalog: Option<&[ToolSpec]>) -> String;
+
+    /// Description of the `script` input property.
+    fn script_description(&self) -> &'static str;
+
+    /// Runs `script` to completion and returns its JSON result. Nested tool
+    /// calls must go through `run.dispatcher`.
+    async fn execute(&self, run: BackendRun) -> Result<Value, ComposeOutcome>;
+}
+
+/// Appended to the compose description when [`ResultEncoding::Toon`] is
+/// active, so the model can read the encoded result without guessing.
+#[cfg(feature = "toon")]
+const TOON_RESULT_NOTE: &str = "\n\nThe compose result is returned as TOON \
+    (Token-Oriented Object Notation), not JSON: nested fields are `key: value` \
+    lines indented two spaces; a list of uniform objects renders as \
+    `name[N]{field1,field2}:` followed by one comma-separated row per element; \
+    other lists render as `name[N]:` with `- ` items or a single \
+    comma-separated line of scalars.";
+
+/// Renders child output schemas for inclusion in a backend description.
+pub fn render_catalog_shapes(catalog: &[ToolSpec]) -> String {
+    let mut out = String::from(
+        "\n\nReturn shapes of callable tools (input schemas are already provided by the \
+         top-level tool catalog):\n",
+    );
+    for spec in catalog {
+        out.push_str("\n- ");
+        out.push_str(spec.name.0.as_str());
+        out.push_str(": ");
+        match spec.output_schema.as_ref() {
+            Some(schema) => {
+                out.push_str(&serde_json::to_string(schema).unwrap_or_else(|_| schema.to_string()))
+            }
+            None => out.push_str("<undocumented>"),
+        }
+    }
+    out
+}
+
+/// Tool that executes composition scripts over the current tool catalog.
 #[derive(Clone)]
 pub struct ComposeTool {
     spec: ToolSpec,
     config: ComposeConfig,
+    backend: Arc<dyn ComposeBackend>,
     states: Arc<Mutex<BTreeMap<ToolCallId, ComposeRunState>>>,
     sources: Vec<Arc<dyn ToolSource>>,
     spec_cache: Arc<ComposeSpecCache>,
@@ -149,7 +476,7 @@ impl ComposeTool {
     /// model writes correct scripts on the first try when it sees concrete
     /// input/output schemas at planning time.
     pub fn new(config: ComposeConfig) -> Self {
-        Self::build(config, Vec::new())
+        Self::build(config, Arc::new(LuaBackend), Vec::new())
     }
 
     /// Wraps a source of child tools. The resulting [`ToolSource`] still
@@ -209,13 +536,24 @@ impl ComposeTool {
     /// Replaces the configuration and rebuilds the compose tool description so
     /// it reflects the new permission filter.
     pub fn with_config(self, config: ComposeConfig) -> Self {
-        Self::build(config, self.sources)
+        Self::build(config, self.backend, self.sources)
     }
 
-    fn build(config: ComposeConfig, sources: Vec<Arc<dyn ToolSource>>) -> Self {
+    /// Replaces the execution backend and rebuilds the compose tool
+    /// description so it reflects the backend's language.
+    pub fn with_backend(self, backend: impl ComposeBackend + 'static) -> Self {
+        Self::build(self.config, Arc::new(backend), self.sources)
+    }
+
+    fn build(
+        config: ComposeConfig,
+        backend: Arc<dyn ComposeBackend>,
+        sources: Vec<Arc<dyn ToolSource>>,
+    ) -> Self {
         let mut tool = Self {
-            spec: Self::base_spec(&config, None),
+            spec: Self::base_spec(&config, backend.as_ref(), None),
             config,
+            backend,
             states: Arc::new(Mutex::new(BTreeMap::new())),
             sources,
             spec_cache: Arc::new(ComposeSpecCache::empty()),
@@ -224,25 +562,34 @@ impl ComposeTool {
         tool
     }
 
-    fn base_spec(config: &ComposeConfig, catalog: Option<&[ToolSpec]>) -> ToolSpec {
+    fn base_spec(
+        config: &ComposeConfig,
+        backend: &dyn ComposeBackend,
+        catalog: Option<&[ToolSpec]>,
+    ) -> ToolSpec {
         let filtered: Option<Vec<ToolSpec>> = catalog.map(|snap| {
             snap.iter()
                 .filter(|spec| config.allows(&spec.name))
                 .cloned()
                 .collect()
         });
+        let mut description = backend.description(filtered.as_deref());
+        #[cfg(feature = "toon")]
+        if config.result_encoding == ResultEncoding::Toon {
+            description.push_str(TOON_RESULT_NOTE);
+        }
         ToolSpec::new(
             COMPOSE_TOOL_NAME,
-            Self::compose_description(filtered.as_deref()),
+            description,
             json!({
                 "type": "object",
                 "properties": {
                     "script": {
                         "type": "string",
-                        "description": "Lua script to execute. Return a value to make it the compose result."
+                        "description": backend.script_description()
                     },
                     "input": {
-                        "description": "Optional JSON value exposed to Lua as global input."
+                        "description": "Optional JSON value exposed to the script as global input."
                     }
                 },
                 "required": ["script"],
@@ -254,7 +601,7 @@ impl ComposeTool {
 
     fn compose_spec(&self) -> ToolSpec {
         let catalog = self.child_specs();
-        Self::base_spec(&self.config, Some(&catalog))
+        Self::base_spec(&self.config, self.backend.as_ref(), Some(&catalog))
     }
 
     /// Returns the compose spec, recomputing it only when a child source
@@ -283,53 +630,6 @@ impl ComposeTool {
             }
         }
         specs
-    }
-
-    fn compose_description(catalog: Option<&[ToolSpec]>) -> String {
-        let mut description = String::from(
-            "Run a sandboxed Lua script that composes available tools through tool(name, input). \
-             Prefer this tool whenever a task takes more than two tool calls: iterating over \
-             list results, paginating, fetching details per item, filtering or aggregating tool \
-             output, or chaining reads into writes. The whole script executes in a single \
-             round-trip — one compose call replaces N individual calls — and only the script's \
-             return value enters the conversation, so intermediate results never consume \
-             context. The script sees a global `input` (the JSON value passed alongside the \
-             script) and may call `tools()` to enumerate the visible tool catalog at runtime. \
-             Return any Lua value to make it the compose result.\n\n\
-             Example — scan every page, drill into matches, return only the summary:\n\
-             local page, hits = 1, {}\n\
-             repeat\n\
-             \x20 local r = tool('list_items', { page = page })\n\
-             \x20 for _, it in ipairs(r.items) do\n\
-             \x20   if it.status == 'open' then hits[#hits + 1] = tool('get_item', { id = it.id }) end\n\
-             \x20 end\n\
-             \x20 page = page + 1\n\
-             until page > r.total_pages\n\
-             return { count = #hits, items = hits }",
-        );
-        if let Some(catalog) = catalog {
-            if catalog.is_empty() {
-                return description;
-            }
-            description.push_str(
-                "\n\nReturn shapes of tools accessible via tool(name, input) (input schemas are \
-                 already provided by the top-level tool catalog):\n",
-            );
-            for spec in catalog {
-                description.push_str("\n- ");
-                description.push_str(spec.name.0.as_str());
-                description.push_str(": ");
-                match spec.output_schema.as_ref() {
-                    Some(schema) => description.push_str(&Self::compact_schema(schema)),
-                    None => description.push_str("<undocumented>"),
-                }
-            }
-        }
-        description
-    }
-
-    fn compact_schema(value: &Value) -> String {
-        serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
     }
 
     fn visible_specs(&self, scope: &ToolExecutionScope) -> Vec<ToolSpec> {
@@ -387,49 +687,6 @@ struct ComposeInput {
     input: Value,
 }
 
-#[derive(Clone, Debug, Default)]
-struct ComposeRunState {
-    records: Vec<ChildRecord>,
-    pending: Option<PendingChild>,
-}
-
-#[derive(Clone, Debug)]
-struct ChildRecord {
-    name: ToolName,
-    input: Value,
-    output: Value,
-}
-
-#[derive(Clone, Debug)]
-struct PendingChild {
-    index: usize,
-    name: ToolName,
-    input: Value,
-    approval_id: String,
-}
-
-#[derive(Debug)]
-struct ComposeInterrupt(ToolInterruption);
-
-impl fmt::Display for ComposeInterrupt {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "compose interrupted")
-    }
-}
-
-impl Error for ComposeInterrupt {}
-
-#[derive(Debug)]
-struct ComposeFailure(ToolError);
-
-impl fmt::Display for ComposeFailure {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-impl Error for ComposeFailure {}
-
 #[async_trait]
 impl Tool for ComposeTool {
     fn spec(&self) -> &ToolSpec {
@@ -470,11 +727,6 @@ impl Tool for ComposeTool {
     }
 }
 
-enum ComposeOutcome {
-    Interrupted(ToolInterruption),
-    Failed(ToolError),
-}
-
 impl ComposeTool {
     async fn invoke_outcome_inner(
         &self,
@@ -513,230 +765,38 @@ impl ComposeTool {
         let cleanup_call_id = request.call_id.clone();
         let visible_specs = self.visible_specs(&scope);
         let cancellation = ctx.cancellation.clone();
-        let approved_request = ctx.approved_request.clone();
-        let outcome = self
-            .run_script(
-                request,
-                input,
-                scope,
-                cancellation,
-                approved_request,
-                visible_specs,
-            )
-            .await;
+        let dispatcher = ChildDispatcher {
+            config: self.config.clone(),
+            states: self.states.clone(),
+            scope,
+            parent_call_id: request.call_id.clone(),
+            session_id: request.session_id.clone(),
+            turn_id: request.turn_id.clone(),
+            approved_request: ctx.approved_request.clone(),
+            call_counter: Arc::new(AtomicUsize::new(0)),
+            cancellation: cancellation.clone(),
+        };
+        let run = BackendRun {
+            script: input.script,
+            input: input.input,
+            visible_specs,
+            dispatcher,
+            config: self.config.clone(),
+            cancellation,
+        };
+        let outcome = self.run_backend(request.call_id, run).await;
         if !matches!(outcome, Err(ComposeOutcome::Interrupted(_))) {
             self.states.lock().await.remove(&cleanup_call_id);
         }
         outcome
     }
 
-    async fn run_script(
+    async fn run_backend(
         &self,
-        request: ToolRequest,
-        input: ComposeInput,
-        scope: ToolExecutionScope,
-        cancellation: Option<TurnCancellation>,
-        approved_request: Option<ApprovalRequest>,
-        visible_specs: Vec<ToolSpec>,
+        call_id: ToolCallId,
+        run: BackendRun,
     ) -> Result<ToolResult, ComposeOutcome> {
-        let lua = Lua::new();
-        install_instruction_limit(
-            &lua,
-            self.config.max_instruction_count,
-            cancellation.clone(),
-        )
-        .map_err(lua_error_to_outcome)?;
-        install_sandbox(&lua).map_err(lua_error_to_outcome)?;
-        let globals = lua.globals();
-        globals
-            .set(
-                "input",
-                lua.to_value(&input.input).map_err(lua_error_to_outcome)?,
-            )
-            .map_err(lua_error_to_outcome)?;
-
-        let specs_value = serde_json::to_value(&visible_specs)
-            .map_err(|error| ComposeOutcome::Failed(ToolError::Internal(error.to_string())))?;
-        globals
-            .set(
-                "tools",
-                lua.create_function(move |lua, ()| lua.to_value(&specs_value))
-                    .map_err(lua_error_to_outcome)?,
-            )
-            .map_err(lua_error_to_outcome)?;
-
-        let config = self.config.clone();
-        let states = self.states.clone();
-        let parent_call_id = request.call_id.clone();
-        let session_id = request.session_id.clone();
-        let turn_id = request.turn_id.clone();
-        let call_counter = Arc::new(AtomicUsize::new(0));
-
-        let tool_fn = lua
-            .create_async_function(move |lua, (name, lua_input): (String, LuaValue)| {
-                let config = config.clone();
-                let states = states.clone();
-                let scope = scope.clone();
-                let parent_call_id = parent_call_id.clone();
-                let session_id = session_id.clone();
-                let turn_id = turn_id.clone();
-                let approved_request = approved_request.clone();
-                let call_counter = call_counter.clone();
-                let cancellation = cancellation.clone();
-                async move {
-                    if cancellation
-                        .as_ref()
-                        .is_some_and(|cancellation| cancellation.is_cancelled())
-                    {
-                        return Err(mlua::Error::external(ComposeFailure(ToolError::Cancelled)));
-                    }
-                    let index = call_counter.fetch_add(1, Ordering::SeqCst);
-                    if index >= config.max_nested_tool_calls {
-                        return Err(mlua::Error::external(ComposeFailure(
-                            ToolError::ExecutionFailed(format!(
-                                "compose exceeded {} nested tool calls",
-                                config.max_nested_tool_calls
-                            )),
-                        )));
-                    }
-
-                    let tool_name = ToolName::new(name);
-                    if !config.allows(&tool_name) {
-                        return Err(mlua::Error::external(ComposeFailure(
-                            ToolError::PermissionDenied(PermissionDenial {
-                                code: PermissionCode::CustomPolicyDenied,
-                                message: format!("compose cannot call tool {}", tool_name.0),
-                                metadata: MetadataMap::new(),
-                            }),
-                        )));
-                    }
-                    let child_input: Value = lua.from_value(lua_input)?;
-
-                    let replayed = {
-                        let state = states.lock().await;
-                        state
-                            .get(&parent_call_id)
-                            .and_then(|state| state.records.get(index))
-                            .map(|record| {
-                                (
-                                    record.name.clone(),
-                                    record.input.clone(),
-                                    record.output.clone(),
-                                )
-                            })
-                    };
-                    if let Some((recorded_name, recorded_input, recorded_output)) = replayed {
-                        if recorded_name == tool_name && recorded_input == child_input {
-                            return lua.to_value(&recorded_output);
-                        }
-                        return Err(mlua::Error::external(ComposeFailure(
-                            ToolError::ExecutionFailed(format!(
-                                "compose replay diverged at nested tool call {index}"
-                            )),
-                        )));
-                    }
-
-                    let child_call_id =
-                        ToolCallId::new(format!("{}:compose:{}", parent_call_id.0.as_str(), index));
-                    let child_request = ToolRequest {
-                        call_id: child_call_id.clone(),
-                        tool_name: tool_name.clone(),
-                        input: child_input.clone(),
-                        session_id: session_id.clone(),
-                        turn_id: turn_id.clone(),
-                        metadata: MetadataMap::new(),
-                    };
-
-                    let is_approved_pending = {
-                        let state = states.lock().await;
-                        let pending = state
-                            .get(&parent_call_id)
-                            .and_then(|state| state.pending.as_ref());
-                        pending.is_some_and(|pending| {
-                            pending.index == index
-                                && pending.name == tool_name
-                                && pending.input == child_input
-                                && approved_request
-                                    .as_ref()
-                                    .is_some_and(|approval| approval.id.0 == pending.approval_id)
-                        })
-                    };
-
-                    let outcome = if is_approved_pending {
-                        let approval = approved_request.as_ref().ok_or_else(|| {
-                            mlua::Error::external(ComposeFailure(ToolError::Internal(
-                                "missing compose approval request".into(),
-                            )))
-                        })?;
-                        scope.execute_approved_child(child_request, approval).await
-                    } else {
-                        scope.execute_child(child_request).await
-                    };
-
-                    match outcome {
-                        ToolExecutionOutcome::Completed(result) => {
-                            let output = tool_output_to_json(result.result.output)
-                                .map_err(|error| mlua::Error::external(ComposeFailure(error)))?;
-                            {
-                                let mut state = states.lock().await;
-                                let run_state = state.entry(parent_call_id.clone()).or_default();
-                                if run_state.records.len() != index {
-                                    return Err(mlua::Error::external(ComposeFailure(
-                                        ToolError::ExecutionFailed(format!(
-                                            "compose replay cannot append nested tool call {index}"
-                                        )),
-                                    )));
-                                }
-                                run_state.records.push(ChildRecord {
-                                    name: tool_name,
-                                    input: child_input,
-                                    output: output.clone(),
-                                });
-                                run_state.pending = None;
-                            }
-                            lua.to_value(&output)
-                        }
-                        ToolExecutionOutcome::Interrupted(ToolInterruption::ApprovalRequired(
-                            mut approval,
-                        )) => {
-                            approval.metadata.insert(
-                                COMPOSE_CHILD_CALL_ID_METADATA_KEY.into(),
-                                Value::String(child_call_id.0.clone()),
-                            );
-                            {
-                                let mut state = states.lock().await;
-                                let run_state = state.entry(parent_call_id.clone()).or_default();
-                                run_state.pending = Some(PendingChild {
-                                    index,
-                                    name: tool_name,
-                                    input: child_input,
-                                    approval_id: approval.id.0.clone(),
-                                });
-                            }
-                            Err(mlua::Error::external(ComposeInterrupt(
-                                ToolInterruption::ApprovalRequired(approval),
-                            )))
-                        }
-                        ToolExecutionOutcome::FailedBeforeInvocation(error)
-                        | ToolExecutionOutcome::Failed(error) => {
-                            Err(mlua::Error::external(ComposeFailure(error)))
-                        }
-                    }
-                }
-            })
-            .map_err(lua_error_to_outcome)?;
-        globals.set("tool", tool_fn).map_err(lua_error_to_outcome)?;
-
-        let result = match lua
-            .load(input.script.as_str())
-            .set_name("compose")
-            .eval_async::<LuaValue>()
-            .await
-        {
-            Ok(value) => value,
-            Err(error) => return Err(lua_error_to_outcome(error)),
-        };
-        let json_result: Value = lua.from_value(result).map_err(lua_error_to_outcome)?;
+        let json_result = self.backend.execute(run).await?;
         let result_bytes = serde_json::to_vec(&json_result)
             .map_err(|error| ComposeOutcome::Failed(ToolError::Internal(error.to_string())))?
             .len();
@@ -746,61 +806,16 @@ impl ComposeTool {
                 self.config.max_result_bytes
             ))));
         }
-        Ok(ToolResult::new(ToolResultPart::success(
-            request.call_id,
-            ToolOutput::structured(json_result),
-        )))
+        let output = match self.config.result_encoding {
+            ResultEncoding::Json => ToolOutput::structured(json_result),
+            #[cfg(feature = "toon")]
+            ResultEncoding::Toon => match serde_toon2::to_string(&json_result) {
+                Ok(toon) => ToolOutput::text(toon),
+                Err(_) => ToolOutput::structured(json_result),
+            },
+        };
+        Ok(ToolResult::new(ToolResultPart::success(call_id, output)))
     }
-}
-
-fn install_sandbox(lua: &Lua) -> Result<(), mlua::Error> {
-    let globals = lua.globals();
-    for name in [
-        "collectgarbage",
-        "dofile",
-        "load",
-        "loadfile",
-        "require",
-        "io",
-        "os",
-        "package",
-        "debug",
-    ] {
-        globals.set(name, LuaValue::Nil)?;
-    }
-    Ok(())
-}
-
-fn install_instruction_limit(
-    lua: &Lua,
-    max_instruction_count: u64,
-    cancellation: Option<agentkit_core::TurnCancellation>,
-) -> Result<(), mlua::Error> {
-    if max_instruction_count == 0 {
-        return Ok(());
-    }
-    let step = max_instruction_count.min(1_000) as u32;
-    let seen = Arc::new(AtomicU64::new(0));
-    lua.set_global_hook(
-        HookTriggers::new().every_nth_instruction(step),
-        move |_lua, _debug| {
-            if cancellation
-                .as_ref()
-                .is_some_and(|cancellation| cancellation.is_cancelled())
-            {
-                return Err(mlua::Error::external(ComposeFailure(ToolError::Cancelled)));
-            }
-            let previous = seen.fetch_add(u64::from(step), Ordering::Relaxed);
-            if previous.saturating_add(u64::from(step)) > max_instruction_count {
-                return Err(mlua::Error::external(ComposeFailure(
-                    ToolError::ExecutionFailed(format!(
-                        "compose exceeded {max_instruction_count} Lua instructions"
-                    )),
-                )));
-            }
-            Ok(VmState::Continue)
-        },
-    )
 }
 
 fn tool_output_to_json(output: ToolOutput) -> Result<Value, ToolError> {
@@ -813,600 +828,5 @@ fn tool_output_to_json(output: ToolOutput) -> Result<Value, ToolError> {
     }
 }
 
-fn lua_error_to_outcome(error: mlua::Error) -> ComposeOutcome {
-    match &error {
-        mlua::Error::CallbackError { cause, .. }
-        | mlua::Error::BadArgument { cause, .. }
-        | mlua::Error::WithContext { cause, .. } => {
-            return lua_error_to_outcome((**cause).clone());
-        }
-        mlua::Error::ExternalError(inner) => {
-            if let Some(interrupt) = inner.downcast_ref::<ComposeInterrupt>() {
-                return ComposeOutcome::Interrupted(interrupt.0.clone());
-            }
-            if let Some(failure) = inner.downcast_ref::<ComposeFailure>() {
-                return ComposeOutcome::Failed(failure.0.clone());
-            }
-        }
-        _ => {}
-    }
-    ComposeOutcome::Failed(ToolError::ExecutionFailed(error.to_string()))
-}
-
 #[cfg(test)]
-mod tests {
-    use std::any::Any;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    use agentkit_core::{ApprovalId, SessionId, TurnId};
-    use agentkit_tools_core::{
-        AllowAllPermissions, ApprovalReason, ApprovalRequest, BasicToolExecutor, PermissionChecker,
-        PermissionDecision, PermissionRequest, ToolExecutionScope, ToolExecutor,
-    };
-    use serde_json::json;
-
-    use super::*;
-
-    #[derive(Clone)]
-    struct EchoTool {
-        spec: ToolSpec,
-        calls: Arc<AtomicUsize>,
-    }
-
-    impl EchoTool {
-        fn new() -> Self {
-            Self {
-                spec: ToolSpec::new("echo", "echo input", json!({"type": "object"})),
-                calls: Arc::new(AtomicUsize::new(0)),
-            }
-        }
-    }
-
-    #[async_trait]
-    impl Tool for EchoTool {
-        fn spec(&self) -> &ToolSpec {
-            &self.spec
-        }
-
-        async fn invoke(
-            &self,
-            request: ToolRequest,
-            _ctx: &mut ToolContext<'_>,
-        ) -> Result<ToolResult, ToolError> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(ToolResult::new(ToolResultPart::success(
-                request.call_id,
-                ToolOutput::structured(request.input),
-            )))
-        }
-    }
-
-    struct ApprovalPermissionRequest {
-        metadata: MetadataMap,
-    }
-
-    impl PermissionRequest for ApprovalPermissionRequest {
-        fn kind(&self) -> &'static str {
-            "compose.test.approval"
-        }
-
-        fn summary(&self) -> String {
-            "approval required".into()
-        }
-
-        fn metadata(&self) -> &MetadataMap {
-            &self.metadata
-        }
-
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-    }
-
-    #[derive(Clone)]
-    struct ApprovalEchoTool {
-        spec: ToolSpec,
-        calls: Arc<AtomicUsize>,
-    }
-
-    impl ApprovalEchoTool {
-        fn new() -> Self {
-            Self {
-                spec: ToolSpec::new("approval_echo", "approval echo", json!({"type": "object"})),
-                calls: Arc::new(AtomicUsize::new(0)),
-            }
-        }
-    }
-
-    #[async_trait]
-    impl Tool for ApprovalEchoTool {
-        fn spec(&self) -> &ToolSpec {
-            &self.spec
-        }
-
-        fn proposed_requests(
-            &self,
-            _request: &ToolRequest,
-        ) -> Result<Vec<Box<dyn PermissionRequest>>, ToolError> {
-            Ok(vec![Box::new(ApprovalPermissionRequest {
-                metadata: MetadataMap::new(),
-            })])
-        }
-
-        async fn invoke(
-            &self,
-            request: ToolRequest,
-            _ctx: &mut ToolContext<'_>,
-        ) -> Result<ToolResult, ToolError> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(ToolResult::new(ToolResultPart::success(
-                request.call_id,
-                ToolOutput::structured(request.input),
-            )))
-        }
-    }
-
-    struct RequireApproval;
-
-    impl PermissionChecker for RequireApproval {
-        fn evaluate(&self, request: &dyn PermissionRequest) -> PermissionDecision {
-            PermissionDecision::RequireApproval(ApprovalRequest {
-                task_id: None,
-                call_id: None,
-                id: ApprovalId::new("approval:test"),
-                request_kind: request.kind().into(),
-                reason: ApprovalReason::PolicyRequiresConfirmation,
-                summary: request.summary(),
-                metadata: request.metadata().clone(),
-            })
-        }
-    }
-
-    fn request(script: &str, input: Value) -> ToolRequest {
-        ToolRequest {
-            call_id: ToolCallId::new("compose-call"),
-            tool_name: ToolName::new(COMPOSE_TOOL_NAME),
-            input: json!({ "script": script, "input": input }),
-            session_id: SessionId::new("session"),
-            turn_id: TurnId::new("turn"),
-            metadata: MetadataMap::new(),
-        }
-    }
-
-    fn owned_context(
-        executor: Arc<dyn ToolExecutor>,
-        permissions: Arc<dyn PermissionChecker>,
-    ) -> agentkit_tools_core::OwnedToolContext {
-        let session_id = SessionId::new("session");
-        let turn_id = TurnId::new("turn");
-        let metadata = MetadataMap::new();
-        let resources: Arc<dyn agentkit_tools_core::ToolResources> = Arc::new(());
-        let scope = ToolExecutionScope {
-            executor,
-            session_id: session_id.clone(),
-            turn_id: turn_id.clone(),
-            permissions: permissions.clone(),
-            resources: resources.clone(),
-            cancellation: None,
-        };
-        agentkit_tools_core::OwnedToolContext {
-            session_id,
-            turn_id,
-            metadata,
-            permissions,
-            resources,
-            cancellation: None,
-            execution_scope: Some(scope),
-            approved_request: None,
-        }
-    }
-
-    async fn execute_compose(
-        config: ComposeConfig,
-        child: impl Tool + 'static,
-        req: ToolRequest,
-    ) -> ToolExecutionOutcome {
-        let compose = ComposeTool::new(config);
-        let executor: Arc<dyn ToolExecutor> = Arc::new(BasicToolExecutor::from_registry(
-            ToolRegistry::new().with(compose).with(child),
-        ));
-        let owned = owned_context(executor.clone(), Arc::new(AllowAllPermissions));
-        let mut ctx = owned.borrowed();
-        executor.execute(req, &mut ctx).await
-    }
-
-    #[tokio::test]
-    async fn converts_lua_result_to_structured_json() {
-        let outcome = execute_compose(
-            ComposeConfig::default(),
-            EchoTool::new(),
-            request(
-                "return { count = input.count + 1, label = 'ok' }",
-                json!({ "count": 2 }),
-            ),
-        )
-        .await;
-
-        match outcome {
-            ToolExecutionOutcome::Completed(result) => {
-                assert_eq!(
-                    result.result.output,
-                    ToolOutput::structured(json!({ "count": 3, "label": "ok" }))
-                );
-            }
-            other => panic!("unexpected outcome: {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn tool_function_calls_child_tool() {
-        let child = EchoTool::new();
-        let calls = child.calls.clone();
-        let outcome = execute_compose(
-            ComposeConfig::default(),
-            child,
-            request(
-                "local out = tool('echo', { value = input.value }); return out",
-                json!({ "value": 7 }),
-            ),
-        )
-        .await;
-
-        match outcome {
-            ToolExecutionOutcome::Completed(result) => {
-                assert_eq!(
-                    result.result.output,
-                    ToolOutput::structured(json!({ "value": 7 }))
-                );
-                assert_eq!(calls.load(Ordering::SeqCst), 1);
-            }
-            other => panic!("unexpected outcome: {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn tools_excludes_compose_by_default() {
-        let outcome = execute_compose(
-            ComposeConfig::default(),
-            EchoTool::new(),
-            request(
-                "for _, spec in ipairs(tools()) do if spec.name == 'compose' then return 'bad' end end; return 'ok'",
-                Value::Null,
-            ),
-        )
-        .await;
-
-        match outcome {
-            ToolExecutionOutcome::Completed(result) => {
-                assert_eq!(result.result.output, ToolOutput::structured(json!("ok")));
-            }
-            other => panic!("unexpected outcome: {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn sandbox_removes_os_io_and_require() {
-        for script in [
-            "return os.getenv('HOME')",
-            "return io.open('Cargo.toml')",
-            "return require('x')",
-        ] {
-            let outcome = execute_compose(
-                ComposeConfig::default(),
-                EchoTool::new(),
-                request(script, Value::Null),
-            )
-            .await;
-            assert!(matches!(outcome, ToolExecutionOutcome::Failed(_)));
-        }
-    }
-
-    #[tokio::test]
-    async fn nested_tool_call_limit_fails() {
-        let outcome = execute_compose(
-            ComposeConfig::default().with_max_nested_tool_calls(0),
-            EchoTool::new(),
-            request("return tool('echo', {})", Value::Null),
-        )
-        .await;
-
-        assert!(matches!(outcome, ToolExecutionOutcome::Failed(_)));
-    }
-
-    #[tokio::test]
-    async fn instruction_limit_fails() {
-        let outcome = execute_compose(
-            ComposeConfig::default().with_max_instruction_count(25),
-            EchoTool::new(),
-            request(
-                "local x = 0; for i = 1, 100000 do x = x + 1 end; return x",
-                Value::Null,
-            ),
-        )
-        .await;
-
-        assert!(matches!(outcome, ToolExecutionOutcome::Failed(_)));
-    }
-
-    #[tokio::test]
-    async fn nested_approval_replays_completed_children_once() {
-        let compose = ComposeTool::new(ComposeConfig::default());
-        let states = compose.states.clone();
-        let first = EchoTool::new();
-        let gated = ApprovalEchoTool::new();
-        let first_calls = first.calls.clone();
-        let gated_calls = gated.calls.clone();
-        let executor: Arc<dyn ToolExecutor> = Arc::new(BasicToolExecutor::from_registry(
-            ToolRegistry::new().with(compose).with(first).with(gated),
-        ));
-        let permissions: Arc<dyn PermissionChecker> = Arc::new(RequireApproval);
-        let req = request(
-            "local a = tool('echo', { value = 1 }); local b = tool('approval_echo', { value = a.value + 1 }); return b",
-            Value::Null,
-        );
-
-        let owned = owned_context(executor.clone(), permissions.clone());
-        let mut ctx = owned.borrowed();
-        let first_outcome = executor.execute(req.clone(), &mut ctx).await;
-        let approval = match first_outcome {
-            ToolExecutionOutcome::Interrupted(ToolInterruption::ApprovalRequired(approval)) => {
-                approval
-            }
-            other => panic!("unexpected first outcome: {other:?}"),
-        };
-        assert_eq!(first_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(gated_calls.load(Ordering::SeqCst), 0);
-        // After an approval interrupt, the per-call replay state must persist so
-        // the resumed run can replay completed children and re-issue the
-        // pending one.
-        assert!(
-            !states.lock().await.is_empty(),
-            "compose run state must be retained across approval interrupts"
-        );
-
-        let owned = owned_context(executor.clone(), permissions);
-        let outcome = executor.execute_approved_owned(req, &approval, owned).await;
-        match outcome {
-            ToolExecutionOutcome::Completed(result) => {
-                assert_eq!(
-                    result.result.output,
-                    ToolOutput::structured(json!({ "value": 2 }))
-                );
-            }
-            other => panic!("unexpected approved outcome: {other:?}"),
-        }
-        assert_eq!(first_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(gated_calls.load(Ordering::SeqCst), 1);
-        // Once the compose run completes, the state-map entry must be cleared.
-        assert!(
-            states.lock().await.is_empty(),
-            "compose run state must be cleared after a successful resume"
-        );
-    }
-
-    #[tokio::test]
-    async fn state_map_cleared_after_successful_run() {
-        let compose = ComposeTool::new(ComposeConfig::default());
-        let states = compose.states.clone();
-        let child = EchoTool::new();
-        let executor: Arc<dyn ToolExecutor> = Arc::new(BasicToolExecutor::from_registry(
-            ToolRegistry::new().with(compose).with(child),
-        ));
-        let owned = owned_context(executor.clone(), Arc::new(AllowAllPermissions));
-        let mut ctx = owned.borrowed();
-        let outcome = executor
-            .execute(
-                request("return tool('echo', { value = 1 })", Value::Null),
-                &mut ctx,
-            )
-            .await;
-        assert!(matches!(outcome, ToolExecutionOutcome::Completed(_)));
-        assert!(
-            states.lock().await.is_empty(),
-            "compose run state must be cleared after a successful run"
-        );
-    }
-
-    #[tokio::test]
-    async fn state_map_cleared_after_script_eval_failure() {
-        // Regression: an oversized result returned from the Lua script used
-        // to leak the state-map entry created during the run's setup.
-        let compose = ComposeTool::new(ComposeConfig::default().with_max_result_bytes(1));
-        let states = compose.states.clone();
-        let executor: Arc<dyn ToolExecutor> = Arc::new(BasicToolExecutor::from_registry(
-            ToolRegistry::new().with(compose).with(EchoTool::new()),
-        ));
-        let owned = owned_context(executor.clone(), Arc::new(AllowAllPermissions));
-        let mut ctx = owned.borrowed();
-        let outcome = executor
-            .execute(
-                request(
-                    "return 'this string is far longer than one byte'",
-                    Value::Null,
-                ),
-                &mut ctx,
-            )
-            .await;
-        assert!(
-            matches!(outcome, ToolExecutionOutcome::Failed(_)),
-            "expected oversized compose result to fail",
-        );
-        assert!(
-            states.lock().await.is_empty(),
-            "compose run state must be cleared after a script-eval failure"
-        );
-    }
-
-    #[tokio::test]
-    async fn concurrent_runs_over_disjoint_call_ids() {
-        let compose = ComposeTool::new(ComposeConfig::default());
-        let child = EchoTool::new();
-        let child_calls = child.calls.clone();
-        let executor: Arc<dyn ToolExecutor> = Arc::new(BasicToolExecutor::from_registry(
-            ToolRegistry::new().with(compose).with(child),
-        ));
-
-        let make_request = |call: &str, base: i64| ToolRequest {
-            call_id: ToolCallId::new(call),
-            tool_name: ToolName::new(COMPOSE_TOOL_NAME),
-            input: json!({
-                "script": "local a = tool('echo', { value = input.base }); local b = tool('echo', { value = a.value + 1 }); return { a = a.value, b = b.value }",
-                "input": { "base": base },
-            }),
-            session_id: SessionId::new("session"),
-            turn_id: TurnId::new("turn"),
-            metadata: MetadataMap::new(),
-        };
-
-        let permissions: Arc<dyn PermissionChecker> = Arc::new(AllowAllPermissions);
-
-        let executor_a = executor.clone();
-        let permissions_a = permissions.clone();
-        let req_a = make_request("compose-call-a", 10);
-        let handle_a = tokio::spawn(async move {
-            let owned = owned_context(executor_a.clone(), permissions_a);
-            let mut ctx = owned.borrowed();
-            executor_a.execute(req_a, &mut ctx).await
-        });
-
-        let executor_b = executor.clone();
-        let permissions_b = permissions.clone();
-        let req_b = make_request("compose-call-b", 100);
-        let handle_b = tokio::spawn(async move {
-            let owned = owned_context(executor_b.clone(), permissions_b);
-            let mut ctx = owned.borrowed();
-            executor_b.execute(req_b, &mut ctx).await
-        });
-
-        let outcome_a = handle_a.await.expect("compose A join");
-        let outcome_b = handle_b.await.expect("compose B join");
-
-        match outcome_a {
-            ToolExecutionOutcome::Completed(result) => assert_eq!(
-                result.result.output,
-                ToolOutput::structured(json!({ "a": 10, "b": 11 }))
-            ),
-            other => panic!("unexpected outcome A: {other:?}"),
-        }
-        match outcome_b {
-            ToolExecutionOutcome::Completed(result) => assert_eq!(
-                result.result.output,
-                ToolOutput::structured(json!({ "a": 100, "b": 101 }))
-            ),
-            other => panic!("unexpected outcome B: {other:?}"),
-        }
-
-        // Two compose runs, each making two nested calls.
-        assert_eq!(child_calls.load(Ordering::SeqCst), 4);
-    }
-
-    #[tokio::test]
-    async fn unadvertised_children_dispatch_without_advertisement() {
-        let child = EchoTool::new();
-        let child_calls = child.calls.clone();
-        let compose = ComposeTool::new(ComposeConfig::default())
-            .with_source(ToolRegistry::new().with(child).unadvertised());
-
-        let specs = ToolSource::specs(&compose);
-        let names: Vec<_> = specs.iter().map(|s| s.name.0.as_str()).collect();
-        assert_eq!(names, vec![COMPOSE_TOOL_NAME]);
-        assert!(
-            !specs[0].description.contains("echo"),
-            "hidden child must not be enumerated in the compose description"
-        );
-        assert!(
-            ToolSource::get(&compose, &ToolName::new("echo")).is_some(),
-            "hidden child stays resolvable for dispatch"
-        );
-
-        let executor: Arc<dyn ToolExecutor> = Arc::new(BasicToolExecutor::new([
-            Arc::new(compose) as Arc<dyn ToolSource>
-        ]));
-        let owned = owned_context(executor.clone(), Arc::new(AllowAllPermissions));
-        let mut ctx = owned.borrowed();
-        let outcome = executor
-            .execute(
-                request("return tool('echo', { value = 7 })", Value::Null),
-                &mut ctx,
-            )
-            .await;
-        match outcome {
-            ToolExecutionOutcome::Completed(result) => assert_eq!(
-                result.result.output,
-                ToolOutput::structured(json!({ "value": 7 }))
-            ),
-            other => panic!("unexpected outcome: {other:?}"),
-        }
-        assert_eq!(child_calls.load(Ordering::SeqCst), 1);
-    }
-
-    /// A dynamic source whose advertised description can change at runtime
-    /// and whose pending catalog events are surfaced through
-    /// `drain_catalog_events`.
-    struct MutableSource {
-        spec: StdMutex<ToolSpec>,
-        pending_event: AtomicBool,
-        specs_calls: Arc<AtomicUsize>,
-    }
-
-    impl ToolSource for MutableSource {
-        fn specs(&self) -> Vec<ToolSpec> {
-            self.specs_calls.fetch_add(1, Ordering::SeqCst);
-            vec![self.spec.lock().expect("spec lock").clone()]
-        }
-
-        fn get(&self, _name: &ToolName) -> Option<Arc<dyn Tool>> {
-            None
-        }
-
-        fn drain_catalog_events(&self) -> Vec<ToolCatalogEvent> {
-            if self.pending_event.swap(false, Ordering::AcqRel) {
-                let mut event = ToolCatalogEvent::new("mutable");
-                event.changed.push("echo".into());
-                vec![event]
-            } else {
-                Vec::new()
-            }
-        }
-    }
-
-    #[test]
-    fn compose_spec_is_cached_until_catalog_events() {
-        let specs_calls = Arc::new(AtomicUsize::new(0));
-        let source = Arc::new(MutableSource {
-            spec: StdMutex::new(
-                ToolSpec::new("echo", "echo input", json!({"type": "object"}))
-                    .with_output_schema(json!({"type": "string"})),
-            ),
-            pending_event: AtomicBool::new(false),
-            specs_calls: specs_calls.clone(),
-        });
-        let compose = ComposeTool::new(ComposeConfig::default()).with_source(source.clone());
-
-        let baseline = specs_calls.load(Ordering::SeqCst);
-        let first = ToolSource::specs(&compose);
-        // One walk for the live child list only — the compose description is
-        // served from cache, not re-rendered from another source.specs() pass.
-        assert_eq!(specs_calls.load(Ordering::SeqCst), baseline + 1);
-        let second = ToolSource::specs(&compose);
-        assert_eq!(specs_calls.load(Ordering::SeqCst), baseline + 2);
-        assert_eq!(first[0].description, second[0].description);
-
-        // Change the child's output schema without an event: the cached
-        // compose description intentionally stays as-is (the model's catalog
-        // would not refresh either).
-        *source.spec.lock().expect("spec lock") =
-            ToolSpec::new("echo", "echo input", json!({"type": "object"}))
-                .with_output_schema(json!({"type": "number"}));
-        let stale = ToolSource::specs(&compose);
-        assert!(stale[0].description.contains("\"string\""));
-
-        // After the source reports a catalog event, the description refreshes.
-        source.pending_event.store(true, Ordering::Release);
-        let events = ToolSource::drain_catalog_events(&compose);
-        assert!(!events.is_empty());
-        let fresh = ToolSource::specs(&compose);
-        assert!(fresh[0].description.contains("\"number\""));
-    }
-}
+mod tests;

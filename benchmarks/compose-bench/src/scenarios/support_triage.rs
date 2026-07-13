@@ -120,7 +120,10 @@ impl Scenario for SupportTriage {
                     .collect();
                 Ok(paginate(items, page, 10))
             },
-        );
+        )
+        .read_only()
+        // First call per run fails with a transient 503 (see FnTool::flaky).
+        .flaky(1);
 
         let get_world = world.clone();
         let get_ticket = FnTool::new(
@@ -161,7 +164,8 @@ impl Scenario for SupportTriage {
                     "tags": ticket.tags,
                 }))
             },
-        );
+        )
+        .read_only();
 
         let update_world = world.clone();
         let update_ticket = FnTool::new(

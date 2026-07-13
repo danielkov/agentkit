@@ -6,7 +6,10 @@ adoption from 0% to 95% of cells, and the task-shape × model-capability
 conditions under which composition actually pays.**
 
 _agentkit, June 2026. Reproduction: `benchmarks/compose-bench` in this
-repository._
+repository. Follow-up: [The Familiarity Tax](runlet-case-study.md) benchmarks
+a purpose-built composition language (Runlet) against Lua on the same harness
+and decomposes where the cost of an out-of-distribution language actually
+goes._
 
 ---
 

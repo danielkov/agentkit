@@ -110,7 +110,10 @@ impl Scenario for RevenueReport {
                     .collect();
                 Ok(paginate(items, page, 10))
             },
-        );
+        )
+        .read_only()
+        // First call per run fails with a transient 503 (see FnTool::flaky).
+        .flaky(1);
 
         let get_order_data = orders.clone();
         let get_order = FnTool::new(
@@ -146,7 +149,8 @@ impl Scenario for RevenueReport {
                     "currency": "USD",
                 }))
             },
-        );
+        )
+        .read_only();
 
         let get_customer = FnTool::new(
             "get_customer",
@@ -178,7 +182,8 @@ impl Scenario for RevenueReport {
                     "region": customer_region(index),
                 }))
             },
-        );
+        )
+        .read_only();
 
         let (submit, submission) = submit_result_tool(json!({
             "type": "object",

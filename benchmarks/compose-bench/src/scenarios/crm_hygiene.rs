@@ -135,7 +135,10 @@ impl Scenario for CrmHygiene {
                     .collect();
                 Ok(paginate(items, page, 8))
             },
-        );
+        )
+        .read_only()
+        // First call per run fails with a transient 503 (see FnTool::flaky).
+        .flaky(1);
 
         let list_companies = FnTool::new(
             "list_companies",
@@ -159,7 +162,8 @@ impl Scenario for CrmHygiene {
                         .collect(),
                 ))
             },
-        );
+        )
+        .read_only();
 
         let update_world = world.clone();
         let update_contact = FnTool::new(

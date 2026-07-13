@@ -117,7 +117,9 @@ impl Scenario for ConfigMigration {
 
         let tools = match arm {
             Arm::Bash => agentkit_tool_shell::registry().with(submit),
-            Arm::Granular | Arm::Compose => agentkit_tool_fs::registry().with(submit),
+            Arm::Granular | Arm::Compose | Arm::RunletCompose => {
+                agentkit_tool_fs::registry().with(submit)
+            }
         };
 
         let permissions =
