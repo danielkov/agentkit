@@ -239,6 +239,52 @@ async fn unregister_server_removes_registration_and_tools() {
 }
 
 #[tokio::test]
+async fn disconnect_against_dead_server_cleans_catalog() {
+    let mut alpha = spawn_http_mcp(vec![simple_tool("only_alpha", "alpha-only tool.")]).await;
+
+    let mut manager =
+        McpServerManager::new().with_server(McpServerConfig::streamable_http("alpha", &alpha.url));
+    let source = manager.source();
+    manager.connect_all().await.expect("connect_all succeeds");
+    assert_tool_names(&source, &["mcp_alpha_only_alpha"]);
+
+    let mut events = manager.subscribe_catalog_events();
+
+    // Kill the server before disconnecting. rmcp swallows the failed
+    // session DELETE (close only errors when its service task panicked),
+    // so `result` may be Ok or Err — the contract under test is that
+    // manager state, catalog, and lifecycle events are identical to a
+    // clean disconnect either way.
+    alpha.shutdown();
+    let _advisory = manager.disconnect_server(&McpServerId::new("alpha")).await;
+    assert!(
+        manager
+            .connected_server(&McpServerId::new("alpha"))
+            .is_none()
+    );
+    assert_tool_names(&source, &[]);
+    let mut saw_disconnected = false;
+    while let Ok(event) = events.try_recv() {
+        if matches!(&event, McpCatalogEvent::ServerDisconnected { server_id }
+            if *server_id == McpServerId::new("alpha"))
+        {
+            saw_disconnected = true;
+        }
+    }
+    assert!(
+        saw_disconnected,
+        "ServerDisconnected must be emitted even when close fails"
+    );
+
+    // The config survives, so a retry is a reconnect attempt (which fails
+    // against the dead server) — not an UnknownServer contract violation.
+    assert!(!matches!(
+        manager.connect_server(&McpServerId::new("alpha")).await,
+        Err(McpError::UnknownServer(_))
+    ));
+}
+
+#[tokio::test]
 async fn connect_all_settled_times_out_slow_discovery_per_server() {
     let fast = spawn_http_mcp(vec![simple_tool("fast_tool", "Fast tool.")]).await;
     let slow = spawn_http_mcp(vec![simple_tool("slow_tool", "Slow tool.")]).await;

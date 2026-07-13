@@ -312,7 +312,10 @@ fn normalise_recording(recording: &mut SessionRecording) {
             }
         }
     }
-    recording.final_transcript.iter_mut().for_each(normalise_item);
+    recording
+        .final_transcript
+        .iter_mut()
+        .for_each(normalise_item);
 }
 
 fn normalise_item(item: &mut Item) {
