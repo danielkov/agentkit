@@ -1,0 +1,133 @@
+[
+  {
+    "id": null,
+    "kind": "System",
+    "parts": [
+      {
+        "Text": {
+          "text": "You are an operations assistant completing a task with the available tools. Work autonomously and never ask the user questions. Be efficient: keep the number of steps as low as you can. When the task is complete, call the `submit_result` tool exactly once with the JSON shape requested in the task, then stop.",
+          "metadata": {}
+        }
+      }
+    ],
+    "metadata": {},
+    "usage": null,
+    "finish_reason": null,
+    "created_at": null
+  },
+  {
+    "id": null,
+    "kind": "User",
+    "parts": [
+      {
+        "Text": {
+          "text": "Today is 2026-06-10. In our helpdesk, escalate every OPEN ticket that was created MORE than 7 days ago AND whose body mentions a refund: set its priority to \"high\" and add the tag \"billing-escalation\". Subjects do not mention refunds — you must check ticket bodies. Do not modify any other ticket. When done, submit {\"escalated_ticket_ids\": [..]} via submit_result.",
+          "metadata": {}
+        }
+      }
+    ],
+    "metadata": {},
+    "usage": null,
+    "finish_reason": null,
+    "created_at": 1784405707431
+  },
+  {
+    "id": "gen-1784405707-bLxcbYP5YzaS1ymQEW5W",
+    "kind": "Assistant",
+    "parts": [
+      {
+        "Reasoning": {
+          "summary": "The task is to:\n1. Find all open tickets created more than 7 days ago (before 2026-06-03)\n2. Check each ticket's body for the word \"refund\"\n3. For matching tickets: set priority to \"high\" and add tag \"billing-escalation\"\n4. Submit the list of escalated ticket IDs\n\nLet me start by listing all open tickets.",
+          "data": null,
+          "redacted": false,
+          "metadata": {}
+        }
+      },
+      {
+        "ToolCall": {
+          "id": "call_ffc0e5c94bf84b24ac91292c",
+          "name": "list_tickets",
+          "input": {
+            "page": 1,
+            "status": "open"
+          },
+          "metadata": {}
+        }
+      }
+    ],
+    "metadata": {
+      "openrouter.model": "deepseek/deepseek-v4-pro"
+    },
+    "usage": {
+      "tokens": {
+        "input_tokens": 1324,
+        "output_tokens": 145,
+        "reasoning_tokens": 83,
+        "cached_input_tokens": 0,
+        "cache_write_input_tokens": 0
+      },
+      "cost": {
+        "amount": 0.0011514276,
+        "currency": "USD",
+        "provider_amount": null
+      },
+      "metadata": {}
+    },
+    "finish_reason": "ToolCall",
+    "created_at": 1784405712700
+  },
+  {
+    "id": null,
+    "kind": "Tool",
+    "parts": [
+      {
+        "ToolResult": {
+          "call_id": "call_ffc0e5c94bf84b24ac91292c",
+          "output": {
+            "Text": "tool unavailable: 503 service unavailable: transient upstream error, retry"
+          },
+          "is_error": true,
+          "metadata": {}
+        }
+      }
+    ],
+    "metadata": {},
+    "usage": null,
+    "finish_reason": null,
+    "created_at": 1784405712700
+  },
+  {
+    "id": "gen-1784405712-DE2FsCbv9AICYsyHYVsW",
+    "kind": "Assistant",
+    "parts": [
+      {
+        "Reasoning": {
+          "summary": "Let me retry listing open tickets.\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"list_tickets\">\n<｜DSML｜parameter name=\"page\" string=\"false\">1</｜DSML｜parameter>\n<｜DSML｜parameter name=\"status\" string=\"true\">open</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+          "data": null,
+          "redacted": false,
+          "metadata": {}
+        }
+      }
+    ],
+    "metadata": {
+      "openrouter.model": "deepseek/deepseek-v4-pro"
+    },
+    "usage": {
+      "tokens": {
+        "input_tokens": 1493,
+        "output_tokens": 68,
+        "reasoning_tokens": 67,
+        "cached_input_tokens": 1280,
+        "cache_write_input_tokens": 0
+      },
+      "cost": {
+        "amount": 0.0003250726,
+        "currency": "USD",
+        "provider_amount": null
+      },
+      "metadata": {}
+    },
+    "finish_reason": "Completed",
+    "created_at": 1784405716012
+  }
+]

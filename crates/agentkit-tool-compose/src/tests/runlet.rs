@@ -93,7 +93,7 @@ async fn loop_fans_out_and_preserves_order() {
         ComposeConfig::default(),
         child,
         request(
-            "results = for item in input.items limit 4 {\n\
+            "results = for item in input.items {\n\
                  detail = echo({ value: item })\n\
                  return detail.value\n\
              }\n\
@@ -287,6 +287,7 @@ async fn prelude_intrinsics_and_folds_run_locally_without_consuming_call_budget(
         request(
             "r = echo({ value: input.values })\n\
              flat = fold acc = [] for page in r.value { return acc + page }\n\
+             assert(list.length(flat) == 3, \"unexpected flattened length\")\n\
              return {\n\
                  total: fold t = 0 for x in flat { return t + x },\n\
                  count: fold n = 0 for x in flat { return n + 1 },\n\

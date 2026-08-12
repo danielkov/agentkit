@@ -305,7 +305,7 @@ async fn compose_source_tracks_dynamic_child_catalog() {
         .find(|spec| spec.name.0 == "compose")
         .expect("compose spec");
     assert!(compose_spec.description.contains("alpha"));
-    assert!(compose_spec.description.contains("\"value\""));
+    assert!(compose_spec.description.contains("value?: int"));
     assert!(tools.get(&ToolName::new("alpha")).is_some());
 
     assert!(writer.remove(&ToolName::new("alpha")));

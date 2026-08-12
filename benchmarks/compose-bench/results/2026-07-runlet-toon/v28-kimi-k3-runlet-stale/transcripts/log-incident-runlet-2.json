@@ -1,0 +1,545 @@
+[
+  {
+    "id": null,
+    "kind": "System",
+    "parts": [
+      {
+        "Text": {
+          "text": "You are an operations assistant completing a task with the available tools. Work autonomously and never ask the user questions. Be efficient: keep the number of steps as low as you can. When the task is complete, call the `submit_result` tool exactly once with the JSON shape requested in the task, then stop.",
+          "metadata": {}
+        }
+      }
+    ],
+    "metadata": {},
+    "usage": null,
+    "finish_reason": null,
+    "created_at": null
+  },
+  {
+    "id": null,
+    "kind": "User",
+    "parts": [
+      {
+        "Text": {
+          "text": "On 2026-06-09 one of our services started failing in production. Using the monitoring tools, identify: (1) the service whose ERROR rate spiked well above its background level, (2) the sha of the deploy to that service which immediately preceded the spike, and (3) the on-call owner's email for that service. Every service logs occasional transient errors all day — the incident is a sustained burst. When done, submit {\"service\": .., \"deploy_sha\": .., \"owner_email\": ..} via submit_result.",
+          "metadata": {}
+        }
+      }
+    ],
+    "metadata": {},
+    "usage": null,
+    "finish_reason": null,
+    "created_at": 1784387248131
+  },
+  {
+    "id": "gen-1784387248-CwoBXnFWI6QmuOlyxTHb",
+    "kind": "Assistant",
+    "parts": [
+      {
+        "Reasoning": {
+          "summary": "Let me plan. I need to find the service with a spike in ERROR logs on 2026-06-09, find the deploy that immediately preceded the spike, and get the owner's email.\n\nStrategy: use compose to orchestrate. First list services, then search logs for ERROR per service to find the one with a spike. Then get deploys and find the one before the spike start. Then get owner.\n\nLet me write a Runlet program that:\n1. Lists services.\n2. For each service, searches ERROR logs (maybe page 1 to see total_items) to gauge error counts. The spike would be high total_items.\n3. For the service with high errors, fetch all pages to find the earliest timestamp of the sustained burst.\n4. Get deploys for that service, find the latest deploy before the spike start.\n5. Get owner email.\n6. Submit.\n\nLet me be careful: search_logs returns 20 per page with total_items. Background errors occasional — so the spiking service will have a much higher total_items count.\n\nLet me write the compose program:\n\n```runlet\nservices = list_services({})\ncounts = for svc in services {\n    res = search_logs({ service: svc, level: \"ERROR\", page: 1 })\n    return { service: svc, total: res.total_items }\n}\n# find max\nbest = fold acc = { service: \"\", total: 0 } for row in counts {\n    return row if row.total > acc.total else acc\n}\n# fetch all pages for that service to find earliest error in burst\nfirst_page = search_logs({ service: best.service, level: \"ERROR\", page: 1 })\nrest = for page in list.range(2, first_page.total_pages + 1) {\n    r = search_logs({ service: best.service, level: \"ERROR\", page })\n    return r.items\n}\nall_items = fold acc = first_page.items for chunk in rest { return acc + chunk }\n```\n\nHmm, but total_pages could be huge. Better to cap. Actually since logs are sorted by timestamp ascending presumably. The first page gives earliest errors. The spike start: I could look at timestamps and find where sustained burst begins. Simpler: get earliest error timestamp overall? But background errors occur all day, so earliest error may be background. The deploy preceding the spike — the spike starts at some point. The deploy \"immediately preceded the spike.\"\n\nBetter approach: identify the burst start by finding a gap — or just look at timestamps distribution. Alternatively, get the earliest timestamp in the burst: maybe find first error after a long gap. Or, since it's a sustained burst \"well above background,\" the majority of errors are in the burst. The burst start could be estimated by looking at the first page (earliest 20 errors) — if the burst dominates, page 1 may already be within the burst or show background before.\n\nAlternative simpler approach: get deploys for the service, then for each deploy check error counts before/after to find which deploy triggered spike. But typically: find the deploy immediately before the first error of the burst.\n\nLet me fetch all errors (bounded pages) and compute the earliest time such that errors are dense afterwards. A simpler heuristic: find the largest time gap between consecutive errors; the burst starts after the largest gap. Actually background errors all day, then sustained burst — the gap between the last background error and the first burst error is likely the largest gap. That works.\n\nThen deploy_sha = latest deploy with deployed_at <= burst_start. If none, the earliest deploy? There must be one.\n\nThen owner = get_service_owners(service).\n\nThen submit_result nested.\n\nLet me handle pagination safely: cap pages at, say, 25 (500 errors). If total_pages is larger, we still can find burst start from first 500? Sorted by ts — burst likely recent. Hmm. Alternatively use since/until to binary search. But let me first see the data scale. I could do an initial compose to explore, then a second to finalize. That's fine — but \"keep steps low.\" Let me do exploratory compose first: list services + error counts per service + first page of errors for top service + deploys for top service. Then analyze and submit in a second call.\n\nActually, I can do it all in one program with the gap heuristic, and submit inside. But risk: heuristic wrong. Let me do exploration first to be safe, then submit. Two compose calls is acceptable.\n\nActually let me just do one exploratory compose returning detailed info, then decide and submit (submit_result must be called exactly once — I can call it directly, not via compose; but the instructions say compose can nest submit_result. Direct call is fine too).\n\nPlan call 1 (compose):\n- services = list_services\n- counts per service (ERROR total_items)\n- best = max\n- first_page of best (items with ts)\n- last_page of best (items with ts) to see the end\n- deploys = get_deploys(best.service)\n- owner = get_service_owners(best.service)\n- Also maybe sample middle pages.\n\nReturn everything relevant. Then in call 2, compute burst start precisely (maybe fetch more pages if needed) and submit.\n\nLet me also collect counts to compare background vs spike magnitudes.\n\nWrite it:\n\n```runlet\nservices = list_services({})\ncounts = for svc in services {\n    res = search_logs({ service: svc, level: \"ERROR\", page: 1 })\n    return { service: svc, total: res.total_items, pages: res.total_pages, first_ts: res.items[0].ts if res.items != [] else null, last_ts_first_page: res.items[list.length(res.items)-1].ts if res.items != [] else null }\n}\nbest = fold acc = { service: \"\", total: 0 } for row in counts {\n    return row if row.total > acc.total else acc\n}\nfp = search_logs({ service: best.service, level: \"ERROR\", page: 1 })\nlp = search_logs({ service: best.service, level: \"ERROR\", page: fp.total_pages })\ndeploys = get_deploys({ service: best.service })\nowner = get_service_owners({ service: best.service })\nreturn { counts, best, first_page_items: fp.items, last_page_items: lp.items, total_pages: fp.total_pages, deploys, owner }\n```\n\nWait — `res.items[0].ts if ... else null` — inline if expression syntax: `x if cond else y`. That's fine.\n\nAlso note `search_logs` pagination: 20 per page. The first page sorted by timestamp — presumably ascending. Good.\n\nThen I'll determine burst start by analyzing first page: if the burst dominates, first page might contain background errors early in day then burst start. I can look at gaps in first page items. Actually I get the first 20 items and last 20. Gap analysis needs consecutive items. If burst starts within first page, I can see it. If total errors are huge, first page is early day.\n\nAlternatively, compute burst start via time-range queries: binary search using since/until counts. But maybe simpler: after seeing data in call 1, in call 2 fetch enough pages.\n\nLet me just run call 1 now.",
+          "data": null,
+          "redacted": false,
+          "metadata": {}
+        }
+      },
+      {
+        "Text": {
+          "text": "I'll start by surveying all services for their ERROR counts on 2026-06-09, then drill into the worst offender.",
+          "metadata": {}
+        }
+      },
+      {
+        "ToolCall": {
+          "id": "compose_0",
+          "name": "compose",
+          "input": {
+            "script": "services = list_services({})\ncounts = for svc in services {\n    res = search_logs({ service: svc, level: \"ERROR\", page: 1 })\n    return {\n        service: svc,\n        total: res.total_items,\n        pages: res.total_pages,\n        first_ts: res.items[0].ts if res.items != [] else null,\n        last_ts_on_page: res.items[list.length(res.items) - 1].ts if res.items != [] else null\n    }\n}\nbest = fold acc = { service: \"\", total: 0 } for row in counts {\n    return row if row.total > acc.total else acc\n}\nfp = search_logs({ service: best.service, level: \"ERROR\", page: 1 })\nlp = search_logs({ service: best.service, level: \"ERROR\", page: fp.total_pages })\ndeploys = get_deploys({ service: best.service })\nowner = get_service_owners({ service: best.service })\nreturn { counts, best, first_page_items: fp.items, last_page_items: lp.items, total_pages: fp.total_pages, total_items: fp.total_items, deploys, owner }"
+          },
+          "metadata": {}
+        }
+      }
+    ],
+    "metadata": {
+      "openrouter.model": "moonshotai/kimi-k3"
+    },
+    "usage": {
+      "tokens": {
+        "input_tokens": 2400,
+        "output_tokens": 1815,
+        "reasoning_tokens": 1502,
+        "cached_input_tokens": 0,
+        "cache_write_input_tokens": 0
+      },
+      "cost": {
+        "amount": 0.034425,
+        "currency": "USD",
+        "provider_amount": null
+      },
+      "metadata": {}
+    },
+    "finish_reason": "ToolCall",
+    "created_at": 1784387330519
+  },
+  {
+    "id": null,
+    "kind": "Tool",
+    "parts": [
+      {
+        "ToolResult": {
+          "call_id": "compose_0",
+          "output": {
+            "Text": "tool unavailable: 503 service unavailable: transient upstream error, retry"
+          },
+          "is_error": true,
+          "metadata": {}
+        }
+      }
+    ],
+    "metadata": {},
+    "usage": null,
+    "finish_reason": null,
+    "created_at": 1784387330521
+  },
+  {
+    "id": "gen-1784387330-TubmU04WZ7dU75vHuejZ",
+    "kind": "Assistant",
+    "parts": [
+      {
+        "Reasoning": {
+          "summary": "Transient error — retry the compose call.",
+          "data": null,
+          "redacted": false,
+          "metadata": {}
+        }
+      },
+      {
+        "Text": {
+          "text": "Transient error — retrying.",
+          "metadata": {}
+        }
+      },
+      {
+        "ToolCall": {
+          "id": "compose_1",
+          "name": "compose",
+          "input": {
+            "script": "services = list_services({})\ncounts = for svc in services {\n    res = search_logs({ service: svc, level: \"ERROR\", page: 1 })\n    return {\n        service: svc,\n        total: res.total_items,\n        pages: res.total_pages,\n        first_ts: res.items[0].ts if res.items != [] else null,\n        last_ts_on_page: res.items[list.length(res.items) - 1].ts if res.items != [] else null\n    }\n}\nbest = fold acc = { service: \"\", total: 0 } for row in counts {\n    return row if row.total > acc.total else acc\n}\nfp = search_logs({ service: best.service, level: \"ERROR\", page: 1 })\nlp = search_logs({ service: best.service, level: \"ERROR\", page: fp.total_pages })\ndeploys = get_deploys({ service: best.service })\nowner = get_service_owners({ service: best.service })\nreturn { counts, best, first_page_items: fp.items, last_page_items: lp.items, total_pages: fp.total_pages, total_items: fp.total_items, deploys, owner }"
+          },
+          "metadata": {}
+        }
+      }
+    ],
+    "metadata": {
+      "openrouter.model": "moonshotai/kimi-k3"
+    },
+    "usage": {
+      "tokens": {
+        "input_tokens": 4254,
+        "output_tokens": 302,
+        "reasoning_tokens": 9,
+        "cached_input_tokens": 2304,
+        "cache_write_input_tokens": 0
+      },
+      "cost": {
+        "amount": 0.0110712,
+        "currency": "USD",
+        "provider_amount": null
+      },
+      "metadata": {}
+    },
+    "finish_reason": "ToolCall",
+    "created_at": 1784387356938
+  },
+  {
+    "id": null,
+    "kind": "Tool",
+    "parts": [
+      {
+        "ToolResult": {
+          "call_id": "compose_1",
+          "output": {
+            "Structured": {
+              "best": {
+                "first_ts": "2026-06-09T09:29:00Z",
+                "last_ts_on_page": "2026-06-09T14:35:00Z",
+                "pages": 2,
+                "service": "payments",
+                "total": 33
+              },
+              "counts": [
+                {
+                  "first_ts": "2026-06-09T09:07:00Z",
+                  "last_ts_on_page": "2026-06-09T15:07:00Z",
+                  "pages": 1,
+                  "service": "auth",
+                  "total": 3
+                },
+                {
+                  "first_ts": "2026-06-09T09:18:00Z",
+                  "last_ts_on_page": "2026-06-09T15:18:00Z",
+                  "pages": 1,
+                  "service": "checkout",
+                  "total": 3
+                },
+                {
+                  "first_ts": "2026-06-09T09:29:00Z",
+                  "last_ts_on_page": "2026-06-09T14:35:00Z",
+                  "pages": 2,
+                  "service": "payments",
+                  "total": 33
+                },
+                {
+                  "first_ts": "2026-06-09T09:40:00Z",
+                  "last_ts_on_page": "2026-06-09T15:40:00Z",
+                  "pages": 1,
+                  "service": "search",
+                  "total": 3
+                }
+              ],
+              "deploys": [
+                {
+                  "deployed_at": "2026-06-09T09:10:00Z",
+                  "service": "payments",
+                  "sha": "4e0d9c1"
+                },
+                {
+                  "deployed_at": "2026-06-09T14:05:00Z",
+                  "service": "payments",
+                  "sha": "9f3c2ab"
+                },
+                {
+                  "deployed_at": "2026-06-09T16:45:00Z",
+                  "service": "payments",
+                  "sha": "b8123f7"
+                }
+              ],
+              "first_page_items": [
+                {
+                  "level": "ERROR",
+                  "message": "payments: transient upstream 503 (retried ok)",
+                  "service": "payments",
+                  "ts": "2026-06-09T09:29:00Z"
+                },
+                {
+                  "level": "ERROR",
+                  "message": "payments: transient upstream 503 (retried ok)",
+                  "service": "payments",
+                  "ts": "2026-06-09T12:29:00Z"
+                },
+                {
+                  "level": "ERROR",
+                  "message": "payments: provider timeout after 30000ms (card capture failed)",
+                  "service": "payments",
+                  "ts": "2026-06-09T14:10:00Z"
+                },
+                {
+                  "level": "ERROR",
+                  "message": "payments: provider timeout after 30000ms (card capture failed)",
+                  "service": "payments",
+                  "ts": "2026-06-09T14:11:00Z"
+                },
+                {
+                  "level": "ERROR",
+                  "message": "payments: provider timeout after 30000ms (card capture failed)",
+                  "service": "payments",
+                  "ts": "2026-06-09T14:13:00Z"
+                },
+                {
+                  "level": "ERROR",
+                  "message": "payments: provider timeout after 30000ms (card capture failed)",
+                  "service": "payments",
+                  "ts": "2026-06-09T14:14:00Z"
+                },
+                {
+                  "level": "ERROR",
+                  "message": "payments: provider timeout after 30000ms (card capture failed)",
+                  "service": "payments",
+                  "ts": "2026-06-09T14:16:00Z"
+                },
+                {
+                  "level": "ERROR",
+                  "message": "payments: provider timeout after 30000ms (card capture failed)",
+                  "service": "payments",
+                  "ts": "2026-06-09T14:17:00Z"
+                },
+                {
+                  "level": "ERROR",
+                  "message": "payments: provider timeout after 30000ms (card capture failed)",
+                  "service": "payments",
+                  "ts": "2026-06-09T14:19:00Z"
+                },
+                {
+                  "level": "ERROR",
+                  "message": "payments: provider timeout after 30000ms (card capture failed)",
+                  "service": "payments",
+                  "ts": "2026-06-09T14:20:00Z"
+                },
+                {
+                  "level": "ERROR",
+                  "message": "payments: provider timeout after 30000ms (card capture failed)",
+                  "service": "payments",
+                  "ts": "2026-06-09T14:22:00Z"
+                },
+                {
+                  "level": "ERROR",
+                  "message": "payments: provider timeout after 30000ms (card capture failed)",
+                  "service": "payments",
+                  "ts": "2026-06-09T14:23:00Z"
+                },
+                {
+                  "level": "ERROR",
+                  "message": "payments: provider timeout after 30000ms (card capture failed)",
+                  "service": "payments",
+                  "ts": "2026-06-09T14:25:00Z"
+                },
+                {
+                  "level": "ERROR",
+                  "message": "payments: provider timeout after 30000ms (card capture failed)",
+                  "service": "payments",
+                  "ts": "2026-06-09T14:26:00Z"
+                },
+                {
+                  "level": "ERROR",
+                  "message": "payments: provider timeout after 30000ms (card capture failed)",
+                  "service": "payments",
+                  "ts": "2026-06-09T14:28:00Z"
+                },
+                {
+                  "level": "ERROR",
+                  "message": "payments: provider timeout after 30000ms (card capture failed)",
+                  "service": "payments",
+                  "ts": "2026-06-09T14:29:00Z"
+                },
+                {
+                  "level": "ERROR",
+                  "message": "payments: provider timeout after 30000ms (card capture failed)",
+                  "service": "payments",
+                  "ts": "2026-06-09T14:31:00Z"
+                },
+                {
+                  "level": "ERROR",
+                  "message": "payments: provider timeout after 30000ms (card capture failed)",
+                  "service": "payments",
+                  "ts": "2026-06-09T14:32:00Z"
+                },
+                {
+                  "level": "ERROR",
+                  "message": "payments: provider timeout after 30000ms (card capture failed)",
+                  "service": "payments",
+                  "ts": "2026-06-09T14:34:00Z"
+                },
+                {
+                  "level": "ERROR",
+                  "message": "payments: provider timeout after 30000ms (card capture failed)",
+                  "service": "payments",
+                  "ts": "2026-06-09T14:35:00Z"
+                }
+              ],
+              "last_page_items": [
+                {
+                  "level": "ERROR",
+                  "message": "payments: provider timeout after 30000ms (card capture failed)",
+                  "service": "payments",
+                  "ts": "2026-06-09T14:37:00Z"
+                },
+                {
+                  "level": "ERROR",
+                  "message": "payments: provider timeout after 30000ms (card capture failed)",
+                  "service": "payments",
+                  "ts": "2026-06-09T14:38:00Z"
+                },
+                {
+                  "level": "ERROR",
+                  "message": "payments: provider timeout after 30000ms (card capture failed)",
+                  "service": "payments",
+                  "ts": "2026-06-09T14:40:00Z"
+                },
+                {
+                  "level": "ERROR",
+                  "message": "payments: provider timeout after 30000ms (card capture failed)",
+                  "service": "payments",
+                  "ts": "2026-06-09T14:41:00Z"
+                },
+                {
+                  "level": "ERROR",
+                  "message": "payments: provider timeout after 30000ms (card capture failed)",
+                  "service": "payments",
+                  "ts": "2026-06-09T14:43:00Z"
+                },
+                {
+                  "level": "ERROR",
+                  "message": "payments: provider timeout after 30000ms (card capture failed)",
+                  "service": "payments",
+                  "ts": "2026-06-09T14:44:00Z"
+                },
+                {
+                  "level": "ERROR",
+                  "message": "payments: provider timeout after 30000ms (card capture failed)",
+                  "service": "payments",
+                  "ts": "2026-06-09T14:46:00Z"
+                },
+                {
+                  "level": "ERROR",
+                  "message": "payments: provider timeout after 30000ms (card capture failed)",
+                  "service": "payments",
+                  "ts": "2026-06-09T14:47:00Z"
+                },
+                {
+                  "level": "ERROR",
+                  "message": "payments: provider timeout after 30000ms (card capture failed)",
+                  "service": "payments",
+                  "ts": "2026-06-09T14:49:00Z"
+                },
+                {
+                  "level": "ERROR",
+                  "message": "payments: provider timeout after 30000ms (card capture failed)",
+                  "service": "payments",
+                  "ts": "2026-06-09T14:50:00Z"
+                },
+                {
+                  "level": "ERROR",
+                  "message": "payments: provider timeout after 30000ms (card capture failed)",
+                  "service": "payments",
+                  "ts": "2026-06-09T14:52:00Z"
+                },
+                {
+                  "level": "ERROR",
+                  "message": "payments: provider timeout after 30000ms (card capture failed)",
+                  "service": "payments",
+                  "ts": "2026-06-09T14:53:00Z"
+                },
+                {
+                  "level": "ERROR",
+                  "message": "payments: transient upstream 503 (retried ok)",
+                  "service": "payments",
+                  "ts": "2026-06-09T15:29:00Z"
+                }
+              ],
+              "owner": {
+                "owner_email": "maya@example.com",
+                "service": "payments"
+              },
+              "total_items": 33,
+              "total_pages": 2
+            }
+          },
+          "is_error": false,
+          "metadata": {}
+        }
+      }
+    ],
+    "metadata": {},
+    "usage": null,
+    "finish_reason": null,
+    "created_at": 1784387356940
+  },
+  {
+    "id": "gen-1784387357-4rQ1ERu5wZDWAUcY2nAN",
+    "kind": "Assistant",
+    "parts": [
+      {
+        "Reasoning": {
+          "summary": "Clear picture:\n\n- payments has 33 ERRORs vs 3 each for others. Sustained burst from 14:10 to 14:53 (\"provider timeout after 30000ms (card capture failed)\"), with only two transient 503s at 09:29 and 12:29 before, and one at 15:29 after (background).\n- Deploys for payments: 4e0d9c1 at 09:10, 9f3c2ab at 14:05, b8123f7 at 16:45. Burst started 14:10 → deploy immediately preceding = 9f3c2ab (14:05).\n- Owner: maya@example.com.\n\nSubmit.",
+          "data": null,
+          "redacted": false,
+          "metadata": {}
+        }
+      },
+      {
+        "Text": {
+          "text": "The picture is clear:\n\n- **payments** has 33 ERRORs vs. just 3 each for auth, checkout, and search. Its errors show a sustained burst of `provider timeout (card capture failed)` from **14:10–14:53**, while the only other errors are isolated transient 503s (09:29, 12:29, 15:29 — normal background).\n- Deploys to payments: `4e0d9c1` @ 09:10, `9f3c2ab` @ 14:05, `b8123f7` @ 16:45. The burst began at 14:10, immediately after the **14:05 deploy `9f3c2ab`** (and the 16:45 deploy came after the burst ended — likely the fix).\n- On-call owner: **maya@example.com**.",
+          "metadata": {}
+        }
+      },
+      {
+        "ToolCall": {
+          "id": "submit_result_2",
+          "name": "submit_result",
+          "input": {
+            "answer": {
+              "deploy_sha": "9f3c2ab",
+              "owner_email": "maya@example.com",
+              "service": "payments"
+            }
+          },
+          "metadata": {}
+        }
+      }
+    ],
+    "metadata": {
+      "openrouter.model": "moonshotai/kimi-k3"
+    },
+    "usage": {
+      "tokens": {
+        "input_tokens": 6271,
+        "output_tokens": 413,
+        "reasoning_tokens": 154,
+        "cached_input_tokens": 4096,
+        "cache_write_input_tokens": 0
+      },
+      "cost": {
+        "amount": 0.0139488,
+        "currency": "USD",
+        "provider_amount": null
+      },
+      "metadata": {}
+    },
+    "finish_reason": "ToolCall",
+    "created_at": 1784387382374
+  },
+  {
+    "id": null,
+    "kind": "Tool",
+    "parts": [
+      {
+        "ToolResult": {
+          "call_id": "submit_result_2",
+          "output": {
+            "Structured": {
+              "recorded": true
+            }
+          },
+          "is_error": false,
+          "metadata": {}
+        }
+      }
+    ],
+    "metadata": {},
+    "usage": null,
+    "finish_reason": null,
+    "created_at": 1784387382374
+  },
+  {
+    "id": "gen-1784387382-Tzfm4oBgjndebGbmxUil",
+    "kind": "Assistant",
+    "parts": [
+      {
+        "Text": {
+          "text": "Submitted. Summary of the incident:\n\n1. **Service:** `payments` — 33 ERRORs on 2026-06-09 (vs. ~3 background errors on every other service), forming a sustained burst of `provider timeout after 30000ms (card capture failed)` from 14:10 to 14:53 UTC.\n2. **Triggering deploy:** `9f3c2ab`, deployed at 14:05 UTC — five minutes before the burst started. (A later deploy, `b8123f7` at 16:45, came after the burst subsided — presumably the rollback/fix.)\n3. **On-call owner:** maya@example.com.",
+          "metadata": {}
+        }
+      }
+    ],
+    "metadata": {
+      "openrouter.model": "moonshotai/kimi-k3"
+    },
+    "usage": {
+      "tokens": {
+        "input_tokens": 6716,
+        "output_tokens": 159,
+        "reasoning_tokens": 1,
+        "cached_input_tokens": 6144,
+        "cache_write_input_tokens": 0
+      },
+      "cost": {
+        "amount": 0.0059442,
+        "currency": "USD",
+        "provider_amount": null
+      },
+      "metadata": {}
+    },
+    "finish_reason": "Completed",
+    "created_at": 1784387408355
+  }
+]

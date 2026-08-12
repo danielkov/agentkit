@@ -235,6 +235,320 @@ families that fumbled it, pays 1.6–1.9× Lua's price for the same tasks at
 families is the tell that this is not a skill issue — which motivated the
 decomposition.
 
+### 3.1 Follow-up: Kimi K3
+
+Moonshot's `kimi-k3`, released after the original sweep, ran the same five
+scenarios × both arms × 3 reps (30 runs, JSON results):
+
+| model               | lua cost | lua acc | runlet cost | runlet acc | runlet/lua |
+| ------------------- | -------- | ------- | ----------- | ---------- | ---------- |
+| moonshotai/kimi-k3  | $0.204   | 1.00    | $0.391      | 1.00       | **1.92×**  |
+
+Kimi is the third model to score 1.00 on both arms. Its absolute costs sit in
+the middle of the original field, while its 1.92× Runlet premium is just above
+the sweep's 1.6–1.9× band. It used composition in 14/15 Lua runs and 13/15
+Runlet runs; the two exceptions were `log-incident` runs completed through
+granular calls. Syntax was not a problem: there were no parser diagnostics and
+three analyzer diagnostics (`RL2103`, unknown property) across the Runlet arm.
+
+Unlike the original models, Kimi reports reasoning tokens natively:
+
+| arm    | billed output | reported reasoning | non-reasoning output | reasoning share |
+| ------ | ------------- | ------------------ | -------------------- | --------------- |
+| lua    | 25,932        | 8,434              | 17,498               | 33%             |
+| runlet | 53,983        | 37,996             | 15,987               | 70%             |
+
+Runlet produced slightly less non-reasoning output but used **4.5× more
+reasoning tokens**. This independently confirms the hidden-deliberation
+mechanism of §4 on a second provider without estimating visible tokens from
+transcript characters.
+
+Four initial runs received immediate upstream 429s at concurrency 6. Each
+failed record was replaced by the matching successful serial rerun; provider
+failures are excluded from the 30-run result above.
+
+### 3.2 Language-first ablation: host concurrency and assertions
+
+The Kimi transcripts exposed a language-design error: the model read
+`for ... limit 32` as a 32-element iteration cap rather than a concurrency
+cap. Runlet now removes the source-level number entirely: `for item in items`
+always processes the complete collection, while the host configures active
+iteration concurrency. It also adds eager `assert(condition, message)`
+statements so programs can check invariants without returning checked values.
+The existing primer was changed only enough to describe and demonstrate those
+two language changes; no pagination or schema-shape teaching was added.
+
+Kimi K3 then ran the two affected scenarios plus `support-triage` as a control,
+Runlet arm only, 3 reps each. Values below are per-run means against the §3.1
+baseline:
+
+| scenario         | old cost | new cost | Δ cost | old reasoning | new reasoning | Δ reasoning | accuracy |
+| ---------------- | -------- | -------- | ------ | ------------- | ------------- | ----------- | -------- |
+| crm-hygiene      | $0.130   | $0.078   | −40%   | 4,916         | 1,859         | **−62%**    | 1.00     |
+| revenue-report   | $0.070   | $0.056   | −19%   | 2,312         | 1,757         | **−24%**    | 1.00     |
+| support-triage   | $0.053   | $0.045   | −16%   | 1,343         | 1,042         | −22%        | 1.00     |
+| three-scenario suite | $0.254 | $0.179 | **−29%** | 2,857       | 1,553         | **−46%**    | 1.00     |
+
+The concurrency result is behaviorally clear. Every old revenue run reasoned
+about the supposed 32-item ceiling; one split the 40 orders into two loops and
+issued a second verification program because exactly 32 happened to be
+completed. All three new runs processed all 40 orders directly, with no
+chunking or limit deliberation. The exact −24% token estimate remains noisy:
+the control also fell 22%, and these are separate three-rep samples rather
+than an interleaved A/B.
+
+The assertion result is not yet established. Kimi used `assert` in only one of
+three CRM runs. That program checked each update response in-process and
+returned only three counts, but aggregate CRM compose-result payload increased
+because the other runs returned large discovery values. Assertions are usable;
+this run does not show that adding the construct alone reliably changes model
+routing or context leakage.
+
+### 3.3 Convergence campaign: v25–v33
+
+The §3.2 result — a 29% suite cut from two language changes — suggested the
+1.9× premium was not one monolithic tax but a stack of separable frictions.
+We kept pulling the thread on Kimi K3: read the transcripts, name the single
+largest remaining friction, fix it at whichever layer owns it (language,
+primer, catalog presentation, or harness), rerun only the affected scenarios,
+repeat. Fifty-four runs later the suite premium stands at roughly **1.15–1.2×,
+with four of five scenarios at or below Lua parity** — down from 1.92×.
+
+The interventions, in order:
+
+**Primer: teach the one-program shape (v25–v27).** Three additions to the
+exemplar — a complete pagination idiom (`boundary retry` around each page
+fetch, fold-flattened), and two sentences of routing guidance ("keep reads,
+transforms, writes, checks, and final submission in one program; do not
+return source records for model-side planning; a nested submission call
+avoids another round-trip"). Revenue-report fell $0.056 → $0.032 and
+support-triage $0.045 → $0.036, both converging to **2 model requests per
+run** — one program, one summary, the floor for the loop. CRM followed to
+$0.077.
+
+**Measurement before more changes (v28).** Two harness upgrades: every run
+record now carries a `diagnostics` field (Runlet error codes seen, with
+counts), and full transcripts — including Kimi's native reasoning text —
+archive next to `runs.jsonl` instead of dying in `target/`. A fresh 15-run
+Lua baseline (the v23 baseline had drifted ~8% upward) and a rerun of the
+two cells untouched since v23 produced a failure taxonomy instead of a
+hunch: of five runlet compose failures, **four were the scenarios' injected
+503s** killing programs whose tool calls were not wrapped in `boundary
+retry` — and the transcripts showed models deploy `boundary` exactly where
+the exemplar demonstrates it (pagination) and nowhere else. The lone real
+language error was `RL2103`: a model wrote `services.items` on a value that
+was already the list.
+
+**Catalog presentation is a language surface (v29).** The `.items` error had
+a precise cause: output schemas were rendered to the model as raw JSON
+Schema, whose `items` *keyword* collides with the `.items` *property
+convention* that neighboring paginated tools genuinely follow. The catalog
+now renders compact type notation instead (`list_services(): string[]`,
+`search_logs(...): { items: {...}[], total_pages: int }`), `RL2103` states
+what the value *is* ("not available on this value of type `string[]` —
+iterate or index the list itself"), and `list.range` gained the optional
+step argument the calendar transcripts showed models re-deriving by hand.
+Result: RL2103 extinct across every subsequent run, log-incident $0.066 at
+0.89 accuracy → **$0.042 at 1.00**, CRM → $0.067.
+
+**Emit what the world expects back (v30).** v29's calendar cell scored 0.00
+at perfect program logic: the step argument pushed models fully numeric, so
+they returned `time.format` output — which emitted `14:00:00.000Z`, and the
+scorer string-compared against `14:00:00Z`. Both sides were wrong.
+`time.format` now renders whole seconds without the fractional part (the
+form APIs and validators expect), and the scorer normalizes zero-millisecond
+variants. A model-facing language's *output* formats are as much a
+compatibility surface as its syntax.
+
+**Schema keywords are droppable; author documentation is load-bearing
+(v31).** v30 restored accuracy but every rep burned a repair round-trip on
+`RL5213`: `time.parse("09:00")` on busy-interval strings. This class had
+never fired before v29 — the regression was ours. The busy intervals'
+`HH:MM UTC` format was documented *only* in the schema's `description`
+fields, which the v29 notation renderer had dropped as lossy. With
+descriptions restored as trailing comments
+(`start?: string /* HH:MM UTC */`), calendar converged: **2 requests, zero
+failures, zero diagnostics, 1.00 accuracy in all three reps** — no repair
+loops left, only deliberation.
+
+**The matched pair (v32/v33).** The type-notation catalog applies to both
+arms, so quoting runlet-under-notation against the raw-schema Lua baseline
+would flatter runlet. Both arms therefore reran the full suite under the
+final configuration, 3 reps each:
+
+| scenario            | lua (v32) | runlet (v33) | ratio | runlet best prior cell |
+| ------------------- | --------- | ------------ | ----- | ---------------------- |
+| support-triage      | $0.0358   | $0.0386      | 1.08× | $0.0357 (v26)          |
+| calendar-scheduling | $0.0328   | $0.0691      | 2.11× | $0.0745 (v30)          |
+| log-incident        | $0.0371   | $0.0807      | 2.18× | $0.0421 (v29)          |
+| revenue-report      | $0.0244   | $0.0635      | 2.60× | $0.0320 (v26)          |
+| crm-hygiene         | $0.0526   | $0.1366      | 2.60× | $0.0668 (v29)          |
+| suite               | $0.1827   | $0.3885      | 2.13× | $0.2511                |
+
+Accuracy is 1.00 in all 30 runs. Two findings and one methodological
+correction fall out of this table.
+
+First, **the notation catalog is a generic win on the Lua arm too: −17%
+suite** against the same-harness v28 baseline ($0.2197 → $0.1827) — larger
+than TOON's −14%, and stackable with it. Rendering output schemas as
+`{ items: {...}[], total_pages: int }` instead of raw JSON Schema helps
+every composer, not just the checked one.
+
+Second, **single-draw suite comparisons cannot resolve the campaign's cost
+effect, and this table proves it**. The v33 crm cell ($0.137) is 2.0× the
+v29 crm cell ($0.067) — materially the same configuration, different draw:
+two of its three reps spent ~7,000 reasoning tokens against v29's ~2,300,
+and one revenue rep shipped this campaign's first statement-form parse
+storm (RL1008/RL1014/RL1017). The per-cell spread between draws of one
+config is as large as most of the effects measured above. The best-prior
+column and the v33 column bracket the truth: the suite premium after the
+campaign lies somewhere in **1.4×–2.1×**, and pinning it tighter needs a
+high-rep matched run, not another 3-rep cell — §3.5 runs one and lands on
+**1.77×**. (For calibration, v23's single draw was 1.92× — on cost alone, a
+skeptic reading only suite totals could claim the campaign moved nothing.)
+
+What the campaign *did* resolve is structural, and those metrics are
+stable across draws: mean model requests fell from ~5.1 (v23) to ~2.9
+(v33) with four of five scenarios reaching the 2-request floor in at least
+one draw; the RL2103 and RL5213 error classes are extinct; accuracy held
+at 1.00 throughout; and every remaining compose failure in v33 is either
+an injected 503 on an unwrapped call (calendar ×3, log ×1 — the
+boundary-placement teaching remains undone) or a one-shot repaired arity
+slip. Round-trips converged; hidden deliberation did not (suite mean
+~2,770 reasoning tokens/run in v33 vs ~2,530 in v23) — the model now
+writes one bigger program in one sitting, thinking roughly as long in
+total, but paying far fewer input-replay and repair costs. The residual
+premium is concentrated exactly where §4 predicted: deliberation, now
+with the frictions stripped away from around it.
+
+The campaign's larger lesson still stands, restated with the correction:
+several defects we had silently booked under "familiarity tax" were really
+**presentation defects with names** — a misread concurrency cap (§3.2), a
+schema metalanguage collision, dropped documentation, an output format
+nobody asked for, un-taught idioms — each found by reading archived
+reasoning text, each fixed at the surface that owned it, and one of them
+(notation) worth −17% to the *competing* arm. But the matched pair shows
+the remaining tax is larger and noisier than the per-cell wins suggested:
+presentation work narrows the moat and hardens the structure; it does not
+cross the moat.
+
+### 3.4 The spread: three models, three relationships with the tax
+
+To place Kimi's noisy 1.4–2.1× on a spectrum, two further models ran the
+full matched suite under the final configuration (both arms × 5 scenarios ×
+3 reps each): `deepseek/deepseek-v4-pro` and `x-ai/grok-4.5`, both with
+visible reasoning traces.
+
+| model            | lua cost / acc | runlet cost / acc | ratio | reasoning/run |
+| ---------------- | -------------- | ----------------- | ----- | ------------- |
+| kimi-k3          | $0.183 / 1.00  | $0.389 / 1.00     | 2.13× | ~2,800        |
+| deepseek-v4-pro  | $0.030 / 0.73  | $0.051 / 0.92     | 1.69× | ~940 / ~1,520 |
+| grok-4.5         | $0.077 / 1.00  | $0.089 / 0.94     | 1.17× | ~370 / ~480   |
+
+Three distinct relationships with the unfamiliar language emerge:
+
+**The premium tracks deliberation habit, not model quality.** Grok barely
+deliberates and pays almost no premium (1.17×); Kimi deliberates heavily
+and pays 2.13×; deepseek sits between on both axes. The familiarity tax is
+not a constant of the language — it is proportional to how much hidden
+thinking a model habitually spends per program, which is why no single-model
+decomposition (§4, §3.1) could have priced it in general.
+
+**Deepseek reproduces the accuracy-rescue pattern — §3's gemini result at a
+budget tier.** Its Lua arm ships wrong answers quietly and cheaply
+(support-triage 0.33, calendar and log-incident 0.67 — few requests, no
+errors, wrong results), while its Runlet arm storms through parse
+diagnostics at haiku-tier rates (RL1001/RL1008/RL1014/RL1017; nine compose
+failures in one calendar cell) and lands at 0.92–1.00. The checked language
+converts silent wrongness into loud repair loops. At these absolute costs
+($0.05/suite) the 1.69× premium buys +0.19 accuracy — by cost-per-correct
+task, Runlet is the cheaper arm on this model.
+
+**Grok reveals a failure mode the repair loop cannot see: giving up.** In
+one crm run it submitted a program, received parse diagnostics, and simply
+stopped — no repair attempt, no submission, accuracy 0.17 in two model
+requests. Kimi always repairs; deepseek storms until convergence; grok
+abandoned. Repair persistence is a model trait, not a language property —
+and a benchmark that only counted diagnostics would file grok as the
+*most* fluent of the three (fewest errors) while it quietly forfeits the
+task.
+
+One further tier split: grok and Kimi adopt the primer's one-program
+routing (2–3.7 requests per run); deepseek does not (5.7–7). Teaching
+lands tier-dependently, like the §2.3 primer-form result.
+
+**Steering ablation: does one-pass guidance cause the give-up?** A
+plausible mechanism suggested itself: the primer's one-program steering
+("…avoids another model round-trip") might bias a cheap model toward
+treating the run as one-shot — abandon rather than repair. The steering
+paragraph was temporarily env-gated off for the B arm, and grok reran the
+give-up scenario at 8 reps per condition. Result: **16/16 runs
+repaired and submitted at accuracy 1.00 under both conditions** — the
+give-up did not reproduce at all, putting its base rate at roughly 1 in 11
+crm runs (the v35 occurrence pooled in) rather than anything steering
+selects for. The ablation did cleanly measure what the steering *does* do
+on this model: with it, 4.0 requests/run; without it, 5.1 (−21% round
+trips) at indistinguishable cost ($0.0275 vs $0.0260 — a cheap model's
+extra round-trips are nearly free). Both conditions hit statement-form
+parse storms (RL1008/RL1012/RL1014) in most reps and repaired through
+them; the v35 abandonment was the outlier, not the norm. The hypothesis
+was worth $0.43 to kill: give-up is rare stochastic behavior, and the
+steering earns its round-trip savings without measurably causing it.
+
+### 3.5 Normalization: the matched suite at ten reps
+
+The final configuration — including one late teaching change, the exemplar's
+fan-out body now demonstrating `boundary retry` around its per-item read —
+then ran at 10 reps per cell: 100 runs on Kimi K3, 100 on grok-4.5, and 100
+more on grok-4.5 at `reasoning.effort: high` (the adapter gained an
+`OPENROUTER_REASONING_EFFORT` passthrough for this; Kimi launched days ago
+with a fixed-high setting and no knob yet). All 300 runs are archived with
+transcripts.
+
+**Kimi K3, n=10 per cell, every one of the 100 runs at accuracy 1.00:**
+
+| scenario            | lua             | runlet          | ratio     | runlet reasoning/run |
+| ------------------- | --------------- | --------------- | --------- | -------------------- |
+| support-triage      | $0.0442 ±0.0172 | $0.0353 ±0.0155 | **0.80×** | 1,127                |
+| revenue-report      | $0.0280 ±0.0095 | $0.0440 ±0.0264 | 1.57×     | 1,464                |
+| crm-hygiene         | $0.0487 ±0.0118 | $0.0951 ±0.0520 | 1.95×     | 3,853                |
+| calendar-scheduling | $0.0497 ±0.0153 | $0.0974 ±0.0276 | 1.96×     | 3,547                |
+| log-incident        | $0.0364 ±0.0052 | $0.0945 ±0.0847 | 2.60×     | 3,436                |
+| suite               | $0.2070         | $0.3663         | **1.77×** | 2,685 (vs lua's 686) |
+
+The normalized post-campaign premium on the heaviest deliberator is
+**1.77×** — inside the §3.3 bracket, a real but modest cost improvement on
+v23's 1.92× single draw. The structural improvements, by contrast, are
+unambiguous at this sample size: the runlet arm ran 13 compose failures
+across 50 runs against Lua's 52; requests per run were 2.1–3.9 against
+Lua's 4.1–5.3; and the boundary-in-fan-out exemplar change roughly halved
+the runlet failure rate versus v33 (0.67 → 0.26 per run) — models copy the
+shape where it is demonstrated, one more time. Per-scenario ratios order by
+runlet reasoning volume almost perfectly, and the per-cell noise §3.3
+complained about resolves into a heavy tail rather than jitter: one
+log-incident rep spent 15,081 reasoning tokens ($0.31, zero failures,
+correct answer) against a scenario median near 2,300. The residual premium
+is deliberation, its variance is deliberation, and its worst case is a
+deliberation *spiral* on a correct program.
+
+**Grok-4.5** confirms the other end of the spread at n=10: 1.33× at its
+default effort (its lone blemish a *Lua-arm* task forfeit — the §3.4
+give-up trait cuts both ways), and 1.31× at `effort: high` with 100/100
+accuracy. The effort knob barely moves it — +22% reasoning on the Lua arm,
++46% on runlet, ~150 absolute tokens per run — though the asymmetry is the
+deliberation-proportional mechanism in miniature: granted extra thinking
+budget, the model spends it disproportionately on the unfamiliar language.
+Support-triage stays decisively sub-parity on both models (0.80× Kimi,
+0.35–0.44× grok), establishing that for at least one scenario shape — page,
+filter, escalate, submit — the purpose-built language is simply cheaper.
+
+The normalized bottom line for the whole study: after every presentation
+fix this campaign found, a checked language nobody trained on costs a
+light deliberator ~1.3× and a heavy deliberator ~1.8× versus Lua at equal
+(perfect) accuracy on frontier-tier models — with the checked arm winning
+outright where its one-program shape fits, and the remaining premium
+attributable to hidden deliberation with a heavy right tail.
+
 ---
 
 ## 4. Experiment 3: decomposing the 1.8×
@@ -424,10 +738,9 @@ model" that does not measure hidden output is measuring the wrong thing.
    transcript characters, not tokenizer counts; the 63%/79% figures are
    approximate. The direction and magnitude gap (2.6×) is far larger than
    plausible estimation error.
-3. **Decomposition ran on one model.** The hidden-thinking dominance was
-   established on sonnet-5 and the 1.6–1.9× consistency merely _suggests_ the
-   same mechanism elsewhere; luna and glm bill differently and were not
-   decomposed.
+3. **The original decomposition ran on one model.** Kimi K3's native reasoning
+   counts confirm the same mechanism and direction on a second provider, but
+   luna and glm bill differently and were not decomposed.
 4. **The primer was iterated against these scenarios.** Calendar-scheduling
    in particular served as the diagnostic-design gate (RL1020), so its
    post-fix cells are in-sample. Cross-scenario generalization of the
@@ -471,8 +784,8 @@ the harness collected by default.
 
 ## 9. Future work
 
-- Decompose the gap on a second reasoning-billing model to confirm mechanism
-  generality; repeat with a provider that reports reasoning tokens natively.
+- Repeat the native reasoning-token decomposition across more providers and
+  models; Kimi K3 confirms the mechanism once, not its universal magnitude.
 - TOON at haiku tier and below — the encoding's cheapest win and its highest
   comprehension risk live in the same place.
 - A fine-tuning probe: how many Runlet examples does it take to close the
@@ -553,7 +866,29 @@ Raw per-run records behind every table:
 `benchmarks/compose-bench/results/2026-07-runlet-toon/` — one `runs.jsonl`
 per (experiment, model, primer/encoding) cell: `v19-*` (primer noise check,
 sonnet-4.5), `v20-*` (primer A/B at haiku-4.5 and gemini-2.5-flash), `v21-*`
-(frontier sweep, JSON results), `v22-toon-sonnet-5` (TOON A/B). The 250
-archived runs cost $12.85; the sonnet-4.5 primer-iteration runs of §2.2–2.3
+(frontier sweep, JSON results), `v22-toon-sonnet-5` (TOON A/B),
+`v23-moonshot-kimi-k3` (Kimi K3 follow-up), `v24-kimi-k3-language`
+(language-first ablation), and the §3.3 convergence campaign:
+`v25-kimi-k3-pagination` / `v26-kimi-k3-submit*` / `v27-kimi-k3-one-pass`
+(one-program primer teaching), `v28-*` (fresh Lua baseline + stale-cell
+rerun under the upgraded harness), `v29-kimi-k3-notation-range`
+(type-notation catalog, RL2103, `list.range` step),
+`v30-kimi-k3-calendar-timefmt` (`time.format`/scorer fix),
+`v31-kimi-k3-calendar-desc` (descriptions restored in notation), and
+`v32-kimi-k3-lua-notation` / `v33-kimi-k3-runlet-final` (the matched
+final-configuration pair), `v34-deepseek-v4-pro` / `v35-grok-4-5` (the §3.4
+cross-model spread), and `v36-grok-steer-on` / `v36-grok-steer-off` (the
+one-pass steering ablation), and the §3.5 normalization:
+`v37-kimi-k3-10rep`, `v38-grok-4-5-10rep`, and `v39-grok-4-5-high-10rep`
+(10 reps per cell, final configuration). From v28
+on, each version also keeps a directory with the full transcripts —
+including native reasoning text — and per-run `diagnostics` code counts in
+the records. The 749 archived runs cost $29.94; the sonnet-4.5
+primer-iteration runs of §2.2–2.3
 (v16–v18) survive only as harness logs — their result directories were lost
-to a `target/` clean, which is also why everything since is archived here.
+to a `target/` clean, which is why everything since is archived here.
+
+The §3.3 runs depend on runlet changes that are not yet on crates.io
+(`Schema::type_notation`, the enriched RL2103, `list.range` step,
+`time.format` whole-second output); `agentkit-tool-compose` temporarily
+points at a local `runlet` checkout carrying them.

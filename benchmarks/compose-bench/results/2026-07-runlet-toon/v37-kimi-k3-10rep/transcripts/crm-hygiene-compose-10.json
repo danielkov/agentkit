@@ -1,0 +1,632 @@
+[
+  {
+    "id": null,
+    "kind": "System",
+    "parts": [
+      {
+        "Text": {
+          "text": "You are an operations assistant completing a task with the available tools. Work autonomously and never ask the user questions. Be efficient: keep the number of steps as low as you can. When the task is complete, call the `submit_result` tool exactly once with the JSON shape requested in the task, then stop.",
+          "metadata": {}
+        }
+      }
+    ],
+    "metadata": {},
+    "usage": null,
+    "finish_reason": null,
+    "created_at": null
+  },
+  {
+    "id": null,
+    "kind": "User",
+    "parts": [
+      {
+        "Text": {
+          "text": "Clean up our CRM contacts: (1) rewrite every phone number that is not already in E.164 format (US numbers: `+1` followed by exactly 10 digits, no spaces or punctuation) into E.164, leaving already-valid numbers untouched; (2) for every contact whose company field is empty, fill it with the company name matching the contact's email domain (see list_companies). Do not change any other field or any already-correct value. When done, submit {\"phones_fixed\": <count>, \"companies_filled\": <count>} via submit_result.",
+          "metadata": {}
+        }
+      }
+    ],
+    "metadata": {},
+    "usage": null,
+    "finish_reason": null,
+    "created_at": 1784411167021
+  },
+  {
+    "id": "gen-1784411167-AjqctYW0MosX9cPY42vt",
+    "kind": "Assistant",
+    "parts": [
+      {
+        "Reasoning": {
+          "summary": "Let me start by listing contacts and companies to understand the data. I'll use the compose tool to do this efficiently in one round trip.\n\nLet me first fetch all contacts (paginated) and companies.",
+          "data": null,
+          "redacted": false,
+          "metadata": {}
+        }
+      },
+      {
+        "ToolCall": {
+          "id": "compose_0",
+          "name": "compose",
+          "input": {
+            "script": "local companies = tool('list_companies', {})\nlocal page, contacts = 1, {}\nrepeat\n  local r = tool('list_contacts', { page = page })\n  for _, c in ipairs(r.items) do contacts[#contacts + 1] = c end\n  page = page + 1\nuntil page > r.total_pages\nreturn { companies = companies, contacts = contacts, total = #contacts }"
+          },
+          "metadata": {}
+        }
+      }
+    ],
+    "metadata": {
+      "openrouter.model": "moonshotai/kimi-k3"
+    },
+    "usage": {
+      "tokens": {
+        "input_tokens": 1066,
+        "output_tokens": 177,
+        "reasoning_tokens": 41,
+        "cached_input_tokens": 0,
+        "cache_write_input_tokens": 0
+      },
+      "cost": {
+        "amount": 0.005853,
+        "currency": "USD",
+        "provider_amount": null
+      },
+      "metadata": {}
+    },
+    "finish_reason": "ToolCall",
+    "created_at": 1784411173146
+  },
+  {
+    "id": null,
+    "kind": "Tool",
+    "parts": [
+      {
+        "ToolResult": {
+          "call_id": "compose_0",
+          "output": {
+            "Text": "tool unavailable: 503 service unavailable: transient upstream error, retry"
+          },
+          "is_error": true,
+          "metadata": {}
+        }
+      }
+    ],
+    "metadata": {},
+    "usage": null,
+    "finish_reason": null,
+    "created_at": 1784411173146
+  },
+  {
+    "id": "gen-1784411173-yuJ3mCMZcKUu2LtXval6",
+    "kind": "Assistant",
+    "parts": [
+      {
+        "Reasoning": {
+          "summary": "The compose tool hit a transient error. Let me retry.",
+          "data": null,
+          "redacted": false,
+          "metadata": {}
+        }
+      },
+      {
+        "Text": {
+          "text": "Transient error — retrying:",
+          "metadata": {}
+        }
+      },
+      {
+        "ToolCall": {
+          "id": "compose_1",
+          "name": "compose",
+          "input": {
+            "script": "local companies = tool('list_companies', {})\nlocal page, contacts = 1, {}\nrepeat\n  local r = tool('list_contacts', { page = page })\n  for _, c in ipairs(r.items) do contacts[#contacts + 1] = c end\n  page = page + 1\nuntil page > r.total_pages\nreturn { companies = companies, contacts = contacts, total = #contacts }"
+          },
+          "metadata": {}
+        }
+      }
+    ],
+    "metadata": {
+      "openrouter.model": "moonshotai/kimi-k3"
+    },
+    "usage": {
+      "tokens": {
+        "input_tokens": 1282,
+        "output_tokens": 155,
+        "reasoning_tokens": 13,
+        "cached_input_tokens": 1024,
+        "cache_write_input_tokens": 0
+      },
+      "cost": {
+        "amount": 0.0034062,
+        "currency": "USD",
+        "provider_amount": null
+      },
+      "metadata": {}
+    },
+    "finish_reason": "ToolCall",
+    "created_at": 1784411179076
+  },
+  {
+    "id": null,
+    "kind": "Tool",
+    "parts": [
+      {
+        "ToolResult": {
+          "call_id": "compose_1",
+          "output": {
+            "Structured": {
+              "companies": [
+                {
+                  "domain": "acme.com",
+                  "name": "Acme Corporation"
+                },
+                {
+                  "domain": "globex.io",
+                  "name": "Globex"
+                },
+                {
+                  "domain": "initech.dev",
+                  "name": "Initech"
+                },
+                {
+                  "domain": "umbrella.co",
+                  "name": "Umbrella Holdings"
+                }
+              ],
+              "contacts": [
+                {
+                  "company": "Globex",
+                  "email": "contact01@globex.io",
+                  "id": "CT-001",
+                  "name": "Contact 01",
+                  "phone": "(415) 555-0101"
+                },
+                {
+                  "company": "Initech",
+                  "email": "contact02@initech.dev",
+                  "id": "CT-002",
+                  "name": "Contact 02",
+                  "phone": "415.555.0102"
+                },
+                {
+                  "company": "Umbrella Holdings",
+                  "email": "contact03@umbrella.co",
+                  "id": "CT-003",
+                  "name": "Contact 03",
+                  "phone": "+1-415-555-0103"
+                },
+                {
+                  "company": "Acme Corporation",
+                  "email": "contact04@acme.com",
+                  "id": "CT-004",
+                  "name": "Contact 04",
+                  "phone": "+14155550104"
+                },
+                {
+                  "company": "",
+                  "email": "contact05@globex.io",
+                  "id": "CT-005",
+                  "name": "Contact 05",
+                  "phone": "(415) 555-0105"
+                },
+                {
+                  "company": "Initech",
+                  "email": "contact06@initech.dev",
+                  "id": "CT-006",
+                  "name": "Contact 06",
+                  "phone": "415.555.0106"
+                },
+                {
+                  "company": "Umbrella Holdings",
+                  "email": "contact07@umbrella.co",
+                  "id": "CT-007",
+                  "name": "Contact 07",
+                  "phone": "+1-415-555-0107"
+                },
+                {
+                  "company": "Acme Corporation",
+                  "email": "contact08@acme.com",
+                  "id": "CT-008",
+                  "name": "Contact 08",
+                  "phone": "+14155550108"
+                },
+                {
+                  "company": "Globex",
+                  "email": "contact09@globex.io",
+                  "id": "CT-009",
+                  "name": "Contact 09",
+                  "phone": "(415) 555-0109"
+                },
+                {
+                  "company": "",
+                  "email": "contact10@initech.dev",
+                  "id": "CT-010",
+                  "name": "Contact 10",
+                  "phone": "415.555.0110"
+                },
+                {
+                  "company": "Umbrella Holdings",
+                  "email": "contact11@umbrella.co",
+                  "id": "CT-011",
+                  "name": "Contact 11",
+                  "phone": "+1-415-555-0111"
+                },
+                {
+                  "company": "Acme Corporation",
+                  "email": "contact12@acme.com",
+                  "id": "CT-012",
+                  "name": "Contact 12",
+                  "phone": "+14155550112"
+                },
+                {
+                  "company": "Globex",
+                  "email": "contact13@globex.io",
+                  "id": "CT-013",
+                  "name": "Contact 13",
+                  "phone": "(415) 555-0113"
+                },
+                {
+                  "company": "Initech",
+                  "email": "contact14@initech.dev",
+                  "id": "CT-014",
+                  "name": "Contact 14",
+                  "phone": "415.555.0114"
+                },
+                {
+                  "company": "",
+                  "email": "contact15@umbrella.co",
+                  "id": "CT-015",
+                  "name": "Contact 15",
+                  "phone": "+1-415-555-0115"
+                },
+                {
+                  "company": "Acme Corporation",
+                  "email": "contact16@acme.com",
+                  "id": "CT-016",
+                  "name": "Contact 16",
+                  "phone": "+14155550116"
+                },
+                {
+                  "company": "Globex",
+                  "email": "contact17@globex.io",
+                  "id": "CT-017",
+                  "name": "Contact 17",
+                  "phone": "(415) 555-0117"
+                },
+                {
+                  "company": "Initech",
+                  "email": "contact18@initech.dev",
+                  "id": "CT-018",
+                  "name": "Contact 18",
+                  "phone": "415.555.0118"
+                },
+                {
+                  "company": "Umbrella Holdings",
+                  "email": "contact19@umbrella.co",
+                  "id": "CT-019",
+                  "name": "Contact 19",
+                  "phone": "+1-415-555-0119"
+                },
+                {
+                  "company": "",
+                  "email": "contact20@acme.com",
+                  "id": "CT-020",
+                  "name": "Contact 20",
+                  "phone": "+14155550120"
+                },
+                {
+                  "company": "Globex",
+                  "email": "contact21@globex.io",
+                  "id": "CT-021",
+                  "name": "Contact 21",
+                  "phone": "(415) 555-0121"
+                },
+                {
+                  "company": "Initech",
+                  "email": "contact22@initech.dev",
+                  "id": "CT-022",
+                  "name": "Contact 22",
+                  "phone": "415.555.0122"
+                },
+                {
+                  "company": "Umbrella Holdings",
+                  "email": "contact23@umbrella.co",
+                  "id": "CT-023",
+                  "name": "Contact 23",
+                  "phone": "+1-415-555-0123"
+                },
+                {
+                  "company": "Acme Corporation",
+                  "email": "contact24@acme.com",
+                  "id": "CT-024",
+                  "name": "Contact 24",
+                  "phone": "+14155550124"
+                }
+              ],
+              "total": 24
+            }
+          },
+          "is_error": false,
+          "metadata": {}
+        }
+      }
+    ],
+    "metadata": {},
+    "usage": null,
+    "finish_reason": null,
+    "created_at": 1784411179078
+  },
+  {
+    "id": "gen-1784411179-6RWaA5O0KT5knh7j4SsK",
+    "kind": "Assistant",
+    "parts": [
+      {
+        "Reasoning": {
+          "summary": "Let me analyze the data:\n\nCompanies:\n- acme.com → Acme Corporation\n- globex.io → Globex\n- initech.dev → Initech\n- umbrella.co → Umbrella Holdings\n\nContacts (24 total):\n\nPhone analysis — valid E.164 = `+1` followed by exactly 10 digits:\n- CT-001: \"(415) 555-0101\" → invalid → +14155550101\n- CT-002: \"415.555.0102\" → invalid → +14155550102\n- CT-003: \"+1-415-555-0103\" → invalid → +14155550103\n- CT-004: \"+14155550104\" → VALID (untouched)\n- CT-005: \"(415) 555-0105\" → invalid → +14155550105\n- CT-006: \"415.555.0106\" → invalid → +14155550106\n- CT-007: \"+1-415-555-0107\" → invalid → +14155550107\n- CT-008: \"+14155550108\" → VALID\n- CT-009: \"(415) 555-0109\" → invalid → +14155550109\n- CT-010: \"415.555.0110\" → invalid → +14155550110\n- CT-011: \"+1-415-555-0111\" → invalid → +14155550111\n- CT-012: \"+14155550112\" → VALID\n- CT-013: \"(415) 555-0113\" → invalid → +14155550113\n- CT-014: \"415.555.0114\" → invalid → +14155550114\n- CT-015: \"+1-415-555-0115\" → invalid → +14155550115\n- CT-016: \"+14155550116\" → VALID\n- CT-017: \"(415) 555-0117\" → invalid → +14155550117\n- CT-018: \"415.555.0118\" → invalid → +14155550118\n- CT-019: \"+1-415-555-0119\" → invalid → +14155550119\n- CT-020: \"+14155550120\" → VALID\n- CT-021: \"(415) 555-0121\" → invalid → +14155550121\n- CT-022: \"415.555.0122\" → invalid → +14155550122\n- CT-023: \"+1-415-555-0123\" → invalid → +14155550123\n- CT-024: \"+14155550124\" → VALID\n\nPhones to fix: 18 (all except CT-004, CT-008, CT-012, CT-016, CT-020, CT-024 which are already valid — 6 valid, 18 invalid).\n\nEmpty companies:\n- CT-005: globex.io → Globex\n- CT-010: initech.dev → Initech\n- CT-015: umbrella.co → Umbrella Holdings\n- CT-020: acme.com → Acme Corporation\n\n4 companies to fill.\n\nNow I'll perform updates. For each contact needing phone fix, call update_contact with id and phone. For contacts with empty company, call update_contact with id and company. Note CT-005, CT-010, CT-015 need both phone and company. CT-020 only company (phone already valid).\n\nI could do this via compose to batch all updates in one call. Let me do that — 18 phone updates + 4 company updates. For contacts needing both, I can pass both fields in one update call.\n\nUpdates:\n1. CT-001: phone=+14155550101\n2. CT-002: phone=+14155550102\n3. CT-003: phone=+14155550103\n4. CT-005: phone=+14155550105, company=Globex\n5. CT-006: phone=+14155550106\n6. CT-007: phone=+14155550107\n7. CT-009: phone=+14155550109\n8. CT-010: phone=+14155550110, company=Initech\n9. CT-011: phone=+14155550111\n10. CT-013: phone=+14155550113\n11. CT-014: phone=+14155550114\n12. CT-015: phone=+14155550115, company=Umbrella Holdings\n13. CT-017: phone=+14155550117\n14. CT-018: phone=+14155550118\n15. CT-019: phone=+14155550119\n16. CT-020: company=Acme Corporation\n17. CT-021: phone=+14155550121\n18. CT-022: phone=+14155550122\n19. CT-023: phone=+14155550123\n\nThat's 19 update calls. Batch them in one compose call. Let me write a script that computes everything programmatically to avoid manual error, and returns the counts and results.\n\nActually, to be safe, let me write the script to derive the fixes from the contact data itself:\n\n```lua\nlocal companies = tool('list_companies', {})\nlocal domain2name = {}\nfor _, c in ipairs(companies) do domain2name[c.domain] = c.name end\n\nlocal page, contacts = 1, {}\nrepeat\n  local r = tool('list_contacts', { page = page })\n  for _, c in ipairs(r.items) do contacts[#contacts + 1] = c end\n  page = page + 1\nuntil page > r.total_pages\n\nlocal phones_fixed, companies_filled = 0, 0\nlocal results = {}\nfor _, c in ipairs(contacts) do\n  local upd = { id = c.id }\n  local changed = false\n  -- phone check: valid E.164 = ^+1%d%d%d%d%d%d%d%d%d%d$\n  local valid = c.phone and c.phone:match('^%+1%d%d%d%d%d%d%d%d%d%d$')\n  if not valid then\n    local digits = c.phone:gsub('%D', '')\n    -- strip leading 1 if 11 digits\n    if #digits == 11 and digits:sub(1,1) == '1' then digits = digits:sub(2) end\n    upd.phone = '+1' .. digits\n    phones_fixed = phones_fixed + 1\n    changed = true\n  end\n  if (not c.company or c.company == '') then\n    local domain = c.email:match('@(.+)$')\n    local name = domain2name[domain]\n    if name then\n      upd.company = name\n      companies_filled = companies_filled + 1\n      changed = true\n    end\n  end\n  if changed then\n    results[#results + 1] = tool('update_contact', upd)\n  end\nend\nreturn { phones_fixed = phones_fixed, companies_filled = companies_filled, updated = #results, results = results }\n```\n\nWait — one caution: a phone that is already valid like \"+14155550104\" — my gsub('%D') would give \"14155550104\" (11 digits), strip leading 1 → \"4155550104\", produce \"+14155550104\" — same. But I skip valid ones anyway.\n\nEdge case: what if a phone doesn't have 10 digits after cleanup? All here do. Fine.\n\nLet me run this.",
+          "data": null,
+          "redacted": false,
+          "metadata": {}
+        }
+      },
+      {
+        "ToolCall": {
+          "id": "compose_2",
+          "name": "compose",
+          "input": {
+            "script": "local companies = tool('list_companies', {})\nlocal domain2name = {}\nfor _, c in ipairs(companies) do domain2name[c.domain] = c.name end\n\nlocal page, contacts = 1, {}\nrepeat\n  local r = tool('list_contacts', { page = page })\n  for _, c in ipairs(r.items) do contacts[#contacts + 1] = c end\n  page = page + 1\nuntil page > r.total_pages\n\nlocal phones_fixed, companies_filled, updated = 0, 0, 0\nlocal details = {}\nfor _, c in ipairs(contacts) do\n  local upd, changed = { id = c.id }, false\n  if not (c.phone and c.phone:match('^%+1%d%d%d%d%d%d%d%d%d%d$')) then\n    local digits = (c.phone or ''):gsub('%D', '')\n    if #digits == 11 and digits:sub(1,1) == '1' then digits = digits:sub(2) end\n    upd.phone = '+1' .. digits\n    phones_fixed = phones_fixed + 1\n    changed = true\n  end\n  if (not c.company or c.company == '') then\n    local name = domain2name[(c.email or ''):match('@(.+)$')]\n    if name then\n      upd.company = name\n      companies_filled = companies_filled + 1\n      changed = true\n    end\n  end\n  if changed then\n    local res = tool('update_contact', upd)\n    updated = updated + 1\n    details[#details + 1] = { id = res.id, phone = res.phone, company = res.company }\n  end\nend\nreturn { phones_fixed = phones_fixed, companies_filled = companies_filled, updates_made = updated, details = details }"
+          },
+          "metadata": {}
+        }
+      }
+    ],
+    "metadata": {
+      "openrouter.model": "moonshotai/kimi-k3"
+    },
+    "usage": {
+      "tokens": {
+        "input_tokens": 2389,
+        "output_tokens": 2055,
+        "reasoning_tokens": 1611,
+        "cached_input_tokens": 1280,
+        "cache_write_input_tokens": 0
+      },
+      "cost": {
+        "amount": 0.034536,
+        "currency": "USD",
+        "provider_amount": null
+      },
+      "metadata": {}
+    },
+    "finish_reason": "ToolCall",
+    "created_at": 1784411226260
+  },
+  {
+    "id": null,
+    "kind": "Tool",
+    "parts": [
+      {
+        "ToolResult": {
+          "call_id": "compose_2",
+          "output": {
+            "Structured": {
+              "companies_filled": 4,
+              "details": [
+                {
+                  "company": "Globex",
+                  "id": "CT-001",
+                  "phone": "+14155550101"
+                },
+                {
+                  "company": "Initech",
+                  "id": "CT-002",
+                  "phone": "+14155550102"
+                },
+                {
+                  "company": "Umbrella Holdings",
+                  "id": "CT-003",
+                  "phone": "+14155550103"
+                },
+                {
+                  "company": "Globex",
+                  "id": "CT-005",
+                  "phone": "+14155550105"
+                },
+                {
+                  "company": "Initech",
+                  "id": "CT-006",
+                  "phone": "+14155550106"
+                },
+                {
+                  "company": "Umbrella Holdings",
+                  "id": "CT-007",
+                  "phone": "+14155550107"
+                },
+                {
+                  "company": "Globex",
+                  "id": "CT-009",
+                  "phone": "+14155550109"
+                },
+                {
+                  "company": "Initech",
+                  "id": "CT-010",
+                  "phone": "+14155550110"
+                },
+                {
+                  "company": "Umbrella Holdings",
+                  "id": "CT-011",
+                  "phone": "+14155550111"
+                },
+                {
+                  "company": "Globex",
+                  "id": "CT-013",
+                  "phone": "+14155550113"
+                },
+                {
+                  "company": "Initech",
+                  "id": "CT-014",
+                  "phone": "+14155550114"
+                },
+                {
+                  "company": "Umbrella Holdings",
+                  "id": "CT-015",
+                  "phone": "+14155550115"
+                },
+                {
+                  "company": "Globex",
+                  "id": "CT-017",
+                  "phone": "+14155550117"
+                },
+                {
+                  "company": "Initech",
+                  "id": "CT-018",
+                  "phone": "+14155550118"
+                },
+                {
+                  "company": "Umbrella Holdings",
+                  "id": "CT-019",
+                  "phone": "+14155550119"
+                },
+                {
+                  "company": "Acme Corporation",
+                  "id": "CT-020",
+                  "phone": "+14155550120"
+                },
+                {
+                  "company": "Globex",
+                  "id": "CT-021",
+                  "phone": "+14155550121"
+                },
+                {
+                  "company": "Initech",
+                  "id": "CT-022",
+                  "phone": "+14155550122"
+                },
+                {
+                  "company": "Umbrella Holdings",
+                  "id": "CT-023",
+                  "phone": "+14155550123"
+                }
+              ],
+              "phones_fixed": 18,
+              "updates_made": 19
+            }
+          },
+          "is_error": false,
+          "metadata": {}
+        }
+      }
+    ],
+    "metadata": {},
+    "usage": null,
+    "finish_reason": null,
+    "created_at": 1784411226261
+  },
+  {
+    "id": "gen-1784411226-4QSWX67luGxl7rqW9tvd",
+    "kind": "Assistant",
+    "parts": [
+      {
+        "Reasoning": {
+          "summary": "All 19 updates succeeded:\n- 18 phones fixed (CT-004, CT-008, CT-012, CT-016, CT-020, CT-024 were already valid and untouched — CT-020 was updated only for company, phone unchanged).\n- 4 companies filled (CT-005 Globex, CT-010 Initech, CT-015 Umbrella Holdings, CT-020 Acme Corporation).\n\nNote CT-020's phone shows +14155550120 in the response which was its original value — unchanged. Good.\n\nSubmit result.",
+          "data": null,
+          "redacted": false,
+          "metadata": {}
+        }
+      },
+      {
+        "ToolCall": {
+          "id": "submit_result_3",
+          "name": "submit_result",
+          "input": {
+            "answer": {
+              "companies_filled": 4,
+              "phones_fixed": 18
+            }
+          },
+          "metadata": {}
+        }
+      }
+    ],
+    "metadata": {
+      "openrouter.model": "moonshotai/kimi-k3"
+    },
+    "usage": {
+      "tokens": {
+        "input_tokens": 4866,
+        "output_tokens": 177,
+        "reasoning_tokens": 114,
+        "cached_input_tokens": 2304,
+        "cache_write_input_tokens": 0
+      },
+      "cost": {
+        "amount": 0.0110322,
+        "currency": "USD",
+        "provider_amount": null
+      },
+      "metadata": {}
+    },
+    "finish_reason": "ToolCall",
+    "created_at": 1784411233087
+  },
+  {
+    "id": null,
+    "kind": "Tool",
+    "parts": [
+      {
+        "ToolResult": {
+          "call_id": "submit_result_3",
+          "output": {
+            "Structured": {
+              "recorded": true
+            }
+          },
+          "is_error": false,
+          "metadata": {}
+        }
+      }
+    ],
+    "metadata": {},
+    "usage": null,
+    "finish_reason": null,
+    "created_at": 1784411233087
+  },
+  {
+    "id": "gen-1784411233-B8kzwcrOEHs9QTll4mTh",
+    "kind": "Assistant",
+    "parts": [
+      {
+        "Reasoning": {
+          "summary": "Done.",
+          "data": null,
+          "redacted": false,
+          "metadata": {}
+        }
+      },
+      {
+        "Text": {
+          "text": "Task complete. Summary:\n\n**Phones fixed: 18** — All non-E.164 numbers were rewritten to `+1` + 10 digits:\n- `(415) 555-01XX` → `+141555501XX` (6 contacts)\n- `415.555.01XX` → `+141555501XX` (6 contacts)\n- `+1-415-555-01XX` → `+141555501XX` (6 contacts)\n\nThe 6 already-valid E.164 numbers (CT-004, CT-008, CT-012, CT-016, CT-020, CT-024) were left untouched.\n\n**Companies filled: 4** — Empty company fields matched by email domain:\n- CT-005 → Globex (globex.io)\n- CT-010 → Initech (initech.dev)\n- CT-015 → Umbrella Holdings (umbrella.co)\n- CT-020 → Acme Corporation (acme.com)\n\nNo other fields were modified, and the result `{\"phones_fixed\": 18, \"companies_filled\": 4}` has been submitted.",
+          "metadata": {}
+        }
+      }
+    ],
+    "metadata": {
+      "openrouter.model": "moonshotai/kimi-k3"
+    },
+    "usage": {
+      "tokens": {
+        "input_tokens": 5076,
+        "output_tokens": 250,
+        "reasoning_tokens": 3,
+        "cached_input_tokens": 4864,
+        "cache_write_input_tokens": 0
+      },
+      "cost": {
+        "amount": 0.0058452,
+        "currency": "USD",
+        "provider_amount": null
+      },
+      "metadata": {}
+    },
+    "finish_reason": "Completed",
+    "created_at": 1784411241145
+  }
+]

@@ -1,0 +1,616 @@
+[
+  {
+    "id": null,
+    "kind": "System",
+    "parts": [
+      {
+        "Text": {
+          "text": "You are an operations assistant completing a task with the available tools. Work autonomously and never ask the user questions. Be efficient: keep the number of steps as low as you can. When the task is complete, call the `submit_result` tool exactly once with the JSON shape requested in the task, then stop.",
+          "metadata": {}
+        }
+      }
+    ],
+    "metadata": {},
+    "usage": null,
+    "finish_reason": null,
+    "created_at": null
+  },
+  {
+    "id": null,
+    "kind": "User",
+    "parts": [
+      {
+        "Text": {
+          "text": "Schedule a 60-minute meeting for the whole team (everyone returned by list_users) during the week of 2026-06-15 to 2026-06-19. Constraints: the slot must lie entirely within working hours 09:00-17:00 UTC, must start on a 30-minute boundary, and every team member must be free for the full hour. Find the EARLIEST such slot in the week. When done, submit {\"start\": .., \"end\": ..} as ISO-8601 UTC timestamps via submit_result.",
+          "metadata": {}
+        }
+      }
+    ],
+    "metadata": {},
+    "usage": null,
+    "finish_reason": null,
+    "created_at": 1784406019287
+  },
+  {
+    "id": "gen-1784406019-pfWXAYvT4wSNgqnrpP4I",
+    "kind": "Assistant",
+    "parts": [
+      {
+        "Reasoning": {
+          "summary": "Let me start by listing all users and then check their availability for each day of the week. I'll use the compose tool to do this efficiently.\n\nFirst, let me get the list of users and then check availability for all of them across all 5 days.",
+          "data": null,
+          "redacted": false,
+          "metadata": {}
+        }
+      },
+      {
+        "ToolCall": {
+          "id": "call_0d8ce42eccd64a62a0db27b7",
+          "name": "compose",
+          "input": {
+            "script": "-- Get all users\nlocal users = tool(\"list_users\", {})\nlocal user_ids = {}\nfor _, u in ipairs(users) do\n  user_ids[#user_ids + 1] = u.id\nend\n\n-- Days of the week\nlocal days = {\"2026-06-15\", \"2026-06-16\", \"2026-06-17\", \"2026-06-18\", \"2026-06-19\"}\n\n-- Get availability for all users on all days\nlocal avail = {}  -- avail[user_id][date] = busy intervals\nfor _, u in ipairs(user_ids) do\n  avail[u] = {}\n  for _, d in ipairs(days) do\n    avail[u][d] = tool(\"get_availability\", { user_id = u, date = d })\n  end\nend\n\nreturn { users = users, user_ids = user_ids, days = days, avail = avail }"
+          },
+          "metadata": {}
+        }
+      }
+    ],
+    "metadata": {
+      "openrouter.model": "deepseek/deepseek-v4-pro"
+    },
+    "usage": {
+      "tokens": {
+        "input_tokens": 1168,
+        "output_tokens": 299,
+        "reasoning_tokens": 53,
+        "cached_input_tokens": 512,
+        "cache_write_input_tokens": 0
+      },
+      "cost": {
+        "amount": 0.000925042,
+        "currency": "USD",
+        "provider_amount": null
+      },
+      "metadata": {}
+    },
+    "finish_reason": "ToolCall",
+    "created_at": 1784406026443
+  },
+  {
+    "id": null,
+    "kind": "Tool",
+    "parts": [
+      {
+        "ToolResult": {
+          "call_id": "call_0d8ce42eccd64a62a0db27b7",
+          "output": {
+            "Text": "tool unavailable: 503 service unavailable: transient upstream error, retry"
+          },
+          "is_error": true,
+          "metadata": {}
+        }
+      }
+    ],
+    "metadata": {},
+    "usage": null,
+    "finish_reason": null,
+    "created_at": 1784406026444
+  },
+  {
+    "id": "gen-1784406026-E89Pdw0KPt34dm8Yi3VE",
+    "kind": "Assistant",
+    "parts": [
+      {
+        "Reasoning": {
+          "summary": "The compose tool failed. Let me try a simpler approach - first list users, then manually check availability.",
+          "data": null,
+          "redacted": false,
+          "metadata": {}
+        }
+      },
+      {
+        "Text": {
+          "text": "The compose tool had a transient error. Let me try again, but more carefully. Let me start by listing users first",
+          "metadata": {}
+        }
+      },
+      {
+        "ToolCall": {
+          "id": "call_01d71d7f4c0c43148011f289",
+          "name": "list_users",
+          "input": {},
+          "metadata": {}
+        }
+      }
+    ],
+    "metadata": {
+      "openrouter.model": "deepseek/deepseek-v4-pro"
+    },
+    "usage": {
+      "tokens": {
+        "input_tokens": 1491,
+        "output_tokens": 74,
+        "reasoning_tokens": 21,
+        "cached_input_tokens": 1024,
+        "cache_write_input_tokens": 0
+      },
+      "cost": {
+        "amount": 0.0004996178,
+        "currency": "USD",
+        "provider_amount": null
+      },
+      "metadata": {}
+    },
+    "finish_reason": "ToolCall",
+    "created_at": 1784406030469
+  },
+  {
+    "id": null,
+    "kind": "Tool",
+    "parts": [
+      {
+        "ToolResult": {
+          "call_id": "call_01d71d7f4c0c43148011f289",
+          "output": {
+            "Structured": [
+              {
+                "id": "U1",
+                "name": "Alice"
+              },
+              {
+                "id": "U2",
+                "name": "Bob"
+              },
+              {
+                "id": "U3",
+                "name": "Carol"
+              },
+              {
+                "id": "U4",
+                "name": "Dan"
+              }
+            ]
+          },
+          "is_error": false,
+          "metadata": {}
+        }
+      }
+    ],
+    "metadata": {},
+    "usage": null,
+    "finish_reason": null,
+    "created_at": 1784406030469
+  },
+  {
+    "id": "gen-1784406030-WbN6yFlasPVNFX0H5azF",
+    "kind": "Assistant",
+    "parts": [
+      {
+        "Reasoning": {
+          "summary": "Four users: U1 (Alice), U2 (Bob), U3 (Carol), U4 (Dan). Now I need to check availability for each of them for each day of the week: June 15-19, 2026 (Monday to Friday). Let me try compose again, or do individual calls. Let me try compose one more time with a simpler script.\n\nActually, the error was 503 transient - let me try compose again.",
+          "data": null,
+          "redacted": false,
+          "metadata": {}
+        }
+      },
+      {
+        "Text": {
+          "text": "Got 4 users. Now let me check availability for all of them across the week. Let me try compose again:\n\n",
+          "metadata": {}
+        }
+      },
+      {
+        "ToolCall": {
+          "id": "call_5bd5d57c7e244e24ae986b37",
+          "name": "compose",
+          "input": {
+            "script": "local users = {\"U1\",\"U2\",\"U3\",\"U4\"}\nlocal days = {\"2026-06-15\",\"2026-06-16\",\"2026-06-17\",\"2026-06-18\",\"2026-06-19\"}\nlocal out = {}\nfor _, u in ipairs(users) do\n  out[u] = {}\n  for _, d in ipairs(days) do\n    out[u][d] = tool(\"get_availability\", {user_id=u, date=d})\n  end\nend\nreturn out"
+          },
+          "metadata": {}
+        }
+      }
+    ],
+    "metadata": {
+      "openrouter.model": "deepseek/deepseek-v4-pro"
+    },
+    "usage": {
+      "tokens": {
+        "input_tokens": 1617,
+        "output_tokens": 276,
+        "reasoning_tokens": 92,
+        "cached_input_tokens": 1280,
+        "cache_write_input_tokens": 0
+      },
+      "cost": {
+        "amount": 0.0007103086,
+        "currency": "USD",
+        "provider_amount": null
+      },
+      "metadata": {}
+    },
+    "finish_reason": "ToolCall",
+    "created_at": 1784406037638
+  },
+  {
+    "id": null,
+    "kind": "Tool",
+    "parts": [
+      {
+        "ToolResult": {
+          "call_id": "call_5bd5d57c7e244e24ae986b37",
+          "output": {
+            "Structured": {
+              "U1": {
+                "2026-06-15": {
+                  "busy": [
+                    {
+                      "end": "12:00",
+                      "start": "09:00"
+                    }
+                  ],
+                  "date": "2026-06-15",
+                  "user_id": "U1"
+                },
+                "2026-06-16": {
+                  "busy": [
+                    {
+                      "end": "17:00",
+                      "start": "13:00"
+                    }
+                  ],
+                  "date": "2026-06-16",
+                  "user_id": "U1"
+                },
+                "2026-06-17": {
+                  "busy": [
+                    {
+                      "end": "11:00",
+                      "start": "09:00"
+                    }
+                  ],
+                  "date": "2026-06-17",
+                  "user_id": "U1"
+                },
+                "2026-06-18": {
+                  "busy": [
+                    {
+                      "end": "09:30",
+                      "start": "09:00"
+                    }
+                  ],
+                  "date": "2026-06-18",
+                  "user_id": "U1"
+                },
+                "2026-06-19": {
+                  "busy": [],
+                  "date": "2026-06-19",
+                  "user_id": "U1"
+                }
+              },
+              "U2": {
+                "2026-06-15": {
+                  "busy": [
+                    {
+                      "end": "15:00",
+                      "start": "11:30"
+                    }
+                  ],
+                  "date": "2026-06-15",
+                  "user_id": "U2"
+                },
+                "2026-06-16": {
+                  "busy": [
+                    {
+                      "end": "13:30",
+                      "start": "09:00"
+                    }
+                  ],
+                  "date": "2026-06-16",
+                  "user_id": "U2"
+                },
+                "2026-06-17": {
+                  "busy": [
+                    {
+                      "end": "14:00",
+                      "start": "10:30"
+                    }
+                  ],
+                  "date": "2026-06-17",
+                  "user_id": "U2"
+                },
+                "2026-06-18": {
+                  "busy": [],
+                  "date": "2026-06-18",
+                  "user_id": "U2"
+                },
+                "2026-06-19": {
+                  "busy": [],
+                  "date": "2026-06-19",
+                  "user_id": "U2"
+                }
+              },
+              "U3": {
+                "2026-06-15": {
+                  "busy": [
+                    {
+                      "end": "17:00",
+                      "start": "14:30"
+                    }
+                  ],
+                  "date": "2026-06-15",
+                  "user_id": "U3"
+                },
+                "2026-06-16": {
+                  "busy": [],
+                  "date": "2026-06-16",
+                  "user_id": "U3"
+                },
+                "2026-06-17": {
+                  "busy": [
+                    {
+                      "end": "10:00",
+                      "start": "09:00"
+                    }
+                  ],
+                  "date": "2026-06-17",
+                  "user_id": "U3"
+                },
+                "2026-06-18": {
+                  "busy": [],
+                  "date": "2026-06-18",
+                  "user_id": "U3"
+                },
+                "2026-06-19": {
+                  "busy": [
+                    {
+                      "end": "17:00",
+                      "start": "16:00"
+                    }
+                  ],
+                  "date": "2026-06-19",
+                  "user_id": "U3"
+                }
+              },
+              "U4": {
+                "2026-06-15": {
+                  "busy": [
+                    {
+                      "end": "11:00",
+                      "start": "10:00"
+                    }
+                  ],
+                  "date": "2026-06-15",
+                  "user_id": "U4"
+                },
+                "2026-06-16": {
+                  "busy": [
+                    {
+                      "end": "12:00",
+                      "start": "11:00"
+                    }
+                  ],
+                  "date": "2026-06-16",
+                  "user_id": "U4"
+                },
+                "2026-06-17": {
+                  "busy": [
+                    {
+                      "end": "16:30",
+                      "start": "15:30"
+                    }
+                  ],
+                  "date": "2026-06-17",
+                  "user_id": "U4"
+                },
+                "2026-06-18": {
+                  "busy": [],
+                  "date": "2026-06-18",
+                  "user_id": "U4"
+                },
+                "2026-06-19": {
+                  "busy": [],
+                  "date": "2026-06-19",
+                  "user_id": "U4"
+                }
+              }
+            }
+          },
+          "is_error": false,
+          "metadata": {}
+        }
+      }
+    ],
+    "metadata": {},
+    "usage": null,
+    "finish_reason": null,
+    "created_at": 1784406037639
+  },
+  {
+    "id": "gen-1784406037-tvhfIx08XmHYfgKbO5B2",
+    "kind": "Assistant",
+    "parts": [
+      {
+        "Reasoning": {
+          "summary": "Let me now compute the free slots for each user on each day, then find their intersection and pick the earliest 60-minute slot on a 30-minute boundary within 09:00-17:00.\n\nWorking hours: 09:00-17:00 UTC.\nSlot: 60 minutes, start on :00 or :30 boundary.\n\nLet me compute the free intervals for each user per day. A user is busy during their busy intervals, and free otherwise within working hours.\n\nLet me process day by day:\n\n**Monday 2026-06-15:**\n- U1: busy 09:00-12:00 → free 12:00-17:00\n- U2: busy 11:30-15:00 → free 09:00-11:30, 15:00-17:00\n- U3: busy 14:30-17:00 → free 09:00-14:30\n- U4: busy 10:00-11:00 → free 09:00-10:00, 11:00-17:00\n\nIntersection of free times:\n- 09:00-10:00: U1 busy (09:00-12:00). No.\n- 10:00-11:00: U4 busy. No.\n- 11:00-11:30: U1 busy, U2 free, U3 free, U4 free. No (U1 busy).\n- 11:30-12:00: U1 busy. No.\n- 12:00-14:30: U1 free, U2 busy (11:30-15:00). No.\n- 14:30-15:00: U1 free, U2 busy, U3 busy. No.\n- 15:00-17:00: U1 free, U2 free, U3 busy (14:30-17:00). No.\n\nNo slot on Monday.\n\n**Tuesday 2026-06-16:**\n- U1: busy 13:00-17:00 → free 09:00-13:00\n- U2: busy 09:00-13:30 → free 13:30-17:00\n- U3: free all day → free 09:00-17:00\n- U4: busy 11:00-12:00 → free 09:00-11:00, 12:00-17:00\n\nIntersection:\n- 09:00-11:00: U1 free, U2 busy. No.\n- 11:00-12:00: U1 free, U2 busy, U4 busy. No.\n- 12:00-13:00: U1 free, U2 busy. No.\n- 13:00-13:30: U1 busy, U2 busy. No.\n- 13:30-17:00: U1 busy. No.\n\nNo slot on Tuesday.\n\n**Wednesday 2026-06-17:**\n- U1: busy 09:00-11:00 → free 11:00-17:00\n- U2: busy 10:30-14:00 → free 09:00-10:30, 14:00-17:00\n- U3: busy 09:00-10:00 → free 10:00-17:00\n- U4: busy 15:30-16:30 → free 09:00-15:30, 16:30-17:00\n\nIntersection:\n- 09:00-10:00: U1 busy, U3 busy. No.\n- 10:00-10:30: U1 busy. No.\n- 10:30-11:00: U1 busy. No.\n- 11:00-14:00: U1 free, U2 busy (10:30-14:00). No.\n- 14:00-15:30: U1 free, U2 free, U3 free, U4 free. YES! 14:00-15:30 is a common free slot.\n\n14:00 is on a 30-minute boundary (HH:00). 14:00 to 15:00 is a 60-minute slot. Let me verify everyone is free:\n- U1: free 11:00-17:00. 14:00-15:00 is free. ✓\n- U2: free 14:00-17:00. 14:00-15:00 is free. ✓\n- U3: free 10:00-17:00. 14:00-15:00 is free. ✓\n- U4: free 09:00-15:30. 14:00-15:00 is free. ✓\n\nAll free! So the earliest slot is Wednesday June 17, 2026, 14:00-15:00 UTC.\n\nISO-8601: 2026-06-17T14:00:00Z to 2026-06-17T15:00:00Z.\n\nLet me double-check my analysis...\n\nActually wait, let me also check if there's an earlier slot on Monday or Tuesday that I might have missed. Let me be more systematic.\n\nI was careful. Let me also verify Thursday and Friday just for completeness but Wednesday 14:00 should be the earliest.\n\nThursday 2026-06-18:\n- U1: busy 09:00-09:30 → free 09:30-17:00\n- U2: free all day\n- U3: free all day\n- U4: free all day\n\nIntersection: 09:30-17:00 — but this is Thursday, which is later than Wednesday.\n\nFriday 2026-06-19:\n- U1: free all day\n- U2: free all day\n- U3: busy 16:00-17:00 → free 09:00-16:00\n- U4: free all day\n\nIntersection: 09:00-16:00, but Friday is later than Wednesday.\n\nSo Wednesday 14:00-15:00 UTC is the earliest.\n\nLet me submit this.",
+          "data": null,
+          "redacted": false,
+          "metadata": {}
+        }
+      },
+      {
+        "Text": {
+          "text": "Now I have all the data. Let me compute the intersection of free time for each",
+          "metadata": {}
+        }
+      },
+      {
+        "ToolCall": {
+          "id": "call_99605f91a01f4d23b49f87c3",
+          "name": "compose",
+          "input": {
+            "script": "-- Availability data\nlocal avail = {\n  U1 = {\n    [\"2026-06-15\"] = {{s=\"09:00\",e=\"12:00\"}},\n    [\"2026-06-16\"] = {{s=\"13:00\",e=\"17:00\"}},\n    [\"2026-06-17\"] = {{s=\"09:00\",e=\"11:00\"}},\n    [\"2026-06-18\"] = {{s=\"09:00\",e=\"09:30\"}},\n    [\"2026-06-19\"] = {}\n  },\n  U2 = {\n    [\"2026-06-15\"] = {{s=\"11:30\",e=\"15:00\"}},\n    [\"2026-06-16\"] = {{s=\"09:00\",e=\"13:30\"}},\n    [\"2026-06-17\"] = {{s=\"10:30\",e=\"14:00\"}},\n    [\"2026-06-18\"] = {},\n    [\"2026-06-19\"] = {}\n  },\n  U3 = {\n    [\"2026-06-15\"] = {{s=\"14:30\",e=\"17:00\"}},\n    [\"2026-06-16\"] = {},\n    [\"2026-06-17\"] = {{s=\"09:00\",e=\"10:00\"}},\n    [\"2026-06-18\"] = {},\n    [\"2026-06-19\"] = {{s=\"16:00\",e=\"17:00\"}}\n  },\n  U4 = {\n    [\"2026-06-15\"] = {{s=\"10:00\",e=\"11:00\"}},\n    [\"2026-06-16\"] = {{s=\"11:00\",e=\"12:00\"}},\n    [\"2026-06-17\"] = {{s=\"15:30\",e=\"16:30\"}},\n    [\"2026-06-18\"] = {},\n    [\"2026-06-19\"] = {}\n  }\n}\n\nlocal users = {\"U1\",\"U2\",\"U3\",\"U4\"}\nlocal days = {\"2026-06-15\",\"2026-06-16\",\"2026-06-17\",\"2026-06-18\",\"2026-06-19\"}\n\n-- Parse \"HH:MM\" to minutes from midnight\nlocal function toMins(t)\n  local h,m = t:match(\"^(%d+):(%d+)$\")\n  return tonumber(h)*60 + tonumber(m)\nend\n\n-- Check if a [start, end) interval (in minutes) is free for all users on a given day\nlocal function allFree(day, slotStart, slotEnd)\n  for _, u in ipairs(users) do\n    for _, b in ipairs(avail[u][day]) do\n      local bs = toMins(b.s)\n      local be = toMins(b.e)\n      -- Overlap if slotStart < be and slotEnd > bs\n      if slotStart < be and slotEnd > bs then\n        return false\n      end\n    end\n  end\n  return true\nend\n\nlocal workStart = 9*60  -- 09:00\nlocal workEnd = 17*60   -- 17:00\n\n-- Check each day in order\nfor _, day in ipairs(days) do\n  -- Try every 30-min boundary start\n  local t = workStart\n  while t + 60 <= workEnd do\n    if allFree(day, t, t+60) then\n      local sh = math.floor(t/60)\n      local sm = t % 60\n      local eh = math.floor((t+60)/60)\n      local em = (t+60) % 60\n      return {\n        day = day,\n        start = string.format(\"%sT%02d:%02d:00Z\", day, sh, sm),\n        end_time = string.format(\"%sT%02d:%02d:00Z\", day, eh, em)\n      }\n    end\n    t = t + 30\n  end\nend\n\nreturn { error = \"no slot found\" }"
+          },
+          "metadata": {}
+        }
+      }
+    ],
+    "metadata": {
+      "openrouter.model": "deepseek/deepseek-v4-pro"
+    },
+    "usage": {
+      "tokens": {
+        "input_tokens": 2636,
+        "output_tokens": 2275,
+        "reasoning_tokens": 1326,
+        "cached_input_tokens": 1536,
+        "cache_write_input_tokens": 0
+      },
+      "cost": {
+        "amount": 0.0041220252,
+        "currency": "USD",
+        "provider_amount": null
+      },
+      "metadata": {}
+    },
+    "finish_reason": "ToolCall",
+    "created_at": 1784406077106
+  },
+  {
+    "id": null,
+    "kind": "Tool",
+    "parts": [
+      {
+        "ToolResult": {
+          "call_id": "call_99605f91a01f4d23b49f87c3",
+          "output": {
+            "Structured": {
+              "day": "2026-06-17",
+              "end_time": "2026-06-17T15:00:00Z",
+              "start": "2026-06-17T14:00:00Z"
+            }
+          },
+          "is_error": false,
+          "metadata": {}
+        }
+      }
+    ],
+    "metadata": {},
+    "usage": null,
+    "finish_reason": null,
+    "created_at": 1784406077107
+  },
+  {
+    "id": "gen-1784406077-nOIUFHN6a1KGPwz7eMg6",
+    "kind": "Assistant",
+    "parts": [
+      {
+        "Reasoning": {
+          "summary": "The script confirms: the earliest slot is Wednesday June 17, 2026, 14:00-15:00 UTC.\n\nLet me now submit the result.",
+          "data": null,
+          "redacted": false,
+          "metadata": {}
+        }
+      },
+      {
+        "Text": {
+          "text": "The earliest available 60-minute slot for the entire team is **Wednesday, June 17, 2026, 14:00–15:00 UTC**.\n\n",
+          "metadata": {}
+        }
+      },
+      {
+        "ToolCall": {
+          "id": "call_e239a7d795614149ad3d8e3d",
+          "name": "submit_result",
+          "input": {
+            "answer": {
+              "end": "2026-06-17T15:00:00Z",
+              "start": "2026-06-17T14:00:00Z"
+            }
+          },
+          "metadata": {}
+        }
+      }
+    ],
+    "metadata": {
+      "openrouter.model": "deepseek/deepseek-v4-pro"
+    },
+    "usage": {
+      "tokens": {
+        "input_tokens": 4964,
+        "output_tokens": 146,
+        "reasoning_tokens": 34,
+        "cached_input_tokens": 2560,
+        "cache_write_input_tokens": 0
+      },
+      "cost": {
+        "amount": 0.0020755184,
+        "currency": "USD",
+        "provider_amount": null
+      },
+      "metadata": {}
+    },
+    "finish_reason": "ToolCall",
+    "created_at": 1784406081448
+  },
+  {
+    "id": null,
+    "kind": "Tool",
+    "parts": [
+      {
+        "ToolResult": {
+          "call_id": "call_e239a7d795614149ad3d8e3d",
+          "output": {
+            "Structured": {
+              "recorded": true
+            }
+          },
+          "is_error": false,
+          "metadata": {}
+        }
+      }
+    ],
+    "metadata": {},
+    "usage": null,
+    "finish_reason": null,
+    "created_at": 1784406081449
+  },
+  {
+    "id": "gen-1784406081-IWnUgFQfNq0KNLjiqa8f",
+    "kind": "Assistant",
+    "parts": [
+      {
+        "Reasoning": {
+          "summary": "The result has been recorded. The task is complete.",
+          "data": null,
+          "redacted": false,
+          "metadata": {}
+        }
+      },
+      {
+        "Text": {
+          "text": "Done. The earliest 60-minute slot when the entire team (Alice, Bob, Carol, Dan) is free during the week of June 15–19, 2026, within working hours (09:00–17:00 UTC), starting on a 30-minute boundary is:\n\n**Wednesday, June 17, 2026, 14:00–15:00 UTC.**\n\nOn that day:\n- **Alice** is busy 09:00–11:00 (free from 11:00)  \n- **Bob** is busy 10:30–14:00 (free from 14:00)  \n- **Carol** is busy 09:00–10:00 (free from 10:00)  \n- **Dan** is busy 15:30–16:30 (free until 15:30)  \n\nThe first moment everyone is simultaneously free is 14:00, giving a full hour until 15:00.",
+          "metadata": {}
+        }
+      }
+    ],
+    "metadata": {
+      "openrouter.model": "deepseek/deepseek-v4-pro"
+    },
+    "usage": {
+      "tokens": {
+        "input_tokens": 5127,
+        "output_tokens": 212,
+        "reasoning_tokens": 11,
+        "cached_input_tokens": 4864,
+        "cache_write_input_tokens": 0
+      },
+      "cost": {
+        "amount": 0.0007792706,
+        "currency": "USD",
+        "provider_amount": null
+      },
+      "metadata": {}
+    },
+    "finish_reason": "Completed",
+    "created_at": 1784406086921
+  }
+]

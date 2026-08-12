@@ -82,6 +82,12 @@ pub struct OpenRouterConfig {
     /// single turn. Omitted from the request when `None` so the
     /// upstream's per-model default applies.
     pub parallel_tool_calls: Option<bool>,
+    /// Reasoning effort requested from reasoning-capable models
+    /// (`"low"`/`"medium"`/`"high"`). Sent as `reasoning: { effort }`;
+    /// OpenRouter normalizes it per provider and ignores it for models
+    /// without the knob. Omitted when `None` so the per-model default
+    /// applies.
+    pub reasoning_effort: Option<ReasoningEffort>,
     /// Request SSE streaming responses. Defaults to `true`.
     pub streaming: bool,
     /// Arbitrary extra fields merged into the request body.
@@ -100,9 +106,16 @@ impl OpenRouterConfig {
             max_completion_tokens: None,
             temperature: None,
             parallel_tool_calls: None,
+            reasoning_effort: None,
             streaming: true,
             extra_body: MetadataMap::new(),
         }
+    }
+
+    /// Requests a reasoning effort level from reasoning-capable models.
+    pub fn with_reasoning_effort(mut self, effort: ReasoningEffort) -> Self {
+        self.reasoning_effort = Some(effort);
+        self
     }
 
     /// Overrides the default chat completions endpoint URL.
@@ -170,6 +183,7 @@ impl OpenRouterConfig {
     /// | `OPENROUTER_SITE_URL` | no | -- |
     /// | `OPENROUTER_MAX_COMPLETION_TOKENS` | no | -- |
     /// | `OPENROUTER_TEMPERATURE` | no | -- |
+    /// | `OPENROUTER_REASONING_EFFORT` | no | -- (`minimal`/`low`/`medium`/`high`, or any provider-specific tier passed through verbatim) |
     pub fn from_env() -> Result<Self, OpenRouterError> {
         let api_key = std::env::var("OPENROUTER_API_KEY")
             .map_err(|_| OpenRouterError::MissingEnv("OPENROUTER_API_KEY"))?;
@@ -198,6 +212,16 @@ impl OpenRouterConfig {
             })?;
             config = config.with_temperature(parsed);
         }
+        if let Ok(value) = std::env::var("OPENROUTER_REASONING_EFFORT") {
+            let effort = match value.as_str() {
+                "minimal" => ReasoningEffort::Minimal,
+                "low" => ReasoningEffort::Low,
+                "medium" => ReasoningEffort::Medium,
+                "high" => ReasoningEffort::High,
+                other => ReasoningEffort::Custom(other.to_string()),
+            };
+            config = config.with_reasoning_effort(effort);
+        }
 
         Ok(config)
     }
@@ -219,9 +243,59 @@ pub struct OpenRouterRequestConfig {
     /// Parallel tool calls toggle (omitted when `None`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parallel_tool_calls: Option<bool>,
+    /// Reasoning configuration (omitted when `None`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<OpenRouterReasoningConfig>,
     /// Extra fields merged into the body.
     #[serde(flatten)]
     pub extra: MetadataMap,
+}
+
+/// The `reasoning` object of an OpenRouter request body.
+#[derive(Clone, Debug, Serialize)]
+pub struct OpenRouterReasoningConfig {
+    /// Effort level.
+    pub effort: ReasoningEffort,
+}
+
+/// Reasoning effort level requested from a reasoning-capable model.
+///
+/// The named variants cover the tiers OpenRouter normalizes across
+/// providers; [`ReasoningEffort::Custom`] passes any other value through
+/// verbatim (e.g. `"xhigh"` on OpenAI codex models, `"none"` on GPT-5.1)
+/// so the adapter never rejects a tier the upstream accepts — the provider
+/// remains the final validator.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReasoningEffort {
+    /// Least deliberation a model supports.
+    Minimal,
+    /// Low deliberation.
+    Low,
+    /// Moderate deliberation.
+    Medium,
+    /// High deliberation.
+    High,
+    /// Provider-specific tier passed through verbatim.
+    Custom(String),
+}
+
+impl ReasoningEffort {
+    /// The wire value sent in `reasoning.effort`.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Custom(value) => value,
+        }
+    }
+}
+
+impl Serialize for ReasoningEffort {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
 }
 
 // --- Provider implementation ---
@@ -250,6 +324,9 @@ impl From<OpenRouterConfig> for OpenRouterProvider {
                 temperature: config.temperature,
                 max_completion_tokens: config.max_completion_tokens,
                 parallel_tool_calls: config.parallel_tool_calls,
+                reasoning: config
+                    .reasoning_effort
+                    .map(|effort| OpenRouterReasoningConfig { effort }),
                 extra: config.extra_body,
             },
         }
@@ -829,6 +906,24 @@ mod tests {
     use agentkit_core::{Item, ItemKind, MetadataMap, Part, SessionId, TextPart, TurnId};
 
     use super::*;
+
+    #[test]
+    fn reasoning_effort_serializes_into_request_config() {
+        let provider = OpenRouterProvider::from(
+            OpenRouterConfig::new("key", "m").with_reasoning_effort(ReasoningEffort::High),
+        );
+        let body = serde_json::to_value(provider.config()).unwrap();
+        assert_eq!(body["reasoning"]["effort"], "high");
+        let custom = OpenRouterProvider::from(
+            OpenRouterConfig::new("key", "m")
+                .with_reasoning_effort(ReasoningEffort::Custom("xhigh".into())),
+        );
+        let body = serde_json::to_value(custom.config()).unwrap();
+        assert_eq!(body["reasoning"]["effort"], "xhigh");
+        let bare = OpenRouterProvider::from(OpenRouterConfig::new("key", "m"));
+        let body = serde_json::to_value(bare.config()).unwrap();
+        assert!(body.get("reasoning").is_none());
+    }
 
     fn empty_turn_request(transcript: Vec<Item>, cache: Option<PromptCacheRequest>) -> TurnRequest {
         TurnRequest {

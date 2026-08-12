@@ -29,8 +29,7 @@ use crate::{
 /// Loop concurrency defaults for compose runs. Each active iteration pins one
 /// OS thread while its tool call blocks on the async executor, so these are
 /// deliberately far below runlet's own defaults.
-const DEFAULT_LOOP_LIMIT: u32 = 8;
-const MAX_LOOP_LIMIT: u32 = 32;
+const LOOP_CONCURRENCY: u32 = 8;
 /// Concurrently-active child dispatches per compose run. Additional
 /// dispatches block until a permit frees (backpressure, not failure).
 const DISPATCH_LIMIT: usize = 16;
@@ -68,12 +67,12 @@ const RULES_PRIMER: &str = "Run a Runlet program that composes available tools. 
              there is NO truthiness, so write `x != null`, `s != \"\"`, `xs != []`. To \
              include an object property conditionally, use `key: value if cond` — a null \
              value omits the key from optional properties.\n\
-             - Concurrent loops: `out = for item in items limit 8 { ... return shaped }` \
-             returns an ordered list; `limit N` (required, at most 32) bounds concurrent \
-             iterations. Iterating an object yields `{ key, value }` pairs. Filter with \
+             - Concurrent loops: `out = for item in items { ... return shaped }` returns an \
+             ordered list. Every item is processed; the host bounds active iterations. \
+             Iterating an object yields `{ key, value }` pairs. Filter with \
              `skip`: `skip if item.status != \"open\"` drops the element and moves on.\n\
              - Aggregation: `fold acc = init for x in xs { ... return next_acc }` is a \
-             sequential reduce (no `limit` — that belongs to `for` only) — the body's return becomes the next accumulator: \
+             sequential reduce — the body's return becomes the next accumulator: \
              `total = fold acc = 0 for o in orders { return acc + o.amount }`. `skip if cond` \
              keeps the accumulator unchanged. Count: `fold n = 0 for x in xs { return n + 1 }`. \
              Group or index by key with computed keys: \
@@ -88,6 +87,9 @@ const RULES_PRIMER: &str = "Run a Runlet program that composes available tools. 
              `fail(\"NO_MATCH\", \"explanation\")` — e.g. `x = items[0] if items != [] else \
              fail(\"EMPTY\", \"expected results\")` or a guard `g = fail(\"BAD\", \"...\") if \
              invalid`.\n\
+             - Validate an invariant eagerly with `assert(condition, \"message\")`; a false \
+             assertion fails the program. Assert inside Runlet instead of returning raw \
+             intermediate values for model-side checking.\n\
              - No functions, imports, mutation, recursion, while loops, or method calls. \
              Bindings are immutable — `total = total + x` cannot work; use fold.\n\
              - Reads are lazy, writes always run: pure work executes only if the returned \
@@ -104,7 +106,8 @@ const RULES_PRIMER: &str = "Run a Runlet program that composes available tools. 
              $1/$name references, regex.split(s, pattern) — Rust regex syntax, NO lookahead \
              (?=...). \
              list.length(xs), list.sort(xs), list.sort_by(xs, \"a.b\"[, \"desc\"]), \
-             list.slice(xs, start[, end]), list.range(start, end) (end exclusive). \
+             list.slice(xs, start[, end]), list.range(start, end[, step]) (end exclusive; \
+             step defaults to 1, negative counts down). \
              json.parse(s), json.encode(v). number.round/floor/ceil(x), number.parse(s). \
              time.parse(\"2026-07-12T09:30:00Z\") -> epoch ms, time.format(ms) -> RFC 3339; \
              time math is plain integer ms (86400000 per day). \
@@ -112,7 +115,7 @@ const RULES_PRIMER: &str = "Run a Runlet program that composes available tools. 
              - The global `input` holds the JSON value passed alongside the program.\n\n\
              Example — fetch and filter concurrently, aggregate with fold:\n\
              listing = list_items({ page: 1 })\n\
-             open_items = for item in listing.items limit 8 {\n\
+             open_items = for item in listing.items {\n\
                  detail = get_item({ id: item.id })\n\
                  skip if detail.status != \"open\"\n\
                  return { id: item.id, amount: detail.amount }\n\
@@ -131,16 +134,31 @@ const EXEMPLAR_PRIMER: &str = r#"Run a Runlet program that composes available to
 Runlet is not Lua/Python/JavaScript. The annotated program below exercises the ENTIRE language; every construct and every rule you may rely on appears here, with its constraint in the comments:
 
 # A program is immutable bindings ending in one `return`. No functions, imports,
-# methods, while loops, mutation, or early returns exist.
-listing = list_records({ page: 1 })                   # tools take ONE object argument
+# methods, while loops, mutation, or early returns exist. Tools take ONE object argument.
+first = boundary retry 2 {                            # retry transient failures where they occur
+    return list_records({ page: 1 })
+} catch err {
+    return fail("LIST_FAILED", err.code + ": " + err.message)
+}
+remaining = for page in list.range(2, first.total_pages + 1) {
+    result = boundary retry 2 { return list_records({ page }) } catch err {
+        return fail("LIST_FAILED", err.code + ": " + err.message)
+    }
+    return result.items
+}
+listing = fold acc = first.items for page in remaining { return acc + page }
 config = json.parse(input.settings)                   # `input` is the JSON value submitted with the program
 
 # These two bindings share no data, so their calls run IN PARALLEL — there is
 # no await; referencing a result creates the dependency.
 
-shaped = for record in listing.items limit 8 {        # concurrent loop; `limit` is required (max 32);
-                                                      # result is an ordered list of each body's return
-    detail = get_record({ id: record.id })            # iterations run concurrently
+shaped = for record in listing {                      # concurrent loop; the host bounds active iterations;
+                                                      # every item runs and results preserve input order
+    detail = boundary retry 2 {                       # ANY remote call can fail transiently (503s, rate limits);
+        return get_record({ id: record.id })          # wrap reads in `boundary retry` so one flaky call cannot
+    } catch err {                                     # kill the whole program — iterations still run concurrently
+        return fail("GET_FAILED", err.code + ": " + err.message)
+    }
     skip if detail.status == "archived"               # `skip` drops this element. Conditions must be BOOLEAN —
                                                       # no truthiness: write x != null, s != "", xs != []
     r = fix_record({ id: record.id }) if detail.broken  # postfix conditional; `else` optional (defaults to null).
@@ -155,8 +173,8 @@ shaped = for record in listing.items limit 8 {        # concurrent loop; `limit`
 
 total = fold acc = 0 for row in shaped {              # fold is THE way to aggregate: sequential reduce,
     return acc + row.amount                           # the body's return becomes the next accumulator;
-}                                                     # fold takes no `limit` (that belongs to `for` only)
-                                                      # and `total = total + x` is an error — bindings are immutable.
+}                                                     # `total = total + x` is an error — bindings are immutable.
+assert(total >= 0, "total cannot be negative")        # eager invariant check; no need to return checked rows
 by_id = fold acc = {} for row in shaped {
     return acc + { [row.id]: row }                    # computed key { [expr]: v } — scalars stringify;
 }                                                     # object + object merges shallowly, right side wins.
@@ -171,19 +189,19 @@ label = if total >= config.threshold {                # block-bodied if is an ex
     return "empty"
 }
 
-summary = boundary retry 2 {                          # retries retryable failures; lasting failure
-    first = shaped[0] if shaped != [] and total > 0 else fail("EMPTY", "no rows")
+first_row = shaped[0] if shaped != [] and total > 0 else fail("EMPTY", "no rows")
                                                       # comparisons, `and`/`or`/`not` — operands must be boolean
-    return text.upper(first.id)                       # fail(code, message) raises a catchable error
-} catch err {
-    return "unavailable: " + err.code                 # err.code, err.message, err.attempt
-}
-
-return { total, by_id, label, summary }               # shorthand: { total } means { total: total }
+summary = text.upper(by_id[first_row.id].id)          # fail(code, message) raises a catchable error
+return { total, label, summary }                      # return only requested summaries, not source rows;
+                                                      # shorthand: { total } means { total: total }
 
 Iterating an object yields { key, value } pairs. Use fold ONLY when iterations depend on each other (sums, cursors, chained writes); independent per-item work belongs in `for`, which runs concurrently.
 
-Pure intrinsics (call like tools; [x] marks optional args): text.length/lower/upper/trim(s), text.starts_with/ends_with(s, x), text.slice(s, start[, end]), text.split(s, sep), text.join(strings, sep), text.replace(s, from, to). regex.test(s, pattern), regex.find_all(s, pattern), regex.captures(s, pattern) -> { full, groups, names } or null, regex.replace(s, pattern, repl) with $1/$name references, regex.split(s, pattern) - Rust regex syntax, NO lookahead (?=...). list.length(xs), list.sort(xs), list.sort_by(xs, "a.b"[, "desc"]), list.slice(xs, start[, end]), list.range(start, end) (end exclusive). json.parse(s), json.encode(v). number.round/floor/ceil(x), number.parse(s). time.parse("2026-07-12T09:30:00Z") -> epoch ms, time.format(ms) -> RFC 3339; time math is plain integer ms (86400000 per day). Substring check is the `in` operator ("x" in s) - there is no text.contains."#;
+Catalog return shapes use type notation: `string[]` is a bare list — iterate or index it directly, it has NO `.items` property; `field?` may be absent.
+
+Keep reads, transforms, writes, checks, and final submission in one program. Do not return source records for model-side planning or re-read successful writes. A nested final submission call satisfies the requirement and avoids another model round-trip.
+
+Pure intrinsics (call like tools; [x] marks optional args): text.length/lower/upper/trim(s), text.starts_with/ends_with(s, x), text.slice(s, start[, end]), text.split(s, sep), text.join(strings, sep), text.replace(s, from, to). regex.test(s, pattern), regex.find_all(s, pattern), regex.captures(s, pattern) -> { full, groups, names } or null, regex.replace(s, pattern, repl) with $1/$name references, regex.split(s, pattern) - Rust regex syntax, NO lookahead (?=...). list.length(xs), list.sort(xs), list.sort_by(xs, "a.b"[, "desc"]), list.slice(xs, start[, end]), list.range(start, end[, step]) (end exclusive; step defaults to 1, negative counts down). json.parse(s), json.encode(v). number.round/floor/ceil(x), number.parse(s). time.parse("2026-07-12T09:30:00Z") -> epoch ms, time.format(ms) -> RFC 3339; time math is plain integer ms (86400000 per day). Substring check is the `in` operator ("x" in s) - there is no text.contains."#;
 
 /// Executes compose scripts as Runlet programs.
 #[derive(Clone, Copy, Debug, Default)]
@@ -270,7 +288,7 @@ impl ComposeBackend for RunletBackend {
         let mut builder = Runtime::builder()
             .registry(registry)
             .with_prelude()
-            .loop_limits(DEFAULT_LOOP_LIMIT, MAX_LOOP_LIMIT)
+            .loop_concurrency(LOOP_CONCURRENCY)
             .dispatch_limit(DISPATCH_LIMIT)
             .graph_node_limit(GRAPH_NODE_LIMIT)
             // Transient upstream failures (rate limits, 503s) back off

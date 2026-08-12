@@ -9,6 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
+use agentkit_core::{Part, ToolOutput};
 use agentkit_loop::{AgentEvent, LoopObserver, ObservedEvent};
 use serde::Serialize;
 
@@ -24,6 +25,10 @@ pub struct MetricsState {
     pub compose_failures: u64,
     #[serde(skip)]
     compose_call_ids: BTreeSet<String>,
+    /// Runlet diagnostic codes (`RLnnnn`) seen in compose results, with
+    /// occurrence counts — the failure taxonomy, queryable without opening
+    /// transcripts. Empty for the Lua arm (its errors carry no codes).
+    pub diagnostics: BTreeMap<String, u64>,
     pub tool_call_names: BTreeMap<String, u64>,
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -73,13 +78,55 @@ impl LoopObserver for MetricsObserver {
                     .or_default() += 1;
             }
             AgentEvent::ToolResultReceived(result) => {
-                if result.is_error && state.compose_call_ids.contains(result.call_id.0.as_str()) {
-                    state.compose_failures += 1;
+                if state.compose_call_ids.contains(result.call_id.0.as_str()) {
+                    if result.is_error {
+                        state.compose_failures += 1;
+                    }
+                    for code in diagnostic_codes(&output_text(&result.output)) {
+                        *state.diagnostics.entry(code).or_default() += 1;
+                    }
                 }
             }
             _ => {}
         }
     }
+}
+
+fn output_text(output: &ToolOutput) -> String {
+    match output {
+        ToolOutput::Text(text) => text.clone(),
+        ToolOutput::Structured(value) => value.to_string(),
+        ToolOutput::Parts(parts) => parts
+            .iter()
+            .filter_map(|part| match part {
+                Part::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        ToolOutput::Files(_) => String::new(),
+    }
+}
+
+/// Extracts `RLnnnn` diagnostic codes (e.g. `RL1008`, `RL2103`).
+fn diagnostic_codes(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut codes = Vec::new();
+    let mut i = 0;
+    while i + 6 <= bytes.len() {
+        if bytes[i] == b'R'
+            && bytes[i + 1] == b'L'
+            && bytes[i + 2..i + 6].iter().all(u8::is_ascii_digit)
+            && (i + 6 == bytes.len() || !bytes[i + 6].is_ascii_alphanumeric())
+            && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
+        {
+            codes.push(text[i..i + 6].to_string());
+            i += 6;
+        } else {
+            i += 1;
+        }
+    }
+    codes
 }
 
 /// One benchmark run, as persisted to `runs.jsonl`.

@@ -417,23 +417,121 @@ const TOON_RESULT_NOTE: &str = "\n\nThe compose result is returned as TOON \
     comma-separated line of scalars.";
 
 /// Renders child output schemas for inclusion in a backend description.
+///
+/// Shapes render as compact type notation rather than raw JSON Schema: the
+/// schema keyword `items` reads as a property to models trained on
+/// `{ items: [...] }` API conventions, and `string[]` cannot be misread that
+/// way.
 pub fn render_catalog_shapes(catalog: &[ToolSpec]) -> String {
     let mut out = String::from(
         "\n\nReturn shapes of callable tools (input schemas are already provided by the \
-         top-level tool catalog):\n",
+         top-level tool catalog). `T[]` is a list of T — iterate it directly; `field?` may be \
+         absent; `{ [key]: T }` has arbitrary keys; `\"a\" | \"b\"` is one of exactly those \
+         strings:\n",
     );
     for spec in catalog {
         out.push_str("\n- ");
         out.push_str(spec.name.0.as_str());
         out.push_str(": ");
         match spec.output_schema.as_ref() {
-            Some(schema) => {
-                out.push_str(&serde_json::to_string(schema).unwrap_or_else(|_| schema.to_string()))
-            }
+            Some(schema) => out.push_str(&type_notation(schema, 0)),
             None => out.push_str("<undocumented>"),
         }
     }
     out
+}
+
+/// Compact type notation for a JSON Schema, mirroring the notation runlet's
+/// analyzer uses in diagnostics. Lossy by design: bounds, formats, and
+/// descriptions are dropped; unrepresentable constructs widen to `any`.
+fn type_notation(schema: &Value, depth: usize) -> String {
+    const MAX_DEPTH: usize = 6;
+    let Some(object) = schema.as_object() else {
+        return "any".to_string();
+    };
+    if let Some(variants) = object
+        .get("oneOf")
+        .or_else(|| object.get("anyOf"))
+        .and_then(Value::as_array)
+    {
+        return variants
+            .iter()
+            .map(|v| type_notation(v, depth + 1))
+            .collect::<Vec<_>>()
+            .join(" | ");
+    }
+    if let Some(values) = object.get("enum").and_then(Value::as_array) {
+        return values
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join(" | ");
+    }
+    match object.get("type").and_then(Value::as_str) {
+        Some("array") => {
+            let items = object
+                .get("items")
+                .map(|items| type_notation(items, depth + 1))
+                .unwrap_or_else(|| "any".to_string());
+            if items.contains(' ') && !items.starts_with('{') {
+                format!("({items})[]")
+            } else {
+                format!("{items}[]")
+            }
+        }
+        Some("object") => {
+            if depth >= MAX_DEPTH {
+                return "object".to_string();
+            }
+            let required: Vec<&str> = object
+                .get("required")
+                .and_then(Value::as_array)
+                .map(|names| names.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            match object.get("properties").and_then(Value::as_object) {
+                Some(properties) if !properties.is_empty() => {
+                    let mut properties = properties.iter().collect::<Vec<_>>();
+                    properties.sort_unstable_by_key(|(name, _)| name.as_str());
+                    let fields = properties
+                        .into_iter()
+                        .map(|(name, prop)| {
+                            let optional = if required.contains(&name.as_str()) {
+                                ""
+                            } else {
+                                "?"
+                            };
+                            // Author-written documentation is load-bearing
+                            // (formats like "HH:MM UTC" exist nowhere else) —
+                            // only schema keywords are lossy to drop.
+                            let comment = prop
+                                .get("description")
+                                .and_then(Value::as_str)
+                                .map(|d| format!(" /* {d} */"))
+                                .unwrap_or_default();
+                            format!(
+                                "{name}{optional}: {}{comment}",
+                                type_notation(prop, depth + 1)
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("{{ {fields} }}")
+                }
+                _ => match object.get("additionalProperties") {
+                    Some(additional) if additional.is_object() => {
+                        format!("{{ [key]: {} }}", type_notation(additional, depth + 1))
+                    }
+                    _ => "object".to_string(),
+                },
+            }
+        }
+        Some("integer") => "int".to_string(),
+        Some("number") => "number".to_string(),
+        Some("string") => "string".to_string(),
+        Some("boolean") => "bool".to_string(),
+        Some("null") => "null".to_string(),
+        _ => "any".to_string(),
+    }
 }
 
 /// Tool that executes composition scripts over the current tool catalog.

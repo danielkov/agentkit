@@ -612,14 +612,50 @@ fn compose_spec_is_cached_until_catalog_events() {
         ToolSpec::new("echo", "echo input", json!({"type": "object"}))
             .with_output_schema(json!({"type": "number"}));
     let stale = ToolSource::specs(&compose);
-    assert!(stale[0].description.contains("\"string\""));
+    assert!(stale[0].description.contains("echo: string"));
 
     // After the source reports a catalog event, the description refreshes.
     source.pending_event.store(true, Ordering::Release);
     let events = ToolSource::drain_catalog_events(&compose);
     assert!(!events.is_empty());
     let fresh = ToolSource::specs(&compose);
-    assert!(fresh[0].description.contains("\"number\""));
+    assert!(fresh[0].description.contains("echo: number"));
+}
+
+#[test]
+fn type_notation_renders_json_schema_compactly() {
+    // A bare array must read as `T[]`, never expose the schema keyword
+    // `items` a model could mistake for a property.
+    assert_eq!(
+        type_notation(&json!({"type": "array", "items": {"type": "string"}}), 0),
+        "string[]"
+    );
+    assert_eq!(
+        type_notation(
+            &json!({
+                "type": "object",
+                "properties": {
+                    "items": {"type": "array", "items": {"type": "object", "properties": {
+                        "id": {"type": "string"},
+                        "start": {"type": "string", "description": "HH:MM UTC"},
+                        "level": {"type": "string", "enum": ["INFO", "ERROR"]}
+                    }, "required": ["id"]}},
+                    "total_pages": {"type": "integer"},
+                    "cursor": {"type": "string"}
+                },
+                "required": ["items", "total_pages"]
+            }),
+            0,
+        ),
+        "{ cursor?: string, items: { id: string, level?: \"INFO\" | \"ERROR\", start?: string /* HH:MM UTC */ }[], total_pages: int }"
+    );
+    assert_eq!(
+        type_notation(
+            &json!({"type": "object", "additionalProperties": {"type": "number"}}),
+            0
+        ),
+        "{ [key]: number }"
+    );
 }
 
 #[cfg(feature = "runlet")]

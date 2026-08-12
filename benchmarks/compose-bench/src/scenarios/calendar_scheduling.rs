@@ -199,6 +199,7 @@ impl Scenario for CalendarScheduling {
                     .unwrap_or_default()
                     .trim()
                     .replace("+00:00", "Z")
+                    .replace(".000Z", "Z")
                     .to_uppercase()
             };
             let start = canon(
