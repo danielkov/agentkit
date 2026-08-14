@@ -57,9 +57,9 @@ Recommended initial crate:
 [dependencies]
 agent-client-protocol = "1.0.0"
 agent-client-protocol-tokio = { version = "0.11.1", optional = true }
-agentkit-core = { path = "../agentkit-core", version = "0.10.3" }
-agentkit-loop = { path = "../agentkit-loop", version = "0.10.3" }
-agentkit-tools-core = { path = "../agentkit-tools-core", version = "0.10.3" }
+agentkit-core = { path = "../agentkit-core", version = "0.10.4" }
+agentkit-loop = { path = "../agentkit-loop", version = "0.10.4" }
+agentkit-tools-core = { path = "../agentkit-tools-core", version = "0.10.4" }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

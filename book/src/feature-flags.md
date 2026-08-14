@@ -36,13 +36,13 @@ The umbrella crate `agentkit` re-exports subcrates behind feature flags.
 **Minimal orchestration:**
 
 ```toml
-agentkit = { version = "0.10.3", features = ["core", "capabilities", "tools", "loop"] }
+agentkit = { version = "0.10.4", features = ["core", "capabilities", "tools", "loop"] }
 ```
 
 **Coding agent:**
 
 ```toml
-agentkit = { version = "0.10.3", features = [
+agentkit = { version = "0.10.4", features = [
     "core", "capabilities", "context", "tools",
     "loop", "tool-fs", "tool-shell", "reporting",
 ] }
@@ -51,7 +51,7 @@ agentkit = { version = "0.10.3", features = [
 **MCP-enabled agent:**
 
 ```toml
-agentkit = { version = "0.10.3", features = [
+agentkit = { version = "0.10.4", features = [
     "core", "capabilities", "context", "tools",
     "loop", "tool-fs", "tool-shell", "reporting", "mcp",
 ] }
@@ -60,7 +60,7 @@ agentkit = { version = "0.10.3", features = [
 **ACP-exposed agent (editor-addressable over the Agent Client Protocol):**
 
 ```toml
-agentkit = { version = "0.10.3", features = [
+agentkit = { version = "0.10.4", features = [
     "core", "capabilities", "context", "tools",
     "loop", "tool-fs", "tool-shell", "reporting", "acp",
 ] }
@@ -69,7 +69,7 @@ agentkit = { version = "0.10.3", features = [
 **OpenRouter-backed example host (streaming, prompt caching):**
 
 ```toml
-agentkit = { version = "0.10.3", features = [
+agentkit = { version = "0.10.4", features = [
     "core", "capabilities", "tools", "loop",
     "reporting", "provider-openrouter",
 ] }
@@ -78,7 +78,7 @@ agentkit = { version = "0.10.3", features = [
 **OpenAI-compatible provider host (streaming):**
 
 ```toml
-agentkit = { version = "0.10.3", features = [
+agentkit = { version = "0.10.4", features = [
     "core", "capabilities", "tools", "loop",
     "reporting", "provider-groq",
 ] }
@@ -90,7 +90,7 @@ or `provider-openai` as needed.
 **Anthropic Messages API host (streaming, extended thinking, server tools):**
 
 ```toml
-agentkit = { version = "0.10.3", features = [
+agentkit = { version = "0.10.4", features = [
     "core", "capabilities", "tools", "loop",
     "reporting", "provider-anthropic",
 ] }
@@ -99,7 +99,7 @@ agentkit = { version = "0.10.3", features = [
 **Cerebras Inference host (streaming, reasoning, rate-limit snapshot):**
 
 ```toml
-agentkit = { version = "0.10.3", features = [
+agentkit = { version = "0.10.4", features = [
     "core", "capabilities", "tools", "loop",
     "reporting", "provider-cerebras",
 ] }
