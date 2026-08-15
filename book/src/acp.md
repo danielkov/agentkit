@@ -173,7 +173,7 @@ On the umbrella crate, ACP is behind the `acp` feature (implies `loop`):
 agentkit = { version = "0.10.5", features = ["acp"] }
 ```
 
-The `agentkit-acp` crate itself has a default `stdio` feature (pulls in `agent-client-protocol-tokio` for `serve_stdio`) and an `unstable-acp` feature that forwards to the upstream SDK's unstable protocol surface.
+The `agentkit-acp` crate itself has a default `stdio` feature that gates `serve_stdio`, which uses the upstream SDK's built-in `Stdio` transport. Its `unstable-acp` feature forwards to the upstream SDK's unstable protocol surface.
 
 ## What the crate does not own
 
