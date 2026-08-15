@@ -123,7 +123,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "agentkit-acp",
  "agentkit-adapter-completions",
@@ -152,7 +152,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-acp"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "agent-client-protocol 1.0.1",
  "agent-client-protocol-tokio",
@@ -171,7 +171,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-adapter-completions"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "agentkit-core",
  "agentkit-http",
@@ -188,7 +188,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-capabilities"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "agentkit-core",
  "async-trait",
@@ -199,7 +199,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-compaction"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "agentkit-core",
  "agentkit-loop",
@@ -212,7 +212,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-context"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "agentkit-core",
  "async-fs",
@@ -224,7 +224,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-core"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "futures-timer",
  "serde",
@@ -234,7 +234,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-http"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "async-trait",
  "bytes",
@@ -250,7 +250,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-integration-tests"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "agentkit-capabilities",
  "agentkit-core",
@@ -273,7 +273,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-loop"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "agentkit-capabilities",
  "agentkit-core",
@@ -289,7 +289,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-mcp"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "agentkit-capabilities",
  "agentkit-core",
@@ -310,7 +310,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-provider-anthropic"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "agentkit-core",
  "agentkit-http",
@@ -329,7 +329,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-provider-cerebras"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "agentkit-core",
  "agentkit-http",
@@ -350,7 +350,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-provider-groq"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "agentkit-adapter-completions",
  "agentkit-core",
@@ -364,7 +364,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-provider-mistral"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "agentkit-adapter-completions",
  "agentkit-core",
@@ -378,7 +378,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-provider-ollama"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "agentkit-adapter-completions",
  "agentkit-core",
@@ -392,7 +392,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-provider-openai"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "agentkit-adapter-completions",
  "agentkit-core",
@@ -406,7 +406,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-provider-openrouter"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "agentkit-adapter-completions",
  "agentkit-core",
@@ -421,7 +421,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-provider-vllm"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "agentkit-adapter-completions",
  "agentkit-core",
@@ -435,7 +435,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-reporting"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "agentkit-core",
  "agentkit-loop",
@@ -447,7 +447,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-task-manager"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "agentkit-core",
  "agentkit-tools-core",
@@ -459,7 +459,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-tool-compose"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "agentkit-core",
  "agentkit-tools-core",
@@ -476,7 +476,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-tool-fs"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "agentkit-capabilities",
  "agentkit-core",
@@ -492,7 +492,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-tool-shell"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "agentkit-capabilities",
  "agentkit-core",
@@ -506,7 +506,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-tool-skills"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "agentkit-capabilities",
  "agentkit-core",
@@ -523,7 +523,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-tools-core"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "agentkit-capabilities",
  "agentkit-core",
@@ -537,7 +537,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-tools-derive"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "agentkit-core",
  "agentkit-tools-core",
@@ -600,7 +600,7 @@ checksum = "940b3a0ca603d1eade50a4846a2afffd5ef57a9feac2c0e2ec2e14f9ead76000"
 
 [[package]]
 name = "anthropic-chat"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "agentkit-core",
  "agentkit-loop",
@@ -909,7 +909,7 @@ dependencies = [
 
 [[package]]
 name = "cerebras-batch"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "agentkit-core",
  "agentkit-loop",
@@ -922,7 +922,7 @@ dependencies = [
 
 [[package]]
 name = "cerebras-chat"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "agentkit-core",
  "agentkit-loop",
@@ -998,7 +998,7 @@ dependencies = [
 
 [[package]]
 name = "compose-bench"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "agentkit-core",
  "agentkit-loop",
@@ -1627,7 +1627,7 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "how-cli"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "agentkit-core",
  "agentkit-loop",
@@ -2103,7 +2103,7 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "mcp-dynamic-auth"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "agentkit-mcp",
  "async-trait",
@@ -2116,7 +2116,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-reference-interop"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "agentkit-core",
  "agentkit-mcp",
@@ -2258,7 +2258,7 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "openrouter-acp-trio"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "agent-client-protocol 1.0.1",
  "agentkit-acp",
@@ -2276,7 +2276,7 @@ dependencies = [
 
 [[package]]
 name = "openrouter-agent-cli"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "agentkit-compaction",
  "agentkit-context",
@@ -2297,7 +2297,7 @@ dependencies = [
 
 [[package]]
 name = "openrouter-chat"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "agentkit-core",
  "agentkit-loop",
@@ -2308,7 +2308,7 @@ dependencies = [
 
 [[package]]
 name = "openrouter-codemod"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "agentkit-core",
  "agentkit-loop",
@@ -2324,7 +2324,7 @@ dependencies = [
 
 [[package]]
 name = "openrouter-coding-agent"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "agentkit-compaction",
  "agentkit-core",
@@ -2340,7 +2340,7 @@ dependencies = [
 
 [[package]]
 name = "openrouter-compaction-agent"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "agentkit-compaction",
  "agentkit-core",
@@ -2356,7 +2356,7 @@ dependencies = [
 
 [[package]]
 name = "openrouter-context-agent"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "agentkit-context",
  "agentkit-core",
@@ -2371,7 +2371,7 @@ dependencies = [
 
 [[package]]
 name = "openrouter-context-window-compaction"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "agentkit-compaction",
  "agentkit-core",
@@ -2388,7 +2388,7 @@ dependencies = [
 
 [[package]]
 name = "openrouter-macro-tool"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "agentkit-core",
  "agentkit-loop",
@@ -2404,7 +2404,7 @@ dependencies = [
 
 [[package]]
 name = "openrouter-mcp-tool"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "agentkit-core",
  "agentkit-loop",
@@ -2417,7 +2417,7 @@ dependencies = [
 
 [[package]]
 name = "openrouter-parallel-agent"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "agentkit-core",
  "agentkit-loop",
@@ -2433,7 +2433,7 @@ dependencies = [
 
 [[package]]
 name = "openrouter-session-persistence"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "agentkit-core",
  "agentkit-loop",
@@ -2447,7 +2447,7 @@ dependencies = [
 
 [[package]]
 name = "openrouter-subagent-tool"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "agentkit-core",
  "agentkit-loop",

@@ -70,10 +70,13 @@ use agentkit_core::{
     Usage,
 };
 use agentkit_task_manager::{
-    PendingLoopUpdates, SimpleTaskManager, TOOL_RESULT_FAILURE_KIND_METADATA_KEY,
-    TOOL_RESULT_FAILURE_KIND_PERMISSION_DENIED, TOOL_RESULT_NOT_STARTED_METADATA_KEY, TaskApproval,
+    PendingLoopUpdates, SimpleTaskManager, TOOL_RESULT_NOT_STARTED_METADATA_KEY, TaskApproval,
     TaskLaunchKind, TaskLaunchRequest, TaskManager, TaskResolution, TaskStartContext,
     TaskStartOutcome, TurnTaskUpdate,
+};
+#[cfg(test)]
+use agentkit_task_manager::{
+    TOOL_RESULT_FAILURE_KIND_METADATA_KEY, TOOL_RESULT_FAILURE_KIND_PERMISSION_DENIED,
 };
 #[cfg(test)]
 use agentkit_tools_core::ToolContext;
@@ -1209,7 +1212,9 @@ where
             active_tool_round: None,
             pending_round_resume: None,
             next_turn_index: 1,
+            background_call_ids: HashSet::new(),
             detached_call_ids: HashSet::new(),
+            interrupted_background_call_ids: HashSet::new(),
             tool_cancellations: HashMap::new(),
         };
         driver.emit(AgentEvent::RunStarted { session_id });
@@ -1469,6 +1474,8 @@ where
     active_tool_round: Option<ActiveToolRound>,
     pending_round_resume: Option<agentkit_core::TurnId>,
     next_turn_index: u64,
+    /// Calls currently running in the background without a transcript result.
+    background_call_ids: HashSet<ToolCallId>,
     /// Call ids whose original tool_use was already paired with a
     /// synthetic detach tool_result. When the real result eventually
     /// arrives via the task manager, we MUST NOT emit a second
@@ -1477,6 +1484,10 @@ where
     /// resolution into a [`ItemKind::Notification`] item that the model
     /// can react to on the next turn.
     detached_call_ids: HashSet<ToolCallId>,
+    /// Background calls whose cancellation result was already terminal.
+    /// Their eventual completion becomes a notification without emitting a
+    /// second [`AgentEvent::ToolResultReceived`].
+    interrupted_background_call_ids: HashSet<ToolCallId>,
     tool_cancellations: HashMap<ToolCallId, TurnCancellation>,
 }
 
@@ -1597,6 +1608,7 @@ where
         cancellation: Option<TurnCancellation>,
     ) {
         let call_id = task.tool_request.call_id.clone();
+        self.background_call_ids.remove(&call_id);
         let cancellation = self.tool_cancellation_for(&call_id, cancellation);
         let call = ToolCallPart {
             id: call_id.clone(),
@@ -1836,10 +1848,11 @@ where
                     }
                     TaskStartOutcome::Pending { kind, .. } => {
                         self.emit(AgentEvent::ToolExecutionStarted(call.clone()));
-                        if kind == agentkit_task_manager::TaskKind::Background
-                            && let Some(active) = self.active_tool_round.as_mut()
-                        {
-                            active.background_pending = true;
+                        if kind == agentkit_task_manager::TaskKind::Background {
+                            self.background_call_ids.insert(call.id.clone());
+                            if let Some(active) = self.active_tool_round.as_mut() {
+                                active.background_pending = true;
+                            }
                         }
                         continue;
                     }
@@ -1885,6 +1898,7 @@ where
                     // via the task manager) is the one converted to a
                     // Notification by `maybe_convert_detached`.
                     let detached_call_id = snapshot.call_id.clone();
+                    self.background_call_ids.insert(detached_call_id.clone());
                     let detached_result = ToolResultPart {
                         call_id: detached_call_id.clone(),
                         output: ToolOutput::Text(format!(
@@ -2303,7 +2317,11 @@ where
                             return Ok(step);
                         }
                     }
-                    TaskStartOutcome::Pending { .. } => {}
+                    TaskStartOutcome::Pending { kind, .. } => {
+                        if kind == agentkit_task_manager::TaskKind::Background {
+                            self.background_call_ids.insert(pending.call.id.clone());
+                        }
+                    }
                 }
             }
             ApprovalDecision::Deny { reason } => {
@@ -2343,6 +2361,9 @@ where
         turn_id: agentkit_core::TurnId,
         items: Vec<Item>,
     ) -> Result<LoopStep, LoopError> {
+        let pending = self.drain_pending_approval_items();
+        self.reject_drained_approvals(pending);
+        self.close_interrupted_tool_calls();
         self.extend_transcript(items.clone());
         let turn_result = TurnResult {
             turn_id,
@@ -2644,7 +2665,13 @@ where
     fn append_tool_result_item(&mut self, item: Item) {
         for part in &item.parts {
             if let Part::ToolResult(result) = part {
-                self.emit(AgentEvent::ToolResultReceived(result.clone()));
+                if !self
+                    .interrupted_background_call_ids
+                    .contains(&result.call_id)
+                {
+                    self.emit(AgentEvent::ToolResultReceived(result.clone()));
+                }
+                self.background_call_ids.remove(&result.call_id);
                 self.clear_tool_cancellation(&result.call_id);
             }
         }
@@ -2683,6 +2710,34 @@ where
         }
     }
 
+    /// Answer every tool call the cancelled turn will never come back to.
+    ///
+    /// A cancelled turn abandons the calls it had in flight, and a transcript
+    /// carrying a `tool_use` without its `tool_result` is one that
+    /// [`validate_transcript_invariants`] rejects and that providers refuse
+    /// outright ("No tool output found for function call ..."). Since the
+    /// results are appended through [`Self::append_tool_result_item`], hosts
+    /// persisting the transcript through a [`TranscriptObserver`] record a
+    /// resumable session rather than one that has to be repaired on read.
+    ///
+    /// This is the same closing move [`Self::reject_drained_approvals`] makes
+    /// for a denied approval; cancellation owes its calls the same answer.
+    ///
+    /// Background tasks outlive the turn that started them. Their real results
+    /// are converted to notifications; calls that never started or were
+    /// cancelled in the foreground are not retained as detached work.
+    fn close_interrupted_tool_calls(&mut self) {
+        for call in unanswered_tool_calls(&self.transcript) {
+            let call_id = call.id.clone();
+            let completes_in_background = self.background_call_ids.contains(&call_id);
+            self.append_tool_result_item(interrupted_tool_result_item(call));
+            if completes_in_background {
+                self.detached_call_ids.insert(call_id.clone());
+                self.interrupted_background_call_ids.insert(call_id);
+            }
+        }
+    }
+
     fn maybe_convert_detached(&mut self, item: Item) -> Item {
         if !matches!(item.kind, ItemKind::Tool) {
             return item;
@@ -2705,6 +2760,7 @@ where
         let mut text = String::new();
         for result in &results {
             self.detached_call_ids.remove(&result.call_id);
+            self.interrupted_background_call_ids.remove(&result.call_id);
             if !text.is_empty() {
                 text.push_str("\n\n");
             }
@@ -2770,6 +2826,40 @@ fn interrupted_assistant_items() -> Vec<Item> {
         finish_reason: None,
         created_at: None,
     }]
+}
+
+/// Tool calls in `transcript` that no `tool_result` answers, in call order.
+fn unanswered_tool_calls(transcript: &[Item]) -> Vec<ToolCallPart> {
+    let mut open: Vec<ToolCallPart> = Vec::new();
+    for part in transcript.iter().flat_map(|item| &item.parts) {
+        match part {
+            Part::ToolCall(call) => open.push(call.clone()),
+            Part::ToolResult(result) => open.retain(|call| call.id != result.call_id),
+            _ => {}
+        }
+    }
+    open
+}
+
+/// The result recorded for a call the cancelled turn abandoned.
+///
+/// It is an error result: the call produced no output, and the work it started
+/// may or may not have run to completion.
+fn interrupted_tool_result_item(call: ToolCallPart) -> Item {
+    Item {
+        id: None,
+        kind: ItemKind::Tool,
+        parts: vec![Part::ToolResult(ToolResultPart {
+            call_id: call.id,
+            output: ToolOutput::Text("tool call interrupted before it reported a result".into()),
+            is_error: true,
+            metadata: interrupted_metadata("tool"),
+        })],
+        metadata: interrupted_metadata("tool"),
+        usage: None,
+        finish_reason: None,
+        created_at: None,
+    }
 }
 
 fn cancelled_approval_item(pending: PendingApprovalToolCall) -> Item {
@@ -3002,6 +3092,7 @@ mod tests {
     struct DelayedApprovalExecutor {
         entered: StdArc<AtomicBool>,
         release: StdArc<Notify>,
+        cancellation: Option<CancellationController>,
         spec: ToolSpec,
     }
 
@@ -3010,6 +3101,7 @@ mod tests {
             Self {
                 entered,
                 release,
+                cancellation: None,
                 spec: ToolSpec {
                     name: ToolName::new("echo"),
                     description: "delayed approval".into(),
@@ -3027,6 +3119,11 @@ mod tests {
                 },
             }
         }
+
+        fn cancelling_on_approval(mut self, controller: CancellationController) -> Self {
+            self.cancellation = Some(controller);
+            self
+        }
     }
 
     #[async_trait]
@@ -3042,6 +3139,9 @@ mod tests {
         ) -> ToolExecutionOutcome {
             self.entered.store(true, Ordering::SeqCst);
             self.release.notified().await;
+            if let Some(controller) = &self.cancellation {
+                controller.interrupt();
+            }
             ToolExecutionOutcome::Interrupted(
                 agentkit_tools_core::ToolInterruption::ApprovalRequired(ApprovalRequest {
                     task_id: None,
@@ -4854,6 +4954,246 @@ mod tests {
             }
             other => panic!("unexpected background completion event: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_turn_answers_the_tool_call_it_abandoned() {
+        // A transcript whose tool_use has no tool_result cannot be resumed:
+        // validation rejects it, and providers refuse it outright. Cancelling
+        // mid-call must therefore leave the pair complete — on the driver's
+        // transcript, and in whatever the host persisted from it.
+        let controller = CancellationController::new();
+        let entered = StdArc::new(AtomicBool::new(false));
+        let release = StdArc::new(Notify::new());
+        let items = StdArc::new(StdMutex::new(Vec::<Item>::new()));
+        let task_manager = AsyncTaskManager::new().routing(NameRoutingPolicy::new([(
+            "wait",
+            RoutingDecision::Foreground,
+        )]));
+        let agent = Agent::builder()
+            .model(FakeAdapter)
+            .add_tool_source(ToolRegistry::new().with(BlockingTool::new(
+                "wait",
+                entered.clone(),
+                release,
+                "done",
+            )))
+            .permissions(AllowAllPermissions)
+            .cancellation(controller.handle())
+            .task_manager(task_manager)
+            .transcript_observer(RecordingTranscriptObserver {
+                items: items.clone(),
+            })
+            .build()
+            .unwrap();
+
+        let mut driver = agent
+            .start(SessionConfig {
+                session_id: SessionId::new("session-cancel-mid-call"),
+                metadata: MetadataMap::new(),
+                cache: None,
+            })
+            .await
+            .unwrap();
+
+        driver
+            .submit_input(vec![Item {
+                id: None,
+                kind: ItemKind::User,
+                parts: vec![Part::Text(TextPart {
+                    text: "run the tool".into(),
+                    metadata: MetadataMap::new(),
+                })],
+                metadata: MetadataMap::new(),
+                usage: None,
+                finish_reason: None,
+                created_at: None,
+            }])
+            .unwrap();
+
+        let cancelled = tokio::join!(async { driver.next().await }, async {
+            wait_until_entered(entered.as_ref()).await;
+            controller.interrupt();
+        })
+        .0
+        .unwrap();
+
+        match cancelled {
+            LoopStep::Finished(turn) => assert_eq!(turn.finish_reason, FinishReason::Cancelled),
+            other => panic!("unexpected loop step after interrupt: {other:?}"),
+        }
+
+        let transcript = driver.snapshot().transcript;
+        assert!(
+            unanswered_tool_calls(&transcript).is_empty(),
+            "the cancelled turn left a tool call unanswered: {transcript:?}"
+        );
+        validate_transcript_invariants(&transcript)
+            .expect("a cancelled turn must leave a resumable transcript");
+
+        let persisted = items.lock().unwrap().clone();
+        let results: Vec<&ToolResultPart> = persisted
+            .iter()
+            .flat_map(|item| &item.parts)
+            .filter_map(|part| match part {
+                Part::ToolResult(result) => Some(result),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(results.len(), 1, "{persisted:?}");
+        assert_eq!(results[0].call_id, ToolCallId::new("call-1"));
+        assert!(results[0].is_error);
+        assert_eq!(
+            results[0].metadata.get(INTERRUPTED_METADATA_KEY),
+            Some(&Value::Bool(true))
+        );
+    }
+
+    #[tokio::test]
+    async fn regression_cancelled_background_completion_emits_one_terminal_result() {
+        let events = StdArc::new(StdMutex::new(Vec::new()));
+        let agent = Agent::builder()
+            .model(FakeAdapter)
+            .observer(RecordingObserver {
+                events: events.clone(),
+            })
+            .build()
+            .unwrap();
+        let mut driver = agent
+            .start(SessionConfig::new("session-cancelled-background-event"))
+            .await
+            .unwrap();
+
+        driver.append_item(Item::new(
+            ItemKind::Assistant,
+            vec![Part::ToolCall(ToolCallPart {
+                id: ToolCallId::new("call-1"),
+                name: "wait".into(),
+                input: json!({}),
+                metadata: MetadataMap::new(),
+            })],
+        ));
+        driver.background_call_ids.insert(ToolCallId::new("call-1"));
+        driver.close_interrupted_tool_calls();
+        driver.append_tool_result_item(Item::new(
+            ItemKind::Tool,
+            vec![Part::ToolResult(ToolResultPart {
+                call_id: ToolCallId::new("call-1"),
+                output: ToolOutput::Text("background-done".into()),
+                is_error: false,
+                metadata: MetadataMap::new(),
+            })],
+        ));
+
+        let events = events.lock().unwrap();
+        let terminal_results = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    AgentEvent::ToolResultReceived(result)
+                        if result.call_id == ToolCallId::new("call-1")
+                )
+            })
+            .count();
+        assert_eq!(
+            terminal_results, 1,
+            "a cancelled background call emitted multiple terminal results: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn regression_cancelled_queued_approval_is_answered_once() {
+        let controller = CancellationController::new();
+        let entered = StdArc::new(AtomicBool::new(false));
+        let release = StdArc::new(Notify::new());
+        release.notify_one();
+        let events = StdArc::new(StdMutex::new(Vec::new()));
+        let agent = Agent::builder()
+            .model(FakeAdapter)
+            .tool_executor(
+                DelayedApprovalExecutor::new(entered, release)
+                    .cancelling_on_approval(controller.clone()),
+            )
+            .cancellation(controller.handle())
+            .observer(RecordingObserver {
+                events: events.clone(),
+            })
+            .build()
+            .unwrap();
+        let mut driver = agent
+            .start(SessionConfig::new("session-cancelled-queued-approval"))
+            .await
+            .unwrap();
+        driver
+            .submit_input(vec![Item::text(ItemKind::User, "ping")])
+            .unwrap();
+
+        match driver.next().await.unwrap() {
+            LoopStep::Finished(turn) => assert_eq!(turn.finish_reason, FinishReason::Cancelled),
+            other => panic!("unexpected first cancellation step: {other:?}"),
+        }
+        match driver.next().await.unwrap() {
+            LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_)) => {}
+            other => panic!("unexpected post-cancellation step: {other:?}"),
+        }
+
+        let events = events.lock().unwrap();
+        let terminal_results = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    AgentEvent::ToolResultReceived(result)
+                        if result.call_id == ToolCallId::new("call-1")
+                )
+            })
+            .count();
+        assert_eq!(
+            terminal_results, 1,
+            "a cancelled queued approval was answered more than once: {events:?}"
+        );
+        drop(events);
+
+        let transcript = driver.snapshot().transcript;
+        assert!(
+            !transcript.iter().any(|item| {
+                item.kind == ItemKind::Notification
+                    && item.parts.iter().any(|part| {
+                        matches!(part, Part::Text(text) if text.text.contains("Background tool call"))
+                    })
+            }),
+            "a queued approval was misreported as a background call: {transcript:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn regression_cancelled_unstarted_call_is_not_tracked_as_detached() {
+        let agent = Agent::builder().model(FakeAdapter).build().unwrap();
+        let mut driver = agent
+            .start(SessionConfig::new("session-cancelled-unstarted-call"))
+            .await
+            .unwrap();
+
+        driver.append_item(Item::new(
+            ItemKind::Assistant,
+            vec![Part::ToolCall(ToolCallPart {
+                id: ToolCallId::new("call-never-started"),
+                name: "wait".into(),
+                input: json!({}),
+                metadata: MetadataMap::new(),
+            })],
+        ));
+        driver
+            .finish_cancelled(agentkit_core::TurnId::new("turn-cancelled"), Vec::new())
+            .unwrap();
+
+        assert!(
+            !driver
+                .detached_call_ids
+                .contains(&ToolCallId::new("call-never-started")),
+            "an unstarted call can never deliver a detached result"
+        );
     }
 
     #[tokio::test]
