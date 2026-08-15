@@ -2,10 +2,10 @@
 //!
 //! This crate provides [`ComposeTool`], a tool that runs a script in a
 //! pluggable execution backend and lets that script call the current AgentKit
-//! tool catalog. The default backend is sandboxed Lua ([`LuaBackend`]); the
+//! tool catalog. The default backend is sandboxed Lua (`LuaBackend`); the
 //! optional `runlet` feature adds [`RunletBackend`], which executes
 //! [Runlet](https://github.com/danielkov/runlet) programs instead. The
-//! optional `toon` feature adds [`ResultEncoding::Toon`] for compact compose
+//! optional `toon` feature adds `ResultEncoding::Toon` for compact compose
 //! results.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -25,10 +25,15 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
+#[cfg(not(any(feature = "lua", feature = "runlet")))]
+compile_error!("agentkit-tool-compose requires either the `lua` or `runlet` feature");
+
+#[cfg(feature = "lua")]
 mod lua;
 #[cfg(feature = "runlet")]
 mod runlet_backend;
 
+#[cfg(feature = "lua")]
 pub use lua::LuaBackend;
 #[cfg(feature = "runlet")]
 pub use runlet_backend::RunletBackend;
@@ -574,7 +579,12 @@ impl ComposeTool {
     /// model writes correct scripts on the first try when it sees concrete
     /// input/output schemas at planning time.
     pub fn new(config: ComposeConfig) -> Self {
-        Self::build(config, Arc::new(LuaBackend), Vec::new())
+        #[cfg(feature = "lua")]
+        let backend: Arc<dyn ComposeBackend> = Arc::new(LuaBackend);
+        #[cfg(all(not(feature = "lua"), feature = "runlet"))]
+        let backend: Arc<dyn ComposeBackend> = Arc::new(RunletBackend);
+
+        Self::build(config, backend, Vec::new())
     }
 
     /// Wraps a source of child tools. The resulting [`ToolSource`] still
@@ -671,11 +681,15 @@ impl ComposeTool {
                 .cloned()
                 .collect()
         });
-        let mut description = backend.description(filtered.as_deref());
+        let description = backend.description(filtered.as_deref());
         #[cfg(feature = "toon")]
-        if config.result_encoding == ResultEncoding::Toon {
-            description.push_str(TOON_RESULT_NOTE);
-        }
+        let description = {
+            let mut description = description;
+            if config.result_encoding == ResultEncoding::Toon {
+                description.push_str(TOON_RESULT_NOTE);
+            }
+            description
+        };
         ToolSpec::new(
             COMPOSE_TOOL_NAME,
             description,

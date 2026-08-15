@@ -1,10 +1,16 @@
 # agentkit-tool-compose
 
-Lua tool composition for agentkit.
+Scripted tool composition for agentkit.
 
-This crate exposes a single `compose` tool. The model supplies a Lua script and
+This crate exposes a single `compose` tool. The model supplies a script and
 optional JSON input; the script can call the current tool catalog with
 `tool(name, input)` and inspect available tools with `tools()`.
+
+Sandboxed Lua is enabled by default. To use only the Runlet backend:
+
+```toml
+agentkit-tool-compose = { version = "0.10.6", default-features = false, features = ["runlet"] }
+```
 
 ```rust
 let registry = agentkit_tool_compose::registry();

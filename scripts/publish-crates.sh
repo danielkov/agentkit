@@ -5,26 +5,14 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-workspace_version() {
-  awk '
-    /^\[workspace\.package\]$/ { in_workspace_package = 1; next }
-    /^\[/ { in_workspace_package = 0 }
-    in_workspace_package && $1 == "version" {
-      gsub(/"/, "", $3)
-      print $3
-      exit
-    }
-  ' Cargo.toml
-}
-
-ROOT_VERSION="$(workspace_version)"
-if [[ -z "$ROOT_VERSION" ]]; then
-  echo "Failed to determine workspace version from Cargo.toml" >&2
-  exit 1
-fi
-
-VERSION="${VERSION:-$ROOT_VERSION}"
 WAIT_SECONDS="${WAIT_SECONDS:-10}"
+
+crate_version() {
+  local package_id
+  package_id="$(cargo pkgid -p "$1")"
+  package_id="${package_id##*#}"
+  printf '%s\n' "${package_id##*@}"
+}
 
 CRATES=(
   agentkit-core
@@ -58,7 +46,8 @@ CRATES=(
 
 crate_exists() {
   local crate="$1"
-  python3 - "$crate" "$VERSION" <<'PY' >/dev/null 2>&1
+  local version="$2"
+  python3 - "$crate" "$version" <<'PY' >/dev/null 2>&1
 import sys
 import urllib.error
 import urllib.request
@@ -78,17 +67,19 @@ PY
 
 publish_and_wait() {
   local crate="$1"
+  local version
+  version="$(crate_version "$crate")"
 
-  if crate_exists "$crate"; then
-    echo "Skipping ${crate}@${VERSION}; already present on crates.io."
+  if crate_exists "$crate" "$version"; then
+    echo "Skipping ${crate}@${version}; already present on crates.io."
     return 0
   fi
 
-  echo "Publishing ${crate}@${VERSION}..."
+  echo "Publishing ${crate}@${version}..."
   cargo publish -p "$crate" --locked --no-verify
 
-  echo "Waiting for ${crate}@${VERSION} to appear on crates.io..."
-  until crate_exists "$crate"; do
+  echo "Waiting for ${crate}@${version} to appear on crates.io..."
+  until crate_exists "$crate" "$version"; do
     sleep "$WAIT_SECONDS"
   done
 }
