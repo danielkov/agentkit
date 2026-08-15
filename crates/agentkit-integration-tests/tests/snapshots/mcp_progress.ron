@@ -48,7 +48,6 @@ SessionRecording(
                         "required": [
                             "text",
                         ],
-                        "title": "EchoArgs",
                         "type": "object",
                     },
                     annotations: ToolAnnotations(
@@ -79,7 +78,6 @@ SessionRecording(
                             "a",
                             "b",
                         ],
-                        "title": "MultiplyArgs",
                         "type": "object",
                     },
                     annotations: ToolAnnotations(
@@ -200,7 +198,6 @@ SessionRecording(
                         "required": [
                             "text",
                         ],
-                        "title": "EchoArgs",
                         "type": "object",
                     },
                     annotations: ToolAnnotations(
@@ -231,7 +228,6 @@ SessionRecording(
                             "a",
                             "b",
                         ],
-                        "title": "MultiplyArgs",
                         "type": "object",
                     },
                     annotations: ToolAnnotations(

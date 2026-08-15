@@ -65,27 +65,35 @@ use tokio::sync::{Mutex, broadcast, mpsc};
 /// content blocks, structured tool output, embedded resources, sampling /
 /// elicitation requests, progress and log notifications, etc.
 pub use rmcp::model::{
-    Annotations as McpAnnotations, AudioContent, CallToolResult,
+    Annotations as McpAnnotations, AudioContent, AudioContent as RawAudioContent, CallToolResult,
     CancelledNotificationParam as McpCancelledNotificationParam,
-    ClientCapabilities as McpClientCapabilities, Content,
-    CreateElicitationRequestParams as McpCreateElicitationRequestParams,
-    CreateElicitationResult as McpCreateElicitationResult,
-    CreateMessageRequestParams as McpCreateMessageRequestParams,
-    CreateMessageResult as McpCreateMessageResult, ElicitationAction as McpElicitationAction,
+    ClientCapabilities as McpClientCapabilities, ContentBlock, ContentBlock as Content,
+    ContentBlock as PromptMessageContent, ContentBlock as RawContent, ElicitRequestParams,
+    ElicitRequestParams as McpCreateElicitationRequestParams, ElicitResult,
+    ElicitResult as McpCreateElicitationResult, ElicitationAction as McpElicitationAction,
     ElicitationCapability as McpElicitationCapability, EmbeddedResource,
+    EmbeddedResource as RawEmbeddedResource,
     FormElicitationCapability as McpFormElicitationCapability, GetPromptResult, ImageContent,
-    Implementation as McpImplementation, ListRootsResult as McpListRootsResult,
-    LoggingLevel as McpLoggingLevel,
-    LoggingMessageNotificationParam as McpLoggingMessageNotificationParam,
+    ImageContent as RawImageContent, Implementation as McpImplementation,
     ProgressNotificationParam as McpProgressNotificationParam, Prompt as McpPrompt, PromptArgument,
-    PromptMessage, PromptMessageContent, PromptMessageRole, RawAudioContent, RawContent,
-    RawEmbeddedResource, RawImageContent, RawResource as McpRawResource, RawTextContent,
-    ReadResourceResult, Resource as McpResource, ResourceContents as McpResourceContents,
-    ResourceUpdatedNotificationParam as McpResourceUpdatedNotificationParam, Root as McpRoot,
-    RootsCapabilities as McpRootsCapabilities, SamplingCapability as McpSamplingCapability,
-    SamplingMessage as McpSamplingMessage, SetLevelRequestParams as McpSetLevelRequestParams,
-    TextContent, Tool as McpTool, ToolAnnotations as McpToolAnnotations,
+    PromptMessage, ReadResourceResult, Resource as McpRawResource, Resource as McpResource,
+    ResourceContents as McpResourceContents,
+    ResourceUpdatedNotificationParam as McpResourceUpdatedNotificationParam, Role,
+    Role as PromptMessageRole, RootsCapabilities as McpRootsCapabilities,
+    SamplingCapability as McpSamplingCapability, TextContent as RawTextContent, TextContent,
+    Tool as McpTool, ToolAnnotations as McpToolAnnotations,
     UrlElicitationCapability as McpUrlElicitationCapability,
+};
+
+// RMCP 3 still supports these legacy MCP surfaces. Keep exposing them for API
+// compatibility while containing the upstream deprecation allowance here.
+#[allow(deprecated)]
+pub use rmcp::model::{
+    CreateMessageRequestParams as McpCreateMessageRequestParams,
+    CreateMessageResult as McpCreateMessageResult, ListRootsResult as McpListRootsResult,
+    LoggingLevel as McpLoggingLevel,
+    LoggingMessageNotificationParam as McpLoggingMessageNotificationParam, Root as McpRoot,
+    SamplingMessage as McpSamplingMessage, SetLevelRequestParams as McpSetLevelRequestParams,
 };
 
 /// Re-export of the JSON-RPC client→server envelope handed to
@@ -108,6 +116,8 @@ pub type McpToolDescriptor = McpTool;
 pub type McpResourceDescriptor = McpResource;
 /// Alias for [`McpPrompt`].
 pub type McpPromptDescriptor = McpPrompt;
+
+const URL_ELICITATION_REQUIRED_CODE: i32 = -32042;
 
 /// An auth challenge raised by an MCP server during a tool call, resource
 /// read, prompt fetch, or connection handshake.
@@ -249,8 +259,8 @@ pub trait McpAuthResponder: Send + Sync + 'static {
 /// writing; anything else (custom server codes, future protocol additions)
 /// lands in [`Self::Other`] with the original code preserved.
 ///
-/// For the URL elicitation case ([`rmcp::model::ErrorCode::URL_ELICITATION_REQUIRED`])
-/// the `data` payload is best-effort parsed into [`UrlElicitationData`].
+/// For the legacy URL elicitation error (`-32042`), the `data` payload is
+/// best-effort parsed into [`UrlElicitationData`].
 /// When the server's payload does not match the documented shape the typed
 /// `data` slot is `None` but `raw_data` always preserves the original
 /// [`serde_json::Value`] so callers can fall back to ad-hoc inspection.
@@ -315,7 +325,7 @@ pub enum McpInvocationError {
 
 /// Typed payload for the URL elicitation error case.
 ///
-/// Mirrors the shape of [`rmcp::model::CreateElicitationRequestParams::UrlElicitationParams`]
+/// Mirrors the shape of [`rmcp::model::ElicitRequestParams::UrlElicitationParams`]
 /// (camelCase on the wire). Server messages that include extra fields are
 /// accepted; missing required fields make typed parsing fail and the
 /// surrounding [`McpInvocationError::UrlElicitation`] preserves the raw
@@ -344,7 +354,9 @@ impl McpInvocationError {
         } = err;
         let message = message.into_owned();
         match code {
-            rmcp::model::ErrorCode::URL_ELICITATION_REQUIRED => {
+            // RMCP 3 removed this legacy constant, but servers still use the
+            // established code and agentkit keeps recognizing it.
+            code if code.0 == URL_ELICITATION_REQUIRED_CODE => {
                 let typed = data.as_ref().and_then(|value| {
                     serde_json::from_value::<UrlElicitationData>(value.clone()).ok()
                 });
@@ -371,7 +383,7 @@ impl McpInvocationError {
     /// Returns the underlying JSON-RPC error code.
     pub fn code(&self) -> i32 {
         match self {
-            Self::UrlElicitation { .. } => rmcp::model::ErrorCode::URL_ELICITATION_REQUIRED.0,
+            Self::UrlElicitation { .. } => URL_ELICITATION_REQUIRED_CODE,
             Self::InvalidRequest { .. } => rmcp::model::ErrorCode::INVALID_REQUEST.0,
             Self::MethodNotFound { .. } => rmcp::model::ErrorCode::METHOD_NOT_FOUND.0,
             Self::InvalidParams { .. } => rmcp::model::ErrorCode::INVALID_PARAMS.0,
@@ -641,7 +653,7 @@ pub trait McpHttpClient: Send + Sync + 'static {
     async fn get_stream(
         &self,
         uri: Arc<str>,
-        session_id: Arc<str>,
+        session_id: Option<Arc<str>>,
         last_event_id: Option<String>,
         auth_header: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
@@ -684,7 +696,7 @@ impl RmcpStreamableHttpClient for DynHttpClient {
     async fn get_stream(
         &self,
         uri: Arc<str>,
-        session_id: Arc<str>,
+        session_id: Option<Arc<str>>,
         last_event_id: Option<String>,
         auth_header: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
@@ -956,6 +968,7 @@ pub enum McpServerNotification {
 /// catalog refresh path: progress, logging, resource updates, cancellation,
 /// plus list-changed announcements (also delivered over the legacy
 /// [`McpServerNotification`] channel).
+#[allow(deprecated)]
 #[derive(Clone, Debug)]
 pub enum McpServerEvent {
     /// `notifications/progress` from the server, scoped to a
@@ -982,6 +995,7 @@ pub enum McpServerEvent {
 ///
 /// Install one via [`McpHandlerConfig::with_sampling_responder`] to expose
 /// the host application's LLM as a sampling target for connected MCP servers.
+#[allow(deprecated)]
 #[async_trait]
 pub trait McpSamplingResponder: Send + Sync + 'static {
     /// Produces a sampled completion in response to a server-initiated
@@ -1009,6 +1023,7 @@ pub trait McpElicitationResponder: Send + Sync + 'static {
 ///
 /// Install one via [`McpHandlerConfig::with_roots_provider`] to surface
 /// workspace roots that scope the server's filesystem access.
+#[allow(deprecated)]
 #[async_trait]
 pub trait McpRootsProvider: Send + Sync + 'static {
     /// Returns the roots the server should consider in scope.
@@ -1056,6 +1071,7 @@ pub struct McpClientHandler {
 }
 
 impl ClientHandler for McpClientHandler {
+    #[allow(deprecated)]
     fn create_message(
         &self,
         params: rmcp_model::CreateMessageRequestParams,
@@ -1074,6 +1090,7 @@ impl ClientHandler for McpClientHandler {
         }
     }
 
+    #[allow(deprecated)]
     fn list_roots(
         &self,
         _context: rmcp::service::RequestContext<RoleClient>,
@@ -1095,9 +1112,9 @@ impl ClientHandler for McpClientHandler {
 
     fn create_elicitation(
         &self,
-        params: rmcp_model::CreateElicitationRequestParams,
+        params: rmcp_model::ElicitRequestParams,
         _context: rmcp::service::RequestContext<RoleClient>,
-    ) -> impl Future<Output = Result<rmcp_model::CreateElicitationResult, rmcp_model::ErrorData>>
+    ) -> impl Future<Output = Result<rmcp_model::ElicitResult, rmcp_model::ErrorData>>
     + rmcp::service::MaybeSendFuture
     + '_ {
         let responder = self.elicitation.clone();
@@ -1123,6 +1140,7 @@ impl ClientHandler for McpClientHandler {
         std::future::ready(())
     }
 
+    #[allow(deprecated)]
     fn on_logging_message(
         &self,
         params: rmcp_model::LoggingMessageNotificationParam,
@@ -1306,10 +1324,9 @@ impl McpHandlerConfig {
             capabilities.sampling = Some(McpSamplingCapability::default());
         }
         if self.elicitation.is_some() {
-            capabilities.elicitation = Some(McpElicitationCapability {
-                form: Some(McpFormElicitationCapability::default()),
-                url: None,
-            });
+            capabilities.elicitation = Some(
+                McpElicitationCapability::new().with_form(McpFormElicitationCapability::default()),
+            );
         }
         if self.roots.is_some() {
             capabilities.roots = Some(McpRootsCapabilities::default());
@@ -1553,6 +1570,7 @@ impl McpConnection {
     ///
     /// Updates surface as [`McpServerEvent::ResourceUpdated`] on every
     /// receiver returned by [`Self::subscribe_events`].
+    #[allow(deprecated)]
     pub async fn subscribe_resource(&self, uri: impl Into<String>) -> Result<(), McpError> {
         let uri = uri.into();
         self.peer()
@@ -1568,6 +1586,7 @@ impl McpConnection {
     }
 
     /// Cancels a previous [`Self::subscribe_resource`] subscription.
+    #[allow(deprecated)]
     pub async fn unsubscribe_resource(&self, uri: impl Into<String>) -> Result<(), McpError> {
         let uri = uri.into();
         self.peer()
@@ -1584,6 +1603,7 @@ impl McpConnection {
 
     /// Negotiates the minimum severity the server should emit through
     /// `notifications/message`. Surfaced as [`McpServerEvent::Logging`].
+    #[allow(deprecated)]
     pub async fn set_logging_level(&self, level: McpLoggingLevel) -> Result<(), McpError> {
         self.peer()
             .set_level(rmcp_model::SetLevelRequestParams::new(level))
@@ -3282,12 +3302,11 @@ fn tool_annotations_from_rmcp(annotations: Option<&McpToolAnnotations>) -> ToolA
 }
 
 fn resource_descriptor_from_rmcp(resource: McpResource) -> ResourceDescriptor {
-    let raw = resource.raw;
     ResourceDescriptor {
-        id: ResourceId::new(raw.uri),
-        name: raw.name,
-        description: raw.description,
-        mime_type: raw.mime_type,
+        id: ResourceId::new(resource.uri),
+        name: resource.name,
+        description: resource.description,
+        mime_type: resource.mime_type,
         metadata: MetadataMap::new(),
     }
 }
@@ -3360,6 +3379,8 @@ fn resource_contents_to_capabilities(content: McpResourceContents) -> ResourceCo
             // rmcp delivers blobs as base64-encoded text on the wire.
             DataRef::InlineText(blob)
         }
+        // Preserve future RMCP resource variants rather than rejecting them.
+        other => DataRef::InlineText(serde_json::to_string(&other).unwrap_or_default()),
     };
     ResourceContents { data, metadata }
 }
@@ -3394,19 +3415,7 @@ fn prompt_message_to_item(message: PromptMessage) -> Item {
 }
 
 fn prompt_message_content_to_part(content: PromptMessageContent) -> Part {
-    match content {
-        PromptMessageContent::Text { text } => Part::Text(TextPart::new(text)),
-        PromptMessageContent::Image { image } => Part::Media(MediaPart::new(
-            Modality::Image,
-            image.mime_type.clone(),
-            DataRef::InlineText(image.data.clone()),
-        )),
-        PromptMessageContent::Resource { resource } => {
-            let agentkit_resource = resource_contents_to_capabilities(resource.resource.clone());
-            agentkit_part_from_resource(agentkit_resource)
-        }
-        PromptMessageContent::ResourceLink { link } => Part::Text(TextPart::new(link.uri.clone())),
-    }
+    content_to_part(content)
 }
 
 fn agentkit_part_from_resource(resource: ResourceContents) -> Part {
@@ -3444,7 +3453,7 @@ fn call_tool_content_to_parts(contents: Vec<Content>) -> Vec<Part> {
 }
 
 fn content_to_part(content: Content) -> Part {
-    match content.raw {
+    match content {
         RawContent::Text(text) => Part::Text(TextPart::new(text.text)),
         RawContent::Image(image) => Part::Media(MediaPart::new(
             Modality::Image,
@@ -3460,6 +3469,9 @@ fn content_to_part(content: Content) -> Part {
             agentkit_part_from_resource(resource_contents_to_capabilities(embedded.resource))
         }
         RawContent::ResourceLink(link) => Part::Text(TextPart::new(link.uri)),
+        other => Part::Text(TextPart::new(
+            serde_json::to_string(&other).unwrap_or_default(),
+        )),
     }
 }
 

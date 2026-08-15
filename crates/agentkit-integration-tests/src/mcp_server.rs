@@ -14,7 +14,7 @@ use agentkit_mcp::{McpConnection, McpHandlerConfig, McpServerId};
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, Content, ErrorData as RmcpError, ServerCapabilities, ServerInfo,
+    CallToolResult, ContentBlock as Content, ErrorData as RmcpError, ServerCapabilities, ServerInfo,
 };
 use rmcp::service::{Peer, RoleServer};
 use rmcp::{ServerHandler, ServiceExt, schemars, tool, tool_handler, tool_router};

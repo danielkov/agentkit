@@ -18,7 +18,7 @@ This crate covers:
 - a broadcast subscription for server-pushed events: progress, logging, resource updates, list-changed, cancellation
 - auth replay for MCP operations that fail with an authentication challenge
 
-The wire-protocol types — `CallToolResult`, `ReadResourceResult`, `GetPromptResult`, `Content`, `RawContent`, `ToolAnnotations`, `Prompt`, etc. — are re-exported from `rmcp` directly. There is no parallel agentkit-side type vocabulary to maintain.
+The wire-protocol types — `CallToolResult`, `ReadResourceResult`, `GetPromptResult`, `ContentBlock` (also exported through the compatibility name `Content`), `ToolAnnotations`, `Prompt`, etc. — are re-exported from `rmcp` directly. There is no parallel agentkit-side type vocabulary to maintain.
 
 ## Why this matters
 

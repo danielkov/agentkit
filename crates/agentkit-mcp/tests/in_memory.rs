@@ -2,6 +2,8 @@
 //! duplex pipes. Replaces the legacy fake-transport unit tests; covers the
 //! agentkit-side adapters end-to-end through a real rmcp client+server pair.
 
+#![allow(deprecated)]
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,10 +29,11 @@ use async_trait::async_trait;
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    Annotated, CallToolResult, Content, ErrorData as RmcpError, GetPromptRequestParams,
-    GetPromptResult, ListPromptsResult, ListResourcesResult, PaginatedRequestParams, Prompt,
-    PromptArgument, PromptMessage, PromptMessageRole, RawResource, ReadResourceRequestParams,
-    ReadResourceResult, ResourceContents, ServerCapabilities, ServerInfo,
+    CallToolResult, ContentBlock as Content, ErrorCode, ErrorData as RmcpError,
+    GetPromptRequestParams, GetPromptResponse, GetPromptResult, ListPromptsResult,
+    ListResourcesResult, PaginatedRequestParams, Prompt, PromptArgument, PromptMessage,
+    ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
+    ResourceContents, Role as PromptMessageRole, ServerCapabilities, ServerInfo,
 };
 use rmcp::service::{Peer, RequestContext, RoleServer};
 use rmcp::{ServerHandler, ServiceExt, schemars, tool, tool_handler, tool_router};
@@ -64,6 +67,9 @@ impl InMemoryServer {
         &self,
         Parameters(EchoArgs { text }): Parameters<EchoArgs>,
     ) -> Result<CallToolResult, RmcpError> {
+        if text == "trigger invalid params" {
+            return Err(RmcpError::invalid_params("triggered invalid params", None));
+        }
         Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 }
@@ -85,9 +91,9 @@ impl ServerHandler for InMemoryServer {
         _params: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, RmcpError> {
-        Ok(ListResourcesResult::with_all_items(vec![Annotated::new(
-            RawResource::new("memo:welcome", "welcome"),
-            None,
+        Ok(ListResourcesResult::with_all_items(vec![Resource::new(
+            "memo:welcome",
+            "welcome",
         )]))
     }
 
@@ -95,12 +101,13 @@ impl ServerHandler for InMemoryServer {
         &self,
         params: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<ReadResourceResult, RmcpError> {
+    ) -> Result<ReadResourceResponse, RmcpError> {
         if params.uri == "memo:welcome" {
             Ok(ReadResourceResult::new(vec![
                 ResourceContents::text("hello from the in-memory MCP server", params.uri)
                     .with_mime_type("text/plain"),
-            ]))
+            ])
+            .into())
         } else {
             Err(RmcpError::invalid_params("unknown resource", None))
         }
@@ -126,7 +133,7 @@ impl ServerHandler for InMemoryServer {
         &self,
         params: GetPromptRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<GetPromptResult, RmcpError> {
+    ) -> Result<GetPromptResponse, RmcpError> {
         if params.name != "summarize" {
             return Err(RmcpError::invalid_params("unknown prompt", None));
         }
@@ -141,7 +148,8 @@ impl ServerHandler for InMemoryServer {
             PromptMessageRole::User,
             format!("Please summarize: {argument}"),
         )])
-        .with_description("Summarize the supplied text."))
+        .with_description("Summarize the supplied text.")
+        .into())
     }
 }
 
@@ -213,8 +221,8 @@ impl McpErrorResponder for InvalidParamsResponder {
         };
         assert_eq!(ctx.server_id.0.as_str(), "in-memory");
         assert_eq!(name, "echo");
-        assert_eq!(arguments, &json!({}));
-        assert_eq!(ctx.input, Some(&json!({})));
+        assert_eq!(arguments, &json!({"text": "trigger invalid params"}));
+        assert_eq!(ctx.input, Some(&json!({"text": "trigger invalid params"})));
         assert!(data.is_none());
 
         ErrorResponderOutcome::SynthesizeResult(CallToolResult::success(vec![Content::text(
@@ -273,8 +281,7 @@ async fn call_tool_returns_typed_result_with_content_blocks() {
         .expect("tool call succeeds");
     assert_eq!(result.is_error, Some(false));
     assert_eq!(result.content.len(), 1);
-    let raw = &result.content[0].raw;
-    let text = raw
+    let text = result.content[0]
         .as_text()
         .map(|text| text.text.clone())
         .expect("first content block is text");
@@ -290,7 +297,8 @@ fn invocation_error_preserves_url_elicitation_data() {
         "elicitationId": "elicit-123",
     });
 
-    let error = McpInvocationError::from_error_data(RmcpError::url_elicitation_required(
+    let error = McpInvocationError::from_error_data(RmcpError::new(
+        ErrorCode(-32042),
         "authorization needed",
         Some(raw_data.clone()),
     ));
@@ -359,10 +367,10 @@ async fn get_prompt_returns_typed_messages() {
         .expect("prompt fetch succeeds");
     assert_eq!(prompt.messages.len(), 1);
     let message = &prompt.messages[0];
-    let PromptMessageContent::Text { text } = &message.content else {
+    let PromptMessageContent::Text(text) = &message.content else {
         panic!("expected text content, saw {:?}", message.content);
     };
-    assert!(text.contains("essay body"));
+    assert!(text.text.contains("essay body"));
 }
 
 #[tokio::test]
@@ -440,7 +448,7 @@ async fn tool_adapter_error_responder_receives_typed_invocation_error() {
             ToolRequest {
                 call_id: "call-1".into(),
                 tool_name: ToolName::new("mcp_in-memory_echo"),
-                input: json!({}),
+                input: json!({"text": "trigger invalid params"}),
                 session_id: "session-1".into(),
                 turn_id: "turn-1".into(),
                 metadata: MetadataMap::new(),
@@ -530,7 +538,7 @@ impl McpSamplingResponder for EchoSampling {
             .rev()
             .find_map(|message| match &message.content {
                 rmcp::model::SamplingContent::Single(
-                    rmcp::model::SamplingMessageContent::Text(text),
+                    rmcp::model::SamplingMessageContentBlock::Text(text),
                 ) => Some(text.text.clone()),
                 _ => None,
             })
@@ -583,9 +591,9 @@ async fn sampling_responder_handles_create_message_request() {
     assert_eq!(result.model, "test-model");
     assert_eq!(result.message.role, rmcp::model::Role::Assistant);
     let text = match &result.message.content {
-        rmcp::model::SamplingContent::Single(rmcp::model::SamplingMessageContent::Text(text)) => {
-            text.text.clone()
-        }
+        rmcp::model::SamplingContent::Single(rmcp::model::SamplingMessageContentBlock::Text(
+            text,
+        )) => text.text.clone(),
         other => panic!("unexpected sampling content: {other:?}"),
     };
     assert_eq!(text, "ping");
@@ -660,14 +668,14 @@ async fn progress_notification_reaches_event_subscribers() {
     let (connection, peer) = connect_in_memory_with_server_peer(McpHandlerConfig::new()).await;
     let mut events = connection.subscribe_events();
 
-    peer.notify_progress(McpProgressNotificationParam {
-        progress_token: rmcp::model::ProgressToken(rmcp::model::NumberOrString::String(
-            "tok".into(),
-        )),
-        progress: 0.5,
-        total: Some(1.0),
-        message: Some("halfway".into()),
-    })
+    peer.notify_progress(
+        McpProgressNotificationParam::new(
+            rmcp::model::ProgressToken(rmcp::model::NumberOrString::String("tok".into())),
+            0.5,
+        )
+        .with_total(1.0)
+        .with_message("halfway"),
+    )
     .await
     .expect("server notify_progress succeeds");
 
@@ -689,11 +697,13 @@ async fn logging_message_reaches_event_subscribers() {
     let (connection, peer) = connect_in_memory_with_server_peer(McpHandlerConfig::new()).await;
     let mut events = connection.subscribe_events();
 
-    peer.notify_logging_message(McpLoggingMessageNotificationParam {
-        level: McpLoggingLevel::Info,
-        logger: Some("test".into()),
-        data: serde_json::json!({"msg": "hi"}),
-    })
+    peer.notify_logging_message(
+        McpLoggingMessageNotificationParam::new(
+            McpLoggingLevel::Info,
+            serde_json::json!({"msg": "hi"}),
+        )
+        .with_logger("test"),
+    )
     .await
     .expect("server notify_logging_message succeeds");
 
@@ -715,11 +725,9 @@ async fn resource_updated_notification_reaches_event_subscribers() {
     let (connection, peer) = connect_in_memory_with_server_peer(McpHandlerConfig::new()).await;
     let mut events = connection.subscribe_events();
 
-    peer.notify_resource_updated(McpResourceUpdatedNotificationParam {
-        uri: "memo:welcome".into(),
-    })
-    .await
-    .expect("server notify_resource_updated succeeds");
+    peer.notify_resource_updated(McpResourceUpdatedNotificationParam::new("memo:welcome"))
+        .await
+        .expect("server notify_resource_updated succeeds");
 
     let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
         .await

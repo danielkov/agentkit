@@ -154,7 +154,7 @@ impl McpHttpClient for SequentialBearerClient {
     async fn get_stream(
         &self,
         uri: Arc<str>,
-        session_id: Arc<str>,
+        session_id: Option<Arc<str>>,
         last_event_id: Option<String>,
         _auth_header: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,

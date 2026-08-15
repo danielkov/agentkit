@@ -13,9 +13,9 @@ use std::time::Duration;
 use rmcp::{
     RoleServer, ServerHandler,
     model::{
-        CallToolRequestParams, CallToolResult, Content, ErrorData as RmcpError,
-        InitializeRequestParams, InitializeResult, ListToolsResult, PaginatedRequestParams,
-        ServerCapabilities, ServerInfo, Tool, ToolsCapability,
+        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock as Content,
+        ErrorData as RmcpError, InitializeRequestParams, InitializeResult, ListToolsResult,
+        PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
     },
     service::{NotificationContext, Peer, RequestContext},
     transport::streamable_http_server::{
@@ -52,9 +52,8 @@ impl ServerHandler for MutableMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(
             ServerCapabilities::builder()
-                .enable_tools_with(ToolsCapability {
-                    list_changed: Some(true),
-                })
+                .enable_tools()
+                .enable_tool_list_changed()
                 .build(),
         )
     }
@@ -84,18 +83,14 @@ impl ServerHandler for MutableMcpServer {
             tokio::time::sleep(delay).await;
         }
         let tools = self.tools.lock().unwrap().clone();
-        Ok(ListToolsResult {
-            tools,
-            next_cursor: None,
-            meta: None,
-        })
+        Ok(ListToolsResult::with_all_items(tools))
     }
 
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, RmcpError> {
+    ) -> Result<CallToolResponse, RmcpError> {
         let name = request.name.to_string();
         let arguments = request
             .arguments
@@ -119,9 +114,7 @@ impl ServerHandler for MutableMcpServer {
             ));
         }
 
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "ok:{name}"
-        ))]))
+        Ok(CallToolResult::success(vec![Content::text(format!("ok:{name}"))]).into())
     }
 
     async fn on_initialized(&self, context: NotificationContext<RoleServer>) {

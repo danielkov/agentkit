@@ -107,7 +107,7 @@ So:
 
 - MCP tools participate in the shared tool registry
 - MCP resources/prompts do not get forced into the tool system
-- Wire-protocol types are not re-wrapped — `CallToolResult`, `ReadResourceResult`, `Content`, `ToolAnnotations`, etc. flow through unchanged
+- Wire-protocol types are not re-wrapped — `CallToolResult`, `ReadResourceResult`, `ContentBlock`/`Content`, `ToolAnnotations`, etc. flow through unchanged
 
 ## Core concepts
 
