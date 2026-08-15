@@ -89,7 +89,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-acp"
-version = "0.10.5"
+version = "0.10.6"
 dependencies = [
  "agent-client-protocol",
  "agentkit-core",
@@ -225,7 +225,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-mcp"
-version = "0.10.5"
+version = "0.10.6"
 dependencies = [
  "agentkit-capabilities",
  "agentkit-core",
