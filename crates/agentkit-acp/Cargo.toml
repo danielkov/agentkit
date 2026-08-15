@@ -11,12 +11,11 @@ rust-version.workspace = true
 
 [features]
 default = ["stdio"]
-stdio = ["dep:agent-client-protocol-tokio"]
+stdio = []
 unstable-acp = ["agent-client-protocol/unstable"]
 
 [dependencies]
-agent-client-protocol = "1.0.1"
-agent-client-protocol-tokio = { version = "0.11.1", optional = true }
+agent-client-protocol = "2.0.0"
 agentkit-core = { version = "0.10.5", path = "../agentkit-core" }
 agentkit-loop = { version = "0.10.5", path = "../agentkit-loop" }
 agentkit-tools-core = { version = "0.10.5", path = "../agentkit-tools-core" }

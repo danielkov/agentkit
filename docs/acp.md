@@ -29,7 +29,6 @@ There is already an official Rust ACP SDK:
 
 - `agent-client-protocol`
 - `agent-client-protocol-schema`
-- `agent-client-protocol-tokio`
 - `agent-client-protocol-rmcp`
 
 So agentkit should not build a parallel protocol crate by default. A separate `racp` crate only makes sense if the official SDK becomes unsuitable. The first implementation should mirror `agentkit-mcp`: re-export upstream wire types and make agentkit own only the lifecycle and conversion glue.
@@ -55,8 +54,7 @@ Recommended initial crate:
 
 ```toml
 [dependencies]
-agent-client-protocol = "1.0.0"
-agent-client-protocol-tokio = { version = "0.11.1", optional = true }
+agent-client-protocol = "2.0.0"
 agentkit-core = { path = "../agentkit-core", version = "0.10.5" }
 agentkit-loop = { path = "../agentkit-loop", version = "0.10.5" }
 agentkit-tools-core = { path = "../agentkit-tools-core", version = "0.10.5" }
@@ -69,7 +67,7 @@ tracing = { workspace = true }
 
 [features]
 default = ["stdio"]
-stdio = ["dep:agent-client-protocol-tokio"]
+stdio = []
 unstable-acp = ["agent-client-protocol/unstable"]
 ```
 
@@ -170,7 +168,7 @@ Each session should own or reference a `Mutex<LoopDriver<S>>` rather than holdin
 
 ### 5. The initial runtime should be local-first
 
-Phase 1 should support stdio through `agent-client-protocol-tokio::Stdio`. HTTP and WebSocket transports should wait until the ACP transport working group and upstream SDK settle the server-side ergonomics.
+Phase 1 should support stdio through `agent-client-protocol::Stdio`. HTTP and WebSocket transports should wait until the ACP transport working group and upstream SDK settle the server-side ergonomics.
 
 ### 6. Client callbacks are host boundaries
 
@@ -722,6 +720,6 @@ The key should be explicit and policy-owned. A good default key should include:
 - ACP introduction: <https://agentclientprotocol.com/get-started/introduction>
 - ACP Rust SDK: <https://agentclientprotocol.com/libraries/rust>
 - ACP protocol docs: <https://agentclientprotocol.com/protocol/v1/overview>
-- Rust crate docs: <https://docs.rs/agent-client-protocol/1.0.0/agent_client_protocol/>
+- Rust crate docs: <https://docs.rs/agent-client-protocol/2.0.0/agent_client_protocol/>
 - Existing MCP integration design: [`mcp.md`](./mcp.md)
 - Agentkit permission design: [`permissions.md`](./permissions.md)
