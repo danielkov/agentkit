@@ -112,12 +112,14 @@ async fn server_progress_notification_reaches_subscriber_during_agent_run() {
     // would still surface as a missing event below.
     server
         .peer
-        .notify_progress(McpProgressNotificationParam {
-            progress_token: ProgressToken(NumberOrString::String("agent-tok".into())),
-            progress: 0.42,
-            total: Some(1.0),
-            message: Some("midway".into()),
-        })
+        .notify_progress(
+            McpProgressNotificationParam::new(
+                ProgressToken(NumberOrString::String("agent-tok".into())),
+                0.42,
+            )
+            .with_total(1.0)
+            .with_message("midway"),
+        )
         .await
         .expect("server notify_progress succeeds");
 

@@ -57,5 +57,5 @@ cargo test -p mcp-reference-interop -- --nocapture
 
 ## Upstream Targets
 
-- Rust SDK crate: `rmcp = 1.3.0`
+- Rust SDK crate: `rmcp = 3.1.2`
 - Upstream repository: <https://github.com/modelcontextprotocol/rust-sdk>

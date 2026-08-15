@@ -180,7 +180,7 @@ async fn probe_server(
 fn decode_tool_text(result: agentkit_mcp::CallToolResult) -> Result<String, Box<dyn Error>> {
     let mut chunks = Vec::new();
     for content in result.content {
-        if let Some(text) = content.raw.as_text() {
+        if let Some(text) = content.as_text() {
             chunks.push(text.text.clone());
         }
     }
@@ -204,8 +204,8 @@ fn decode_resource_text(
 fn collect_prompt_text(prompt: &agentkit_mcp::GetPromptResult) -> Result<String, Box<dyn Error>> {
     let mut text_parts = Vec::new();
     for message in &prompt.messages {
-        if let agentkit_mcp::PromptMessageContent::Text { text } = &message.content {
-            text_parts.push(text.clone());
+        if let agentkit_mcp::PromptMessageContent::Text(text) = &message.content {
+            text_parts.push(text.text.clone());
         }
     }
     if text_parts.is_empty() {

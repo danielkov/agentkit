@@ -24,7 +24,7 @@ async-trait.workspace = true
 schemars = { workspace = true, features = ["derive"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 pretty_assertions = "1.4"
-rmcp = { version = "1.5.0", default-features = false, features = ["client", "server", "transport-async-rw", "transport-streamable-http-server", "macros"] }
+rmcp = { version = "3.1.2", default-features = false, features = ["client", "server", "transport-async-rw", "transport-streamable-http-server", "macros"] }
 ron = "0.8"
 serde.workspace = true
 serde_json.workspace = true

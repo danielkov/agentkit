@@ -182,7 +182,7 @@ impl McpHttpClient for SequentialBearerClient {
     async fn get_stream(
         &self,
         uri: Arc<str>,
-        session_id: Arc<str>,
+        session_id: Option<Arc<str>>,
         last_event_id: Option<String>,
         _auth_header: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
@@ -244,7 +244,6 @@ async fn dynamic_bearer_rotates_per_http_op() {
             .await
             .expect("tool call succeeds");
         let text = result.content[0]
-            .raw
             .as_text()
             .map(|t| t.text.clone())
             .expect("text content");

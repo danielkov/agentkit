@@ -21,7 +21,7 @@ Without MCP:                          With MCP:
   custom auth, custom schema           standard auth, standard schema
 ```
 
-`agentkit-mcp` is built on top of the official [`rmcp`](https://crates.io/crates/rmcp) Rust SDK. The wire-protocol types (`CallToolResult`, `ReadResourceResult`, `Content`, `Tool`, `Prompt`, …) are re-exported as `McpTool`, `McpResource`, `McpPrompt`, etc. — there is no parallel agentkit-side vocabulary.
+`agentkit-mcp` is built on top of the official [`rmcp`](https://crates.io/crates/rmcp) Rust SDK. The wire-protocol types (`CallToolResult`, `ReadResourceResult`, `ContentBlock` (also exported as `Content` for compatibility), `Tool`, `Prompt`, …) are re-exported as `McpTool`, `McpResource`, `McpPrompt`, etc. — there is no parallel agentkit-side vocabulary.
 
 ## Built on rmcp: spec changes propagate for free
 
@@ -64,7 +64,7 @@ After connecting, the server's capabilities are captured in a snapshot of rmcp w
 pub struct McpDiscoverySnapshot {
     pub server_id: McpServerId,
     pub tools: Vec<McpTool>,        // = rmcp::model::Tool
-    pub resources: Vec<McpResource>, // = rmcp::model::Resource (Annotated<RawResource>)
+    pub resources: Vec<McpResource>, // = rmcp::model::Resource
     pub prompts: Vec<McpPrompt>,     // = rmcp::model::Prompt
     pub metadata: MetadataMap,
 }

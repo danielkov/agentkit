@@ -13,20 +13,17 @@ use axum::{
 };
 use mcp_reference_interop::{FIXTURE_RESOURCE_URI, RecordedRequest};
 use rmcp::{
-    ErrorData, RoleServer, ServerHandler,
+    ErrorData, ServerHandler,
     handler::server::{
-        router::{Router as McpRouter, prompt::PromptRouter, tool::ToolRouter},
+        router::{prompt::PromptRouter, tool::ToolRouter},
         wrapper::Parameters,
     },
     model::{
-        AnnotateAble, GetPromptRequestParams, GetPromptResult, Implementation, ListPromptsResult,
-        ListResourcesResult, PaginatedRequestParams, PromptMessage, PromptMessageRole, RawResource,
-        ReadResourceRequestParams, ReadResourceResult, ResourceContents, ServerCapabilities,
-        ServerInfo,
+        GetPromptResult, Implementation, ListResourcesResult, PaginatedRequestParams,
+        PromptMessage, ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult,
+        Resource, ResourceContents, Role, ServerCapabilities, ServerInfo,
     },
-    prompt, prompt_handler, prompt_router,
-    service::RequestContext,
-    tool, tool_handler, tool_router,
+    prompt, prompt_handler, prompt_router, tool, tool_handler, tool_router,
     transport::streamable_http_server::{
         StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
     },
@@ -88,7 +85,7 @@ impl ServerMode {
         match self {
             Self::Stateful => config,
             Self::StatelessJson => config
-                .with_stateful_mode(false)
+                .with_legacy_session_mode(false)
                 .with_json_response(true)
                 .with_sse_keep_alive(None),
         }
@@ -138,7 +135,7 @@ impl ReferenceServer {
         Parameters(GreetingPromptRequest { name }): Parameters<GreetingPromptRequest>,
     ) -> GetPromptResult {
         GetPromptResult::new(vec![PromptMessage::new_text(
-            PromptMessageRole::User,
+            Role::User,
             self.mode.prompt_text(&name),
         )])
     }
@@ -165,10 +162,9 @@ impl ServerHandler for ReferenceServer {
     ) -> Result<ListResourcesResult, ErrorData> {
         Ok(ListResourcesResult {
             resources: vec![
-                RawResource::new(FIXTURE_RESOURCE_URI, "greeting-resource")
+                Resource::new(FIXTURE_RESOURCE_URI, "greeting-resource")
                     .with_mime_type("text/plain")
-                    .with_description("Fixture greeting resource")
-                    .no_annotation(),
+                    .with_description("Fixture greeting resource"),
             ],
             ..Default::default()
         })
@@ -178,7 +174,7 @@ impl ServerHandler for ReferenceServer {
         &self,
         request: ReadResourceRequestParams,
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
-    ) -> Result<ReadResourceResult, ErrorData> {
+    ) -> Result<ReadResourceResponse, ErrorData> {
         if request.uri != FIXTURE_RESOURCE_URI {
             return Err(ErrorData::resource_not_found(
                 format!("unknown resource: {}", request.uri),
@@ -189,7 +185,8 @@ impl ServerHandler for ReferenceServer {
         Ok(ReadResourceResult::new(vec![
             ResourceContents::text(self.mode.resource_text(), FIXTURE_RESOURCE_URI)
                 .with_mime_type("text/plain"),
-        ]))
+        ])
+        .into())
     }
 }
 
@@ -207,14 +204,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let config = mode.transport_config();
     let state = AppState::default();
-    let service: StreamableHttpService<McpRouter<ReferenceServer>, LocalSessionManager> =
+    let service: StreamableHttpService<ReferenceServer, LocalSessionManager> =
         StreamableHttpService::new(
-            move || {
-                let server = ReferenceServer::new(mode);
-                Ok(McpRouter::new(server.clone())
-                    .with_tools(server.tool_router.clone())
-                    .with_prompts(server.prompt_router.clone()))
-            },
+            move || Ok(ReferenceServer::new(mode)),
             Default::default(),
             config,
         );
