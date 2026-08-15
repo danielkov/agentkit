@@ -58,7 +58,7 @@ CRATES=(
 
 crate_exists() {
   local crate="$1"
-  python - "$crate" "$VERSION" <<'PY' >/dev/null 2>&1
+  python3 - "$crate" "$VERSION" <<'PY' >/dev/null 2>&1
 import sys
 import urllib.error
 import urllib.request
