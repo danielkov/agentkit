@@ -28,6 +28,7 @@ CRATES=(
   agentkit-adapter-completions
   agentkit-reporting
   agentkit-mcp
+  agentkit-plugins
   agentkit-tool-fs
   agentkit-tool-shell
   agentkit-tool-compose

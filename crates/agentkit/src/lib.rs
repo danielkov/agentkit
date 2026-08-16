@@ -26,6 +26,7 @@
 //! | `context` | [`context`] | `AGENTS.md` discovery and context loading |
 //! | `acp` | [`acp`] | Agent Client Protocol (ACP) session binding and host integration |
 //! | `mcp` | [`mcp`] | Model Context Protocol (MCP) server connections |
+//! | `plugins` | [`plugins`] | Agent Plugins package parsing and validation |
 //! | `provider-anthropic` | [`provider_anthropic`] | Anthropic Messages API [`loop_::ModelAdapter`] implementation |
 //! | `provider-cerebras` | [`provider_cerebras`] | Cerebras Inference API [`loop_::ModelAdapter`] implementation |
 //! | `provider-openrouter` | [`provider_openrouter`] | OpenRouter [`loop_::ModelAdapter`] implementation |
@@ -204,6 +205,15 @@ pub use agentkit_context as context;
 #[cfg(feature = "mcp")]
 pub use agentkit_mcp as mcp;
 
+/// Agent Plugins package parsing and validation.
+///
+/// Discovers standard skill directories and portable MCP declarations without
+/// installing, launching, or proxying plugin assets.
+///
+/// Requires the `plugins` feature.
+#[cfg(feature = "plugins")]
+pub use agentkit_plugins as plugins;
+
 /// Agent Client Protocol (ACP) integration for hybrid hosts.
 ///
 /// Exposes upstream ACP wire types plus agentkit session binding, observer
@@ -357,6 +367,8 @@ pub mod prelude {
     pub use crate::loop_::*;
     #[cfg(feature = "mcp")]
     pub use crate::mcp::*;
+    #[cfg(feature = "plugins")]
+    pub use crate::plugins::*;
     #[cfg(feature = "provider-anthropic")]
     pub use crate::provider_anthropic;
     #[cfg(feature = "provider-cerebras")]

@@ -62,6 +62,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   - `AGENTS.md` and skills loading
 - `agentkit-mcp`
   - MCP integration built on `rmcp`: stdio + Streamable HTTP transports, discovery, lifecycle, auth + replay, tool/resource/prompt adapters, sampling/elicitation/roots responders, and a server-event broadcast
+- `agentkit-plugins`
+  - information-first Agent Plugins 1.0 parsing, validation, and portable asset discovery
 - `agentkit-acp`
   - Agent Client Protocol integration built on the official `agent-client-protocol` SDK: session binding, observer routing, prompt conversion, approval resolvers, and a headless stdio runtime for standalone ACP agents
 - `agentkit-reporting`
@@ -345,6 +347,7 @@ Optional flags:
 - `compaction`
 - `context`
 - `mcp`
+- `plugins`
 - `adapter-completions`
 - `provider-openrouter`
 - `provider-openai`
@@ -364,6 +367,7 @@ More detail is in [docs/feature-flags.md](./docs/feature-flags.md).
 
 - [docs/getting-started.md](./docs/getting-started.md)
 - [docs/architecture.md](./docs/architecture.md)
+- [docs/plugins.md](./docs/plugins.md)
 - [docs/core.md](./docs/core.md)
 - [docs/tools.md](./docs/tools.md)
 - [docs/loop.md](./docs/loop.md)

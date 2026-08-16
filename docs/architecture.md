@@ -18,6 +18,8 @@
   - `AGENTS.md` and skills loading
 - `agentkit-mcp`
   - MCP transports, discovery, lifecycle, auth, replay, tool/resource/prompt adapters
+- `agentkit-plugins`
+  - Agent Plugins package validation and portable skill/MCP asset discovery; runtime composition stays in the satellite crates
 - `agentkit-acp`
   - Agent Client Protocol integration: session binding, observer routing, prompt
     conversion, approval resolvers, and a headless stdio runtime built on the

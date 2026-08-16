@@ -4,7 +4,7 @@ homepage.workspace = true
 name = "agentkit"
 readme = "README.md"
 repository.workspace = true
-version.workspace = true
+version = "0.10.6"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -17,6 +17,7 @@ agentkit-context = { version = "0.10.5", path = "../agentkit-context", optional 
 agentkit-core = { version = "0.10.5", path = "../agentkit-core", optional = true }
 agentkit-loop = { version = "0.10.5", path = "../agentkit-loop", optional = true }
 agentkit-mcp = { version = "0.10.5", path = "../agentkit-mcp", optional = true }
+agentkit-plugins = { version = "0.10.6", path = "../agentkit-plugins", optional = true }
 agentkit-adapter-completions = { version = "0.10.5", path = "../agentkit-adapter-completions", optional = true }
 agentkit-provider-anthropic = { version = "0.10.5", path = "../agentkit-provider-anthropic", optional = true }
 agentkit-provider-cerebras = { version = "0.10.5", path = "../agentkit-provider-cerebras", optional = true }
@@ -31,7 +32,7 @@ agentkit-task-manager = { version = "0.10.5", path = "../agentkit-task-manager",
 agentkit-tool-compose = { version = "0.10.5", path = "../agentkit-tool-compose", optional = true }
 agentkit-tool-fs = { version = "0.10.5", path = "../agentkit-tool-fs", optional = true }
 agentkit-tool-shell = { version = "0.10.5", path = "../agentkit-tool-shell", optional = true }
-agentkit-tool-skills = { version = "0.10.5", path = "../agentkit-tool-skills", optional = true }
+agentkit-tool-skills = { version = "0.10.6", path = "../agentkit-tool-skills", optional = true }
 agentkit-tools-core = { version = "0.10.5", path = "../agentkit-tools-core", optional = true }
 
 [features]
@@ -45,6 +46,7 @@ tools = ["dep:agentkit-tools-core", "capabilities"]
 task-manager = ["dep:agentkit-task-manager", "tools"]
 loop = ["dep:agentkit-loop", "tools", "task-manager"]
 mcp = ["dep:agentkit-mcp", "capabilities", "tools"]
+plugins = ["dep:agentkit-plugins"]
 adapter-completions = ["dep:agentkit-adapter-completions", "loop"]
 provider-anthropic = ["dep:agentkit-provider-anthropic", "loop"]
 provider-cerebras = ["dep:agentkit-provider-cerebras", "loop"]

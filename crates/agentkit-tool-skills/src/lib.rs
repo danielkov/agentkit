@@ -168,7 +168,7 @@ where
 /// # }
 /// ```
 pub struct SkillRegistry {
-    roots: Vec<PathBuf>,
+    source: SkillDiscoverySource,
     filters: Vec<Arc<dyn SkillFilter>>,
     skills: BTreeMap<String, Skill>,
     activations: Arc<Mutex<HashMap<SessionId, HashSet<String>>>>,
@@ -184,7 +184,27 @@ impl SkillRegistry {
     /// filesystem.
     pub fn from_paths(roots: Vec<PathBuf>) -> Self {
         Self {
-            roots,
+            source: SkillDiscoverySource::Recursive(roots),
+            filters: Vec::new(),
+            skills: BTreeMap::new(),
+            activations: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Create a registry from exact skill directories.
+    ///
+    /// Each path is treated as one skill directory and only its direct
+    /// `SKILL.md` file is considered. Nested descendants are never searched.
+    /// This is useful for consumers such as Agent Plugins that have already
+    /// performed their own package-level discovery.
+    ///
+    /// Missing or invalid skills are silently skipped, matching
+    /// [`from_paths`](Self::from_paths). Reloads and tool invocations reparse
+    /// only these exact files so content changes are picked up without
+    /// broadening discovery.
+    pub fn from_skill_dirs(dirs: Vec<PathBuf>) -> Self {
+        Self {
+            source: SkillDiscoverySource::ExactDirectories(dirs),
             filters: Vec::new(),
             skills: BTreeMap::new(),
             activations: Arc::new(Mutex::new(HashMap::new())),
@@ -223,7 +243,7 @@ impl SkillRegistry {
     /// also silently skipped so that a missing directory does not prevent
     /// discovery of other roots.
     pub async fn discover_skills(mut self) -> Self {
-        self.skills = discover_filtered_skills(&self.roots, &self.filters);
+        self.skills = discover_filtered_skills(&self.source, &self.filters);
         self
     }
 
@@ -233,7 +253,7 @@ impl SkillRegistry {
     /// Activation tracking is preserved across reloads — skills that were
     /// already activated remain marked.
     pub async fn reload(&mut self) {
-        self.skills = discover_filtered_skills(&self.roots, &self.filters);
+        self.skills = discover_filtered_skills(&self.source, &self.filters);
     }
 
     /// Returns `true` if the catalog contains at least one skill after
@@ -254,7 +274,7 @@ impl SkillRegistry {
     /// configured, returns an empty registry.
     pub fn tool_registry(&self) -> ToolRegistry {
         let mut registry = ToolRegistry::new();
-        if !self.roots.is_empty() {
+        if !self.source.is_empty() {
             registry.register(self.build_tool());
         }
         registry
@@ -291,7 +311,7 @@ impl SkillRegistry {
 
         ActivateSkillTool {
             static_spec: spec,
-            roots: self.roots.clone(),
+            source: self.source.clone(),
             filters: self.filters.clone(),
             activations: Arc::clone(&self.activations),
         }
@@ -345,7 +365,7 @@ struct ActivateSkillInput {
 
 struct ActivateSkillTool {
     static_spec: ToolSpec,
-    roots: Vec<PathBuf>,
+    source: SkillDiscoverySource,
     filters: Vec<Arc<dyn SkillFilter>>,
     activations: Arc<Mutex<HashMap<SessionId, HashSet<String>>>>,
 }
@@ -357,7 +377,7 @@ impl Tool for ActivateSkillTool {
     }
 
     fn current_spec(&self) -> Option<ToolSpec> {
-        let skills = discover_filtered_skills(&self.roots, &self.filters);
+        let skills = discover_filtered_skills(&self.source, &self.filters);
         (!skills.is_empty()).then(|| build_activate_skill_spec(&skills))
     }
 
@@ -369,7 +389,7 @@ impl Tool for ActivateSkillTool {
         let input: ActivateSkillInput = serde_json::from_value(request.input)
             .map_err(|e| ToolError::InvalidInput(format!("invalid input: {e}")))?;
 
-        let skills = discover_filtered_skills(&self.roots, &self.filters);
+        let skills = discover_filtered_skills(&self.source, &self.filters);
         let skill = skills
             .get(&input.name)
             .ok_or_else(|| ToolError::InvalidInput(format!("unknown skill: {}", input.name)))?;
@@ -481,20 +501,48 @@ fn build_catalog_yaml(skills: &BTreeMap<String, Skill>) -> String {
 // Discovery and parsing
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
+enum SkillDiscoverySource {
+    Recursive(Vec<PathBuf>),
+    ExactDirectories(Vec<PathBuf>),
+}
+
+impl SkillDiscoverySource {
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Recursive(paths) | Self::ExactDirectories(paths) => paths.is_empty(),
+        }
+    }
+
+    fn groups(&self) -> Vec<Vec<PathBuf>> {
+        match self {
+            Self::Recursive(roots) => roots
+                .iter()
+                .filter(|root| path_exists(root))
+                .filter_map(|root| collect_skill_files(root).ok())
+                .collect(),
+            Self::ExactDirectories(dirs) => dirs
+                .iter()
+                .map(|dir| {
+                    let skill_file = dir.join(DEFAULT_SKILL_FILE);
+                    if path_exists(&skill_file) {
+                        vec![skill_file]
+                    } else {
+                        Vec::new()
+                    }
+                })
+                .collect(),
+        }
+    }
+}
+
 fn discover_filtered_skills(
-    roots: &[PathBuf],
+    source: &SkillDiscoverySource,
     filters: &[Arc<dyn SkillFilter>],
 ) -> BTreeMap<String, Skill> {
     let mut skills = BTreeMap::new();
 
-    for root in roots {
-        if !path_exists(root) {
-            continue;
-        }
-        let Ok(paths) = collect_skill_files(root) else {
-            continue;
-        };
-
+    for paths in source.groups() {
         for path in paths {
             let Some(skill) = parse_skill(&path) else {
                 continue;
@@ -795,6 +843,49 @@ mod tests {
 
         assert_eq!(reg.skills().len(), 2);
         assert!(reg.has_skills());
+
+        async_fs::remove_dir_all(&root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn exact_skill_directories_do_not_recurse() {
+        let root = temp_dir("exact-directories");
+        write_skill(&root, "direct", "Direct skill.", "Direct body.").await;
+        write_skill(
+            &root.join("direct"),
+            "nested",
+            "Nested skill.",
+            "Nested body.",
+        )
+        .await;
+
+        let reg = SkillRegistry::from_skill_dirs(vec![root.join("direct")])
+            .discover_skills()
+            .await;
+
+        let names = reg
+            .skills()
+            .iter()
+            .map(|skill| skill.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["direct"]);
+
+        async_fs::remove_dir_all(&root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn exact_skill_directories_reparse_on_reload() {
+        let root = temp_dir("exact-reload");
+        write_skill(&root, "direct", "Before.", "Body.").await;
+
+        let mut reg = SkillRegistry::from_skill_dirs(vec![root.join("direct")])
+            .discover_skills()
+            .await;
+        assert_eq!(reg.skills()[0].description, "Before.");
+
+        write_skill(&root, "direct", "After.", "Body.").await;
+        reg.reload().await;
+        assert_eq!(reg.skills()[0].description, "After.");
 
         async_fs::remove_dir_all(&root).await.unwrap();
     }

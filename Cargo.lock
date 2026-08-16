@@ -60,7 +60,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit"
-version = "0.10.5"
+version = "0.10.6"
 dependencies = [
  "agentkit-acp",
  "agentkit-adapter-completions",
@@ -70,6 +70,7 @@ dependencies = [
  "agentkit-core",
  "agentkit-loop",
  "agentkit-mcp",
+ "agentkit-plugins",
  "agentkit-provider-anthropic",
  "agentkit-provider-cerebras",
  "agentkit-provider-groq",
@@ -242,6 +243,18 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "agentkit-plugins"
+version = "0.10.6"
+dependencies = [
+ "http",
+ "serde",
+ "serde-saphyr",
+ "serde_json",
+ "thiserror 2.0.18",
+ "url",
 ]
 
 [[package]]
@@ -442,7 +455,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-tool-skills"
-version = "0.10.5"
+version = "0.10.6"
 dependencies = [
  "agentkit-capabilities",
  "agentkit-core",

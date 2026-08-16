@@ -16,6 +16,7 @@ on demand.
 ## What it provides
 
 - recursive skill discovery from one or more roots
+- exact-directory loading for package formats with fixed discovery rules
 - frontmatter parsing for skill metadata
 - per-session activation tracking to avoid duplicate loads
 - progressive disclosure so the model sees descriptions first and bodies later
@@ -57,3 +58,14 @@ let registry = SkillRegistry::from_paths(vec![
 # Ok(())
 # }
 ```
+
+When another package loader has already discovered exact skills, avoid a second recursive scan:
+
+```rust,ignore
+let plugin = agentkit_plugins::AgentPlugin::load("./plugin")?;
+let registry = SkillRegistry::from_skill_dirs(plugin.skill_directories())
+    .discover_skills()
+    .await;
+```
+
+Only `<directory>/SKILL.md` is considered for each supplied directory.

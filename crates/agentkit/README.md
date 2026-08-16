@@ -30,6 +30,7 @@ Feature-gated umbrella crate for assembling agent applications from the agentkit
 | `compaction`          | `compaction`          | Transcript compaction triggers, strategies, and pipelines                                      |
 | `context`             | `context`             | `AGENTS.md` discovery and context loading                                                      |
 | `mcp`                 | `mcp`                 | Model Context Protocol server connections (stdio + Streamable HTTP)                            |
+| `plugins`             | `plugins`             | Agent Plugins package parsing and portable asset discovery                                     |
 | `acp`                 | `acp`                 | Agent Client Protocol integration: session binding, approval resolvers, headless stdio runtime |
 | `task-manager`        | `task_manager`        | Foreground / background tool task scheduling                                                   |
 | `adapter-completions` | `adapter_completions` | Generic chat completions adapter base for building provider crates                             |

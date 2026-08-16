@@ -27,6 +27,9 @@ The umbrella crate `agentkit` re-exports subcrates behind feature flags.
 - `mcp`
   - enables `agentkit-mcp`
   - implies `capabilities`, `tools`
+- `plugins`
+  - enables the information-first `agentkit-plugins` package loader
+  - does not imply skill or MCP runtimes
 - `acp`
   - enables `agentkit-acp`
   - implies `loop`

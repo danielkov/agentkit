@@ -17,6 +17,7 @@ Start here:
 - [`reporting.md`](./reporting.md): the proposed design for the `agentkit-reporting` crate and event-consumer adapters.
 - [`tools.md`](./tools.md): the proposed design for `agentkit-tools-core` and the built-in tool boundaries.
 - [`mcp.md`](./mcp.md): the proposed design for the `agentkit-mcp` integration crate.
+- [`plugins.md`](./plugins.md): Agent Plugins package parsing and composition with skills and MCP.
 - [`acp.md`](./acp.md): the proposed design for the `agentkit-acp` runtime integration and ACP approval resolver.
 - [`permissions.md`](./permissions.md): the proposed shared policy and approval model across tools and MCP.
 
