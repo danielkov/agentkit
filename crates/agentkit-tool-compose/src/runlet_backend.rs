@@ -47,14 +47,19 @@ const RULES_PRIMER: &str = "Run a Runlet program that composes available tools. 
              task takes more than two tool calls: iterating over list results, fetching details \
              per item, filtering or aggregating tool output, or chaining reads into writes. The \
              whole program executes in a single round-trip and only its returned value enters \
-             the conversation. Independent tool calls run CONCURRENTLY: any two calls without a \
-             data dependency between them execute in parallel automatically.\n\n\
+             the conversation. Independent calls, including effectful calls, run CONCURRENTLY: \
+             any two calls without a dependency between them execute in parallel automatically. \
+             Ordinary data references create dependencies.\n\n\
              Runlet is not Lua/Python/JavaScript. Complete rules:\n\
              - `name = expression` creates an immutable binding; the program and every block \
              end with exactly one `return expression`.\n\
              - Call tools like functions with one object argument: `r = get_item({ id: 4 })`. \
              Results are plain values; access fields with `r.field` or `r.items[0]`. There is \
-             no await: using a result creates the dependency.\n\
+             no await: using a result creates the dependency. When a call must wait for earlier \
+             work whose value it does not read, add an explicit edge: \
+             `result = after earlier { return publish_item({ id: 4 }) }`. Calls lexically created \
+             inside the `after` block wait for every prerequisite to succeed. Source order alone \
+             does not sequence calls.\n\
              - Objects `{ key: value }`, lists `[a, b]`, strings, integers, floats, booleans, \
              null. String concat with `+`; `a + b` on two objects merges them shallowly (right \
              side wins). `{ [expr]: value }` computes a property key (scalars stringify: \
@@ -95,6 +100,8 @@ const RULES_PRIMER: &str = "Run a Runlet program that composes available tools. 
              - Reads are lazy, writes always run: pure work executes only if the returned \
              value needs it, but any statement that calls a tool with side effects (writes, \
              updates, sends) runs when its block runs, even if you never use its result. \
+             Independent writes still run concurrently; use a data reference or `after` when \
+             ordering is required. \
              Fire-and-forget is fine: `r = update_contact({ id: c.id, phone: fixed }) if \
              needs_fix` inside a loop performs the update without returning `r`.\n\
              - Pure intrinsics (call like tools; [x] marks optional args): \
@@ -129,7 +136,7 @@ const RULES_PRIMER: &str = "Run a Runlet program that composes available tools. 
 /// equal at sonnet tier, roughly 4x fewer syntax rejections and half the
 /// cost at haiku tier. The program is validated against a mock registry;
 /// keep it compiling if you edit it.
-const EXEMPLAR_PRIMER: &str = r#"Run a Runlet program that composes available tools. Prefer this tool whenever a task takes more than two tool calls: iterating over list results, fetching details per item, filtering or aggregating tool output, or chaining reads into writes. The whole program executes in a single round-trip and only its returned value enters the conversation. Independent tool calls run CONCURRENTLY: any two calls without a data dependency between them execute in parallel automatically.
+const EXEMPLAR_PRIMER: &str = r#"Run a Runlet program that composes available tools. Prefer this tool whenever a task takes more than two tool calls: iterating over list results, fetching details per item, filtering or aggregating tool output, or chaining reads into writes. The whole program executes in a single round-trip and only its returned value enters the conversation. Independent calls, including effectful calls, run CONCURRENTLY: any two calls without a dependency between them execute in parallel automatically. Ordinary data references create dependencies.
 
 Runlet is not Lua/Python/JavaScript. The annotated program below exercises the ENTIRE language; every construct and every rule you may rely on appears here, with its constraint in the comments:
 
@@ -149,8 +156,9 @@ remaining = for page in list.range(2, first.total_pages + 1) {
 listing = fold acc = first.items for page in remaining { return acc + page }
 config = json.parse(input.settings)                   # `input` is the JSON value submitted with the program
 
-# These two bindings share no data, so their calls run IN PARALLEL — there is
-# no await; referencing a result creates the dependency.
+# `config` and the listing work share no data, so they run IN PARALLEL — this
+# includes effectful calls. There is no await; ordinary result references create
+# dependencies. Source order alone never sequences independent calls.
 
 shaped = for record in listing {                      # concurrent loop; the host bounds active iterations;
                                                       # every item runs and results preserve input order
@@ -169,6 +177,13 @@ shaped = for record in listing {                      # concurrent loop; the hos
         amount: detail.amount,
         flag: detail.note if "urgent" in detail.note  # `in`: substring, list membership, object key.
     }                                                 # null values omit the key from optional tool inputs
+}
+
+# Use `after` when a call must wait for work whose value it does not read. Calls
+# lexically created in this block wait until `shaped` succeeds; this is a real
+# ordering edge, unlike source order.
+checkpoint = after shaped {
+    return log_event({ kind: "shaping_complete" })
 }
 
 total = fold acc = 0 for row in shaped {              # fold is THE way to aggregate: sequential reduce,
@@ -202,6 +217,21 @@ Catalog return shapes use type notation: `string[]` is a bare list — iterate o
 Keep reads, transforms, writes, checks, and final submission in one program. Do not return source records for model-side planning or re-read successful writes. A nested final submission call satisfies the requirement and avoids another model round-trip.
 
 Pure intrinsics (call like tools; [x] marks optional args): text.length/lower/upper/trim(s), text.starts_with/ends_with(s, x), text.slice(s, start[, end]), text.split(s, sep), text.join(strings, sep), text.replace(s, from, to). regex.test(s, pattern), regex.find_all(s, pattern), regex.captures(s, pattern) -> { full, groups, names } or null, regex.replace(s, pattern, repl) with $1/$name references, regex.split(s, pattern) - Rust regex syntax, NO lookahead (?=...). list.length(xs), list.sort(xs), list.sort_by(xs, "a.b"[, "desc"]), list.slice(xs, start[, end]), list.range(start, end[, step]) (end exclusive; step defaults to 1, negative counts down). json.parse(s), json.encode(v). number.round/floor/ceil(x), number.parse(s). time.parse("2026-07-12T09:30:00Z") -> epoch ms, time.format(ms) -> RFC 3339; time math is plain integer ms (86400000 per day). Substring check is the `in` operator ("x" in s) - there is no text.contains."#;
+
+#[cfg(test)]
+mod primer_tests {
+    use super::{EXEMPLAR_PRIMER, RULES_PRIMER};
+
+    #[test]
+    fn primers_advertise_explicit_after_dependencies() {
+        for primer in [RULES_PRIMER, EXEMPLAR_PRIMER] {
+            assert!(primer.contains("including effectful calls"));
+            assert!(primer.contains("Ordinary data references create dependencies"));
+            assert!(primer.contains("after "));
+            assert!(primer.contains("lexically created"));
+        }
+    }
+}
 
 /// Executes compose scripts as Runlet programs.
 #[derive(Clone, Copy, Debug, Default)]

@@ -9,7 +9,7 @@ optional JSON input; the script can call the current tool catalog with
 Sandboxed Lua is enabled by default. To use only the Runlet backend:
 
 ```toml
-agentkit-tool-compose = { version = "0.10.6", default-features = false, features = ["runlet"] }
+agentkit-tool-compose = { version = "0.10.7", default-features = false, features = ["runlet"] }
 ```
 
 ```rust
@@ -28,6 +28,26 @@ let tools = agentkit_tool_compose::ComposeTool::wrap(child_source);
 The wrapped source still advertises and executes its child tools directly, while
 `compose` renders child output schemas into its own description. Dynamic sources
 remain live: catalog events and child lookups delegate to the wrapped source.
+
+## Runlet ordering
+
+Runlet schedules independent calls concurrently, including effectful calls such
+as writes. Ordinary data references establish dependencies: a call that uses an
+earlier result waits for that result. When a call must wait for earlier work it
+does not read, express the ordering edge explicitly:
+
+```runlet
+prepared = prepare_workspace({ path: input.path })
+result = after prepared {
+    return publish_workspace({ path: input.path })
+}
+return result
+```
+
+Calls lexically created inside an `after` block are created only after every
+prerequisite succeeds. Use `after` for required sequencing, not source order;
+two adjacent calls with no data dependency or explicit `after` edge may run in
+parallel.
 
 The final compose result enters the transcript as compact JSON by default.
 With the `toon` feature enabled,

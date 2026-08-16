@@ -1,10 +1,11 @@
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 
-use agentkit_core::{MetadataMap, SessionId, ToolCallId, ToolOutput, TurnId};
+use agentkit_core::{MetadataMap, SessionId, ToolCallId, ToolOutput, ToolResultPart, TurnId};
 use agentkit_tools_core::{
-    AllowAllPermissions, BasicToolExecutor, PermissionChecker, Tool, ToolExecutionOutcome,
-    ToolExecutor, ToolInterruption, ToolName, ToolRegistry, ToolRequest,
+    AllowAllPermissions, BasicToolExecutor, PermissionChecker, Tool, ToolContext, ToolError,
+    ToolExecutionOutcome, ToolExecutor, ToolInterruption, ToolName, ToolRegistry, ToolRequest,
+    ToolResult, ToolSpec,
 };
 use serde_json::{Value, json};
 
@@ -34,6 +35,121 @@ async fn execute_compose(
     let owned = owned_context(executor.clone(), Arc::new(AllowAllPermissions));
     let mut ctx = owned.borrowed();
     executor.execute(req, &mut ctx).await
+}
+
+#[derive(Clone)]
+struct OrderingProbeTool {
+    spec: ToolSpec,
+    active_parallel: Arc<AtomicUsize>,
+    saw_parallel_overlap: Arc<AtomicBool>,
+    events: Arc<StdMutex<Vec<String>>>,
+}
+
+impl OrderingProbeTool {
+    fn new() -> Self {
+        Self {
+            // Default annotations intentionally make this an effectful,
+            // at-most-once Runlet call rather than a pure read.
+            spec: ToolSpec::new(
+                "ordering_probe",
+                "record compose scheduling",
+                json!({"type": "object"}),
+            ),
+            active_parallel: Arc::new(AtomicUsize::new(0)),
+            saw_parallel_overlap: Arc::new(AtomicBool::new(false)),
+            events: Arc::new(StdMutex::new(Vec::new())),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for OrderingProbeTool {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    async fn invoke(
+        &self,
+        request: ToolRequest,
+        _ctx: &mut ToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
+        let kind = request.input["kind"].as_str().unwrap_or_default();
+        match kind {
+            "parallel_a" | "parallel_b" => {
+                self.active_parallel.fetch_add(1, Ordering::SeqCst);
+                for _ in 0..1_000 {
+                    if self.active_parallel.load(Ordering::SeqCst) >= 2 {
+                        self.saw_parallel_overlap.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                self.active_parallel.fetch_sub(1, Ordering::SeqCst);
+            }
+            "prerequisite" => {
+                self.events
+                    .lock()
+                    .expect("events lock")
+                    .push("prerequisite:start".into());
+                for _ in 0..100 {
+                    tokio::task::yield_now().await;
+                }
+                self.events
+                    .lock()
+                    .expect("events lock")
+                    .push("prerequisite:finish".into());
+            }
+            "after" => self
+                .events
+                .lock()
+                .expect("events lock")
+                .push("after:start".into()),
+            _ => {}
+        }
+
+        Ok(ToolResult::new(ToolResultPart::success(
+            request.call_id,
+            ToolOutput::structured(request.input),
+        )))
+    }
+}
+
+#[tokio::test]
+async fn effectful_calls_run_concurrently_and_after_orders_without_data_flow() {
+    let child = OrderingProbeTool::new();
+    let saw_parallel_overlap = child.saw_parallel_overlap.clone();
+    let events = child.events.clone();
+    let outcome = execute_compose(
+        ComposeConfig::default(),
+        child,
+        request(
+            r#"a = ordering_probe({ kind: "parallel_a" })
+b = ordering_probe({ kind: "parallel_b" })
+earlier = ordering_probe({ kind: "prerequisite" })
+later = after earlier {
+    return ordering_probe({ kind: "after" })
+}
+return [a.kind, b.kind, later.kind]"#,
+            Value::Null,
+        ),
+    )
+    .await;
+
+    match outcome {
+        ToolExecutionOutcome::Completed(result) => assert_eq!(
+            result.result.output,
+            ToolOutput::structured(json!(["parallel_a", "parallel_b", "after"]))
+        ),
+        other => panic!("unexpected outcome: {other:?}"),
+    }
+    assert!(
+        saw_parallel_overlap.load(Ordering::SeqCst),
+        "independent effectful calls should overlap"
+    );
+    assert_eq!(
+        *events.lock().expect("events lock"),
+        vec!["prerequisite:start", "prerequisite:finish", "after:start"]
+    );
 }
 
 #[tokio::test]
