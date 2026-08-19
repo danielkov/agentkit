@@ -42,6 +42,8 @@
   - OpenRouter model adapter
 - `agentkit-provider-openai`
   - OpenAI model adapter
+- `agentkit-provider-baseten`
+  - Baseten Model API adapter
 - `agentkit-provider-anthropic`
   - Anthropic Messages API adapter; implements `ModelAdapter` directly (the
     Messages API is not OpenAI-compatible)

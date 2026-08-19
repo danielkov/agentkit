@@ -35,6 +35,7 @@ Feature-gated umbrella crate for assembling agent applications from the agentkit
 | `task-manager`        | `task_manager`        | Foreground / background tool task scheduling                                                   |
 | `adapter-completions` | `adapter_completions` | Generic chat completions adapter base for building provider crates                             |
 | `provider-anthropic`  | `provider_anthropic`  | Anthropic Messages API adapter (streaming, prompt caching, extended thinking, server tools)    |
+| `provider-baseten`    | `provider_baseten`    | Baseten OpenAI-compatible Model API adapter                                                    |
 | `provider-cerebras`   | `provider_cerebras`   | Cerebras Inference API adapter (streaming, reasoning, compression, Files + Batch)              |
 | `provider-openai`     | `provider_openai`     | OpenAI `/v1/chat/completions` adapter                                                          |
 | `provider-openrouter` | `provider_openrouter` | OpenRouter `/v1/chat/completions` adapter                                                      |

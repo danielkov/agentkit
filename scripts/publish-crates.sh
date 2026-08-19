@@ -40,6 +40,7 @@ CRATES=(
   agentkit-provider-groq
   agentkit-provider-mistral
   agentkit-provider-anthropic
+  agentkit-provider-baseten
   agentkit-provider-cerebras
   agentkit
   how-cli

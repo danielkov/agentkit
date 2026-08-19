@@ -19,6 +19,7 @@ The umbrella crate `agentkit` re-exports subcrates behind feature flags.
 - `mcp` — `agentkit-mcp`
 - `adapter-completions` — `agentkit-adapter-completions`
 - `provider-anthropic` — `agentkit-provider-anthropic`
+- `provider-baseten` — `agentkit-provider-baseten`
 - `provider-cerebras` — `agentkit-provider-cerebras`
 - `provider-groq` — `agentkit-provider-groq`
 - `provider-mistral` — `agentkit-provider-mistral`
@@ -84,8 +85,8 @@ agentkit = { version = "0.10.5", features = [
 ] }
 ```
 
-Swap `provider-groq` for `provider-mistral`, `provider-vllm`, `provider-ollama`,
-or `provider-openai` as needed.
+Swap `provider-groq` for `provider-baseten`, `provider-mistral`, `provider-vllm`,
+`provider-ollama`, or `provider-openai` as needed.
 
 **Anthropic Messages API host (streaming, extended thinking, server tools):**
 

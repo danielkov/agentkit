@@ -88,6 +88,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   - OpenAI adapter with streaming, tool calls, multimodal content, and prompt caching
 - `agentkit-provider-anthropic`
   - Anthropic Messages API adapter with streaming, prompt caching, extended thinking, and server-side tools (web search, web fetch, code execution)
+- `agentkit-provider-baseten`
+  - Baseten Model API adapter with streaming and tool calls, including custom endpoints for dedicated deployments
 - `agentkit-provider-cerebras`
   - Cerebras Inference API adapter with streaming, reasoning, strict JSON schema, compression (msgpack/gzip), predicted outputs, service tiers, and Files + Batch API
 - `agentkit-provider-ollama`
@@ -352,6 +354,7 @@ Optional flags:
 - `provider-openrouter`
 - `provider-openai`
 - `provider-anthropic`
+- `provider-baseten`
 - `provider-cerebras`
 - `provider-ollama`
 - `provider-vllm`

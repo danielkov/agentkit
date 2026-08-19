@@ -28,6 +28,7 @@
 //! | `mcp` | [`mcp`] | Model Context Protocol (MCP) server connections |
 //! | `plugins` | [`plugins`] | Agent Plugins package parsing and validation |
 //! | `provider-anthropic` | [`provider_anthropic`] | Anthropic Messages API [`loop_::ModelAdapter`] implementation |
+//! | `provider-baseten` | [`provider_baseten`] | Baseten Model API [`loop_::ModelAdapter`] implementation |
 //! | `provider-cerebras` | [`provider_cerebras`] | Cerebras Inference API [`loop_::ModelAdapter`] implementation |
 //! | `provider-openrouter` | [`provider_openrouter`] | OpenRouter [`loop_::ModelAdapter`] implementation |
 //! | `task-manager` | [`task_manager`] | Tool task scheduling: [`task_manager::SimpleTaskManager`], [`task_manager::AsyncTaskManager`] |
@@ -243,6 +244,16 @@ pub use agentkit_adapter_completions as adapter_completions;
 #[cfg(feature = "provider-openrouter")]
 pub use agentkit_provider_openrouter as provider_openrouter;
 
+/// Baseten Model API [`loop_::ModelAdapter`] implementation.
+///
+/// Provides [`provider_baseten::BasetenAdapter`] and
+/// [`provider_baseten::BasetenConfig`] for Baseten's OpenAI-compatible Model
+/// APIs and dedicated deployments.
+///
+/// Requires the `provider-baseten` feature.
+#[cfg(feature = "provider-baseten")]
+pub use agentkit_provider_baseten as provider_baseten;
+
 /// Anthropic Messages API [`loop_::ModelAdapter`] implementation.
 ///
 /// Provides [`provider_anthropic::AnthropicAdapter`] and
@@ -371,6 +382,8 @@ pub mod prelude {
     pub use crate::plugins::*;
     #[cfg(feature = "provider-anthropic")]
     pub use crate::provider_anthropic;
+    #[cfg(feature = "provider-baseten")]
+    pub use crate::provider_baseten::*;
     #[cfg(feature = "provider-cerebras")]
     pub use crate::provider_cerebras;
     #[cfg(feature = "provider-groq")]

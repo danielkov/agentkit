@@ -18,6 +18,7 @@ members = [
     "crates/agentkit-provider-groq",
     "crates/agentkit-provider-mistral",
     "crates/agentkit-provider-anthropic",
+    "crates/agentkit-provider-baseten",
     "crates/agentkit-provider-cerebras",
     "crates/agentkit-reporting",
     "crates/agentkit-tool-fs",

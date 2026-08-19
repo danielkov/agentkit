@@ -135,7 +135,7 @@ let agent = Agent::builder()
 
 ## Available providers
 
-agentkit ships eight provider crates. Six go through `CompletionsProvider` (Path 2), and two — Anthropic and Cerebras — implement `ModelAdapter` directly (Path 1):
+agentkit ships nine provider crates. Seven go through `CompletionsProvider` (Path 2), and two — Anthropic and Cerebras — implement `ModelAdapter` directly (Path 1):
 
 | Crate                                                                                                                 | Path       | Auth                  | Notes                                                                                                                                          |
 | --------------------------------------------------------------------------------------------------------------------- | ---------- | --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -143,6 +143,7 @@ agentkit ships eight provider crates. Six go through `CompletionsProvider` (Path
 | `agentkit-provider-openai`                                                                                            | 2 (hooks)  | Bearer                | auth, cache mapping                                                                                                                            |
 | `agentkit-provider-anthropic`                                                                                         | 1 (direct) | `x-api-key` or Bearer | streaming, extended thinking, server tools, explicit cache-breakpoints, thinking-signature round-trip                                          |
 | `agentkit-provider-cerebras`                                                                                          | 1 (direct) | Bearer                | streaming, typed reasoning config, strict JSON-Schema output, rate-limit snapshot, version-patch header; feature-gated compression + Batch API |
+| `agentkit-provider-baseten`                                                                                           | 2 (hooks)  | Bearer                | shared Model API endpoint plus configurable dedicated deployment endpoints                                                                    |
 | `agentkit-provider-ollama`                                                                                            | 2 (hooks)  | none                  | local runtime; no hooks                                                                                                                        |
 | `agentkit-provider-vllm`                                                                                              | 2 (hooks)  | optional Bearer       | `preprocess_request` for optional auth                                                                                                         |
 | `agentkit-provider-groq`                                                                                              | 2 (hooks)  | Bearer                | `preprocess_request` for auth                                                                                                                  |

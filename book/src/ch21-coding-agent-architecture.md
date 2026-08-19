@@ -181,6 +181,7 @@ agentkit-core                    (no dependencies)
      │        ├── agentkit-provider-openai
      │        ├── agentkit-provider-ollama
      │        ├── agentkit-provider-vllm
+     │        ├── agentkit-provider-baseten
      │        ├── agentkit-provider-groq
      │        └── agentkit-provider-mistral
      │

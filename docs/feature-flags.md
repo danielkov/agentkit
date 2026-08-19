@@ -36,6 +36,9 @@ The umbrella crate `agentkit` re-exports subcrates behind feature flags.
 - `adapter-completions`
   - enables `agentkit-adapter-completions`
   - implies `loop`
+- `provider-baseten`
+  - enables `agentkit-provider-baseten`
+  - implies `adapter-completions`
 - `provider-anthropic`
   - enables `agentkit-provider-anthropic`
   - implies `loop` (the Messages API is not OpenAI-compatible, so this adapter
@@ -125,10 +128,10 @@ OpenRouter-backed example host (streaming, prompt caching):
 - everything needed for the host
 - `provider-openrouter`
 
-OpenAI-compatible provider (streaming; e.g. Groq, Mistral, vLLM, Ollama):
+OpenAI-compatible provider (streaming; e.g. Baseten, Groq, Mistral, vLLM, Ollama):
 
 - everything needed for the host
-- `provider-groq` / `provider-mistral` / `provider-vllm` / `provider-ollama`
+- `provider-baseten` / `provider-groq` / `provider-mistral` / `provider-vllm` / `provider-ollama`
 
 Anthropic Messages API (streaming, extended thinking, server tools):
 
