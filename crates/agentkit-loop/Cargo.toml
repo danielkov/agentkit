@@ -4,13 +4,12 @@ homepage.workspace = true
 name = "agentkit-loop"
 readme = "README.md"
 repository.workspace = true
-version.workspace = true
+version = "0.10.6"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-agentkit-capabilities = { version = "0.10.5", path = "../agentkit-capabilities" }
 agentkit-core = { version = "0.10.5", path = "../agentkit-core" }
 agentkit-task-manager = { version = "0.10.5", path = "../agentkit-task-manager" }
 agentkit-tools-core = { version = "0.10.5", path = "../agentkit-tools-core" }

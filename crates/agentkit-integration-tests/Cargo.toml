@@ -12,7 +12,6 @@ path = "src/lib.rs"
 doctest = false
 
 [dependencies]
-agentkit-capabilities = { version = "0.10.5", path = "../agentkit-capabilities" }
 agentkit-core = { version = "0.10.5", path = "../agentkit-core" }
 agentkit-loop = { version = "0.10.5", path = "../agentkit-loop" }
 agentkit-mcp = { version = "0.10.5", path = "../agentkit-mcp" }

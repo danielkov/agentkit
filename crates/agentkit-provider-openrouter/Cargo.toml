@@ -7,7 +7,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-version.workspace = true
+version = "0.10.6"
 
 [dependencies]
 agentkit-adapter-completions = { version = "0.10.5", path = "../agentkit-adapter-completions" }
@@ -18,4 +18,3 @@ async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tracing.workspace = true

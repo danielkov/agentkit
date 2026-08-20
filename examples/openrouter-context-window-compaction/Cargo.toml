@@ -13,7 +13,6 @@ agentkit-http = { path = "../../crates/agentkit-http" }
 agentkit-loop = { path = "../../crates/agentkit-loop" }
 agentkit-provider-openrouter = { path = "../../crates/agentkit-provider-openrouter" }
 agentkit-tools-core = { path = "../../crates/agentkit-tools-core" }
-async-trait.workspace = true
 dotenvy.workspace = true
 reqwest.workspace = true
 serde = { workspace = true, features = ["derive"] }

@@ -91,7 +91,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-acp"
-version = "0.10.6"
+version = "0.10.7"
 dependencies = [
  "agent-client-protocol",
  "agentkit-core",
@@ -100,7 +100,6 @@ dependencies = [
  "agentkit-tools-core",
  "async-trait",
  "base64 0.22.1",
- "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
@@ -190,7 +189,6 @@ dependencies = [
 name = "agentkit-integration-tests"
 version = "0.10.5"
 dependencies = [
- "agentkit-capabilities",
  "agentkit-core",
  "agentkit-loop",
  "agentkit-mcp",
@@ -211,9 +209,8 @@ dependencies = [
 
 [[package]]
 name = "agentkit-loop"
-version = "0.10.5"
+version = "0.10.6"
 dependencies = [
- "agentkit-capabilities",
  "agentkit-core",
  "agentkit-task-manager",
  "agentkit-tools-core",
@@ -248,7 +245,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-plugins"
-version = "0.10.6"
+version = "0.10.7"
 dependencies = [
  "http",
  "serde",
@@ -260,7 +257,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-provider-anthropic"
-version = "0.10.5"
+version = "0.10.6"
 dependencies = [
  "agentkit-core",
  "agentkit-http",
@@ -271,7 +268,6 @@ dependencies = [
  "bytes",
  "futures-util",
  "reqwest",
- "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
@@ -312,43 +308,37 @@ dependencies = [
 
 [[package]]
 name = "agentkit-provider-groq"
-version = "0.10.5"
+version = "0.10.6"
 dependencies = [
  "agentkit-adapter-completions",
- "agentkit-core",
  "agentkit-http",
  "agentkit-loop",
  "async-trait",
  "serde",
- "serde_json",
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "agentkit-provider-mistral"
-version = "0.10.5"
+version = "0.10.6"
 dependencies = [
  "agentkit-adapter-completions",
- "agentkit-core",
  "agentkit-http",
  "agentkit-loop",
  "async-trait",
  "serde",
- "serde_json",
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "agentkit-provider-ollama"
-version = "0.10.5"
+version = "0.10.6"
 dependencies = [
  "agentkit-adapter-completions",
- "agentkit-core",
  "agentkit-http",
  "agentkit-loop",
  "async-trait",
  "serde",
- "serde_json",
  "thiserror 2.0.18",
 ]
 
@@ -368,7 +358,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-provider-openrouter"
-version = "0.10.5"
+version = "0.10.6"
 dependencies = [
  "agentkit-adapter-completions",
  "agentkit-core",
@@ -378,20 +368,17 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
- "tracing",
 ]
 
 [[package]]
 name = "agentkit-provider-vllm"
-version = "0.10.5"
+version = "0.10.6"
 dependencies = [
  "agentkit-adapter-completions",
- "agentkit-core",
  "agentkit-http",
  "agentkit-loop",
  "async-trait",
  "serde",
- "serde_json",
  "thiserror 2.0.18",
 ]
 
@@ -421,7 +408,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-tool-compose"
-version = "0.10.7"
+version = "0.10.8"
 dependencies = [
  "agentkit-core",
  "agentkit-tools-core",
@@ -454,7 +441,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-tool-shell"
-version = "0.10.5"
+version = "0.10.6"
 dependencies = [
  "agentkit-capabilities",
  "agentkit-core",
@@ -462,20 +449,18 @@ dependencies = [
  "async-trait",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
  "tokio",
 ]
 
 [[package]]
 name = "agentkit-tool-skills"
-version = "0.10.6"
+version = "0.10.7"
 dependencies = [
  "agentkit-capabilities",
  "agentkit-core",
  "agentkit-tools-core",
  "async-fs",
  "async-trait",
- "futures-lite",
  "serde",
  "serde-saphyr",
  "serde_json",
@@ -2161,7 +2146,6 @@ dependencies = [
 name = "mcp-reference-interop"
 version = "0.10.5"
 dependencies = [
- "agentkit-core",
  "agentkit-mcp",
  "axum",
  "reqwest",
@@ -2332,7 +2316,6 @@ dependencies = [
  "agentkit-tool-shell",
  "agentkit-tool-skills",
  "agentkit-tools-core",
- "async-trait",
  "dotenvy",
  "serde_json",
  "tokio",
@@ -2389,9 +2372,7 @@ dependencies = [
  "agentkit-core",
  "agentkit-loop",
  "agentkit-provider-openrouter",
- "agentkit-reporting",
  "agentkit-tools-core",
- "async-trait",
  "dotenvy",
  "serde_json",
  "tokio",
@@ -2407,7 +2388,6 @@ dependencies = [
  "agentkit-provider-openrouter",
  "agentkit-reporting",
  "agentkit-tool-skills",
- "agentkit-tools-core",
  "dotenvy",
  "tokio",
 ]
@@ -2422,7 +2402,6 @@ dependencies = [
  "agentkit-loop",
  "agentkit-provider-openrouter",
  "agentkit-tools-core",
- "async-trait",
  "dotenvy",
  "reqwest",
  "serde",
@@ -2483,7 +2462,6 @@ dependencies = [
  "agentkit-provider-openrouter",
  "dotenvy",
  "rusqlite",
- "serde",
  "serde_json",
  "tokio",
 ]
@@ -2853,9 +2831,9 @@ dependencies = [
 
 [[package]]
 name = "regex"
-version = "1.12.4"
+version = "1.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1292b7759ae1cb9ec195452d1390a074f0cd8541ab7a5a8c31cd6db45d4a6ba"
+checksum = "f020237b6c8eed93db2e2cb53c00c60a8e1bc73da7d073199a1180401450218d"
 dependencies = [
  "aho-corasick",
  "memchr",
@@ -3029,9 +3007,9 @@ dependencies = [
 
 [[package]]
 name = "runlet"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ce954be656e6063bd38192fa8b8d16af93f6164097f9b2e31b9e88db88625c4"
+checksum = "b8ec77b030f065b7a5191d96afbb233b785765b87b6f734c03f1ac9da8acbea2"
 dependencies = [
  "hex",
  "regex",
@@ -3286,9 +3264,9 @@ dependencies = [
 
 [[package]]
 name = "serde-saphyr"
-version = "0.0.23"
+version = "0.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "09fbdfe7a27a1b1633dfc0c4c8e65940b8d819c5ddb9cca48ebc3223b00c8b14"
+checksum = "f83ad47c2f14654528a89495f8d0dbc64173176f8512c7c72386cbe81009f661"
 dependencies = [
  "ahash",
  "annotate-snippets",
@@ -3297,7 +3275,6 @@ dependencies = [
  "getrandom 0.3.4",
  "nohash-hasher",
  "num-traits",
- "regex",
  "saphyr-parser-bw",
  "serde",
  "smallvec",

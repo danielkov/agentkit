@@ -4,7 +4,7 @@ homepage.workspace = true
 name = "agentkit-tool-shell"
 readme = "README.md"
 repository.workspace = true
-version.workspace = true
+version = "0.10.6"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -15,7 +15,6 @@ agentkit-tools-core = { version = "0.10.5", path = "../agentkit-tools-core" }
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true
 tokio = { workspace = true, features = ["process", "time"] }
 
 [dev-dependencies]
