@@ -7,13 +7,13 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-version = "0.10.6"
+version = "0.10.7"
 
 [dependencies]
-agentkit-adapter-completions = { version = "0.10.5", path = "../agentkit-adapter-completions" }
+agentkit-adapter-completions = { version = "0.10.6", path = "../agentkit-adapter-completions" }
 agentkit-core = { version = "0.10.5", path = "../agentkit-core" }
 agentkit-http = { version = "0.10.5", path = "../agentkit-http" }
-agentkit-loop = { version = "0.10.5", path = "../agentkit-loop" }
+agentkit-loop = { version = "0.10.7", path = "../agentkit-loop" }
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true

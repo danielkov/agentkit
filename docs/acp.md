@@ -56,7 +56,7 @@ Recommended initial crate:
 [dependencies]
 agent-client-protocol = "2.0.0"
 agentkit-core = { path = "../agentkit-core", version = "0.10.5" }
-agentkit-loop = { path = "../agentkit-loop", version = "0.10.5" }
+agentkit-loop = { path = "../agentkit-loop", version = "0.10.7" }
 agentkit-tools-core = { path = "../agentkit-tools-core", version = "0.10.5" }
 async-trait = { workspace = true }
 serde = { workspace = true }

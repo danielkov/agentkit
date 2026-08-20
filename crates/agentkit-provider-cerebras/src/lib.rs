@@ -309,6 +309,10 @@ impl ModelSession for CerebrasSession {
     fn model_name(&self) -> Option<&str> {
         Some(&self.config.model)
     }
+
+    fn provider_name(&self) -> Option<&str> {
+        Some("cerebras")
+    }
 }
 
 fn attach_body(builder: HttpRequestBuilder, body: bytes::Bytes) -> HttpRequestBuilder {

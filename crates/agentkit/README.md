@@ -30,6 +30,7 @@ Feature-gated umbrella crate for assembling agent applications from the agentkit
 | `compaction`          | `compaction`          | Transcript compaction triggers, strategies, and pipelines                                      |
 | `context`             | `context`             | `AGENTS.md` discovery and context loading                                                      |
 | `mcp`                 | `mcp`                 | Model Context Protocol server connections (stdio + Streamable HTTP)                            |
+| `otel`                | —                     | OpenTelemetry-native GenAI usage, finish-reason, and message attributes                        |
 | `plugins`             | `plugins`             | Agent Plugins package parsing and portable asset discovery                                     |
 | `acp`                 | `acp`                 | Agent Client Protocol integration: session binding, approval resolvers, headless stdio runtime |
 | `task-manager`        | `task_manager`        | Foreground / background tool task scheduling                                                   |
@@ -53,7 +54,7 @@ Add agentkit with the features you need:
 
 ```toml
 [dependencies]
-agentkit = { version = "0.10.5", features = ["provider-openrouter", "tool-fs", "tool-shell"] }
+agentkit = { version = "0.10.8", features = ["provider-openrouter", "tool-fs", "tool-shell"] }
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -163,7 +164,7 @@ When implementing a custom adapter, only the default features are needed:
 
 ```toml
 [dependencies]
-agentkit = "0.10.5"
+agentkit = "0.10.8"
 ```
 
 ```rust,ignore

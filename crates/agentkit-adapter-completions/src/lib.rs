@@ -212,6 +212,7 @@ pub struct CompletionsSession<P: CompletionsProvider> {
     client: Http,
     provider: Arc<P>,
     model: Option<String>,
+    provider_label: String,
     _session_config: SessionConfig,
 }
 
@@ -275,6 +276,7 @@ impl<P: CompletionsProvider + 'static> ModelAdapter for CompletionsAdapter<P> {
             client: self.client.clone(),
             provider: self.provider.clone(),
             model,
+            provider_label: self.provider_label.clone(),
             _session_config: config,
         })
     }
@@ -361,6 +363,10 @@ impl<P: CompletionsProvider + 'static> ModelSession for CompletionsSession<P> {
 
     fn model_name(&self) -> Option<&str> {
         self.model.as_deref()
+    }
+
+    fn provider_name(&self) -> Option<&str> {
+        Some(&self.provider_label)
     }
 }
 

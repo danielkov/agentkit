@@ -12,7 +12,7 @@ use agentkit_core::{
     Delta, FinishReason, Item, ItemKind, MetadataMap, Part, PartId, PartKind, ReasoningPart,
     TextPart, ToolCallPart, Usage,
 };
-use agentkit_loop::{ModelTurnEvent, ModelTurnResult};
+use agentkit_loop::{ModelTurnEvent, ModelTurnResult, set_provider_finish_reasons};
 use serde_json::Value;
 
 use crate::error::ResponseError;
@@ -30,6 +30,7 @@ struct ChoiceState {
     reasoning_buffer: String,
     tool_calls: BTreeMap<u32, ToolCallAccum>,
     finish_reason: Option<FinishReason>,
+    finish_reason_raw: Option<String>,
 }
 
 impl ChoiceState {
@@ -45,6 +46,7 @@ impl ChoiceState {
             reasoning_buffer: String::new(),
             tool_calls: BTreeMap::new(),
             finish_reason: None,
+            finish_reason_raw: None,
         }
     }
 }
@@ -230,6 +232,7 @@ impl EventTranslator {
             // finish_reason -------------------------------------------
             if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
                 state.finish_reason = Some(crate::response::map_finish_reason(reason));
+                state.finish_reason_raw = Some(reason.to_owned());
                 // Commit content/reasoning as soon as we see the finish.
                 out.extend(commit_choice(state));
                 // Flush any ready tool calls.
@@ -280,6 +283,7 @@ impl EventTranslator {
         // Commit any still-open content/reasoning buffers and emit tool calls
         // whose `arguments` stayed unparsed until [DONE].
         let mut aggregate_finish: Option<FinishReason> = None;
+        let mut native_finish_reasons = Vec::new();
         let mut output_items: Vec<Item> = Vec::new();
         for (_index, state) in std::mem::take(&mut self.choices) {
             let mut state = state;
@@ -304,6 +308,9 @@ impl EventTranslator {
             }
             if aggregate_finish.is_none() {
                 aggregate_finish = state.finish_reason.clone();
+            }
+            if let Some(reason) = state.finish_reason_raw {
+                native_finish_reasons.push(reason);
             }
             // Assemble a per-choice Item for the terminal result.
             let mut parts: Vec<Part> = Vec::new();
@@ -341,11 +348,13 @@ impl EventTranslator {
             }
         }
 
+        let mut turn_metadata = MetadataMap::new();
+        set_provider_finish_reasons(&mut turn_metadata, native_finish_reasons);
         events.push(ModelTurnEvent::Finished(ModelTurnResult {
             finish_reason: aggregate_finish.unwrap_or(FinishReason::Completed),
             output_items,
             usage: self.terminal_usage.clone(),
-            metadata: MetadataMap::new(),
+            metadata: turn_metadata,
             model: self.model.clone(),
             response_id: self.message_id.clone(),
         }));
@@ -439,6 +448,10 @@ mod tests {
             panic!("expected Finished");
         };
         assert_eq!(result.finish_reason, FinishReason::Completed);
+        assert_eq!(
+            result.metadata["agentkit.provider_finish_reasons"],
+            serde_json::json!(["done"])
+        );
         let usage = result.usage.as_ref().unwrap();
         assert!(usage.metadata.contains_key("cerebras.time_info"));
         let item = &result.output_items[0];

@@ -881,6 +881,10 @@ impl ModelAdapter for OpenRouterAdapter {
     async fn start_session(&self, config: SessionConfig) -> Result<Self::Session, LoopError> {
         self.0.start_session(config).await
     }
+
+    fn provider_name(&self) -> Option<&str> {
+        Some("openrouter")
+    }
 }
 
 // --- Error type ---
@@ -906,6 +910,12 @@ mod tests {
     use agentkit_core::{Item, ItemKind, MetadataMap, Part, SessionId, TextPart, TurnId};
 
     use super::*;
+
+    #[test]
+    fn adapter_reports_provider_name_without_starting_a_session() {
+        let adapter = OpenRouterAdapter::new(OpenRouterConfig::new("key", "model")).unwrap();
+        assert_eq!(ModelAdapter::provider_name(&adapter), Some("openrouter"));
+    }
 
     #[test]
     fn reasoning_effort_serializes_into_request_config() {

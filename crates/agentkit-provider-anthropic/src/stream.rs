@@ -15,7 +15,7 @@ use agentkit_core::{
     CustomPart, Delta, FinishReason, Item, ItemKind, MetadataMap, Part, PartId, PartKind,
     ReasoningPart, TextPart, TokenUsage, ToolCallPart, Usage,
 };
-use agentkit_loop::{LoopError, ModelTurnEvent, ModelTurnResult};
+use agentkit_loop::{LoopError, ModelTurnEvent, ModelTurnResult, set_provider_finish_reasons};
 use serde_json::{Value, json};
 
 pub(crate) use crate::sse::{SseDecoder, SseEvent};
@@ -132,6 +132,10 @@ impl EventTranslator {
             self.model = Some(model.to_string());
             self.metadata
                 .insert("anthropic.model".into(), Value::String(model.into()));
+        }
+        if let Some(container) = message.get("container") {
+            self.metadata
+                .insert("anthropic.container".into(), container.clone());
         }
         let usage = parse_usage(message.get("usage"));
         self.usage = usage.clone();
@@ -412,6 +416,10 @@ impl EventTranslator {
     fn on_message_stop(&mut self) -> Result<Vec<ModelTurnEvent>, LoopError> {
         self.finished = true;
         let finish_reason = map_stop_reason(self.stop_reason.as_deref());
+        let mut turn_metadata = self.metadata.clone();
+        if let Some(reason) = self.stop_reason.as_deref() {
+            set_provider_finish_reasons(&mut turn_metadata, [reason]);
+        }
         // Sort committed parts by their content-block index to preserve the
         // author-intended ordering (thinking-before-text-before-tools).
         self.committed_parts.sort_by_key(|(idx, _)| *idx);
@@ -436,7 +444,7 @@ impl EventTranslator {
             finish_reason,
             output_items,
             usage: self.usage.clone(),
-            metadata: MetadataMap::new(),
+            metadata: turn_metadata,
             model: self.model.take(),
             response_id,
         })])
@@ -621,6 +629,10 @@ mod tests {
             panic!("last event should be Finished, got {finished:?}");
         };
         assert_eq!(result.finish_reason, FinishReason::Completed);
+        assert_eq!(
+            result.metadata["agentkit.provider_finish_reasons"],
+            serde_json::json!(["end_turn"])
+        );
         assert_eq!(result.output_items.len(), 1);
         let item = &result.output_items[0];
         match &item.parts[0] {
@@ -631,6 +643,33 @@ mod tests {
         let tokens = result.usage.as_ref().unwrap().tokens.as_ref().unwrap();
         assert_eq!(tokens.input_tokens, 10);
         assert_eq!(tokens.output_tokens, 5);
+    }
+
+    #[test]
+    fn empty_output_preserves_provider_metadata_on_terminal_result() {
+        let stream = concat!(
+            "event: message_start\n",
+            "data: {\"message\":{\"id\":\"msg-empty\",\"model\":\"claude-test\",\"container\":{\"id\":\"container-1\"},\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+            "event: message_delta\n",
+            "data: {\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":\"END\"}}\n\n",
+            "event: message_stop\n",
+            "data: {}\n\n",
+        );
+        let events = translate(stream);
+        let ModelTurnEvent::Finished(result) = events.last().unwrap() else {
+            panic!("missing Finished");
+        };
+        assert!(result.output_items.is_empty());
+        assert_eq!(result.metadata["anthropic.model"], "claude-test");
+        assert_eq!(result.metadata["anthropic.stop_sequence"], "END");
+        assert_eq!(
+            result.metadata["anthropic.container"],
+            serde_json::json!({ "id": "container-1" })
+        );
+        assert_eq!(
+            result.metadata["agentkit.provider_finish_reasons"],
+            serde_json::json!(["end_turn"])
+        );
     }
 
     #[test]

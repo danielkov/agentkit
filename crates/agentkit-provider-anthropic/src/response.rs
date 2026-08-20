@@ -4,7 +4,7 @@ use agentkit_core::{
     CustomPart, Delta, FinishReason, Item, ItemKind, MetadataMap, Part, ReasoningPart, TextPart,
     TokenUsage, ToolCallPart, Usage,
 };
-use agentkit_loop::{ModelTurnEvent, ModelTurnResult};
+use agentkit_loop::{ModelTurnEvent, ModelTurnResult, set_provider_finish_reasons};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -67,13 +67,17 @@ pub(crate) fn build_turn_from_response(
     }
 
     let finish_reason = map_stop_reason(stop_reason);
+    let mut turn_metadata = metadata.clone();
+    if let Some(reason) = stop_reason {
+        set_provider_finish_reasons(&mut turn_metadata, [reason]);
+    }
 
     if parts.is_empty() {
         events.push_back(ModelTurnEvent::Finished(ModelTurnResult {
             finish_reason,
             output_items: Vec::new(),
             usage,
-            metadata: MetadataMap::new(),
+            metadata: turn_metadata.clone(),
             model: model.map(str::to_owned),
             response_id: message_id,
         }));
@@ -100,7 +104,7 @@ pub(crate) fn build_turn_from_response(
         finish_reason,
         output_items: vec![item],
         usage,
-        metadata: MetadataMap::new(),
+        metadata: turn_metadata,
         model: model.map(str::to_owned),
         response_id: message_id,
     }));
@@ -272,11 +276,45 @@ mod tests {
         match finished {
             ModelTurnEvent::Finished(result) => {
                 assert_eq!(result.finish_reason, FinishReason::Completed);
+                assert_eq!(
+                    result.metadata["agentkit.provider_finish_reasons"],
+                    serde_json::json!(["end_turn"])
+                );
                 let item = &result.output_items[0];
                 assert!(matches!(item.parts[0], Part::Text(_)));
             }
             other => panic!("expected Finished, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn empty_output_preserves_provider_metadata_on_terminal_result() {
+        let body = json!({
+            "id": "msg-empty",
+            "model": "claude-test",
+            "stop_reason": "end_turn",
+            "stop_sequence": "END",
+            "container": { "id": "container-1" },
+            "content": [],
+            "usage": { "input_tokens": 1, "output_tokens": 0 }
+        })
+        .to_string();
+
+        let events = build_turn_from_response(&body).unwrap();
+        let ModelTurnEvent::Finished(result) = events.back().unwrap() else {
+            panic!("missing Finished");
+        };
+        assert!(result.output_items.is_empty());
+        assert_eq!(result.metadata["anthropic.model"], "claude-test");
+        assert_eq!(result.metadata["anthropic.stop_sequence"], "END");
+        assert_eq!(
+            result.metadata["anthropic.container"],
+            json!({ "id": "container-1" })
+        );
+        assert_eq!(
+            result.metadata["agentkit.provider_finish_reasons"],
+            json!(["end_turn"])
+        );
     }
 
     #[test]

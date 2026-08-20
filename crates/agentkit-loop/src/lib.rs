@@ -65,9 +65,9 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use agentkit_core::{
-    CancellationHandle, Delta, FinishReason, Item, ItemKind, MetadataMap, Part, SessionId, TaskId,
-    TextPart, Timestamp, ToolCallId, ToolCallPart, ToolOutput, ToolResultPart, TurnCancellation,
-    Usage,
+    CancellationHandle, DataRef, Delta, FinishReason, Item, ItemKind, MetadataMap, Modality, Part,
+    SessionId, TaskId, TextPart, Timestamp, ToolCallId, ToolCallPart, ToolOutput, ToolResultPart,
+    TurnCancellation, Usage,
 };
 use agentkit_task_manager::{
     PendingLoopUpdates, SimpleTaskManager, TOOL_RESULT_NOT_STARTED_METADATA_KEY, TaskApproval,
@@ -94,6 +94,151 @@ const INTERRUPTED_METADATA_KEY: &str = "agentkit.interrupted";
 const INTERRUPT_REASON_METADATA_KEY: &str = "agentkit.interrupt_reason";
 const INTERRUPT_STAGE_METADATA_KEY: &str = "agentkit.interrupt_stage";
 const USER_CANCELLED_REASON: &str = "user_cancelled";
+
+/// Metadata key used by adapters to retain provider-native finish reasons.
+pub const PROVIDER_FINISH_REASONS_METADATA_KEY: &str = "agentkit.provider_finish_reasons";
+
+/// Adds provider-native finish reasons to model-turn metadata.
+pub fn set_provider_finish_reasons<I, S>(metadata: &mut MetadataMap, reasons: I)
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let mut seen = HashSet::new();
+    let reasons = reasons
+        .into_iter()
+        .map(Into::into)
+        .filter(|reason: &String| !reason.is_empty() && seen.insert(reason.clone()))
+        .map(Value::String)
+        .collect::<Vec<_>>();
+    metadata.remove(PROVIDER_FINISH_REASONS_METADATA_KEY);
+    if !reasons.is_empty() {
+        metadata.insert(
+            PROVIDER_FINISH_REASONS_METADATA_KEY.into(),
+            Value::Array(reasons),
+        );
+    }
+}
+
+fn provider_finish_reasons(metadata: &MetadataMap, fallback: &FinishReason) -> Vec<String> {
+    metadata
+        .get(PROVIDER_FINISH_REASONS_METADATA_KEY)
+        .and_then(Value::as_array)
+        .map(|values| {
+            let mut seen = HashSet::new();
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|reason| !reason.is_empty() && seen.insert((*reason).to_owned()))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .filter(|reasons| !reasons.is_empty())
+        .unwrap_or_else(|| vec![normalized_finish_reason(fallback).into()])
+}
+
+fn normalized_finish_reason(reason: &FinishReason) -> &str {
+    match reason {
+        FinishReason::Completed => "completed",
+        FinishReason::ToolCall => "tool_call",
+        FinishReason::MaxTokens => "max_tokens",
+        FinishReason::Cancelled => "cancelled",
+        FinishReason::Blocked => "blocked",
+        FinishReason::Error => "error",
+        FinishReason::Other(reason) => reason,
+    }
+}
+
+/// Invalid bounded-message capture configuration.
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub enum MessageCaptureError {
+    /// At least one message slot is required.
+    #[error("message capture max_messages must be nonzero")]
+    ZeroMessages,
+    /// At least one source-content byte is required.
+    #[error("message capture max_bytes must be nonzero")]
+    ZeroBytes,
+}
+
+/// Bounded configuration for capturing structured messages on inference spans.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MessageCapture {
+    max_messages: usize,
+    max_bytes: usize,
+}
+
+impl MessageCapture {
+    /// Creates validated limits without silently changing either value.
+    pub fn new(max_messages: usize, max_bytes: usize) -> Result<Self, MessageCaptureError> {
+        if max_messages == 0 {
+            return Err(MessageCaptureError::ZeroMessages);
+        }
+        if max_bytes == 0 {
+            return Err(MessageCaptureError::ZeroBytes);
+        }
+        Ok(Self {
+            max_messages,
+            max_bytes,
+        })
+    }
+
+    /// Returns the maximum number of exported JSON message elements.
+    pub fn max_messages(self) -> usize {
+        self.max_messages
+    }
+
+    /// Returns the maximum source-content byte budget.
+    pub fn max_bytes(self) -> usize {
+        self.max_bytes
+    }
+}
+
+/// Explicit, in-code configuration for inference telemetry.
+///
+/// Message capture is off by default. Input and output capture are independent,
+/// bounded controls. AgentKit never reads
+/// `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TelemetryConfig {
+    input_messages: Option<MessageCapture>,
+    output_messages: Option<MessageCapture>,
+}
+
+impl TelemetryConfig {
+    /// Enables bounded input-message capture.
+    pub fn with_input_messages(mut self, capture: MessageCapture) -> Self {
+        self.input_messages = Some(capture);
+        self
+    }
+
+    /// Enables bounded output-message capture.
+    pub fn with_output_messages(mut self, capture: MessageCapture) -> Self {
+        self.output_messages = Some(capture);
+        self
+    }
+
+    /// Disables input-message capture.
+    pub fn without_input_messages(mut self) -> Self {
+        self.input_messages = None;
+        self
+    }
+
+    /// Disables output-message capture.
+    pub fn without_output_messages(mut self) -> Self {
+        self.output_messages = None;
+        self
+    }
+
+    /// Returns the input capture configuration, if enabled.
+    pub fn input_messages(self) -> Option<MessageCapture> {
+        self.input_messages
+    }
+
+    /// Returns the output capture configuration, if enabled.
+    pub fn output_messages(self) -> Option<MessageCapture> {
+        self.output_messages
+    }
+}
 
 /// Configuration required to start a new model session.
 ///
@@ -509,6 +654,14 @@ pub trait ModelSession: Send {
     /// attribute from the OpenTelemetry GenAI semantic conventions. The
     /// default returns `None` for sessions without a fixed model.
     fn model_name(&self) -> Option<&str> {
+        None
+    }
+
+    /// Concrete provider identity for this active session, when known.
+    ///
+    /// This value takes precedence over [`ModelAdapter::provider_name`]. The
+    /// default preserves compatibility for existing session implementations.
+    fn provider_name(&self) -> Option<&str> {
         None
     }
 }
@@ -1156,6 +1309,7 @@ where
     transcript_observers: Vec<Arc<dyn TranscriptObserver>>,
     transcript: Vec<Item>,
     input: Vec<Item>,
+    telemetry: TelemetryConfig,
 }
 
 impl<M> Agent<M>
@@ -1186,6 +1340,7 @@ where
         let session_id = config.session_id.clone();
         let default_cache = config.cache.clone();
         let session = self.model.start_session(config).await?;
+        let provider_name = self.model.provider_name().map(str::to_owned);
         let tool_executor = self
             .tool_executor
             .clone()
@@ -1193,7 +1348,8 @@ where
         let driver = LoopDriver {
             session_id: session_id.clone(),
             observed_session_id: Arc::new(session_id.clone()),
-            provider_name: self.model.provider_name().map(str::to_owned),
+            provider_name,
+            telemetry: self.telemetry,
             default_cache,
             next_turn_cache: None,
             session: Some(session),
@@ -1243,6 +1399,7 @@ where
     transcript_observers: Vec<Arc<dyn TranscriptObserver>>,
     transcript: Vec<Item>,
     input: Vec<Item>,
+    telemetry: TelemetryConfig,
 }
 
 impl<M> Default for AgentBuilder<M>
@@ -1263,6 +1420,7 @@ where
             transcript_observers: Vec::new(),
             transcript: Vec::new(),
             input: Vec::new(),
+            telemetry: TelemetryConfig::default(),
         }
     }
 }
@@ -1391,6 +1549,13 @@ where
         self
     }
 
+    /// Configures inference telemetry. Message capture remains off unless
+    /// enabled explicitly here.
+    pub fn telemetry(mut self, telemetry: TelemetryConfig) -> Self {
+        self.telemetry = telemetry;
+        self
+    }
+
     /// Consume the builder and produce an [`Agent`].
     ///
     /// # Errors
@@ -1415,6 +1580,7 @@ where
             transcript_observers: self.transcript_observers,
             transcript: self.transcript,
             input: self.input,
+            telemetry: self.telemetry,
         })
     }
 }
@@ -1456,6 +1622,7 @@ where
     session_id: SessionId,
     observed_session_id: Arc<SessionId>,
     provider_name: Option<String>,
+    telemetry: TelemetryConfig,
     default_cache: Option<PromptCacheRequest>,
     next_turn_cache: Option<PromptCacheRequest>,
     session: Option<S>,
@@ -1979,9 +2146,6 @@ where
             gen_ai.operation.name = "invoke_agent",
             gen_ai.conversation.id = %self.session_id,
             gen_ai.provider.name = tracing::field::Empty,
-            gen_ai.usage.input_tokens = tracing::field::Empty,
-            gen_ai.usage.output_tokens = tracing::field::Empty,
-            gen_ai.usage.cost = tracing::field::Empty,
             session.id = %self.session_id,
             turn.id = %turn_id,
             transcript.len = self.transcript.len(),
@@ -1995,9 +2159,6 @@ where
         emit_started: bool,
         mutation_point: MutationPoint,
     ) -> Result<LoopStep, LoopError> {
-        if let Some(provider) = &self.provider_name {
-            tracing::Span::current().record("gen_ai.provider.name", provider.as_str());
-        }
         let cancellation = self
             .cancellation
             .as_ref()
@@ -2080,12 +2241,28 @@ where
             "gen_ai.response.model" = tracing::field::Empty,
             "gen_ai.response.id" = tracing::field::Empty,
             "gen_ai.response.finish_reasons" = tracing::field::Empty,
+            "gen_ai.input.messages" = tracing::field::Empty,
+            "gen_ai.output.messages" = tracing::field::Empty,
             "gen_ai.usage.input_tokens" = tracing::field::Empty,
             "gen_ai.usage.output_tokens" = tracing::field::Empty,
             "gen_ai.usage.cost" = tracing::field::Empty,
         );
-        if let Some(provider) = &self.provider_name {
+        if let Some(capture) = self.telemetry.input_messages {
+            record_string_array_attribute(
+                &chat_span,
+                "gen_ai.input.messages",
+                capture_messages(&request.transcript, capture, CaptureOrder::NewestTail),
+            );
+        }
+
+        // Seed known identity before begin_turn so request setup failures and
+        // cancellation remain attributable. Successful per-turn routing below
+        // overwrites these values with the effective selection.
+        let initial_provider_name =
+            effective_provider_name(session.provider_name(), self.provider_name.as_deref());
+        if let Some(provider) = &initial_provider_name {
             chat_span.record("gen_ai.provider.name", provider.as_str());
+            tracing::Span::current().record("gen_ai.provider.name", provider.as_str());
         }
         match session.model_name() {
             Some(model) => {
@@ -2113,8 +2290,28 @@ where
             }
             Err(error) => return Err(error),
         };
+
+        // begin_turn may apply per-turn routing. Sample the effective selection
+        // only after that work, while the chat span still wraps begin_turn.
+        let provider_name =
+            effective_provider_name(session.provider_name(), self.provider_name.as_deref());
+        if let Some(provider) = &provider_name {
+            chat_span.record("gen_ai.provider.name", provider.as_str());
+            tracing::Span::current().record("gen_ai.provider.name", provider.as_str());
+        }
+        match session.model_name() {
+            Some(model) => {
+                chat_span.record("gen_ai.request.model", model);
+                chat_span.record("otel.name", format!("chat {model}").as_str());
+            }
+            None => {
+                chat_span.record("otel.name", "chat");
+            }
+        }
+
         let mut saw_tool_call = false;
         let mut finished_result = None;
+        let mut latest_usage = None;
 
         while let Some(event) = match turn
             .next_event(cancellation.clone())
@@ -2144,13 +2341,7 @@ where
             match event {
                 ModelTurnEvent::Delta(delta) => self.emit(AgentEvent::ContentDelta(delta)),
                 ModelTurnEvent::Usage(usage) => {
-                    if let Some(tokens) = &usage.tokens {
-                        chat_span.record("gen_ai.usage.input_tokens", tokens.input_tokens);
-                        chat_span.record("gen_ai.usage.output_tokens", tokens.output_tokens);
-                    }
-                    if let Some(cost) = &usage.cost {
-                        chat_span.record("gen_ai.usage.cost", cost.amount);
-                    }
+                    latest_usage = Some(usage.clone());
                     self.emit(AgentEvent::UsageUpdated(usage));
                 }
                 ModelTurnEvent::ToolCall(call) => {
@@ -2167,6 +2358,7 @@ where
         let mut result = finished_result.ok_or_else(|| {
             LoopError::Provider("model turn ended without a Finished event".into())
         })?;
+        result.usage = merge_usage(result.usage, latest_usage);
         if let Some(model) = &result.model {
             chat_span.record("gen_ai.response.model", model.as_str());
         }
@@ -2178,33 +2370,34 @@ where
             .as_ref()
             .and_then(|usage| usage.tokens.as_ref())
         {
-            chat_span.record("gen_ai.usage.input_tokens", tokens.input_tokens);
-            chat_span.record("gen_ai.usage.output_tokens", tokens.output_tokens);
+            record_token_attribute(&chat_span, "gen_ai.usage.input_tokens", tokens.input_tokens);
+            record_token_attribute(
+                &chat_span,
+                "gen_ai.usage.output_tokens",
+                tokens.output_tokens,
+            );
         }
         if let Some(cost) = result.usage.as_ref().and_then(|usage| usage.cost.as_ref()) {
-            chat_span.record("gen_ai.usage.cost", cost.amount);
+            record_f64_attribute(&chat_span, "gen_ai.usage.cost", cost.amount);
         }
-        chat_span.record(
+        record_string_array_attribute(
+            &chat_span,
             "gen_ai.response.finish_reasons",
-            tracing::field::debug(&result.finish_reason),
+            provider_finish_reasons(&result.metadata, &result.finish_reason),
         );
+        if let Some(capture) = self.telemetry.output_messages {
+            record_string_array_attribute(
+                &chat_span,
+                "gen_ai.output.messages",
+                capture_messages(&result.output_items, capture, CaptureOrder::OldestHead),
+            );
+        }
         drop(chat_span);
         tracing::Span::current().record("saw_tool_call", saw_tool_call);
         tracing::Span::current().record(
             "finish_reason",
             tracing::field::debug(&result.finish_reason),
         );
-        if let Some(tokens) = result
-            .usage
-            .as_ref()
-            .and_then(|usage| usage.tokens.as_ref())
-        {
-            tracing::Span::current().record("gen_ai.usage.input_tokens", tokens.input_tokens);
-            tracing::Span::current().record("gen_ai.usage.output_tokens", tokens.output_tokens);
-        }
-        if let Some(cost) = result.usage.as_ref().and_then(|usage| usage.cost.as_ref()) {
-            tracing::Span::current().record("gen_ai.usage.cost", cost.amount);
-        }
         let now = Timestamp::now();
         let usage = result.usage.clone();
         let finish_reason = result.finish_reason.clone();
@@ -2810,6 +3003,797 @@ fn interrupted_metadata(stage: &str) -> MetadataMap {
     );
     metadata.insert(INTERRUPT_STAGE_METADATA_KEY.into(), stage.into());
     metadata
+}
+
+fn record_token_attribute(span: &tracing::Span, key: &'static str, value: u64) {
+    match i64::try_from(value) {
+        Ok(value) => record_i64_attribute(span, key, value),
+        Err(_) => tracing::warn!(attribute = key, value, "token count exceeds OTEL i64 range"),
+    }
+}
+
+#[cfg(feature = "otel")]
+fn record_i64_attribute(span: &tracing::Span, key: &'static str, value: i64) {
+    use tracing_opentelemetry::OpenTelemetrySpanExt;
+    span.set_attribute(key, value);
+}
+
+#[cfg(not(feature = "otel"))]
+fn record_i64_attribute(span: &tracing::Span, key: &'static str, value: i64) {
+    span.record(key, value);
+}
+
+#[cfg(feature = "otel")]
+fn record_f64_attribute(span: &tracing::Span, key: &'static str, value: f64) {
+    use tracing_opentelemetry::OpenTelemetrySpanExt;
+    span.set_attribute(key, value);
+}
+
+#[cfg(not(feature = "otel"))]
+fn record_f64_attribute(span: &tracing::Span, key: &'static str, value: f64) {
+    span.record(key, value);
+}
+
+#[cfg(feature = "otel")]
+fn otel_string_array(values: Vec<String>) -> opentelemetry::Value {
+    use opentelemetry::{Array, StringValue, Value as OtelValue};
+    OtelValue::Array(Array::String(
+        values.into_iter().map(StringValue::from).collect(),
+    ))
+}
+
+#[cfg(feature = "otel")]
+fn record_string_array_attribute(span: &tracing::Span, key: &'static str, values: Vec<String>) {
+    use tracing_opentelemetry::OpenTelemetrySpanExt;
+    span.set_attribute(key, otel_string_array(values));
+}
+
+#[cfg(not(feature = "otel"))]
+fn record_string_array_attribute(span: &tracing::Span, key: &'static str, values: Vec<String>) {
+    span.record(key, tracing::field::debug(&values));
+}
+
+#[derive(Clone, Copy)]
+enum CaptureOrder {
+    NewestTail,
+    OldestHead,
+}
+
+fn effective_provider_name(
+    session_provider: Option<&str>,
+    adapter_provider: Option<&str>,
+) -> Option<String> {
+    session_provider.or(adapter_provider).map(str::to_owned)
+}
+
+fn merge_usage(final_usage: Option<Usage>, streamed_usage: Option<Usage>) -> Option<Usage> {
+    match (final_usage, streamed_usage) {
+        (None, streamed) => streamed,
+        (Some(final_usage), None) => Some(final_usage),
+        (Some(mut final_usage), Some(streamed)) => {
+            if final_usage.tokens.is_none() {
+                final_usage.tokens = streamed.tokens;
+            }
+            if final_usage.cost.is_none() {
+                final_usage.cost = streamed.cost;
+            }
+            for (key, value) in streamed.metadata {
+                final_usage.metadata.entry(key).or_insert(value);
+            }
+            Some(final_usage)
+        }
+    }
+}
+
+fn capture_messages(items: &[Item], capture: MessageCapture, order: CaptureOrder) -> Vec<String> {
+    let mut captured = Vec::new();
+    let mut used_bytes = 0usize;
+    let indices: Box<dyn Iterator<Item = usize>> = match order {
+        CaptureOrder::NewestTail => Box::new((0..items.len()).rev()),
+        CaptureOrder::OldestHead => Box::new(0..items.len()),
+    };
+
+    for index in indices.take(capture.max_messages) {
+        let item = &items[index];
+        let original_bytes = source_content_bytes(item);
+        let remaining = capture.max_bytes.saturating_sub(used_bytes);
+        if original_bytes > remaining {
+            captured.push(
+                serde_json::json!({
+                    "type": "truncated",
+                    "original_bytes": original_bytes,
+                })
+                .to_string(),
+            );
+            break;
+        }
+        used_bytes += original_bytes;
+        captured.push(capture_item_json(item, remaining));
+    }
+
+    if matches!(order, CaptureOrder::NewestTail) {
+        captured.reverse();
+    }
+    captured
+}
+
+fn source_content_bytes(item: &Item) -> usize {
+    item.parts.iter().fold(0, |total, part| {
+        total.saturating_add(part_source_content_bytes(part))
+    })
+}
+
+fn part_source_content_bytes(part: &Part) -> usize {
+    match part {
+        Part::Text(text) => text.text.len(),
+        Part::Media(media) => media.mime_type.len(),
+        Part::File(file) => file
+            .name
+            .as_deref()
+            .map_or(0, str::len)
+            .saturating_add(file.mime_type.as_deref().map_or(0, str::len)),
+        Part::Structured(_) => 0,
+        Part::Reasoning(reasoning) => reasoning.summary.as_deref().map_or(0, str::len),
+        Part::ToolCall(call) => call.id.0.len().saturating_add(call.name.len()),
+        Part::ToolResult(result) => result
+            .call_id
+            .0
+            .len()
+            .saturating_add(tool_output_source_content_bytes(&result.output)),
+        Part::Custom(custom) => custom.kind.len(),
+    }
+}
+
+fn tool_output_source_content_bytes(output: &ToolOutput) -> usize {
+    match output {
+        ToolOutput::Text(text) => text.len(),
+        ToolOutput::Structured(_) | ToolOutput::Parts(_) | ToolOutput::Files(_) => 0,
+    }
+}
+
+struct CaptureBudget {
+    remaining: usize,
+}
+
+impl CaptureBudget {
+    fn text(&mut self, text: &str) -> (String, bool) {
+        let end = floor_char_boundary(text, self.remaining.min(text.len()));
+        self.remaining = self.remaining.saturating_sub(end);
+        (text[..end].to_owned(), end < text.len())
+    }
+}
+
+fn floor_char_boundary(text: &str, mut index: usize) -> usize {
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+const MAX_CAPTURED_PARTS_PER_ITEM: usize = 256;
+
+fn capture_item_json(item: &Item, max_bytes: usize) -> String {
+    let mut budget = CaptureBudget {
+        remaining: max_bytes,
+    };
+    let mut parts = item
+        .parts
+        .iter()
+        .take(MAX_CAPTURED_PARTS_PER_ITEM)
+        .map(|part| sanitized_part(part, &mut budget))
+        .collect::<Vec<_>>();
+    if item.parts.len() > parts.len() {
+        parts.push(serde_json::json!({
+            "type": "truncated",
+            "reason": "part_limit",
+        }));
+    }
+    serde_json::json!({
+        "role": item_kind_name(item.kind),
+        "parts": parts,
+    })
+    .to_string()
+}
+
+fn item_kind_name(kind: ItemKind) -> &'static str {
+    match kind {
+        ItemKind::System => "system",
+        ItemKind::Developer => "developer",
+        ItemKind::User => "user",
+        ItemKind::Assistant => "assistant",
+        ItemKind::Tool => "tool",
+        ItemKind::Context => "context",
+        ItemKind::Notification => "notification",
+    }
+}
+
+fn modality_name(modality: Modality) -> &'static str {
+    match modality {
+        Modality::Audio => "audio",
+        Modality::Image => "image",
+        Modality::Video => "video",
+        Modality::Binary => "binary",
+    }
+}
+
+fn omitted_data_ref(data: &DataRef) -> Value {
+    let kind = match data {
+        DataRef::InlineText(_) => "inline_text",
+        DataRef::InlineBytes(_) => "inline_bytes",
+        DataRef::Uri(_) => "uri",
+        DataRef::Handle(_) => "handle",
+    };
+    serde_json::json!({ "kind": kind, "omitted": true })
+}
+
+fn bounded_field(text: &str, budget: &mut CaptureBudget) -> Value {
+    let (text, truncated) = budget.text(text);
+    serde_json::json!({ "value": text, "truncated": truncated })
+}
+
+fn sanitized_part(part: &Part, budget: &mut CaptureBudget) -> Value {
+    match part {
+        Part::Text(text) => serde_json::json!({
+            "type": "text",
+            "text": bounded_field(&text.text, budget),
+        }),
+        Part::Media(media) => serde_json::json!({
+            "type": "media",
+            "modality": modality_name(media.modality),
+            "mime_type": bounded_field(&media.mime_type, budget),
+            "data": omitted_data_ref(&media.data),
+        }),
+        Part::File(file) => serde_json::json!({
+            "type": "file",
+            "name": file.name.as_deref().map(|name| bounded_field(name, budget)),
+            "mime_type": file.mime_type.as_deref().map(|mime| bounded_field(mime, budget)),
+            "data": omitted_data_ref(&file.data),
+        }),
+        Part::Structured(_) => serde_json::json!({
+            "type": "structured",
+            "truncated": true,
+        }),
+        Part::Reasoning(reasoning) => serde_json::json!({
+            "type": "reasoning",
+            "summary": reasoning.summary.as_deref().map(|summary| bounded_field(summary, budget)),
+            "redacted": reasoning.redacted,
+            "data": reasoning.data.as_ref().map(omitted_data_ref),
+        }),
+        Part::ToolCall(call) => serde_json::json!({
+            "type": "tool_call",
+            "id": bounded_field(&call.id.0, budget),
+            "name": bounded_field(&call.name, budget),
+            "input": { "truncated": true },
+        }),
+        Part::ToolResult(result) => serde_json::json!({
+            "type": "tool_result",
+            "call_id": bounded_field(&result.call_id.0, budget),
+            "is_error": result.is_error,
+            "output": sanitized_tool_output(&result.output, budget),
+        }),
+        Part::Custom(custom) => serde_json::json!({
+            "type": "custom",
+            "kind": bounded_field(&custom.kind, budget),
+            "data": custom.data.as_ref().map(omitted_data_ref),
+            "value": custom.value.as_ref().map(|_| serde_json::json!({ "truncated": true })),
+        }),
+    }
+}
+
+fn sanitized_tool_output(output: &ToolOutput, budget: &mut CaptureBudget) -> Value {
+    match output {
+        ToolOutput::Text(text) => serde_json::json!({
+            "type": "text",
+            "text": bounded_field(text, budget),
+        }),
+        ToolOutput::Structured(_) => serde_json::json!({
+            "type": "structured",
+            "truncated": true,
+        }),
+        ToolOutput::Parts(parts) => serde_json::json!({
+            "type": "parts",
+            "count": parts.len(),
+            "truncated": true,
+        }),
+        ToolOutput::Files(files) => serde_json::json!({
+            "type": "files",
+            "count": files.len(),
+            "truncated": true,
+        }),
+    }
+}
+
+#[cfg(test)]
+mod telemetry_tests {
+    use super::*;
+
+    #[test]
+    fn message_capture_is_off_by_default_and_independent() {
+        let default = TelemetryConfig::default();
+        assert_eq!(default.input_messages(), None);
+        assert_eq!(default.output_messages(), None);
+
+        let capture = MessageCapture::new(2, 1).unwrap();
+        let input_only = TelemetryConfig::default().with_input_messages(capture);
+        assert_eq!(input_only.input_messages().unwrap().max_messages(), 2);
+        assert_eq!(input_only.input_messages().unwrap().max_bytes(), 1);
+        assert_eq!(input_only.output_messages(), None);
+        assert_eq!(
+            MessageCapture::new(0, 1),
+            Err(MessageCaptureError::ZeroMessages)
+        );
+        assert_eq!(
+            MessageCapture::new(1, 0),
+            Err(MessageCaptureError::ZeroBytes)
+        );
+    }
+
+    #[test]
+    fn one_source_byte_is_not_rejected_for_json_envelope_overhead() {
+        let items = vec![Item::text(ItemKind::User, "x")];
+        let captured = capture_messages(
+            &items,
+            MessageCapture::new(1, 1).unwrap(),
+            CaptureOrder::OldestHead,
+        );
+        assert_eq!(captured.len(), 1);
+        let value: Value = serde_json::from_str(&captured[0]).unwrap();
+        assert_eq!(value["role"], "user");
+        assert_eq!(value["parts"][0]["text"]["value"], "x");
+        assert_eq!(value["parts"][0]["text"]["truncated"], false);
+    }
+
+    #[test]
+    fn multibyte_source_accounting_preserves_utf8_boundaries() {
+        let items = vec![Item::text(ItemKind::User, "é")];
+
+        let exact = capture_messages(
+            &items,
+            MessageCapture::new(1, "é".len()).unwrap(),
+            CaptureOrder::OldestHead,
+        );
+        let value: Value = serde_json::from_str(&exact[0]).unwrap();
+        assert_eq!(value["parts"][0]["text"]["value"], "é");
+        assert_eq!(value["parts"][0]["text"]["truncated"], false);
+
+        let too_small = capture_messages(
+            &items,
+            MessageCapture::new(1, 1).unwrap(),
+            CaptureOrder::OldestHead,
+        );
+        let value: Value = serde_json::from_str(&too_small[0]).unwrap();
+        assert_eq!(value["type"], "truncated");
+        assert_eq!(value["original_bytes"], 2);
+    }
+
+    #[test]
+    fn source_bytes_are_aggregated_without_charging_json_envelopes() {
+        let items = vec![
+            Item::text(ItemKind::User, "a"),
+            Item::text(ItemKind::Assistant, "b"),
+            Item::text(ItemKind::User, "cd"),
+        ];
+        let captured = capture_messages(
+            &items,
+            MessageCapture::new(3, 3).unwrap(),
+            CaptureOrder::OldestHead,
+        );
+        assert_eq!(captured.len(), 3);
+        let values = captured
+            .iter()
+            .map(|encoded| serde_json::from_str::<Value>(encoded).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(values[0]["parts"][0]["text"]["value"], "a");
+        assert_eq!(values[1]["parts"][0]["text"]["value"], "b");
+        assert_eq!(values[2]["type"], "truncated");
+        assert_eq!(values[2]["original_bytes"], 2);
+    }
+
+    #[test]
+    fn tiny_limits_emit_valid_structured_source_byte_truncation() {
+        let items = vec![Item::text(ItemKind::User, "x".repeat(1_000))];
+        let captured = capture_messages(
+            &items,
+            MessageCapture::new(1, 1).unwrap(),
+            CaptureOrder::OldestHead,
+        );
+        assert_eq!(captured.len(), 1);
+        let value: Value = serde_json::from_str(&captured[0]).unwrap();
+        assert_eq!(value["type"], "truncated");
+        assert_eq!(value["original_bytes"], 1_000);
+    }
+
+    #[test]
+    fn provider_finish_reason_metadata_round_trips() {
+        let mut metadata = MetadataMap::new();
+        set_provider_finish_reasons(&mut metadata, ["end_turn", "", "tool_use", "end_turn"]);
+        assert_eq!(
+            provider_finish_reasons(&metadata, &FinishReason::Completed),
+            vec!["end_turn", "tool_use"]
+        );
+        set_provider_finish_reasons(&mut metadata, std::iter::empty::<String>());
+        assert!(!metadata.contains_key(PROVIDER_FINISH_REASONS_METADATA_KEY));
+        let fallbacks = [
+            (FinishReason::Completed, "completed"),
+            (FinishReason::ToolCall, "tool_call"),
+            (FinishReason::MaxTokens, "max_tokens"),
+            (FinishReason::Cancelled, "cancelled"),
+            (FinishReason::Blocked, "blocked"),
+            (FinishReason::Error, "error"),
+            (FinishReason::Other("native".into()), "native"),
+        ];
+        for (reason, expected) in fallbacks {
+            assert_eq!(
+                provider_finish_reasons(&MetadataMap::new(), &reason),
+                [expected]
+            );
+        }
+    }
+
+    #[test]
+    fn input_is_newest_tail_output_is_head_and_data_refs_are_omitted() {
+        let items = vec![
+            Item::text(ItemKind::User, "old"),
+            Item::text(ItemKind::User, "middle"),
+            Item::text(ItemKind::User, "new"),
+        ];
+        let capture = MessageCapture::new(2, 10_000).unwrap();
+        let input = capture_messages(&items, capture, CaptureOrder::NewestTail);
+        assert!(input[0].contains("middle"));
+        assert!(input[1].contains("new"));
+        let output = capture_messages(&items, capture, CaptureOrder::OldestHead);
+        assert!(output[0].contains("old"));
+        assert!(output[1].contains("middle"));
+
+        let media = Item::new(
+            ItemKind::User,
+            vec![Part::media(
+                agentkit_core::Modality::Image,
+                "image/png",
+                agentkit_core::DataRef::uri("https://secret.invalid/image.png"),
+            )],
+        );
+        let encoded = capture_item_json(&media, 10_000);
+        assert!(!encoded.contains("secret.invalid"));
+        assert!(encoded.contains("omitted"));
+    }
+
+    #[test]
+    fn final_usage_wins_and_streamed_usage_fills_only_missing_fields() {
+        let mut final_metadata = MetadataMap::new();
+        final_metadata.insert("shared".into(), serde_json::json!("final"));
+        let final_usage = Usage {
+            tokens: Some(agentkit_core::TokenUsage::new(1, 2)),
+            cost: None,
+            metadata: final_metadata,
+        };
+        let mut streamed_metadata = MetadataMap::new();
+        streamed_metadata.insert("shared".into(), serde_json::json!("streamed"));
+        streamed_metadata.insert("stream_only".into(), serde_json::json!(true));
+        let streamed_usage = Usage {
+            tokens: Some(agentkit_core::TokenUsage::new(10, 20)),
+            cost: Some(agentkit_core::CostUsage::new(0.5, "USD")),
+            metadata: streamed_metadata,
+        };
+        let merged = merge_usage(Some(final_usage), Some(streamed_usage)).unwrap();
+        assert_eq!(merged.tokens.unwrap().input_tokens, 1);
+        assert_eq!(merged.cost.unwrap().amount, 0.5);
+        assert_eq!(merged.metadata["shared"], "final");
+        assert_eq!(merged.metadata["stream_only"], true);
+    }
+
+    #[test]
+    fn session_provider_precedes_adapter_fallback() {
+        assert_eq!(
+            effective_provider_name(Some("session"), Some("adapter")).as_deref(),
+            Some("session")
+        );
+        assert_eq!(
+            effective_provider_name(None, Some("adapter")).as_deref(),
+            Some("adapter")
+        );
+    }
+}
+
+#[cfg(all(test, feature = "otel"))]
+mod true_otel_integration_tests {
+    use std::fs;
+    use std::process::Command;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn actual_layer_exports_driven_loop_spans() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let temp = std::env::temp_dir().join(format!(
+            "agentkit-loop-true-otel-{}-{nonce}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir(&temp).unwrap();
+        fs::create_dir(temp.join("src")).unwrap();
+        let core_path = toml_path(&root.join("crates/agentkit-core"));
+        let loop_path = toml_path(&root.join("crates/agentkit-loop"));
+        // Pin the nested offline build to versions Cargo already fetched for
+        // this workspace, without duplicating versions from Cargo.lock here.
+        let async_trait_version = locked_version(root, "async-trait");
+        let opentelemetry_version = locked_version(root, "opentelemetry");
+        let serde_json_version = locked_version(root, "serde_json");
+        let tokio_version = locked_version(root, "tokio");
+        let tracing_version = locked_version(root, "tracing");
+        let tracing_otel_version = locked_version(root, "tracing-opentelemetry");
+        let tracing_subscriber_version = locked_version(root, "tracing-subscriber");
+        let manifest = format!(
+            r#"[package]
+name = "agentkit-loop-true-otel-test"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+agentkit-core = {{ path = {core_path} }}
+agentkit-loop = {{ path = {loop_path}, features = ["otel"] }}
+async-trait = "={async_trait_version}"
+opentelemetry = {{ version = "={opentelemetry_version}", default-features = false }}
+serde_json = "={serde_json_version}"
+tokio = {{ version = "={tokio_version}", features = ["rt"] }}
+tracing = "={tracing_version}"
+tracing-opentelemetry = {{ version = "={tracing_otel_version}", default-features = false }}
+tracing-subscriber = "={tracing_subscriber_version}"
+"#
+        );
+        fs::write(temp.join("Cargo.toml"), manifest).unwrap();
+        fs::write(temp.join("src/main.rs"), TRUE_OTEL_HARNESS).unwrap();
+
+        let output = Command::new(env!("CARGO"))
+            .args(["run", "--quiet", "--offline"])
+            .current_dir(&temp)
+            .env("CARGO_TARGET_DIR", temp.join("target"))
+            .output()
+            .unwrap();
+        let _ = fs::remove_dir_all(&temp);
+        assert!(
+            output.status.success(),
+            "true OTEL harness failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn locked_version(root: &std::path::Path, name: &str) -> String {
+        let lock = fs::read_to_string(root.join("Cargo.lock")).unwrap();
+        let expected_name = format!("name = {}", serde_json::to_string(name).unwrap());
+        let versions = lock
+            .split("[[package]]")
+            .filter(|package| {
+                package
+                    .lines()
+                    .any(|line| line.trim() == expected_name.as_str())
+            })
+            .filter_map(|package| {
+                package.lines().find_map(|line| {
+                    line.trim()
+                        .strip_prefix("version = \"")
+                        .and_then(|version| version.strip_suffix('\"'))
+                        .map(str::to_owned)
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(versions.len(), 1, "expected one locked version for {name}");
+        versions.into_iter().next().unwrap()
+    }
+
+    fn toml_path(path: &std::path::Path) -> String {
+        serde_json::to_string(&path.to_string_lossy()).unwrap()
+    }
+
+    #[test]
+    fn toml_path_escapes_windows_separators_and_quotes() {
+        let encoded = toml_path(std::path::Path::new(r#"C:\Users\name\quoted\"dir"#));
+        assert_eq!(encoded, r#""C:\\Users\\name\\quoted\\\"dir""#);
+    }
+
+    const TRUE_OTEL_HARNESS: &str = r#"
+use std::borrow::Cow;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
+use agentkit_core::{CostUsage, DataRef, FinishReason, Item, ItemKind, MetadataMap, Modality, Part, TokenUsage, TurnCancellation, Usage};
+use agentkit_loop::{Agent, LoopError, LoopStep, MessageCapture, ModelAdapter, ModelSession, ModelTurn, ModelTurnEvent, ModelTurnResult, SessionConfig, TelemetryConfig, TurnRequest, set_provider_finish_reasons};
+use async_trait::async_trait;
+use opentelemetry::trace::{Span, SpanBuilder, SpanContext, Status, Tracer};
+use opentelemetry::{Array, Context, KeyValue, Value};
+use tracing_subscriber::layer::SubscriberExt;
+
+#[derive(Clone, Debug)]
+struct Exported { name: String, attributes: Vec<KeyValue> }
+#[derive(Clone, Default)]
+struct MemoryTracer { exported: Arc<Mutex<Vec<Exported>>> }
+struct MemorySpan { name: String, attributes: Vec<KeyValue>, exported: Arc<Mutex<Vec<Exported>>>, ended: bool }
+impl Tracer for MemoryTracer {
+    type Span = MemorySpan;
+    fn build_with_context(&self, builder: SpanBuilder, _: &Context) -> MemorySpan {
+        MemorySpan { name: builder.name.into_owned(), attributes: builder.attributes.unwrap_or_default(), exported: self.exported.clone(), ended: false }
+    }
+}
+impl Span for MemorySpan {
+    fn add_event_with_timestamp<T>(&mut self, _: T, _: SystemTime, _: Vec<KeyValue>) where T: Into<Cow<'static, str>> {}
+    fn span_context(&self) -> &SpanContext { &SpanContext::NONE }
+    fn is_recording(&self) -> bool { !self.ended }
+    fn set_attribute(&mut self, attribute: KeyValue) { self.attributes.push(attribute); }
+    fn set_status(&mut self, _: Status) {}
+    fn update_name<T>(&mut self, name: T) where T: Into<Cow<'static, str>> { self.name = name.into().into_owned(); }
+    fn add_link(&mut self, _: SpanContext, _: Vec<KeyValue>) {}
+    fn end_with_timestamp(&mut self, _: SystemTime) {
+        if !self.ended {
+            self.ended = true;
+            self.exported.lock().unwrap().push(Exported { name: self.name.clone(), attributes: self.attributes.clone() });
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum BeginMode { Success, Error, Cancelled }
+#[derive(Clone)]
+struct ScriptedAdapter { adapter_provider: &'static str, final_usage: bool, overflow: bool, begin_mode: BeginMode }
+struct ScriptedSession { selected_provider: Option<&'static str>, model: &'static str, final_usage: bool, overflow: bool, begin_mode: BeginMode }
+struct ScriptedTurn { events: VecDeque<ModelTurnEvent> }
+#[async_trait]
+impl ModelAdapter for ScriptedAdapter {
+    type Session = ScriptedSession;
+    async fn start_session(&self, _: SessionConfig) -> Result<Self::Session, LoopError> {
+        Ok(ScriptedSession { selected_provider: Some("before-begin"), model: "before-model", final_usage: self.final_usage, overflow: self.overflow, begin_mode: self.begin_mode })
+    }
+    fn provider_name(&self) -> Option<&str> { Some(self.adapter_provider) }
+}
+#[async_trait]
+impl ModelSession for ScriptedSession {
+    type Turn = ScriptedTurn;
+    async fn begin_turn(&mut self, _: TurnRequest, _: Option<TurnCancellation>) -> Result<Self::Turn, LoopError> {
+        match self.begin_mode {
+            BeginMode::Error => return Err(LoopError::InvalidState("begin failed".into())),
+            BeginMode::Cancelled => return Err(LoopError::Cancelled),
+            BeginMode::Success => {}
+        }
+        self.selected_provider = if self.final_usage { Some("session-after-begin") } else { None };
+        self.model = if self.final_usage { "model-after-begin" } else { "fallback-model-after-begin" };
+        let mut stream_meta = MetadataMap::new();
+        stream_meta.insert("stream_only".into(), serde_json::json!(true));
+        stream_meta.insert("shared".into(), serde_json::json!("stream"));
+        let streamed = Usage {
+            tokens: Some(TokenUsage::new(if self.overflow { i64::MAX as u64 + 1 } else { 30 }, 40)),
+            cost: Some(CostUsage::new(0.75, "USD")),
+            metadata: stream_meta,
+        };
+        let final_usage = if self.final_usage {
+            let mut metadata = MetadataMap::new();
+            metadata.insert("shared".into(), serde_json::json!("final"));
+            Some(Usage { tokens: Some(TokenUsage::new(if self.overflow { i64::MAX as u64 + 1 } else { 1 }, 2)), cost: None, metadata })
+        } else { None };
+        let mut result_metadata = MetadataMap::new();
+        set_provider_finish_reasons(&mut result_metadata, ["native", "native", "done"]);
+        let outputs = vec![
+            Item::text(ItemKind::Assistant, "first"),
+            Item::text(ItemKind::Assistant, "second"),
+            Item::text(ItemKind::Assistant, "third"),
+        ];
+        Ok(ScriptedTurn { events: VecDeque::from([
+            ModelTurnEvent::Usage(streamed),
+            ModelTurnEvent::Finished(ModelTurnResult { finish_reason: FinishReason::Completed, output_items: outputs, usage: final_usage, metadata: result_metadata, model: Some(self.model.into()), response_id: Some("response-id".into()) }),
+        ]) })
+    }
+    fn model_name(&self) -> Option<&str> { Some(self.model) }
+    fn provider_name(&self) -> Option<&str> { self.selected_provider }
+}
+#[async_trait]
+impl ModelTurn for ScriptedTurn {
+    async fn next_event(&mut self, _: Option<TurnCancellation>) -> Result<Option<ModelTurnEvent>, LoopError> { Ok(self.events.pop_front()) }
+}
+
+fn attr<'a>(span: &'a Exported, key: &str) -> Option<&'a Value> {
+    span.attributes.iter().rev().find(|a| a.key.as_str() == key).map(|a| &a.value)
+}
+fn operation(span: &Exported) -> Option<&str> {
+    match attr(span, "gen_ai.operation.name") { Some(Value::String(value)) => Some(value.as_str()), _ => None }
+}
+fn json_array(span: &Exported, key: &str) -> Vec<serde_json::Value> {
+    match attr(span, key) {
+        Some(Value::Array(Array::String(values))) => values.iter().map(|v| serde_json::from_str(v.as_str()).unwrap()).collect(),
+        other => panic!("{key} was not Array<String>: {other:?}"),
+    }
+}
+
+fn run_attempt(adapter: ScriptedAdapter) -> (Vec<Exported>, Result<LoopStep, LoopError>) {
+    let tracer = MemoryTracer::default();
+    let subscriber = tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer.clone()));
+    let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    let result = tracing::subscriber::with_default(subscriber, || runtime.block_on(async {
+        let media = Item::new(ItemKind::User, vec![
+            Part::media(Modality::Image, "image/png", DataRef::inline_bytes([1, 2, 3])),
+            Part::media(Modality::Audio, "audio/wav", DataRef::uri("https://secret.invalid/audio")),
+        ]);
+        let agent = Agent::builder().model(adapter).transcript(vec![
+            Item::text(ItemKind::System, "old"), Item::text(ItemKind::User, "middle"), media,
+        ]).input(vec![Item::text(ItemKind::User, "newest")]).telemetry(
+            TelemetryConfig::default()
+                .with_input_messages(MessageCapture::new(3, 100_000).unwrap())
+                .with_output_messages(MessageCapture::new(2, 100_000).unwrap())
+        ).build().unwrap();
+        let mut driver = agent.start(SessionConfig::new("otel-test")).await.unwrap();
+        driver.next().await
+    }));
+    (tracer.exported.lock().unwrap().clone(), result)
+}
+fn run(adapter: ScriptedAdapter) -> (Vec<Exported>, agentkit_loop::TurnResult) {
+    let (spans, result) = run_attempt(adapter);
+    let result = match result.unwrap() { LoopStep::Finished(result) => result, other => panic!("unexpected step: {other:?}") };
+    (spans, result)
+}
+
+fn main() {
+    let (spans, result) = run(ScriptedAdapter { adapter_provider: "adapter", final_usage: true, overflow: true, begin_mode: BeginMode::Success });
+    let chat = spans.iter().find(|s| operation(s) == Some("chat")).unwrap();
+    let agent = spans.iter().find(|s| operation(s) == Some("invoke_agent")).unwrap();
+    assert_eq!(attr(chat, "gen_ai.provider.name"), Some(&Value::String("session-after-begin".into())));
+    assert_eq!(attr(chat, "gen_ai.request.model"), Some(&Value::String("model-after-begin".into())));
+    assert!(attr(chat, "gen_ai.usage.input_tokens").is_none());
+    assert_eq!(attr(chat, "gen_ai.usage.output_tokens"), Some(&Value::I64(2)));
+    assert_eq!(attr(chat, "gen_ai.usage.cost"), Some(&Value::F64(0.75)));
+    assert_eq!(attr(agent, "gen_ai.provider.name"), Some(&Value::String("session-after-begin".into())));
+    assert!(attr(agent, "gen_ai.usage.input_tokens").is_none());
+    assert!(attr(agent, "gen_ai.usage.cost").is_none());
+    match attr(chat, "gen_ai.response.finish_reasons") {
+        Some(Value::Array(Array::String(values))) => assert_eq!(values.iter().map(|v| v.as_str()).collect::<Vec<_>>(), ["native", "done"]),
+        other => panic!("finish reasons were not Array<String>: {other:?}"),
+    }
+    assert_eq!(result.usage.as_ref().unwrap().metadata["shared"], "final");
+    assert_eq!(result.usage.as_ref().unwrap().metadata["stream_only"], true);
+    let input = json_array(chat, "gen_ai.input.messages");
+    assert_eq!(input.len(), 3);
+    assert!(input[0].to_string().contains("middle"));
+    assert!(input[1].to_string().contains("omitted"));
+    assert!(input[2].to_string().contains("newest"));
+    assert!(!input.iter().any(|message| message.to_string().contains("old")));
+    let output = json_array(chat, "gen_ai.output.messages");
+    assert_eq!(output.len(), 2);
+    assert!(output[0].to_string().contains("first"));
+    assert!(output[1].to_string().contains("second"));
+    let encoded = format!("{input:?}{output:?}");
+    assert!(!encoded.contains("secret.invalid"));
+    assert!(!encoded.contains("[1,2,3]"));
+
+    let (spans, result) = run(ScriptedAdapter { adapter_provider: "adapter-fallback", final_usage: false, overflow: false, begin_mode: BeginMode::Success });
+    let chat = spans.iter().find(|s| operation(s) == Some("chat")).unwrap();
+    assert_eq!(attr(chat, "gen_ai.provider.name"), Some(&Value::String("adapter-fallback".into())));
+    assert_eq!(attr(chat, "gen_ai.request.model"), Some(&Value::String("fallback-model-after-begin".into())));
+    assert_eq!(attr(chat, "gen_ai.usage.input_tokens"), Some(&Value::I64(30)));
+    assert_eq!(attr(chat, "gen_ai.usage.cost"), Some(&Value::F64(0.75)));
+    assert_eq!(result.usage.unwrap().metadata["stream_only"], true);
+
+    for begin_mode in [BeginMode::Error, BeginMode::Cancelled] {
+        let (spans, result) = run_attempt(ScriptedAdapter { adapter_provider: "adapter-before-error", final_usage: false, overflow: false, begin_mode });
+        match begin_mode {
+            BeginMode::Error => assert!(matches!(result, Err(LoopError::InvalidState(_)))),
+            BeginMode::Cancelled => assert!(matches!(result, Ok(LoopStep::Finished(_)))),
+            BeginMode::Success => unreachable!(),
+        }
+        let chat = spans.iter().find(|s| operation(s) == Some("chat")).unwrap();
+        let agent = spans.iter().find(|s| operation(s) == Some("invoke_agent")).unwrap();
+        assert_eq!(attr(chat, "gen_ai.provider.name"), Some(&Value::String("before-begin".into())));
+        assert_eq!(attr(chat, "gen_ai.request.model"), Some(&Value::String("before-model".into())));
+        assert_eq!(attr(agent, "gen_ai.provider.name"), Some(&Value::String("before-begin".into())));
+    }
+}
+"#;
 }
 
 fn interrupted_assistant_items() -> Vec<Item> {

@@ -17,6 +17,7 @@ The umbrella crate `agentkit` re-exports subcrates behind feature flags.
 - `compaction` — `agentkit-compaction`
 - `context` — `agentkit-context`
 - `mcp` — `agentkit-mcp`
+- `otel` — enables OpenTelemetry-native GenAI attributes in `agentkit-loop`
 - `adapter-completions` — `agentkit-adapter-completions`
 - `provider-anthropic` — `agentkit-provider-anthropic`
 - `provider-baseten` — `agentkit-provider-baseten`
@@ -37,13 +38,13 @@ The umbrella crate `agentkit` re-exports subcrates behind feature flags.
 **Minimal orchestration:**
 
 ```toml
-agentkit = { version = "0.10.5", features = ["core", "capabilities", "tools", "loop"] }
+agentkit = { version = "0.10.8", features = ["core", "capabilities", "tools", "loop"] }
 ```
 
 **Coding agent:**
 
 ```toml
-agentkit = { version = "0.10.5", features = [
+agentkit = { version = "0.10.8", features = [
     "core", "capabilities", "context", "tools",
     "loop", "tool-fs", "tool-shell", "reporting",
 ] }
@@ -52,7 +53,7 @@ agentkit = { version = "0.10.5", features = [
 **MCP-enabled agent:**
 
 ```toml
-agentkit = { version = "0.10.5", features = [
+agentkit = { version = "0.10.8", features = [
     "core", "capabilities", "context", "tools",
     "loop", "tool-fs", "tool-shell", "reporting", "mcp",
 ] }
@@ -61,7 +62,7 @@ agentkit = { version = "0.10.5", features = [
 **ACP-exposed agent (editor-addressable over the Agent Client Protocol):**
 
 ```toml
-agentkit = { version = "0.10.5", features = [
+agentkit = { version = "0.10.8", features = [
     "core", "capabilities", "context", "tools",
     "loop", "tool-fs", "tool-shell", "reporting", "acp",
 ] }
@@ -70,7 +71,7 @@ agentkit = { version = "0.10.5", features = [
 **OpenRouter-backed example host (streaming, prompt caching):**
 
 ```toml
-agentkit = { version = "0.10.5", features = [
+agentkit = { version = "0.10.8", features = [
     "core", "capabilities", "tools", "loop",
     "reporting", "provider-openrouter",
 ] }
@@ -79,7 +80,7 @@ agentkit = { version = "0.10.5", features = [
 **OpenAI-compatible provider host (streaming):**
 
 ```toml
-agentkit = { version = "0.10.5", features = [
+agentkit = { version = "0.10.8", features = [
     "core", "capabilities", "tools", "loop",
     "reporting", "provider-groq",
 ] }
@@ -91,7 +92,7 @@ Swap `provider-groq` for `provider-baseten`, `provider-mistral`, `provider-vllm`
 **Anthropic Messages API host (streaming, extended thinking, server tools):**
 
 ```toml
-agentkit = { version = "0.10.5", features = [
+agentkit = { version = "0.10.8", features = [
     "core", "capabilities", "tools", "loop",
     "reporting", "provider-anthropic",
 ] }
@@ -100,7 +101,7 @@ agentkit = { version = "0.10.5", features = [
 **Cerebras Inference host (streaming, reasoning, rate-limit snapshot):**
 
 ```toml
-agentkit = { version = "0.10.5", features = [
+agentkit = { version = "0.10.8", features = [
     "core", "capabilities", "tools", "loop",
     "reporting", "provider-cerebras",
 ] }

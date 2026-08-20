@@ -7,7 +7,7 @@ use agentkit_core::{
     DataRef, Delta, FinishReason, Item, ItemKind, MediaPart, MetadataMap, Modality, Part, PartId,
     PartKind, ReasoningPart, TextPart, ToolCallPart, Usage,
 };
-use agentkit_loop::{ModelTurnEvent, ModelTurnResult};
+use agentkit_loop::{ModelTurnEvent, ModelTurnResult, set_provider_finish_reasons};
 use serde_json::{Value, json};
 
 use crate::error::CompletionsError;
@@ -295,6 +295,7 @@ impl EventTranslator {
         let mut events = Vec::new();
         let mut output_items = Vec::new();
         let mut aggregate_finish: Option<FinishReason> = None;
+        let mut native_finish_reasons = Vec::new();
         let mut raw_choices = Vec::new();
 
         for (index, mut state) in std::mem::take(&mut self.choices) {
@@ -302,6 +303,9 @@ impl EventTranslator {
             events.extend(flush_tool_calls(&mut state)?);
             if aggregate_finish.is_none() {
                 aggregate_finish = state.finish_reason.clone();
+            }
+            if let Some(reason) = &state.finish_reason_raw {
+                native_finish_reasons.push(reason.clone());
             }
             let mut parts = Vec::new();
             if state.reasoning_emitted && !state.reasoning_buffer.is_empty() {
@@ -401,11 +405,12 @@ impl EventTranslator {
         for item in &mut output_items {
             item.metadata = metadata.clone();
         }
+        set_provider_finish_reasons(&mut metadata, native_finish_reasons);
         events.push(ModelTurnEvent::Finished(ModelTurnResult {
             finish_reason: aggregate_finish.unwrap_or(FinishReason::Completed),
             output_items,
             usage,
-            metadata: MetadataMap::new(),
+            metadata,
             model: self.model.clone(),
             response_id: self.message_id.clone(),
         }));
@@ -528,6 +533,13 @@ mod tests {
             })
             .collect();
         assert_eq!(text, "hi there");
+        let ModelTurnEvent::Finished(result) = events.last().unwrap() else {
+            panic!("missing Finished");
+        };
+        assert_eq!(
+            result.metadata["agentkit.provider_finish_reasons"],
+            serde_json::json!(["stop"])
+        );
         assert!(matches!(
             events.last(),
             Some(ModelTurnEvent::Finished(ModelTurnResult {

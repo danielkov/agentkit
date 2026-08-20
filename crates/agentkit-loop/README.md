@@ -141,3 +141,24 @@ loop {
 # Ok(())
 # }
 ```
+
+## OpenTelemetry telemetry
+
+The loop emits GenAI `tracing` spans without requiring an OpenTelemetry SDK. Enable the optional `otel` feature when exporting through `tracing-opentelemetry`; this preserves token counts as signed 64-bit attributes and provider-native finish reasons as string-array attributes. With that feature enabled, usage, finish-reason, and message attributes are written directly to the OpenTelemetry span and are not visible to a plain `tracing-subscriber` formatting layer.
+
+Message content capture is always off by default and is configured only in code. Input and output limits are independent and bounded:
+
+```rust,ignore
+use agentkit_loop::{Agent, MessageCapture, TelemetryConfig};
+
+let agent = Agent::builder()
+    .model(adapter)
+    .telemetry(
+        TelemetryConfig::default()
+            .with_input_messages(MessageCapture::new(32, 16 * 1024)?)
+            .with_output_messages(MessageCapture::new(16, 8 * 1024)?),
+    )
+    .build()?;
+```
+
+AgentKit does not read `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT`. `MessageCapture::new` rejects zero message and byte limits; it never silently clamps them. The exported `gen_ai.input.messages` and `gen_ai.output.messages` attributes are OpenTelemetry `Array<String>` values whose elements are compact valid JSON. Input capture keeps the newest bounded tail in transcript order; output capture keeps the bounded head. Data references are omitted, so inline image/audio/binary data and URLs are neither exported nor dereferenced. An item that exceeds the remaining source-content budget becomes a structured JSON truncation record, including when the configured byte budget is tiny.

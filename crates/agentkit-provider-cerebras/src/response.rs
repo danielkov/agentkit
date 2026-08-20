@@ -9,7 +9,7 @@ use agentkit_core::{
     Delta, FinishReason, Item, ItemKind, MetadataMap, Part, ReasoningPart, TextPart, TokenUsage,
     ToolCallPart, Usage,
 };
-use agentkit_loop::{ModelTurnEvent, ModelTurnResult};
+use agentkit_loop::{ModelTurnEvent, ModelTurnResult, set_provider_finish_reasons};
 use serde_json::Value;
 
 use crate::error::ResponseError;
@@ -49,13 +49,17 @@ pub fn build_turn_from_response(body: &str) -> Result<VecDeque<ModelTurnEvent>, 
     }
 
     let mut output_items: Vec<Item> = Vec::new();
-    let mut finish_reason = FinishReason::Completed;
+    let mut finish_reason = None;
+    let mut native_finish_reasons = Vec::new();
 
     for choice in choices {
         let message = choice.get("message").unwrap_or(&Value::Null);
         let finish = choice.get("finish_reason").and_then(Value::as_str);
         if let Some(f) = finish {
-            finish_reason = map_finish_reason(f);
+            if finish_reason.is_none() {
+                finish_reason = Some(map_finish_reason(f));
+            }
+            native_finish_reasons.push(f.to_owned());
         }
 
         let mut parts: Vec<Part> = Vec::new();
@@ -102,11 +106,13 @@ pub fn build_turn_from_response(body: &str) -> Result<VecDeque<ModelTurnEvent>, 
         }
     }
 
+    let mut turn_metadata = MetadataMap::new();
+    set_provider_finish_reasons(&mut turn_metadata, native_finish_reasons);
     events.push_back(ModelTurnEvent::Finished(ModelTurnResult {
-        finish_reason,
+        finish_reason: finish_reason.unwrap_or(FinishReason::Completed),
         output_items,
         usage,
-        metadata: MetadataMap::new(),
+        metadata: turn_metadata,
         model: raw.get("model").and_then(Value::as_str).map(str::to_owned),
         response_id: raw.get("id").and_then(Value::as_str).map(str::to_owned),
     }));
@@ -231,6 +237,10 @@ mod tests {
             panic!("last event must be Finished");
         };
         assert_eq!(result.finish_reason, FinishReason::Completed);
+        assert_eq!(
+            result.metadata["agentkit.provider_finish_reasons"],
+            serde_json::json!(["stop"])
+        );
         match &result.output_items[0].parts[0] {
             Part::Text(t) => assert_eq!(t.text, "hello"),
             other => panic!("expected text, got {other:?}"),
@@ -325,6 +335,46 @@ mod tests {
         assert_eq!(
             usage.metadata.get("cerebras.system_fingerprint"),
             Some(&Value::String("fp-123".into()))
+        );
+    }
+
+    #[test]
+    fn multi_choice_finish_reason_matches_streaming_first_choice() {
+        let response = json!({
+            "choices": [
+                {
+                    "index": 0,
+                    "message": { "role": "assistant", "content": "first" },
+                    "finish_reason": "length"
+                },
+                {
+                    "index": 1,
+                    "message": { "role": "assistant", "content": "second" },
+                    "finish_reason": "stop"
+                }
+            ]
+        });
+        let buffered = build_turn_from_response(&response.to_string()).unwrap();
+        let ModelTurnEvent::Finished(buffered_result) = buffered.back().unwrap() else {
+            panic!("missing buffered Finished");
+        };
+
+        let mut decoder = crate::stream::SseDecoder::new();
+        let mut translator = crate::stream::EventTranslator::new();
+        let stream = format!("data: {response}\n\ndata: [DONE]\n\n");
+        let mut streamed = Vec::new();
+        for event in decoder.feed(&stream) {
+            streamed.extend(translator.handle(&event).unwrap());
+        }
+        let ModelTurnEvent::Finished(streamed_result) = streamed.last().unwrap() else {
+            panic!("missing streaming Finished");
+        };
+
+        assert_eq!(buffered_result.finish_reason, FinishReason::MaxTokens);
+        assert_eq!(buffered_result.finish_reason, streamed_result.finish_reason);
+        assert_eq!(
+            buffered_result.metadata["agentkit.provider_finish_reasons"],
+            streamed_result.metadata["agentkit.provider_finish_reasons"]
         );
     }
 

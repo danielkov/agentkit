@@ -4,7 +4,7 @@ use agentkit_core::{
     DataRef, Delta, FinishReason, Item, ItemKind, MediaPart, MetadataMap, Modality, Part,
     ReasoningPart, TextPart, TokenUsage, ToolCallPart, Usage,
 };
-use agentkit_loop::{ModelTurnEvent, ModelTurnResult};
+use agentkit_loop::{ModelTurnEvent, ModelTurnResult, set_provider_finish_reasons};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -42,6 +42,10 @@ pub(crate) fn build_turn_from_response<P: CompletionsProvider>(
     let message = choice.message;
     let mut parts = message_to_parts(&message)?;
     let finish_reason = map_finish_reason(choice.finish_reason.as_deref());
+    let mut turn_metadata = response_metadata.clone();
+    if let Some(reason) = choice.finish_reason.as_deref() {
+        set_provider_finish_reasons(&mut turn_metadata, [reason]);
+    }
     let response_model = response.model;
     let response_id = response.id;
 
@@ -72,7 +76,7 @@ pub(crate) fn build_turn_from_response<P: CompletionsProvider>(
             finish_reason,
             output_items: vec![assistant_item],
             usage,
-            metadata: MetadataMap::new(),
+            metadata: turn_metadata.clone(),
             model: response_model,
             response_id,
         }));
@@ -81,13 +85,82 @@ pub(crate) fn build_turn_from_response<P: CompletionsProvider>(
             finish_reason,
             output_items: Vec::new(),
             usage,
-            metadata: MetadataMap::new(),
+            metadata: turn_metadata,
             model: response_model,
             response_id,
         }));
     }
 
     Ok((events, raw))
+}
+
+#[cfg(test)]
+mod tests {
+    use agentkit_core::{MetadataMap, Usage};
+    use agentkit_loop::ModelTurnEvent;
+    use serde::Serialize;
+    use serde_json::{Value, json};
+
+    use super::build_turn_from_response;
+    use crate::CompletionsProvider;
+
+    #[derive(Clone, Serialize)]
+    struct Config;
+
+    #[derive(Clone)]
+    struct MetadataProvider;
+
+    impl CompletionsProvider for MetadataProvider {
+        type Config = Config;
+
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+
+        fn endpoint_url(&self) -> &str {
+            "https://example.invalid"
+        }
+
+        fn config(&self) -> &Self::Config {
+            &Config
+        }
+
+        fn postprocess_response(
+            &self,
+            _usage: &mut Option<Usage>,
+            metadata: &mut MetadataMap,
+            _raw_response: &Value,
+        ) {
+            metadata.insert("provider.test".into(), json!("preserved"));
+        }
+    }
+
+    #[test]
+    fn buffered_terminal_preserves_provider_metadata_with_and_without_output() {
+        for content in [json!("hello"), Value::Null] {
+            let body = json!({
+                "id": "response-1",
+                "model": "model-1",
+                "choices": [{
+                    "message": { "content": content },
+                    "finish_reason": "stop"
+                }]
+            })
+            .to_string();
+            let (events, _) = build_turn_from_response(&MetadataProvider, &body).unwrap();
+            let ModelTurnEvent::Finished(result) = events.back().unwrap() else {
+                panic!("missing Finished");
+            };
+            assert_eq!(result.metadata["provider.test"], "preserved");
+            assert_eq!(
+                result.metadata["agentkit.provider_finish_reasons"],
+                json!(["stop"])
+            );
+            if let Some(item) = result.output_items.first() {
+                assert_eq!(item.metadata["provider.test"], "preserved");
+            }
+        }
+    }
 }
 
 fn message_to_parts(message: &ResponseMessage) -> Result<Vec<Part>, CompletionsError> {

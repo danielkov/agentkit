@@ -237,6 +237,10 @@ impl ModelSession for AnthropicSession {
     fn model_name(&self) -> Option<&str> {
         Some(&self.config.model)
     }
+
+    fn provider_name(&self) -> Option<&str> {
+        Some("anthropic")
+    }
 }
 
 #[async_trait]
