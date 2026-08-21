@@ -51,8 +51,9 @@ const RULES_PRIMER: &str = "Run a Runlet program that composes available tools. 
              any two calls without a dependency between them execute in parallel automatically. \
              Ordinary data references create dependencies.\n\n\
              Runlet is not Lua/Python/JavaScript. Complete rules:\n\
-             - `name = expression` creates an immutable binding; the program and every block \
-             end with exactly one `return expression`.\n\
+             - `name = expression` creates an immutable binding; `_ = expression` evaluates \
+             eagerly and discards the result, introduces no name, and may repeat. The program \
+             and every block end with exactly one `return expression`.\n\
              - Call tools like functions with one object argument: `r = get_item({ id: 4 })`. \
              Results are plain values; access fields with `r.field` or `r.items[0]`. There is \
              no await: using a result creates the dependency. When a call must wait for earlier \
@@ -97,9 +98,10 @@ const RULES_PRIMER: &str = "Run a Runlet program that composes available tools. 
              intermediate values for model-side checking.\n\
              - No functions, imports, mutation, recursion, while loops, or method calls. \
              Bindings are immutable — `total = total + x` cannot work; use fold.\n\
-             - Reads are lazy, writes always run: pure work executes only if the returned \
-             value needs it, but any statement that calls a tool with side effects (writes, \
-             updates, sends) runs when its block runs, even if you never use its result. \
+             - Reads are lazy, writes and explicit discards always run: pure work executes \
+             only if the returned value needs it, unless written as `_ = expression`; any \
+             statement that calls a tool with side effects (writes, updates, sends) also runs \
+             when its block runs, even if you never use its result. \
              Independent writes still run concurrently; use a data reference or `after` when \
              ordering is required. \
              Fire-and-forget is fine: `r = update_contact({ id: c.id, phone: fixed }) if \
@@ -140,8 +142,9 @@ const EXEMPLAR_PRIMER: &str = r#"Run a Runlet program that composes available to
 
 Runlet is not Lua/Python/JavaScript. The annotated program below exercises the ENTIRE language; every construct and every rule you may rely on appears here, with its constraint in the comments:
 
-# A program is immutable bindings ending in one `return`. No functions, imports,
-# methods, while loops, mutation, or early returns exist. Tools take ONE object argument.
+# A program is immutable bindings ending in one `return`. `_ = expression` eagerly evaluates
+# and discards a value; it introduces no name and may repeat. No functions, imports, methods,
+# while loops, mutation, or early returns exist. Tools take ONE object argument.
 first = boundary retry 2 {                            # retry transient failures where they occur
     return list_records({ page: 1 })
 } catch err {
@@ -182,7 +185,7 @@ shaped = for record in listing {                      # concurrent loop; the hos
 # Use `after` when a call must wait for work whose value it does not read. Calls
 # lexically created in this block wait until `shaped` succeeds; this is a real
 # ordering edge, unlike source order.
-checkpoint = after shaped {
+_ = after shaped {                                  # explicit discard still evaluates even pure work
     return log_event({ kind: "shaping_complete" })
 }
 
@@ -229,6 +232,7 @@ mod primer_tests {
             assert!(primer.contains("Ordinary data references create dependencies"));
             assert!(primer.contains("after "));
             assert!(primer.contains("lexically created"));
+            assert!(primer.contains("_ = expression"));
         }
     }
 }

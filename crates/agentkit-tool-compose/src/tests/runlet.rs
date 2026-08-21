@@ -202,6 +202,26 @@ async fn tool_call_dispatches_child_tool() {
 }
 
 #[tokio::test]
+async fn discard_eagerly_executes_a_pure_call() {
+    let child = EchoTool::new();
+    let calls = child.calls.clone();
+    let outcome = execute_compose(
+        ComposeConfig::default(),
+        child,
+        request("_ = echo({ value: 7 })\nreturn true", Value::Null),
+    )
+    .await;
+
+    match outcome {
+        ToolExecutionOutcome::Completed(result) => {
+            assert_eq!(result.result.output, ToolOutput::structured(json!(true)));
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
+        other => panic!("unexpected outcome: {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn loop_fans_out_and_preserves_order() {
     let child = EchoTool::new();
     let calls = child.calls.clone();
