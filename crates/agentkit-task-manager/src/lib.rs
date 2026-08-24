@@ -11,7 +11,7 @@ use agentkit_tools_core::{
 };
 use async_trait::async_trait;
 use thiserror::Error;
-use tokio::sync::{Mutex, Notify, mpsc};
+use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 pub const TOOL_RESULT_FAILURE_KIND_METADATA_KEY: &str = "agentkit.tool.failure_kind";
@@ -142,6 +142,10 @@ pub struct TaskStartContext {
 pub enum TaskManagerError {
     #[error("task not found: {0}")]
     NotFound(TaskId),
+    #[error("task is not running: {0}")]
+    NotRunning(TaskId),
+    #[error("task is already running in the background: {0}")]
+    AlreadyBackground(TaskId),
     #[error("task manager internal error: {0}")]
     Internal(String),
 }
@@ -199,6 +203,7 @@ pub trait TaskManager: Send + Sync {
 trait TaskManagerControl: Send + Sync {
     async fn next_event(&self) -> Option<TaskEvent>;
     async fn cancel(&self, task_id: TaskId) -> Result<(), TaskManagerError>;
+    async fn detach(&self, task_id: TaskId) -> Result<(), TaskManagerError>;
     async fn list_running(&self) -> Vec<TaskSnapshot>;
     async fn list_completed(&self) -> Vec<TaskSnapshot>;
     async fn drain_ready_items(&self) -> Vec<Item>;
@@ -227,6 +232,11 @@ impl TaskManagerHandle {
 
     pub async fn cancel(&self, task_id: TaskId) -> Result<(), TaskManagerError> {
         self.inner.cancel(task_id).await
+    }
+
+    /// Detach a running foreground task so it continues in the background.
+    pub async fn detach(&self, task_id: TaskId) -> Result<(), TaskManagerError> {
+        self.inner.detach(task_id).await
     }
 
     pub async fn list_running(&self) -> Vec<TaskSnapshot> {
@@ -359,6 +369,10 @@ impl TaskManagerControl for HandleState {
         Err(TaskManagerError::NotFound(task_id))
     }
 
+    async fn detach(&self, task_id: TaskId) -> Result<(), TaskManagerError> {
+        Err(TaskManagerError::NotFound(task_id))
+    }
+
     async fn list_running(&self) -> Vec<TaskSnapshot> {
         Vec::new()
     }
@@ -453,6 +467,65 @@ impl AsyncInner {
         state.next_task_index += 1;
         TaskId::new(format!("task-{}", state.next_task_index))
     }
+
+    async fn detach_running_foreground(&self, task_id: &TaskId) -> Result<(), TaskManagerError> {
+        let mut state = self.state.lock().await;
+        let snapshot = {
+            let record = state
+                .tasks
+                .get_mut(task_id)
+                .ok_or_else(|| TaskManagerError::NotFound(task_id.clone()))?;
+            if !record.running {
+                return Err(TaskManagerError::NotRunning(task_id.clone()));
+            }
+            if record.snapshot.kind == TaskKind::Background {
+                return Err(TaskManagerError::AlreadyBackground(task_id.clone()));
+            }
+            record.snapshot.kind = TaskKind::Background;
+            record.snapshot.clone()
+        };
+
+        if let Some(count) = state.per_turn_running.get_mut(&snapshot.turn_id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                state.per_turn_running.remove(&snapshot.turn_id);
+            }
+        }
+        state
+            .per_turn_updates
+            .entry(snapshot.turn_id.clone())
+            .or_default()
+            .push_back(TurnTaskUpdate::Detached(snapshot.clone()));
+        let _ = self.host_event_tx.send(TaskEvent::Detached(snapshot));
+        self.notify.notify_waiters();
+        Ok(())
+    }
+
+    async fn interrupt_turn(&self, turn_id: &TurnId) {
+        let mut state = self.state.lock().await;
+        let interrupted: Vec<TaskId> = state
+            .tasks
+            .iter()
+            .filter_map(|(id, record)| {
+                (record.snapshot.turn_id == *turn_id
+                    && record.snapshot.kind == TaskKind::Foreground
+                    && record.running)
+                    .then_some(id.clone())
+            })
+            .collect();
+        for task_id in interrupted {
+            if let Some(record) = state.tasks.get_mut(&task_id) {
+                record.running = false;
+                if let Some(join) = record.join.take() {
+                    join.abort();
+                }
+                let snapshot = record.snapshot.clone();
+                let _ = self.host_event_tx.send(TaskEvent::Cancelled(snapshot));
+            }
+        }
+        state.per_turn_running.remove(turn_id);
+        self.notify.notify_waiters();
+    }
 }
 
 #[async_trait]
@@ -479,11 +552,6 @@ impl TaskManager for AsyncTaskManager {
             kind: initial_kind,
             metadata: request.request.metadata.clone(),
         };
-        let _ = self
-            .inner
-            .host_event_tx
-            .send(TaskEvent::Started(snapshot.clone()));
-
         let mut state = self.inner.state.lock().await;
         state.tasks.insert(
             task_id.clone(),
@@ -503,6 +571,10 @@ impl TaskManager for AsyncTaskManager {
                 .or_default() += 1;
         }
         drop(state);
+        let _ = self
+            .inner
+            .host_event_tx
+            .send(TaskEvent::Started(snapshot.clone()));
 
         let event_tx = self.inner.host_event_tx.clone();
         let inner = self.inner.clone();
@@ -513,39 +585,17 @@ impl TaskManager for AsyncTaskManager {
         let owned_ctx = ctx.tool_context.clone();
         let executor = ctx.executor.clone();
         let route_copy = route;
+        let (start_tx, start_rx) = oneshot::channel();
         let join = tokio::spawn(async move {
+            if start_rx.await.is_err() {
+                return;
+            }
             if let RoutingDecision::ForegroundThenDetachAfter(duration) = route_copy {
-                let event_tx = event_tx.clone();
                 let inner = inner.clone();
                 let task_id = task_id_for_future.clone();
-                let turn_id = turn_id.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(duration).await;
-                    let mut state = inner.state.lock().await;
-                    let snapshot = if let Some(record) = state.tasks.get_mut(&task_id)
-                        && record.running
-                        && record.snapshot.kind == TaskKind::Foreground
-                    {
-                        record.snapshot.kind = TaskKind::Background;
-                        Some(record.snapshot.clone())
-                    } else {
-                        None
-                    };
-                    if let Some(snapshot) = snapshot {
-                        if let Some(count) = state.per_turn_running.get_mut(&turn_id) {
-                            *count = count.saturating_sub(1);
-                            if *count == 0 {
-                                state.per_turn_running.remove(&turn_id);
-                            }
-                        }
-                        state
-                            .per_turn_updates
-                            .entry(turn_id.clone())
-                            .or_default()
-                            .push_back(TurnTaskUpdate::Detached(snapshot.clone()));
-                        let _ = event_tx.send(TaskEvent::Detached(snapshot));
-                        inner.notify.notify_waiters();
-                    }
+                    let _ = inner.detach_running_foreground(&task_id).await;
                 });
             }
 
@@ -629,8 +679,17 @@ impl TaskManager for AsyncTaskManager {
         });
 
         let mut state = self.inner.state.lock().await;
-        if let Some(record) = state.tasks.get_mut(&task_id) {
-            record.join = Some(join);
+        let mut join = Some(join);
+        if let Some(record) = state.tasks.get_mut(&task_id)
+            && record.running
+        {
+            record.join = join.take();
+        }
+        drop(state);
+        if let Some(join) = join {
+            join.abort();
+        } else {
+            let _ = start_tx.send(());
         }
         Ok(TaskStartOutcome::Pending {
             task_id,
@@ -644,6 +703,9 @@ impl TaskManager for AsyncTaskManager {
         cancellation: Option<TurnCancellation>,
     ) -> Result<Option<TurnTaskUpdate>, TaskManagerError> {
         loop {
+            let notified = self.inner.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             {
                 let mut state = self.inner.state.lock().await;
                 if let Some(queue) = state.per_turn_updates.get_mut(turn_id)
@@ -665,15 +727,21 @@ impl TaskManager for AsyncTaskManager {
                 .as_ref()
                 .is_some_and(TurnCancellation::is_cancelled)
             {
-                return Ok(None);
+                self.inner.interrupt_turn(turn_id).await;
+                continue;
             }
             if let Some(cancellation) = cancellation.as_ref() {
+                // Prefer an already-queued detach. If cancellation wins, interrupting
+                // under the task-state lock makes it race atomically with detachment.
                 tokio::select! {
-                    _ = self.inner.notify.notified() => {}
-                    _ = cancellation.cancelled() => return Ok(None),
+                    biased;
+                    _ = &mut notified => {}
+                    _ = cancellation.cancelled() => {
+                        self.inner.interrupt_turn(turn_id).await;
+                    },
                 }
             } else {
-                self.inner.notify.notified().await;
+                notified.await;
             }
         }
     }
@@ -686,32 +754,7 @@ impl TaskManager for AsyncTaskManager {
     }
 
     async fn on_turn_interrupted(&self, turn_id: &TurnId) -> Result<(), TaskManagerError> {
-        let mut state = self.inner.state.lock().await;
-        let interrupted: Vec<TaskId> = state
-            .tasks
-            .iter()
-            .filter_map(|(id, record)| {
-                (record.snapshot.turn_id == *turn_id
-                    && record.snapshot.kind == TaskKind::Foreground
-                    && record.running)
-                    .then_some(id.clone())
-            })
-            .collect();
-        for task_id in interrupted {
-            if let Some(record) = state.tasks.get_mut(&task_id) {
-                record.running = false;
-                if let Some(join) = record.join.take() {
-                    join.abort();
-                }
-                let snapshot = record.snapshot.clone();
-                let _ = self
-                    .inner
-                    .host_event_tx
-                    .send(TaskEvent::Cancelled(snapshot));
-            }
-        }
-        state.per_turn_running.remove(turn_id);
-        self.inner.notify.notify_waiters();
+        self.inner.interrupt_turn(turn_id).await;
         Ok(())
     }
 
@@ -750,6 +793,10 @@ impl TaskManagerControl for AsyncInner {
         let _ = self.host_event_tx.send(TaskEvent::Cancelled(snapshot));
         self.notify.notify_waiters();
         Ok(())
+    }
+
+    async fn detach(&self, task_id: TaskId) -> Result<(), TaskManagerError> {
+        self.detach_running_foreground(&task_id).await
     }
 
     async fn list_running(&self) -> Vec<TaskSnapshot> {
@@ -1214,6 +1261,147 @@ mod tests {
             }
             other => panic!("unexpected completion event: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn async_manager_can_manually_detach_a_foreground_task() {
+        let release = StdArc::new(Notify::new());
+        let entered = StdArc::new(AtomicBool::new(false));
+        let executor: Arc<dyn ToolExecutor> = Arc::new(TestExecutor::new([(
+            "foreground",
+            TestBehavior::Block {
+                entered: entered.clone(),
+                release: release.clone(),
+                output: "done",
+            },
+        )]));
+        let manager = AsyncTaskManager::new();
+        let handle = manager.handle();
+        let request = make_request("foreground", "turn-1", "call-1");
+
+        let task_id = match manager
+            .start_task(
+                TaskLaunchRequest {
+                    task_id: None,
+                    request: request.clone(),
+                    kind: TaskLaunchKind::Plain,
+                },
+                make_context(executor, &request.turn_id, None),
+            )
+            .await
+            .unwrap()
+        {
+            TaskStartOutcome::Pending { task_id, .. } => task_id,
+            other => panic!("unexpected start outcome: {other:?}"),
+        };
+
+        let _ = next_event(&handle).await;
+        wait_until_entered(entered.as_ref()).await;
+        handle.detach(task_id.clone()).await.unwrap();
+
+        let running = handle.list_running().await;
+        assert_eq!(running.len(), 1);
+        assert_eq!(running[0].kind, TaskKind::Background);
+        match manager.wait_for_turn(&request.turn_id, None).await.unwrap() {
+            Some(TurnTaskUpdate::Detached(snapshot)) => {
+                assert_eq!(snapshot.id, task_id);
+                assert_eq!(snapshot.kind, TaskKind::Background);
+            }
+            other => panic!("unexpected turn update: {other:?}"),
+        }
+        assert!(
+            manager
+                .wait_for_turn(&request.turn_id, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        match next_event(&handle).await {
+            TaskEvent::Detached(snapshot) => assert_eq!(snapshot.id, task_id),
+            other => panic!("unexpected event after detach: {other:?}"),
+        }
+
+        release.notify_waiters();
+        timeout(Duration::from_secs(1), handle.wait_for_idle())
+            .await
+            .expect("wait_for_idle timed out");
+    }
+
+    #[tokio::test]
+    async fn manual_detach_reports_invalid_task_states() {
+        let missing = TaskId::new("missing");
+        let manager = AsyncTaskManager::new();
+        let handle = manager.handle();
+        assert_eq!(
+            handle.detach(missing.clone()).await,
+            Err(TaskManagerError::NotFound(missing))
+        );
+
+        let approval_executor: Arc<dyn ToolExecutor> =
+            Arc::new(TestExecutor::new([("approval", TestBehavior::Approval)]));
+        let approval_request = make_request("approval", "turn-1", "call-approval");
+        let completed_id = match manager
+            .start_task(
+                TaskLaunchRequest {
+                    task_id: None,
+                    request: approval_request.clone(),
+                    kind: TaskLaunchKind::Plain,
+                },
+                make_context(approval_executor, &approval_request.turn_id, None),
+            )
+            .await
+            .unwrap()
+        {
+            TaskStartOutcome::Pending { task_id, .. } => task_id,
+            other => panic!("unexpected start outcome: {other:?}"),
+        };
+        let _ = next_event(&handle).await;
+        timeout(Duration::from_secs(1), handle.wait_for_idle())
+            .await
+            .expect("wait_for_idle timed out");
+        assert_eq!(
+            handle.detach(completed_id.clone()).await,
+            Err(TaskManagerError::NotRunning(completed_id))
+        );
+
+        let release = StdArc::new(Notify::new());
+        let entered = StdArc::new(AtomicBool::new(false));
+        let background_executor: Arc<dyn ToolExecutor> = Arc::new(TestExecutor::new([(
+            "background",
+            TestBehavior::Block {
+                entered: entered.clone(),
+                release,
+                output: "done",
+            },
+        )]));
+        let manager = AsyncTaskManager::new().routing(NameRoutingPolicy::new([(
+            "background",
+            RoutingDecision::Background,
+        )]));
+        let handle = manager.handle();
+        let request = make_request("background", "turn-2", "call-background");
+        let background_id = match manager
+            .start_task(
+                TaskLaunchRequest {
+                    task_id: None,
+                    request: request.clone(),
+                    kind: TaskLaunchKind::Plain,
+                },
+                make_context(background_executor, &request.turn_id, None),
+            )
+            .await
+            .unwrap()
+        {
+            TaskStartOutcome::Pending { task_id, .. } => task_id,
+            other => panic!("unexpected start outcome: {other:?}"),
+        };
+        let _ = next_event(&handle).await;
+        wait_until_entered(entered.as_ref()).await;
+        assert_eq!(
+            handle.detach(background_id.clone()).await,
+            Err(TaskManagerError::AlreadyBackground(background_id.clone()))
+        );
+        handle.cancel(background_id).await.unwrap();
     }
 
     #[tokio::test]
