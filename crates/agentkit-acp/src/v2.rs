@@ -11,9 +11,10 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use agent_client_protocol::{Client, ConnectionTo, Handled};
 use agentkit_core::{
-    CancellationController, CancellationHandle, DataRef, Delta, FinishReason, Item, ItemKind,
-    MetadataMap, Modality, Part, PartId, PartKind, SessionId as AgentkitSessionId, TextPart,
-    ToolCallPart, ToolResultPart,
+    CancellationController, CancellationHandle, DataRef, Delta, FilePart, FinishReason, Item,
+    ItemKind, MediaPart, MetadataMap, Modality, Part, PartId, PartKind,
+    SessionId as AgentkitSessionId, StructuredPart, TextPart, ToolCallPart, ToolOutput,
+    ToolResultPart,
 };
 use agentkit_loop::{
     AgentEvent, LoopInterrupt, LoopObserver, LoopStep, ModelAdapter, ModelSession, ObservedEvent,
@@ -191,38 +192,18 @@ impl AcpIntegration {
     fn begin_prompt(
         &self,
         session_id: &wire::SessionId,
-    ) -> Result<(wire::MessageId, wire::MessageId, wire::MessageId), AcpRuntimeError> {
+    ) -> Result<wire::MessageId, AcpRuntimeError> {
         let session = self.session(session_id)?;
         let sequence = session.next_message.fetch_add(1, Ordering::Relaxed);
-        let user_id = wire::MessageId::new(format!("{session_id}-user-{sequence}"));
-        let agent_id = wire::MessageId::new(format!("{session_id}-agent-{sequence}"));
-        let thought_id = wire::MessageId::new(format!("{session_id}-thought-{sequence}"));
-        *session
-            .current_messages
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = Some(CurrentMessageIds {
-            agent: agent_id.clone(),
-            thought: thought_id.clone(),
-        });
-        session
-            .part_kinds
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .clear();
-        Ok((user_id, agent_id, thought_id))
+        finish_model_message(&session);
+        Ok(wire::MessageId::new(format!(
+            "{session_id}-user-{sequence}"
+        )))
     }
 
     fn finish_prompt(&self, session_id: &wire::SessionId) {
         if let Ok(session) = self.session(session_id) {
-            *session
-                .current_messages
-                .lock()
-                .unwrap_or_else(|error| error.into_inner()) = None;
-            session
-                .part_kinds
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .clear();
+            finish_model_message(&session);
         }
     }
 
@@ -237,6 +218,31 @@ impl AcpIntegration {
             };
             Arc::clone(session)
         };
+
+        match &event {
+            AgentEvent::TurnStarted { .. } => {
+                start_model_message(&session);
+                return;
+            }
+            AgentEvent::TurnFinished(_) => {
+                finish_model_message(&session);
+                return;
+            }
+            AgentEvent::ToolExecutionStarted(_) | AgentEvent::ToolResultReceived(_) => {
+                finish_model_message(&session);
+            }
+            AgentEvent::ContentDelta(_) | AgentEvent::ToolCallRequested(_) => {
+                let has_message = session
+                    .current_messages
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .is_some();
+                if !has_message {
+                    start_model_message(&session);
+                }
+            }
+            _ => {}
+        }
 
         let message_ids = session
             .current_messages
@@ -257,6 +263,34 @@ impl AcpIntegration {
             tracing::debug!(%error, "failed to queue ACP v2 session update");
         }
     }
+}
+
+fn start_model_message(session: &IntegrationSession) {
+    let sequence = session.next_message.fetch_add(1, Ordering::Relaxed);
+    *session
+        .current_messages
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some(CurrentMessageIds {
+        agent: wire::MessageId::new(format!("{}-agent-{sequence}", session.acp_session_id)),
+        thought: wire::MessageId::new(format!("{}-thought-{sequence}", session.acp_session_id)),
+    });
+    session
+        .part_kinds
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clear();
+}
+
+fn finish_model_message(session: &IntegrationSession) {
+    *session
+        .current_messages
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = None;
+    session
+        .part_kinds
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clear();
 }
 
 impl LoopObserver for AcpIntegration {
@@ -340,6 +374,19 @@ where
     }
 }
 
+struct ServeGuard {
+    shutdown: Option<oneshot::Sender<()>>,
+    task: tokio::task::JoinHandle<Result<(), AcpRuntimeError>>,
+}
+
+impl Drop for ServeGuard {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+    }
+}
+
 impl<M> AcpHeadlessRuntimeBuilder<M>
 where
     M: ModelAdapter + Send + Sync + 'static,
@@ -381,8 +428,8 @@ where
             .factory
             .ok_or(AcpRuntimeError::MissingField("agent_factory"))?;
         let state = Arc::new(RuntimeState::new(factory, self.name, self.version));
-
-        let result = agent_client_protocol::Agent
+        let (shutdown, mut shutdown_rx) = oneshot::channel();
+        let connection = agent_client_protocol::Agent
             .v2()
             .name(state.name.as_str())
             .on_receive_request(
@@ -483,10 +530,27 @@ where
                 },
                 agent_client_protocol::on_receive_request!(),
             )
-            .connect_to(transport)
-            .await;
-        state.shutdown().await;
-        result.map_err(|error| AcpRuntimeError::Sdk(error.to_string()))
+            .connect_to(transport);
+        let task = tokio::spawn(async move {
+            tokio::pin!(connection);
+            let result = tokio::select! {
+                result = &mut connection => {
+                    result.map_err(|error| AcpRuntimeError::Sdk(error.to_string()))
+                }
+                _ = &mut shutdown_rx => Ok(()),
+            };
+            state.shutdown().await;
+            result
+        });
+        let mut guard = ServeGuard {
+            shutdown: Some(shutdown),
+            task,
+        };
+        let result = (&mut guard.task)
+            .await
+            .map_err(|error| AcpRuntimeError::Sdk(error.to_string()));
+        guard.shutdown.take();
+        result?
     }
 }
 
@@ -791,48 +855,75 @@ where
             let mut sessions = self.sessions.lock().await;
             sessions.drain().collect::<Vec<_>>()
         };
-        for (session_id, entry) in sessions {
-            stop_session(Arc::clone(&entry)).await;
-            let _ = self.integration.unbind(&session_id);
-            stop_client(entry).await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut session_tasks = Vec::with_capacity(sessions.len());
+        for (session_id, entry) in &sessions {
+            signal_session_stop(entry);
+            if let Some(task) = take_task(&entry.task) {
+                session_tasks.push(task);
+            }
+            let _ = self.integration.unbind(session_id);
+        }
+        join_tasks_until(deadline, session_tasks).await;
+
+        let drain_tasks = sessions
+            .iter()
+            .filter_map(|(_, entry)| take_task(&entry.drain_task))
+            .collect();
+        drop(sessions);
+        join_tasks_until(deadline, drain_tasks).await;
+    }
+}
+
+fn signal_session_stop(entry: &Arc<SessionEntry>) {
+    let _lifecycle = entry
+        .lifecycle
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    entry.closed.store(true, Ordering::Release);
+    entry.cancellation.interrupt();
+    let _ = entry.commands.send(SessionCommand::Shutdown);
+}
+
+fn take_task(
+    task: &Mutex<Option<tokio::task::JoinHandle<()>>>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    task.lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take()
+}
+
+async fn join_tasks_until(
+    deadline: tokio::time::Instant,
+    mut tasks: Vec<tokio::task::JoinHandle<()>>,
+) {
+    if tokio::time::timeout_at(deadline, async {
+        for task in &mut tasks {
+            let _ = task.await;
+        }
+    })
+    .await
+    .is_err()
+    {
+        for task in tasks {
+            task.abort();
         }
     }
 }
 
 async fn stop_session(entry: Arc<SessionEntry>) {
-    {
-        let _lifecycle = entry
-            .lifecycle
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        entry.closed.store(true, Ordering::Release);
-        entry.cancellation.interrupt();
-        let _ = entry.commands.send(SessionCommand::Shutdown);
-    }
-    let task = entry
-        .task
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .take();
-    let Some(mut task) = task else {
-        return;
-    };
-    if tokio::time::timeout(std::time::Duration::from_secs(2), &mut task)
-        .await
-        .is_err()
-    {
-        task.abort();
-        let _ = task.await;
+    signal_session_stop(&entry);
+    if let Some(task) = take_task(&entry.task) {
+        join_tasks_until(
+            tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+            vec![task],
+        )
+        .await;
     }
 }
 
 async fn stop_client(entry: Arc<SessionEntry>) {
-    let task = entry
-        .drain_task
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .take();
-    if let Some(task) = task {
+    if let Some(task) = take_task(&entry.drain_task) {
         let _ = task.await;
     }
 }
@@ -866,8 +957,8 @@ async fn session_worker<S>(
             let _ = response.send(Err(error));
             continue;
         }
-        let (user_message_id, _, _) = match integration.begin_prompt(&session_id) {
-            Ok(message_ids) => message_ids,
+        let user_message_id = match integration.begin_prompt(&session_id) {
+            Ok(message_id) => message_id,
             Err(error) => {
                 busy.store(false, Ordering::Release);
                 let _ = response.send(Err(error));
@@ -1103,10 +1194,6 @@ fn event_to_update(
                 },
             )))
         }
-        AgentEvent::TurnFinished(_) => {
-            part_kinds.clear();
-            None
-        }
         AgentEvent::Warning { message } => {
             tracing::warn!(%message, "agentkit warning while routing ACP v2 event");
             None
@@ -1170,6 +1257,135 @@ fn tool_result_update(
     wire::ToolCallUpdate::new(result.call_id.to_string())
         .status(status)
         .raw_output(crate::tool_output_raw(&result.output))
+        .content(tool_output_content(&result.output))
+}
+
+fn tool_output_content(output: &ToolOutput) -> Option<Vec<wire::ToolCallContent>> {
+    let content = match output {
+        ToolOutput::Text(text) => vec![text_to_tool_content(text.clone())],
+        ToolOutput::Structured(value) => vec![text_to_tool_content(value.to_string())],
+        ToolOutput::Parts(parts) => parts.iter().filter_map(part_to_tool_content).collect(),
+        ToolOutput::Files(files) => files.iter().map(file_to_tool_content).collect(),
+    };
+    (!content.is_empty()).then_some(content)
+}
+
+fn part_to_tool_content(part: &Part) -> Option<wire::ToolCallContent> {
+    match part {
+        Part::Text(text) => Some(text_to_tool_content(text.text.clone())),
+        Part::Structured(value) => Some(structured_to_tool_content(value)),
+        Part::Media(media) => Some(media_to_tool_content(media)),
+        Part::File(file) => Some(file_to_tool_content(file)),
+        Part::Reasoning(reasoning) => reasoning
+            .summary
+            .as_ref()
+            .map(|summary| text_to_tool_content(summary.clone())),
+        Part::Custom(custom) => Some(text_to_tool_content(
+            custom
+                .value
+                .as_ref()
+                .map(ToString::to_string)
+                .or_else(|| custom.data.as_ref().map(crate::data_ref_payload))
+                .unwrap_or_else(|| custom.kind.clone()),
+        )),
+        Part::ToolCall(_) | Part::ToolResult(_) => None,
+    }
+}
+
+fn text_to_tool_content(text: String) -> wire::ToolCallContent {
+    wire::ToolCallContent::Content(Box::new(wire::Content::new(wire::ContentBlock::Text(
+        wire::TextContent::new(text),
+    ))))
+}
+
+fn structured_to_tool_content(part: &StructuredPart) -> wire::ToolCallContent {
+    text_to_tool_content(part.value.to_string())
+}
+
+fn media_to_tool_content(media: &MediaPart) -> wire::ToolCallContent {
+    match media.modality {
+        Modality::Image
+            if matches!(media.data, DataRef::InlineText(_) | DataRef::InlineBytes(_)) =>
+        {
+            let mut image = wire::ImageContent::new(
+                crate::data_ref_base64_payload(&media.data),
+                media.mime_type.clone(),
+            );
+            if let Some(uri) = crate::data_ref_uri(&media.data) {
+                image = image.uri(uri);
+            }
+            wire::ToolCallContent::Content(Box::new(wire::Content::new(wire::ContentBlock::Image(
+                image,
+            ))))
+        }
+        Modality::Audio
+            if matches!(media.data, DataRef::InlineText(_) | DataRef::InlineBytes(_)) =>
+        {
+            wire::ToolCallContent::Content(Box::new(wire::Content::new(wire::ContentBlock::Audio(
+                wire::AudioContent::new(
+                    crate::data_ref_base64_payload(&media.data),
+                    media.mime_type.clone(),
+                ),
+            ))))
+        }
+        Modality::Image | Modality::Audio | Modality::Video | Modality::Binary => {
+            data_ref_to_resource_content(None, Some(&media.mime_type), &media.data)
+        }
+    }
+}
+
+fn file_to_tool_content(file: &FilePart) -> wire::ToolCallContent {
+    data_ref_to_resource_content(file.name.as_deref(), file.mime_type.as_deref(), &file.data)
+}
+
+fn data_ref_to_resource_content(
+    name: Option<&str>,
+    mime_type: Option<&str>,
+    data: &DataRef,
+) -> wire::ToolCallContent {
+    let content = match data {
+        DataRef::Uri(uri) => {
+            let mut link = wire::ResourceLink::new(name.unwrap_or(uri), uri.clone());
+            if let Some(mime_type) = mime_type {
+                link = link.mime_type(mime_type.to_string());
+            }
+            wire::ContentBlock::ResourceLink(link)
+        }
+        DataRef::Handle(handle) => {
+            let uri = format!("artifact://{handle}");
+            let link_name = name.map(str::to_owned).unwrap_or_else(|| uri.clone());
+            let mut link = wire::ResourceLink::new(link_name, uri);
+            if let Some(mime_type) = mime_type {
+                link = link.mime_type(mime_type.to_string());
+            }
+            wire::ContentBlock::ResourceLink(link)
+        }
+        DataRef::InlineText(text) if mime_type.is_none_or(|mime| mime.starts_with("text/")) => {
+            let mut resource = wire::TextResourceContents::new(
+                text.clone(),
+                crate::inline_resource_uri(name.unwrap_or("tool-output")),
+            );
+            if let Some(mime_type) = mime_type {
+                resource = resource.mime_type(mime_type.to_string());
+            }
+            wire::ContentBlock::Resource(wire::EmbeddedResource::new(
+                wire::EmbeddedResourceResource::TextResourceContents(resource),
+            ))
+        }
+        _ => {
+            let mut resource = wire::BlobResourceContents::new(
+                crate::data_ref_base64_payload(data),
+                crate::inline_resource_uri(name.unwrap_or("tool-output")),
+            );
+            if let Some(mime_type) = mime_type {
+                resource = resource.mime_type(mime_type.to_string());
+            }
+            wire::ContentBlock::Resource(wire::EmbeddedResource::new(
+                wire::EmbeddedResourceResource::BlobResourceContents(resource),
+            ))
+        }
+    };
+    wire::ToolCallContent::Content(Box::new(wire::Content::new(content)))
 }
 
 fn error_stop_reason() -> wire::StopReason {
@@ -1341,6 +1557,32 @@ mod tests {
         ])
     }
 
+    fn streamed_text_and_tool(text: &str, call_id: &str) -> TurnScript {
+        let call = ToolCallPart::new(ToolCallId::new(call_id), "missing_tool", json!({}));
+        TurnScript::new([
+            ModelTurnEvent::Delta(Delta::BeginPart {
+                part_id: PartId::new("part-1"),
+                kind: PartKind::Text,
+            }),
+            ModelTurnEvent::Delta(Delta::AppendText {
+                part_id: PartId::new("part-1"),
+                chunk: text.to_string(),
+            }),
+            ModelTurnEvent::ToolCall(call.clone()),
+            ModelTurnEvent::Finished(ModelTurnResult {
+                model: None,
+                response_id: None,
+                finish_reason: FinishReason::ToolCall,
+                output_items: vec![Item::new(
+                    ItemKind::Assistant,
+                    vec![Part::text(text), Part::ToolCall(call)],
+                )],
+                usage: None,
+                metadata: MetadataMap::new(),
+            }),
+        ])
+    }
+
     fn streamed_text(text: &str) -> TurnScript {
         TurnScript::new([
             ModelTurnEvent::Delta(Delta::BeginPart {
@@ -1428,8 +1670,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_sequences_v2_updates_with_stable_message_ids_per_session() {
+    async fn runtime_rotates_message_ids_per_model_turn_and_session() {
         let adapter = MockAdapter::new();
+        adapter.enqueue(streamed_text_and_tool("before tool", "call-1"));
         adapter.enqueue(streamed_thought_and_text("first thought", "first output"));
         adapter.enqueue(streamed_thought_and_text("second thought", "second output"));
         let updates = Arc::new(Mutex::new(Vec::new()));
@@ -1559,24 +1802,211 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             assert_eq!(user_id, format!("{session_id}-user-1"));
-            assert!(!agent_ids.is_empty());
-            assert!(
-                agent_ids
-                    .iter()
-                    .all(|id| id == &format!("{session_id}-agent-1"))
-            );
-            assert!(!thought_ids.is_empty());
-            assert!(
-                thought_ids
-                    .iter()
-                    .all(|id| id == &format!("{session_id}-thought-1"))
-            );
-            assert_ne!(agent_ids[0], thought_ids[0]);
+            if session_id == "session-1" {
+                assert_eq!(
+                    agent_ids,
+                    [
+                        "session-1-agent-2".to_string(),
+                        "session-1-agent-3".to_string()
+                    ]
+                );
+                assert_eq!(thought_ids, ["session-1-thought-3"]);
+                assert_ne!(agent_ids[0], agent_ids[1]);
+            } else {
+                assert_eq!(agent_ids, ["session-2-agent-2"]);
+                assert_eq!(thought_ids, ["session-2-thought-2"]);
+            }
+            assert_ne!(agent_ids.last(), thought_ids.last());
             assert!(matches!(
                 session_updates.last(),
                 Some(wire::SessionUpdate::StateUpdate(wire::StateUpdate::Idle(_)))
             ));
         }
+    }
+
+    #[test]
+    fn v2_tool_updates_include_visible_text_structured_parts_and_files() {
+        let outputs = [
+            ToolOutput::text("plain text"),
+            ToolOutput::structured(json!({ "ok": true })),
+            ToolOutput::parts(vec![
+                Part::text("part text"),
+                Part::structured(json!({ "part": true })),
+            ]),
+            ToolOutput::files(vec![
+                FilePart::named("artifact.txt", DataRef::inline_text("artifact body"))
+                    .with_mime_type("text/plain"),
+                FilePart::named("remote.txt", DataRef::uri("file:///tmp/remote.txt")),
+            ]),
+        ];
+        let contents = outputs
+            .into_iter()
+            .map(|output| {
+                let result = ToolResultPart::success(ToolCallId::new("call"), output);
+                let update = tool_result_update(&result, wire::ToolCallStatus::Completed);
+                serde_json::to_value(update).expect("serialize tool update")["content"].clone()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(contents[0][0]["content"]["text"], "plain text");
+        assert_eq!(contents[1][0]["content"]["text"], r#"{"ok":true}"#);
+        assert_eq!(contents[2].as_array().map(Vec::len), Some(2));
+        assert_eq!(contents[2][0]["content"]["text"], "part text");
+        assert_eq!(contents[3].as_array().map(Vec::len), Some(2));
+        assert_eq!(
+            contents[3][0]["content"]["resource"]["text"],
+            "artifact body"
+        );
+        assert_eq!(contents[3][1]["content"]["uri"], "file:///tmp/remote.txt");
+    }
+
+    #[tokio::test]
+    async fn joining_stuck_session_tasks_uses_one_shared_deadline() {
+        struct DropMarker(Arc<AtomicUsize>);
+        impl Drop for DropMarker {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let tasks = (0..3)
+            .map(|_| {
+                let dropped = Arc::clone(&dropped);
+                tokio::spawn(async move {
+                    let _marker = DropMarker(dropped);
+                    std::future::pending::<()>().await;
+                })
+            })
+            .collect();
+        tokio::task::yield_now().await;
+        let started = std::time::Instant::now();
+        join_tasks_until(
+            tokio::time::Instant::now() + Duration::from_millis(50),
+            tasks,
+        )
+        .await;
+
+        assert!(started.elapsed() < Duration::from_millis(250));
+        tokio::time::timeout(Duration::from_millis(250), async {
+            while dropped.load(Ordering::Acquire) != 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("aborted session tasks were not dropped");
+    }
+
+    #[tokio::test]
+    async fn aborting_serve_cleans_up_active_sessions() {
+        let adapter = MockAdapter::new();
+        adapter.enqueue(tool_turn("serve-cancel"));
+        let tool = CancellationAwareTool::new();
+        let (client_transport, agent_transport) = Channel::duplex();
+        let server = tokio::spawn({
+            let factory = ToolTestFactory {
+                adapter,
+                tool: tool.clone(),
+            };
+            async move {
+                AcpHeadlessRuntime::<MockAdapter>::builder()
+                    .agent_factory(factory)
+                    .serve(agent_transport)
+                    .await
+            }
+        });
+        let client = tokio::spawn(agent_client_protocol::Client.v2().connect_with(
+            client_transport,
+            async move |cx| {
+                cx.send_request(wire::InitializeRequest::new(
+                    wire::ProtocolVersion::V2,
+                    wire::Implementation::new("test-client", "1"),
+                ))
+                .block_task()
+                .await?;
+                let cwd = std::env::current_dir()
+                    .map_err(agent_client_protocol::Error::into_internal_error)?;
+                let session = cx
+                    .send_request(wire::NewSessionRequest::new(cwd))
+                    .block_task()
+                    .await?;
+                cx.send_request(wire::PromptRequest::new(
+                    session.session_id,
+                    vec![wire::ContentBlock::Text(wire::TextContent::new("run"))],
+                ))
+                .block_task()
+                .await?;
+                std::future::pending::<Result<(), agent_client_protocol::Error>>().await
+            },
+        ));
+
+        tool.wait_for_entered(1).await;
+        server.abort();
+        let _ = server.await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while tool.cleaned.load(Ordering::Acquire) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("serve drop did not clean the active tool");
+        client.abort();
+        let _ = client.await;
+    }
+
+    #[test]
+    fn tool_execution_boundary_rotates_message_ids_without_a_terminal_result() {
+        let integration = AcpIntegration::default();
+        let (client, mut messages) = ClientHandle::channel();
+        let acp_id = wire::SessionId::new("acp-session");
+        let agentkit_id = AgentkitSessionId::new("agentkit-session");
+        integration
+            .bind(acp_id.clone(), agentkit_id.clone(), client)
+            .expect("bind session");
+        integration.begin_prompt(&acp_id).expect("begin prompt");
+
+        for event in [
+            AgentEvent::ContentDelta(Delta::BeginPart {
+                part_id: PartId::new("before-tool"),
+                kind: PartKind::Text,
+            }),
+            AgentEvent::ContentDelta(Delta::AppendText {
+                part_id: PartId::new("before-tool"),
+                chunk: "before".into(),
+            }),
+            AgentEvent::ToolExecutionStarted(ToolCallPart::new(
+                ToolCallId::new("call"),
+                "background_tool",
+                json!({}),
+            )),
+            AgentEvent::ContentDelta(Delta::BeginPart {
+                part_id: PartId::new("after-tool"),
+                kind: PartKind::Text,
+            }),
+            AgentEvent::ContentDelta(Delta::AppendText {
+                part_id: PartId::new("after-tool"),
+                chunk: "after".into(),
+            }),
+        ] {
+            integration.route_event(&agentkit_id, event);
+        }
+
+        let message_ids = std::iter::from_fn(|| messages.try_recv().ok())
+            .filter_map(|message| match message {
+                ClientMessage::Update(notification) => match notification.update {
+                    wire::SessionUpdate::AgentMessageChunk(chunk) => Some(chunk.message_id),
+                    _ => None,
+                },
+                ClientMessage::Flush(_) => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            message_ids,
+            [
+                wire::MessageId::new("acp-session-agent-2"),
+                wire::MessageId::new("acp-session-agent-3"),
+            ]
+        );
     }
 
     #[test]
