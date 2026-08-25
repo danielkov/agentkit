@@ -18,7 +18,7 @@ runlet = { version = "0.4.0", optional = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 serde_toon2 = { version = "0.2.0", optional = true }
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["sync", "time"] }
 
 [features]
 default = ["lua"]
