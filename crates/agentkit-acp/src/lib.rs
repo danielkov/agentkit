@@ -41,6 +41,10 @@ pub mod wire {
     pub use agent_client_protocol::schema::v1::*;
 }
 
+/// Opt-in ACP protocol v2 runtime and upstream wire types.
+#[cfg(feature = "protocol-v2")]
+pub mod v2;
+
 const ALLOW_ONCE_OPTION: &str = "allow_once";
 const ALLOW_ALWAYS_OPTION: &str = "allow_always";
 const REJECT_ONCE_OPTION: &str = "reject_once";

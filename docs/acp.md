@@ -1,5 +1,11 @@
 # agentkit-acp design
 
+> **Implementation status:** Root APIs and default features implement stable ACP
+> v1. Version 0.10.8 also provides an opt-in ACP v2 runtime foundation under
+> `agentkit_acp::v2`; enable it with `protocol-v2`. It uses only the official
+> `agent-client-protocol` 2.0.0 `unstable_protocol_v2` feature. See the crate
+> README or book chapter for the supported v2 lifecycle and current limits.
+
 ## Purpose
 
 `agentkit-acp` is the Agent Client Protocol integration crate for agentkit.
@@ -69,6 +75,7 @@ tracing = { workspace = true }
 default = ["stdio"]
 stdio = []
 unstable-acp = ["agent-client-protocol/unstable"]
+protocol-v2 = ["agent-client-protocol/unstable_protocol_v2"]
 ```
 
 The umbrella crate should later add:
