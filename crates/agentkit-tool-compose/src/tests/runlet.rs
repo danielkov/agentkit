@@ -1,5 +1,8 @@
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
+
+use tokio::sync::Barrier;
 
 use agentkit_core::{MetadataMap, SessionId, ToolCallId, ToolOutput, ToolResultPart, TurnId};
 use agentkit_tools_core::{
@@ -40,8 +43,7 @@ async fn execute_compose(
 #[derive(Clone)]
 struct OrderingProbeTool {
     spec: ToolSpec,
-    active_parallel: Arc<AtomicUsize>,
-    saw_parallel_overlap: Arc<AtomicBool>,
+    parallel_barrier: Arc<Barrier>,
     events: Arc<StdMutex<Vec<String>>>,
 }
 
@@ -55,8 +57,7 @@ impl OrderingProbeTool {
                 "record compose scheduling",
                 json!({"type": "object"}),
             ),
-            active_parallel: Arc::new(AtomicUsize::new(0)),
-            saw_parallel_overlap: Arc::new(AtomicBool::new(false)),
+            parallel_barrier: Arc::new(Barrier::new(2)),
             events: Arc::new(StdMutex::new(Vec::new())),
         }
     }
@@ -76,15 +77,13 @@ impl Tool for OrderingProbeTool {
         let kind = request.input["kind"].as_str().unwrap_or_default();
         match kind {
             "parallel_a" | "parallel_b" => {
-                self.active_parallel.fetch_add(1, Ordering::SeqCst);
-                for _ in 0..1_000 {
-                    if self.active_parallel.load(Ordering::SeqCst) >= 2 {
-                        self.saw_parallel_overlap.store(true, Ordering::SeqCst);
-                        break;
-                    }
-                    tokio::task::yield_now().await;
-                }
-                self.active_parallel.fetch_sub(1, Ordering::SeqCst);
+                tokio::time::timeout(Duration::from_secs(5), self.parallel_barrier.wait())
+                    .await
+                    .map_err(|_| {
+                        ToolError::ExecutionFailed(
+                            "independent effectful calls did not overlap".into(),
+                        )
+                    })?;
             }
             "prerequisite" => {
                 self.events
@@ -117,7 +116,6 @@ impl Tool for OrderingProbeTool {
 #[tokio::test]
 async fn effectful_calls_run_concurrently_and_after_orders_without_data_flow() {
     let child = OrderingProbeTool::new();
-    let saw_parallel_overlap = child.saw_parallel_overlap.clone();
     let events = child.events.clone();
     let outcome = execute_compose(
         ComposeConfig::default(),
@@ -142,10 +140,6 @@ return [a.kind, b.kind, later.kind]"#,
         ),
         other => panic!("unexpected outcome: {other:?}"),
     }
-    assert!(
-        saw_parallel_overlap.load(Ordering::SeqCst),
-        "independent effectful calls should overlap"
-    );
     assert_eq!(
         *events.lock().expect("events lock"),
         vec!["prerequisite:start", "prerequisite:finish", "after:start"]

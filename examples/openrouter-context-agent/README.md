@@ -5,7 +5,7 @@ One-shot OpenRouter example that wires together:
 - `agentkit-loop`
 - `agentkit-provider-openrouter`
 - `agentkit-context` — loads `AGENTS.md` eagerly
-- `agentkit-tool-skills` — discovers skills progressively via the `activate_skill` tool
+- `agentkit-tool-skills` — discovers skills progressively via the `skill` tool
 - `agentkit-reporting`
 
 It accepts a single prompt argument, loads `AGENTS.md` into context, registers discovered skills as a tool, runs one turn to completion, and exits. Skills are **not** loaded eagerly — the model sees a catalog of skill names and descriptions in the tool description and activates them on demand.
@@ -42,4 +42,4 @@ cargo run -p openrouter-context-agent -- \
 - If `--context-root` is omitted, the current working directory is used.
 - `AGENTS.md` is discovered by searching the context root and its ancestors.
 - Skills are discovered from `<context-root>/skills` and `<context-root>/.agents/skills`.
-- If no skills are found, the `activate_skill` tool is not registered.
+- If no skills are found, the `skill` tool is not registered.
