@@ -13,6 +13,7 @@ use agent_client_protocol::{Client, ConnectionTo, Handled};
 use agentkit_core::{
     CancellationController, CancellationHandle, DataRef, Delta, FinishReason, Item, ItemKind,
     MetadataMap, Modality, Part, PartId, PartKind, SessionId as AgentkitSessionId, TextPart,
+    ToolCallPart, ToolResultPart,
 };
 use agentkit_loop::{
     AgentEvent, LoopInterrupt, LoopObserver, LoopStep, ModelAdapter, ModelSession, ObservedEvent,
@@ -93,11 +94,17 @@ async fn drain_client_messages(
     }
 }
 
+#[derive(Clone)]
+struct CurrentMessageIds {
+    agent: wire::MessageId,
+    thought: wire::MessageId,
+}
+
 struct IntegrationSession {
     acp_session_id: wire::SessionId,
     client: ClientHandle,
     next_message: AtomicU64,
-    current_agent_message: Mutex<Option<wire::MessageId>>,
+    current_messages: Mutex<Option<CurrentMessageIds>>,
     part_kinds: Mutex<HashMap<PartId, PartKind>>,
 }
 
@@ -132,6 +139,11 @@ impl AcpIntegration {
                 acp_session_id.to_string(),
             ));
         }
+        if inner.by_agentkit.contains_key(&agentkit_session_id) {
+            return Err(AcpRuntimeError::SessionAlreadyBound(
+                agentkit_session_id.to_string(),
+            ));
+        }
         inner
             .by_agentkit
             .insert(agentkit_session_id, acp_session_id.clone());
@@ -141,7 +153,7 @@ impl AcpIntegration {
                 acp_session_id,
                 client,
                 next_message: AtomicU64::new(1),
-                current_agent_message: Mutex::new(None),
+                current_messages: Mutex::new(None),
                 part_kinds: Mutex::new(HashMap::new()),
             }),
         );
@@ -179,27 +191,31 @@ impl AcpIntegration {
     fn begin_prompt(
         &self,
         session_id: &wire::SessionId,
-    ) -> Result<(wire::MessageId, wire::MessageId), AcpRuntimeError> {
+    ) -> Result<(wire::MessageId, wire::MessageId, wire::MessageId), AcpRuntimeError> {
         let session = self.session(session_id)?;
         let sequence = session.next_message.fetch_add(1, Ordering::Relaxed);
         let user_id = wire::MessageId::new(format!("{session_id}-user-{sequence}"));
         let agent_id = wire::MessageId::new(format!("{session_id}-agent-{sequence}"));
+        let thought_id = wire::MessageId::new(format!("{session_id}-thought-{sequence}"));
         *session
-            .current_agent_message
+            .current_messages
             .lock()
-            .unwrap_or_else(|error| error.into_inner()) = Some(agent_id.clone());
+            .unwrap_or_else(|error| error.into_inner()) = Some(CurrentMessageIds {
+            agent: agent_id.clone(),
+            thought: thought_id.clone(),
+        });
         session
             .part_kinds
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .clear();
-        Ok((user_id, agent_id))
+        Ok((user_id, agent_id, thought_id))
     }
 
     fn finish_prompt(&self, session_id: &wire::SessionId) {
         if let Ok(session) = self.session(session_id) {
             *session
-                .current_agent_message
+                .current_messages
                 .lock()
                 .unwrap_or_else(|error| error.into_inner()) = None;
             session
@@ -222,8 +238,8 @@ impl AcpIntegration {
             Arc::clone(session)
         };
 
-        let message_id = session
-            .current_agent_message
+        let message_ids = session
+            .current_messages
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .clone();
@@ -231,7 +247,7 @@ impl AcpIntegration {
             .part_kinds
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let Some(update) = event_to_update(&event, message_id.as_ref(), &mut part_kinds) else {
+        let Some(update) = event_to_update(&event, message_ids.as_ref(), &mut part_kinds) else {
             return;
         };
         if let Err(error) = session
@@ -402,6 +418,31 @@ where
             .on_receive_request(
                 {
                     let state = Arc::clone(&state);
+                    async move |request: wire::ListSessionsRequest, responder, _cx| {
+                        responder.respond_with_result(
+                            state.list_sessions(request).await.map_err(crate::sdk_error),
+                        )
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                {
+                    let state = Arc::clone(&state);
+                    async move |request: wire::ResumeSessionRequest, responder, _cx| {
+                        responder.respond_with_result(
+                            state
+                                .resume_session(request)
+                                .await
+                                .map_err(crate::sdk_error),
+                        )
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                {
+                    let state = Arc::clone(&state);
                     async move |request: wire::PromptRequest, responder, cx| {
                         let state = Arc::clone(&state);
                         cx.spawn(async move {
@@ -452,6 +493,7 @@ where
 struct SessionEntry {
     commands: mpsc::UnboundedSender<SessionCommand>,
     cancellation: CancellationController,
+    info: wire::SessionInfo,
     busy: Arc<AtomicBool>,
     closed: AtomicBool,
     lifecycle: Mutex<()>,
@@ -466,6 +508,7 @@ enum SessionCommand {
         cancellation_generation: u64,
         response: oneshot::Sender<Result<oneshot::Sender<()>, AcpRuntimeError>>,
     },
+    Shutdown,
 }
 
 struct RuntimeState<M>
@@ -522,6 +565,8 @@ where
         let agentkit_session_id = AgentkitSessionId::new(acp_session_id.to_string());
         let cancellation = CancellationController::new();
         let (client, client_messages) = ClientHandle::channel();
+        let info = wire::SessionInfo::new(acp_session_id.clone(), request.cwd.clone())
+            .additional_directories(request.additional_directories.clone());
 
         let mut metadata = MetadataMap::new();
         metadata.insert("acp.protocol_version".into(), json!(2));
@@ -581,6 +626,7 @@ where
         let entry = Arc::new(SessionEntry {
             commands,
             cancellation,
+            info,
             busy,
             closed: AtomicBool::new(false),
             lifecycle: Mutex::new(()),
@@ -592,6 +638,64 @@ where
             .await
             .insert(acp_session_id.clone(), entry);
         Ok(wire::NewSessionResponse::new(acp_session_id))
+    }
+
+    async fn list_sessions(
+        &self,
+        request: wire::ListSessionsRequest,
+    ) -> Result<wire::ListSessionsResponse, AcpRuntimeError> {
+        if request.cursor.is_some() {
+            return Err(AcpRuntimeError::Unsupported(
+                "ACP v2 session list cursors are not supported".into(),
+            ));
+        }
+        let sessions = self.sessions.lock().await;
+        let mut infos = sessions
+            .values()
+            .filter(|entry| {
+                !entry.closed.load(Ordering::Acquire)
+                    && request
+                        .cwd
+                        .as_ref()
+                        .is_none_or(|cwd| cwd == &entry.info.cwd)
+            })
+            .map(|entry| entry.info.clone())
+            .collect::<Vec<_>>();
+        infos.sort_by(|left, right| {
+            left.session_id
+                .to_string()
+                .cmp(&right.session_id.to_string())
+        });
+        Ok(wire::ListSessionsResponse::new(infos))
+    }
+
+    async fn resume_session(
+        &self,
+        request: wire::ResumeSessionRequest,
+    ) -> Result<wire::ResumeSessionResponse, AcpRuntimeError> {
+        if request.replay_from.is_some() {
+            return Err(AcpRuntimeError::Unsupported(
+                "ACP v2 session replay is not supported".into(),
+            ));
+        }
+        let entry = self
+            .sessions
+            .lock()
+            .await
+            .get(&request.session_id)
+            .cloned()
+            .ok_or_else(|| AcpRuntimeError::SessionNotFound(request.session_id.to_string()))?;
+        if entry.closed.load(Ordering::Acquire) || entry.info.cwd != request.cwd {
+            return Err(AcpRuntimeError::SessionNotFound(
+                request.session_id.to_string(),
+            ));
+        }
+        if entry.info.additional_directories != request.additional_directories {
+            return Err(AcpRuntimeError::Unsupported(
+                "changing ACP v2 session directories on resume is not supported".into(),
+            ));
+        }
+        Ok(wire::ResumeSessionResponse::new())
     }
 
     async fn prompt(
@@ -703,13 +807,20 @@ async fn stop_session(entry: Arc<SessionEntry>) {
             .unwrap_or_else(|error| error.into_inner());
         entry.closed.store(true, Ordering::Release);
         entry.cancellation.interrupt();
+        let _ = entry.commands.send(SessionCommand::Shutdown);
     }
     let task = entry
         .task
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .take();
-    if let Some(task) = task {
+    let Some(mut task) = task else {
+        return;
+    };
+    if tokio::time::timeout(std::time::Duration::from_secs(2), &mut task)
+        .await
+        .is_err()
+    {
         task.abort();
         let _ = task.await;
     }
@@ -737,13 +848,16 @@ async fn session_worker<S>(
 ) where
     S: ModelSession + Send + 'static,
 {
-    while let Some(SessionCommand::Prompt {
-        request,
-        items,
-        cancellation_generation,
-        response,
-    }) = commands.recv().await
-    {
+    while let Some(command) = commands.recv().await {
+        let SessionCommand::Prompt {
+            request,
+            items,
+            cancellation_generation,
+            response,
+        } = command
+        else {
+            break;
+        };
         if let Err(error) = driver
             .submit_input(items)
             .map_err(|error| AcpRuntimeError::Loop(error.to_string()))
@@ -752,7 +866,7 @@ async fn session_worker<S>(
             let _ = response.send(Err(error));
             continue;
         }
-        let (user_message_id, _) = match integration.begin_prompt(&session_id) {
+        let (user_message_id, _, _) = match integration.begin_prompt(&session_id) {
             Ok(message_ids) => message_ids,
             Err(error) => {
                 busy.store(false, Ordering::Release);
@@ -793,14 +907,14 @@ async fn session_worker<S>(
         if let Err(error) = client.flush().await {
             tracing::debug!(%error, "failed to flush ACP v2 output");
         }
+        integration.finish_prompt(&session_id);
+        busy.store(false, Ordering::Release);
         let _ = client.update(
             session_id.clone(),
             wire::SessionUpdate::StateUpdate(wire::StateUpdate::Idle(
                 wire::IdleStateUpdate::new().stop_reason(stop_reason),
             )),
         );
-        integration.finish_prompt(&session_id);
-        busy.store(false, Ordering::Release);
     }
 }
 
@@ -813,13 +927,10 @@ where
     S: ModelSession + Send + 'static,
 {
     loop {
-        let step = tokio::select! {
-            step = driver.next() => step,
-            () = cancellation.cancelled_since(generation) => {
-                return wire::StopReason::Cancelled;
-            }
-        };
-        match step {
+        // Cancellation is installed on the driver and its model/tool work. Keep
+        // polling the driver so it can close interrupted tool calls and leave a
+        // resumable transcript before the session becomes idle.
+        match driver.next().await {
             Ok(LoopStep::Finished(result)) => {
                 if result.finish_reason == FinishReason::ToolCall {
                     continue;
@@ -845,7 +956,7 @@ where
                 return if cancellation.is_cancelled_since(generation) {
                     wire::StopReason::Cancelled
                 } else {
-                    wire::StopReason::Refusal
+                    error_stop_reason()
                 };
             }
             Err(error) => {
@@ -853,7 +964,7 @@ where
                 return if cancellation.is_cancelled_since(generation) {
                     wire::StopReason::Cancelled
                 } else {
-                    wire::StopReason::Refusal
+                    error_stop_reason()
                 };
             }
         }
@@ -968,11 +1079,30 @@ fn resource_item(resource: &wire::EmbeddedResource) -> Result<Item, AcpRuntimeEr
 
 fn event_to_update(
     event: &AgentEvent,
-    message_id: Option<&wire::MessageId>,
+    message_ids: Option<&CurrentMessageIds>,
     part_kinds: &mut HashMap<PartId, PartKind>,
 ) -> Option<wire::SessionUpdate> {
     match event {
-        AgentEvent::ContentDelta(delta) => delta_to_update(delta, message_id, part_kinds),
+        AgentEvent::ContentDelta(delta) => delta_to_update(delta, message_ids, part_kinds),
+        AgentEvent::ToolCallRequested(call) => {
+            Some(wire::SessionUpdate::ToolCallUpdate(tool_call_update(call)))
+        }
+        AgentEvent::ToolExecutionStarted(call) => Some(wire::SessionUpdate::ToolCallUpdate(
+            tool_status_update(&call.id, wire::ToolCallStatus::InProgress),
+        )),
+        AgentEvent::ToolExecutionProgress(result) => Some(wire::SessionUpdate::ToolCallUpdate(
+            tool_result_update(result, wire::ToolCallStatus::InProgress),
+        )),
+        AgentEvent::ToolResultReceived(result) => {
+            Some(wire::SessionUpdate::ToolCallUpdate(tool_result_update(
+                result,
+                if result.is_error {
+                    wire::ToolCallStatus::Failed
+                } else {
+                    wire::ToolCallStatus::Completed
+                },
+            )))
+        }
         AgentEvent::TurnFinished(_) => {
             part_kinds.clear();
             None
@@ -991,7 +1121,7 @@ fn event_to_update(
 
 fn delta_to_update(
     delta: &Delta,
-    message_id: Option<&wire::MessageId>,
+    message_ids: Option<&CurrentMessageIds>,
     part_kinds: &mut HashMap<PartId, PartKind>,
 ) -> Option<wire::SessionUpdate> {
     match delta {
@@ -1000,14 +1130,14 @@ fn delta_to_update(
             None
         }
         Delta::AppendText { part_id, chunk } => {
-            let message_id = message_id?.clone();
+            let message_ids = message_ids?;
             let content = wire::ContentBlock::Text(wire::TextContent::new(chunk.clone()));
             match part_kinds.get(part_id) {
                 Some(PartKind::Reasoning) => Some(wire::SessionUpdate::AgentThoughtChunk(
-                    wire::ContentChunk::new(content, message_id),
+                    wire::ContentChunk::new(content, message_ids.thought.clone()),
                 )),
                 Some(PartKind::Text) | None => Some(wire::SessionUpdate::AgentMessageChunk(
-                    wire::ContentChunk::new(content, message_id),
+                    wire::ContentChunk::new(content, message_ids.agent.clone()),
                 )),
                 Some(_) => None,
             }
@@ -1019,6 +1149,33 @@ fn delta_to_update(
     }
 }
 
+fn tool_call_update(call: &ToolCallPart) -> wire::ToolCallUpdate {
+    wire::ToolCallUpdate::new(call.id.to_string())
+        .title(call.name.clone())
+        .status(wire::ToolCallStatus::Pending)
+        .raw_input(call.input.clone())
+}
+
+fn tool_status_update(
+    call_id: &agentkit_core::ToolCallId,
+    status: wire::ToolCallStatus,
+) -> wire::ToolCallUpdate {
+    wire::ToolCallUpdate::new(call_id.to_string()).status(status)
+}
+
+fn tool_result_update(
+    result: &ToolResultPart,
+    status: wire::ToolCallStatus,
+) -> wire::ToolCallUpdate {
+    wire::ToolCallUpdate::new(result.call_id.to_string())
+        .status(status)
+        .raw_output(crate::tool_output_raw(&result.output))
+}
+
+fn error_stop_reason() -> wire::StopReason {
+    wire::StopReason::Other("_error".into())
+}
+
 fn finish_reason_to_stop_reason(reason: &FinishReason) -> wire::StopReason {
     match reason {
         FinishReason::Completed | FinishReason::ToolCall | FinishReason::Other(_) => {
@@ -1026,7 +1183,7 @@ fn finish_reason_to_stop_reason(reason: &FinishReason) -> wire::StopReason {
         }
         FinishReason::MaxTokens => wire::StopReason::MaxTokens,
         FinishReason::Cancelled => wire::StopReason::Cancelled,
-        FinishReason::Blocked | FinishReason::Error => wire::StopReason::Refusal,
+        FinishReason::Blocked | FinishReason::Error => error_stop_reason(),
     }
 }
 
@@ -1044,14 +1201,18 @@ fn headless_capabilities() -> wire::AgentCapabilities {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
     use agent_client_protocol::Channel;
-    use agentkit_core::{ItemKind, TurnCancellation};
+    use agentkit_core::{ItemKind, ToolCallId, ToolOutput, ToolResultPart, TurnCancellation};
     use agentkit_integration_tests::mock_model::{MockAdapter, TurnScript};
     use agentkit_loop::{
         Agent, LoopError, ModelSession, ModelTurn, ModelTurnEvent, ModelTurnResult, SessionConfig,
         TurnRequest,
+    };
+    use agentkit_tools_core::{
+        Tool, ToolContext, ToolError, ToolRegistry, ToolRequest, ToolResult, ToolSpec,
     };
 
     #[derive(Clone)]
@@ -1081,6 +1242,105 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct CancellationAwareTool {
+        spec: ToolSpec,
+        entered: Arc<AtomicUsize>,
+        cleaned: Arc<AtomicUsize>,
+    }
+
+    impl CancellationAwareTool {
+        fn new() -> Self {
+            Self {
+                spec: ToolSpec::new(
+                    "blocking_tool",
+                    "waits for turn cancellation",
+                    json!({ "type": "object" }),
+                ),
+                entered: Arc::new(AtomicUsize::new(0)),
+                cleaned: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        async fn wait_for_entered(&self, count: usize) {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while self.entered.load(Ordering::Acquire) < count {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("tool did not start");
+        }
+    }
+
+    #[async_trait]
+    impl Tool for CancellationAwareTool {
+        fn spec(&self) -> &ToolSpec {
+            &self.spec
+        }
+
+        async fn invoke(
+            &self,
+            request: ToolRequest,
+            ctx: &mut ToolContext<'_>,
+        ) -> Result<ToolResult, ToolError> {
+            self.entered.fetch_add(1, Ordering::AcqRel);
+            ctx.cancellation
+                .as_ref()
+                .expect("turn cancellation installed")
+                .cancelled()
+                .await;
+            self.cleaned.fetch_add(1, Ordering::AcqRel);
+            Ok(ToolResult::new(ToolResultPart::error(
+                request.call_id,
+                ToolOutput::text("cancelled"),
+            )))
+        }
+    }
+
+    #[derive(Clone)]
+    struct ToolTestFactory {
+        adapter: MockAdapter,
+        tool: CancellationAwareTool,
+    }
+
+    #[async_trait]
+    impl AcpAgentFactory<MockAdapter> for ToolTestFactory {
+        async fn start(
+            &self,
+            ctx: AcpAgentFactoryContext,
+        ) -> Result<
+            agentkit_loop::LoopDriver<<MockAdapter as ModelAdapter>::Session>,
+            AcpRuntimeError,
+        > {
+            Agent::builder()
+                .model(self.adapter.clone())
+                .add_tool_source(ToolRegistry::new().with(self.tool.clone()))
+                .observer(ctx.integration.as_ref().clone())
+                .cancellation(ctx.cancellation)
+                .build()
+                .map_err(|error| AcpRuntimeError::Loop(error.to_string()))?
+                .start(SessionConfig::new(ctx.agentkit_session_id).with_metadata(ctx.metadata))
+                .await
+                .map_err(|error| AcpRuntimeError::Loop(error.to_string()))
+        }
+    }
+
+    fn tool_turn(call_id: &str) -> TurnScript {
+        let call = ToolCallPart::new(ToolCallId::new(call_id), "blocking_tool", json!({}));
+        TurnScript::new([
+            ModelTurnEvent::ToolCall(call.clone()),
+            ModelTurnEvent::Finished(ModelTurnResult {
+                model: None,
+                response_id: None,
+                finish_reason: FinishReason::ToolCall,
+                output_items: vec![Item::new(ItemKind::Assistant, vec![Part::ToolCall(call)])],
+                usage: None,
+                metadata: MetadataMap::new(),
+            }),
+        ])
+    }
+
     fn streamed_text(text: &str) -> TurnScript {
         TurnScript::new([
             ModelTurnEvent::Delta(Delta::BeginPart {
@@ -1102,19 +1362,62 @@ mod tests {
         ])
     }
 
+    fn streamed_thought_and_text(thought: &str, text: &str) -> TurnScript {
+        TurnScript::new([
+            ModelTurnEvent::Delta(Delta::BeginPart {
+                part_id: PartId::new("thought-part"),
+                kind: PartKind::Reasoning,
+            }),
+            ModelTurnEvent::Delta(Delta::AppendText {
+                part_id: PartId::new("thought-part"),
+                chunk: thought.to_string(),
+            }),
+            ModelTurnEvent::Delta(Delta::BeginPart {
+                part_id: PartId::new("text-part"),
+                kind: PartKind::Text,
+            }),
+            ModelTurnEvent::Delta(Delta::AppendText {
+                part_id: PartId::new("text-part"),
+                chunk: text.to_string(),
+            }),
+            ModelTurnEvent::Finished(ModelTurnResult {
+                model: None,
+                response_id: None,
+                finish_reason: FinishReason::Completed,
+                output_items: vec![Item::text(ItemKind::Assistant, text)],
+                usage: None,
+                metadata: MetadataMap::new(),
+            }),
+        ])
+    }
+
     async fn wait_for_idle(
         updates: &Arc<Mutex<Vec<(wire::SessionId, wire::SessionUpdate)>>>,
         session_id: &wire::SessionId,
     ) {
+        wait_for_idle_count(updates, session_id, 1).await;
+    }
+
+    async fn wait_for_idle_count(
+        updates: &Arc<Mutex<Vec<(wire::SessionId, wire::SessionUpdate)>>>,
+        session_id: &wire::SessionId,
+        count: usize,
+    ) {
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                if updates.lock().unwrap().iter().any(|(id, update)| {
-                    id == session_id
-                        && matches!(
-                            update,
-                            wire::SessionUpdate::StateUpdate(wire::StateUpdate::Idle(_))
-                        )
-                }) {
+                let idle_count = updates
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(id, update)| {
+                        id == session_id
+                            && matches!(
+                                update,
+                                wire::SessionUpdate::StateUpdate(wire::StateUpdate::Idle(_))
+                            )
+                    })
+                    .count();
+                if idle_count >= count {
                     return;
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -1127,8 +1430,8 @@ mod tests {
     #[tokio::test]
     async fn runtime_sequences_v2_updates_with_stable_message_ids_per_session() {
         let adapter = MockAdapter::new();
-        adapter.enqueue(streamed_text("first output"));
-        adapter.enqueue(streamed_text("second output"));
+        adapter.enqueue(streamed_thought_and_text("first thought", "first output"));
+        adapter.enqueue(streamed_thought_and_text("second thought", "second output"));
         let updates = Arc::new(Mutex::new(Vec::new()));
         let (client_transport, agent_transport) = Channel::duplex();
 
@@ -1246,6 +1549,15 @@ mod tests {
                     _ => None,
                 })
                 .collect::<Vec<_>>();
+            let thought_ids = session_updates
+                .iter()
+                .filter_map(|update| match update {
+                    wire::SessionUpdate::AgentThoughtChunk(chunk) => {
+                        Some(chunk.message_id.to_string())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
             assert_eq!(user_id, format!("{session_id}-user-1"));
             assert!(!agent_ids.is_empty());
             assert!(
@@ -1253,10 +1565,211 @@ mod tests {
                     .iter()
                     .all(|id| id == &format!("{session_id}-agent-1"))
             );
+            assert!(!thought_ids.is_empty());
+            assert!(
+                thought_ids
+                    .iter()
+                    .all(|id| id == &format!("{session_id}-thought-1"))
+            );
+            assert_ne!(agent_ids[0], thought_ids[0]);
             assert!(matches!(
                 session_updates.last(),
                 Some(wire::SessionUpdate::StateUpdate(wire::StateUpdate::Idle(_)))
             ));
+        }
+    }
+
+    #[test]
+    fn integration_rejects_duplicate_agentkit_session_ids() {
+        let integration = AcpIntegration::default();
+        let (first_client, _first_rx) = ClientHandle::channel();
+        let (second_client, _second_rx) = ClientHandle::channel();
+        let agentkit_id = AgentkitSessionId::new("shared-agentkit-session");
+        let first_acp = wire::SessionId::new("first-acp-session");
+        let second_acp = wire::SessionId::new("second-acp-session");
+        integration
+            .bind(first_acp.clone(), agentkit_id.clone(), first_client)
+            .expect("first binding");
+        let error = integration
+            .bind(second_acp.clone(), agentkit_id, second_client)
+            .expect_err("duplicate AgentKit session id must be rejected");
+        assert!(matches!(error, AcpRuntimeError::SessionAlreadyBound(_)));
+        assert!(matches!(
+            integration.session(&second_acp),
+            Err(AcpRuntimeError::SessionNotFound(_))
+        ));
+        integration.unbind(&first_acp).expect("unbind first");
+    }
+
+    #[test]
+    fn retained_transcript_failures_use_custom_error_stop_reason() {
+        for reason in [FinishReason::Blocked, FinishReason::Error] {
+            assert_eq!(
+                finish_reason_to_stop_reason(&reason),
+                wire::StopReason::Other("_error".into())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_then_prompt_and_close_cleanup_active_tools() {
+        let adapter = MockAdapter::new();
+        adapter.enqueue(tool_turn("call-cancel"));
+        adapter.enqueue(streamed_text("ready again"));
+        adapter.enqueue(tool_turn("call-close"));
+        let tool = CancellationAwareTool::new();
+        let updates = Arc::new(Mutex::new(Vec::new()));
+        let (client_transport, agent_transport) = Channel::duplex();
+
+        let server = tokio::spawn({
+            let factory = ToolTestFactory {
+                adapter: adapter.clone(),
+                tool: tool.clone(),
+            };
+            async move {
+                AcpHeadlessRuntime::<MockAdapter>::builder()
+                    .agent_factory(factory)
+                    .serve(agent_transport)
+                    .await
+            }
+        });
+
+        let client = agent_client_protocol::Client
+            .v2()
+            .on_receive_notification(
+                {
+                    let updates = Arc::clone(&updates);
+                    async move |notification: wire::UpdateSessionNotification, _cx| {
+                        updates
+                            .lock()
+                            .unwrap()
+                            .push((notification.session_id, notification.update));
+                        Ok(())
+                    }
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(client_transport, {
+                let updates = Arc::clone(&updates);
+                let tool = tool.clone();
+                async move |cx| {
+                    let initialize = cx
+                        .send_request(wire::InitializeRequest::new(
+                            wire::ProtocolVersion::V2,
+                            wire::Implementation::new("test-client", "1"),
+                        ))
+                        .block_task()
+                        .await?;
+                    assert!(initialize.capabilities.session.is_some());
+                    let cwd = std::env::current_dir()
+                        .map_err(agent_client_protocol::Error::into_internal_error)?;
+                    let first = cx
+                        .send_request(wire::NewSessionRequest::new(cwd.clone()))
+                        .block_task()
+                        .await?;
+
+                    let listed = cx
+                        .send_request(wire::ListSessionsRequest::new())
+                        .block_task()
+                        .await?;
+                    assert_eq!(listed.sessions.len(), 1);
+                    assert_eq!(listed.sessions[0].session_id, first.session_id);
+                    cx.send_request(wire::ResumeSessionRequest::new(
+                        first.session_id.clone(),
+                        cwd.clone(),
+                    ))
+                    .block_task()
+                    .await?;
+
+                    cx.send_request(wire::PromptRequest::new(
+                        first.session_id.clone(),
+                        vec![wire::ContentBlock::Text(wire::TextContent::new(
+                            "start tool",
+                        ))],
+                    ))
+                    .block_task()
+                    .await?;
+                    tool.wait_for_entered(1).await;
+                    cx.send_notification(wire::CancelSessionNotification::new(
+                        first.session_id.clone(),
+                    ))?;
+                    wait_for_idle_count(&updates, &first.session_id, 1).await;
+                    assert_eq!(tool.cleaned.load(Ordering::Acquire), 1);
+
+                    tokio::time::timeout(
+                        Duration::from_millis(250),
+                        cx.send_request(wire::PromptRequest::new(
+                            first.session_id.clone(),
+                            vec![wire::ContentBlock::Text(wire::TextContent::new("again"))],
+                        ))
+                        .block_task(),
+                    )
+                    .await
+                    .expect("session was not ready when Idle was emitted")?;
+                    wait_for_idle_count(&updates, &first.session_id, 2).await;
+
+                    let second = cx
+                        .send_request(wire::NewSessionRequest::new(cwd))
+                        .block_task()
+                        .await?;
+                    cx.send_request(wire::PromptRequest::new(
+                        second.session_id.clone(),
+                        vec![wire::ContentBlock::Text(wire::TextContent::new(
+                            "close tool",
+                        ))],
+                    ))
+                    .block_task()
+                    .await?;
+                    tool.wait_for_entered(2).await;
+                    tokio::time::timeout(
+                        Duration::from_secs(3),
+                        cx.send_request(wire::CloseSessionRequest::new(second.session_id.clone()))
+                            .block_task(),
+                    )
+                    .await
+                    .expect("close did not complete after cooperative cleanup")?;
+                    assert_eq!(tool.cleaned.load(Ordering::Acquire), 2);
+                    cx.send_request(wire::CloseSessionRequest::new(first.session_id))
+                        .block_task()
+                        .await?;
+                    Ok(())
+                }
+            });
+
+        tokio::time::timeout(Duration::from_secs(8), client)
+            .await
+            .expect("client timed out")
+            .expect("client run");
+        server.abort();
+        let _ = server.await;
+
+        let updates = updates.lock().unwrap();
+        for call_id in ["call-cancel", "call-close"] {
+            let statuses = updates
+                .iter()
+                .filter_map(|(_, update)| match update {
+                    wire::SessionUpdate::ToolCallUpdate(update)
+                        if update.tool_call_id.to_string() == call_id =>
+                    {
+                        Some(update.status.clone())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert!(statuses.iter().any(|status| matches!(
+                status,
+                agent_client_protocol::schema::MaybeUndefined::Value(wire::ToolCallStatus::Pending)
+            )));
+            assert!(statuses.iter().any(|status| matches!(
+                status,
+                agent_client_protocol::schema::MaybeUndefined::Value(
+                    wire::ToolCallStatus::InProgress
+                )
+            )));
+            assert!(statuses.iter().any(|status| matches!(
+                status,
+                agent_client_protocol::schema::MaybeUndefined::Value(wire::ToolCallStatus::Failed)
+            )));
         }
     }
 

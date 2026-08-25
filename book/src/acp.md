@@ -36,20 +36,22 @@ then emits, in order:
 
 1. a `user_message` update with a generated stable message ID;
 2. a `running` state update;
-3. streamed agent message or thought chunks sharing a stable agent message ID;
-4. an `idle` state update with the final stop reason.
+3. streamed agent message or thought chunks with distinct stable message IDs;
+4. tool-call lifecycle updates when tools run;
+5. an `idle` state update with the final stop reason.
 
 Each session has its own worker and loop driver. Independent sessions can make
 progress concurrently, while a second prompt for a running session is rejected.
 `session/cancel` interrupts only the selected session and produces an idle
-`cancelled` update when the loop stops. `session/close` cancels work and drops
-the session worker.
+`cancelled` update after loop cleanup. `session/close` cooperatively cancels
+work and drops the session worker. `session/list` and `session/resume` cover
+active in-memory sessions; replay is not supported.
 
-The initial v2 foundation routes text and reasoning deltas. ACP v2 permission
-callbacks and richer tool updates are intentionally deferred; an approval
-interrupt currently ends the prompt with `refusal`. Upstream labels the v2
-protocol unstable, so opt-in callers should expect the `v2` namespace to track
-official SDK changes.
+The initial v2 foundation routes text, reasoning, and tool lifecycle updates.
+ACP v2 permission callbacks are intentionally deferred; an unsupported approval
+interrupt retains the transcript and ends the prompt with the custom `_error`
+stop reason rather than `refusal`. Upstream labels the v2 protocol unstable, so
+opt-in callers should expect the `v2` namespace to track official SDK changes.
 
 ## Two integration shapes
 

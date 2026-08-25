@@ -29,17 +29,20 @@ The feature maps directly to the official
 wire types live only under `agentkit_acp::v2` (and
 `agentkit_acp::v2::wire`).
 
-`v2::AcpHeadlessRuntime` supports ACP v2 initialize, new session, prompt,
-cancel, session updates, and close. Each session owns a worker and loop driver,
-so work in one session does not block request handling for another. A prompt is
-accepted before model work completes, then the runtime emits ordered
-`UserMessage`, `Running`, streamed output, and `Idle` updates. User and agent
-message IDs are stable for the lifetime of a prompt.
+`v2::AcpHeadlessRuntime` supports ACP v2 initialize, new/list/resume
+session, prompt, cancel, session updates, and close. Listing and resume cover
+the runtime's active in-memory sessions; replay is not supported. Each session
+owns a worker and loop driver, so work in one session does not block request
+handling for another. A prompt is accepted before model work completes, then
+the runtime emits ordered `UserMessage`, `Running`, streamed output, and `Idle`
+updates. User, visible-agent, and thought message IDs are distinct and stable
+for the lifetime of a prompt.
 
-This first v2 foundation streams text and reasoning output. An approval
-interrupt currently ends the prompt with `Refusal`; the v1 permission bridge is
-not exposed through v2 wire types. Because upstream marks protocol v2 unstable,
-all APIs in the `v2` namespace can evolve with the official SDK.
+This first v2 foundation streams text, reasoning, and tool lifecycle updates.
+The v1 permission bridge is not exposed through v2 wire types. Unsupported
+approval interrupts retain the transcript and therefore end with the custom
+`_error` stop reason rather than `Refusal`. Because upstream marks protocol v2
+unstable, all APIs in the `v2` namespace can evolve with the official SDK.
 
 Run the stable v1 in-memory end-to-end example with:
 
