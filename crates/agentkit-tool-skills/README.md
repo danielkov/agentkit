@@ -10,7 +10,7 @@
 Progressive Agent Skills discovery and activation for agentkit.
 
 This crate discovers `SKILL.md` files, builds a lightweight catalog for the
-model, and exposes an `activate_skill` tool that loads full skill instructions
+model, and exposes a `skill` tool that loads full skill instructions
 on demand.
 
 ## What it provides
@@ -18,7 +18,6 @@ on demand.
 - recursive skill discovery from one or more roots
 - exact-directory loading for package formats with fixed discovery rules
 - frontmatter parsing for skill metadata
-- per-session activation tracking to avoid duplicate loads
 - progressive disclosure so the model sees descriptions first and bodies later
 
 ## Example
@@ -31,7 +30,7 @@ use agentkit_tool_skills::SkillRegistry;
 // (`./.agents/skills` and `~/.agents/skills`).
 let registry = SkillRegistry::discover(".").build().await;
 
-// `tool_registry()` returns a `ToolRegistry` exposing only `activate_skill`,
+// `tool_registry()` returns a `ToolRegistry` exposing only `skill`,
 // ready to merge with the rest of your agent's tools.
 let tools = agentkit_tools_core::ToolRegistry::new()
     .merge(registry.tool_registry());

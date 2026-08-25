@@ -351,7 +351,7 @@ pub use agentkit_tool_shell as tool_shell;
 /// Agent Skills tool for progressive skill discovery and activation.
 ///
 /// Provides [`tool_skills::SkillRegistry`] which discovers `SKILL.md` files
-/// and exposes an `activate_skill` tool for on-demand loading. Skills are
+/// and exposes a `skill` tool for on-demand loading. Skills are
 /// listed in the tool description (catalog tier) and their full content is
 /// returned only when the model activates them.
 ///

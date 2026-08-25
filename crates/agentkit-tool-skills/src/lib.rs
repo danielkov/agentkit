@@ -2,7 +2,7 @@
 //!
 //! This crate implements the [Agent Skills specification](https://agentskills.io/specification),
 //! providing a [`SkillRegistry`] that discovers `SKILL.md` files, parses their
-//! frontmatter, and exposes an `activate_skill` tool for on-demand loading.
+//! frontmatter, and exposes a `skill` tool for on-demand loading.
 //!
 //! # Progressive disclosure
 //!
@@ -12,7 +12,7 @@
 //! 1. **Catalog** -- skill names and descriptions are listed in the tool
 //!    description at session start (~50-100 tokens per skill).
 //! 2. **Instructions** -- the full `SKILL.md` body (frontmatter stripped) is
-//!    loaded only when the model calls `activate_skill`.
+//!    loaded only when the model calls `skill`.
 //! 3. **Resources** -- supporting files (scripts, references, assets) are
 //!    enumerated in the activation response; the model reads them on demand.
 //!
@@ -31,12 +31,12 @@
 //! # }
 //! ```
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use agentkit_core::{MetadataMap, SessionId, ToolOutput, ToolResultPart};
+use agentkit_core::{MetadataMap, ToolOutput, ToolResultPart};
 use agentkit_tools_core::{
     Tool, ToolAnnotations, ToolContext, ToolError, ToolName, ToolRegistry, ToolRequest, ToolResult,
     ToolSpec,
@@ -47,7 +47,7 @@ use serde_json::{Value, json};
 use thiserror::Error;
 
 const DEFAULT_SKILL_FILE: &str = "SKILL.md";
-const TOOL_NAME: &str = "activate_skill";
+const TOOL_NAME: &str = "skill";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -132,12 +132,12 @@ where
     }
 }
 
-/// Registry of discovered skills that provides the `activate_skill` tool.
+/// Registry of discovered skills that provides the `skill` tool.
 ///
 /// The registry discovers `SKILL.md` files from one or more directory roots,
 /// parses their frontmatter, and builds an in-memory catalog. When registered
 /// as a tool, the model sees a YAML catalog of available skills in the tool
-/// description and can call `activate_skill` with a skill name to load its
+/// description and can call `skill` with a skill name to load its
 /// full instructions.
 ///
 /// # Discovery order and name collisions
@@ -162,7 +162,7 @@ where
 /// .discover_skills()
 /// .await;
 ///
-/// // Compose with the agent's other tools; activate_skill rediscovers each turn.
+/// // Compose with the agent's other tools; skill rediscovers each turn.
 /// let tools = agentkit_tools_core::ToolRegistry::new().merge(registry.tool_registry());
 /// # Ok(())
 /// # }
@@ -171,7 +171,6 @@ pub struct SkillRegistry {
     source: SkillDiscoverySource,
     filters: Vec<Arc<dyn SkillFilter>>,
     skills: BTreeMap<String, Skill>,
-    activations: Arc<Mutex<HashMap<SessionId, HashSet<String>>>>,
 }
 
 impl SkillRegistry {
@@ -187,7 +186,6 @@ impl SkillRegistry {
             source: SkillDiscoverySource::Recursive(roots),
             filters: Vec::new(),
             skills: BTreeMap::new(),
-            activations: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -207,7 +205,6 @@ impl SkillRegistry {
             source: SkillDiscoverySource::ExactDirectories(dirs),
             filters: Vec::new(),
             skills: BTreeMap::new(),
-            activations: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -250,8 +247,6 @@ impl SkillRegistry {
     /// Re-scan all roots and re-apply filters.
     ///
     /// Call this between turns to pick up newly installed or removed skills.
-    /// Activation tracking is preserved across reloads — skills that were
-    /// already activated remain marked.
     pub async fn reload(&mut self) {
         self.skills = discover_filtered_skills(&self.source, &self.filters);
     }
@@ -267,7 +262,7 @@ impl SkillRegistry {
         self.skills.values().collect()
     }
 
-    /// Build a [`ToolRegistry`] containing only the `activate_skill` tool.
+    /// Build a [`ToolRegistry`] containing only the `skill` tool.
     ///
     /// The tool remains registered even when discovery is currently empty so
     /// future turns can surface newly added skills. If no roots are
@@ -280,13 +275,11 @@ impl SkillRegistry {
         registry
     }
 
-    /// Reset activation tracking. After this call, all skills will return
-    /// their full content on next activation instead of "Skill already read."
-    pub fn reset_activations(&self) {
-        self.activations.lock().unwrap().clear();
-    }
+    /// Retained for compatibility; skill reads are no longer deduplicated.
+    #[deprecated(since = "0.10.8", note = "skill reads are no longer deduplicated")]
+    pub fn reset_activations(&self) {}
 
-    fn build_tool(&self) -> ActivateSkillTool {
+    fn build_tool(&self) -> SkillTool {
         let spec = ToolSpec {
             name: ToolName::new(TOOL_NAME),
             description: "Load a skill's full instructions into the conversation.".into(),
@@ -295,13 +288,13 @@ impl SkillRegistry {
                 "properties": {
                     "name": {
                         "type": "string",
-                        "description": "Name of the skill to activate."
+                        "description": "Name of the skill to load."
                     }
                 },
                 "required": ["name"],
                 "additionalProperties": false
             }),
-            output_schema: None,
+            output_schema: Some(skill_output_schema()),
             annotations: ToolAnnotations {
                 read_only_hint: true,
                 ..Default::default()
@@ -309,11 +302,10 @@ impl SkillRegistry {
             metadata: MetadataMap::new(),
         };
 
-        ActivateSkillTool {
+        SkillTool {
             static_spec: spec,
             source: self.source.clone(),
             filters: self.filters.clone(),
-            activations: Arc::clone(&self.activations),
         }
     }
 }
@@ -355,30 +347,29 @@ impl SkillRegistry {
 }
 
 // ---------------------------------------------------------------------------
-// ActivateSkillTool
+// SkillTool
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
-struct ActivateSkillInput {
+struct SkillInput {
     name: String,
 }
 
-struct ActivateSkillTool {
+struct SkillTool {
     static_spec: ToolSpec,
     source: SkillDiscoverySource,
     filters: Vec<Arc<dyn SkillFilter>>,
-    activations: Arc<Mutex<HashMap<SessionId, HashSet<String>>>>,
 }
 
 #[async_trait]
-impl Tool for ActivateSkillTool {
+impl Tool for SkillTool {
     fn spec(&self) -> &ToolSpec {
         &self.static_spec
     }
 
     fn current_spec(&self) -> Option<ToolSpec> {
         let skills = discover_filtered_skills(&self.source, &self.filters);
-        (!skills.is_empty()).then(|| build_activate_skill_spec(&skills))
+        (!skills.is_empty()).then(|| build_skill_spec(&skills))
     }
 
     async fn invoke(
@@ -386,32 +377,13 @@ impl Tool for ActivateSkillTool {
         request: ToolRequest,
         _ctx: &mut ToolContext<'_>,
     ) -> Result<ToolResult, ToolError> {
-        let input: ActivateSkillInput = serde_json::from_value(request.input)
+        let input: SkillInput = serde_json::from_value(request.input)
             .map_err(|e| ToolError::InvalidInput(format!("invalid input: {e}")))?;
 
         let skills = discover_filtered_skills(&self.source, &self.filters);
         let skill = skills
             .get(&input.name)
             .ok_or_else(|| ToolError::InvalidInput(format!("unknown skill: {}", input.name)))?;
-
-        // Deduplicate within a session, not globally across the registry.
-        {
-            let mut activated = self.activations.lock().unwrap();
-            let session_activations = activated.entry(request.session_id.clone()).or_default();
-            if session_activations.contains(&input.name) {
-                return Ok(ToolResult {
-                    result: ToolResultPart {
-                        call_id: request.call_id,
-                        output: ToolOutput::Text("Skill already read.".into()),
-                        is_error: false,
-                        metadata: MetadataMap::new(),
-                    },
-                    duration: None,
-                    metadata: MetadataMap::new(),
-                });
-            }
-            session_activations.insert(input.name.clone());
-        }
 
         // Build the response with body + directory + resources.
         let mut response = format!(
@@ -445,11 +417,11 @@ impl Tool for ActivateSkillTool {
 // Catalog formatting
 // ---------------------------------------------------------------------------
 
-fn build_activate_skill_spec(skills: &BTreeMap<String, Skill>) -> ToolSpec {
+fn build_skill_spec(skills: &BTreeMap<String, Skill>) -> ToolSpec {
     let catalog = build_catalog_yaml(skills);
     let mut name_schema = json!({
         "type": "string",
-        "description": "Name of the skill to activate."
+        "description": "Name of the skill to load."
     });
     if !skills.is_empty() {
         let enum_values: Vec<Value> = skills.keys().map(|n| Value::String(n.clone())).collect();
@@ -477,13 +449,20 @@ fn build_activate_skill_spec(skills: &BTreeMap<String, Skill>) -> ToolSpec {
             "required": ["name"],
             "additionalProperties": false
         }),
-        output_schema: None,
+        output_schema: Some(skill_output_schema()),
         annotations: ToolAnnotations {
             read_only_hint: true,
             ..Default::default()
         },
         metadata: MetadataMap::new(),
     }
+}
+
+fn skill_output_schema() -> Value {
+    json!({
+        "type": "string",
+        "description": "Full skill instructions, skill directory, and resource paths."
+    })
 }
 
 fn build_catalog_yaml(skills: &BTreeMap<String, Skill>) -> String {
@@ -952,8 +931,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn activation_deduplication() {
-        let root = temp_dir("dedup");
+    async fn repeated_reads_return_instructions() {
+        let root = temp_dir("repeated-reads");
         write_skill(&root, "test-skill", "Test.", "Body content here.").await;
 
         let reg = SkillRegistry::from_paths(vec![root.clone()])
@@ -963,7 +942,7 @@ mod tests {
         let tool = reg.build_tool();
         let call_id = ToolCallId::new("call-1");
 
-        // First activation returns body.
+        // First read returns the body.
         let request = ToolRequest {
             call_id: call_id.clone(),
             tool_name: ToolName::new(TOOL_NAME),
@@ -994,7 +973,7 @@ mod tests {
         };
         assert!(text.contains("Body content here."));
 
-        // Second activation returns dedup message.
+        // Re-reading returns the body again so callers cannot lose the instructions.
         let request2 = ToolRequest {
             call_id: ToolCallId::new("call-2"),
             tool_name: ToolName::new(TOOL_NAME),
@@ -1009,7 +988,7 @@ mod tests {
             ToolOutput::Text(t) => t.clone(),
             _ => panic!("expected text output"),
         };
-        assert_eq!(text2, "Skill already read.");
+        assert!(text2.contains("Body content here."));
 
         async_fs::remove_dir_all(&root).await.unwrap();
     }
@@ -1177,6 +1156,8 @@ mod tests {
         let schema = &spec.input_schema;
         let enum_values = schema["properties"]["name"]["enum"].as_array().unwrap();
 
+        assert_eq!(spec.name.0, "skill");
+        assert_eq!(spec.output_schema, Some(skill_output_schema()));
         assert_eq!(enum_values.len(), 2);
         let names: Vec<&str> = enum_values.iter().map(|v| v.as_str().unwrap()).collect();
         assert!(names.contains(&"alpha"));
@@ -1186,8 +1167,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn activation_deduplicates_per_session() {
-        let root = temp_dir("session-dedup");
+    async fn reads_are_independent_across_sessions() {
+        let root = temp_dir("session-reads");
         write_skill(&root, "test-skill", "Test.", "Body content here.").await;
 
         let reg = SkillRegistry::from_paths(vec![root.clone()])
@@ -1357,70 +1338,6 @@ mod tests {
             .await;
 
         assert!(!reg.has_skills());
-    }
-
-    #[tokio::test]
-    async fn reset_activations_allows_reread() {
-        let root = temp_dir("reset");
-        write_skill(&root, "reread", "Reread.", "Content.").await;
-
-        let reg = SkillRegistry::from_paths(vec![root.clone()])
-            .discover_skills()
-            .await;
-
-        let tool = reg.build_tool();
-        let noop_perms = NoopPermissions;
-        let mut ctx = ToolContext {
-            capability: agentkit_capabilities::CapabilityContext {
-                session_id: None,
-                turn_id: None,
-                metadata: &MetadataMap::new(),
-            },
-            permissions: &noop_perms,
-            resources: &(),
-            cancellation: None,
-            execution_scope: None,
-            approved_request: None,
-        };
-
-        // First read.
-        let req1 = ToolRequest {
-            call_id: ToolCallId::new("c1"),
-            tool_name: ToolName::new(TOOL_NAME),
-            input: json!({ "name": "reread" }),
-            session_id: agentkit_core::SessionId::new("s"),
-            turn_id: agentkit_core::TurnId::new("t"),
-            metadata: MetadataMap::new(),
-        };
-        let r1 = tool.invoke(req1, &mut ctx).await.unwrap();
-        assert!(matches!(r1.result.output, ToolOutput::Text(ref t) if t.contains("Content.")));
-
-        // Second read is deduplicated.
-        let req2 = ToolRequest {
-            call_id: ToolCallId::new("c2"),
-            tool_name: ToolName::new(TOOL_NAME),
-            input: json!({ "name": "reread" }),
-            session_id: agentkit_core::SessionId::new("s"),
-            turn_id: agentkit_core::TurnId::new("t"),
-            metadata: MetadataMap::new(),
-        };
-        let r2 = tool.invoke(req2, &mut ctx).await.unwrap();
-        assert!(matches!(r2.result.output, ToolOutput::Text(ref t) if t == "Skill already read."));
-
-        // Reset and re-read.
-        reg.reset_activations();
-        let req3 = ToolRequest {
-            call_id: ToolCallId::new("c3"),
-            tool_name: ToolName::new(TOOL_NAME),
-            input: json!({ "name": "reread" }),
-            session_id: agentkit_core::SessionId::new("s"),
-            turn_id: agentkit_core::TurnId::new("t"),
-            metadata: MetadataMap::new(),
-        };
-        let r3 = tool.invoke(req3, &mut ctx).await.unwrap();
-        assert!(matches!(r3.result.output, ToolOutput::Text(ref t) if t.contains("Content.")));
-
-        async_fs::remove_dir_all(&root).await.unwrap();
     }
 
     // -- test helpers -------------------------------------------------------
