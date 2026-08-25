@@ -9,6 +9,48 @@ Like `agentkit-mcp`, this crate does not define a parallel protocol vocabulary. 
 - **Protocol docs:** [agentclientprotocol.com](https://agentclientprotocol.com/protocol/v1/overview)
 - **Rust SDK:** [`agent-client-protocol` on crates.io](https://crates.io/crates/agent-client-protocol)
 
+## Opt-in ACP v2 runtime
+
+ACP v2 support is additive and disabled by default. Enable it explicitly:
+
+```toml
+agentkit-acp = { version = "0.10.8", features = ["protocol-v2"] }
+```
+
+`protocol-v2` enables the official upstream
+`agent-client-protocol/unstable_protocol_v2` feature. The root API and
+`agentkit_acp::wire` continue to expose stable v1 behavior. Experimental v2
+runtime APIs and official v2 wire types are isolated under
+`agentkit_acp::v2` and `agentkit_acp::v2::wire`; v1 wire types are not part of
+that namespace.
+
+Build a v2 server with `agentkit_acp::v2::AcpHeadlessRuntime`. Its factory is
+called once for each `session/new` and receives a v2 session ID, an agentkit
+session ID, the v2 output observer, and a cancellation handle. Install the
+observer and cancellation handle on the returned agent loop in the same way as
+the v1 factory.
+
+The v2 prompt lifecycle differs from v1: `session/prompt` acknowledges
+acceptance immediately instead of waiting for the turn to finish. The runtime
+then emits, in order:
+
+1. a `user_message` update with a generated stable message ID;
+2. a `running` state update;
+3. streamed agent message or thought chunks sharing a stable agent message ID;
+4. an `idle` state update with the final stop reason.
+
+Each session has its own worker and loop driver. Independent sessions can make
+progress concurrently, while a second prompt for a running session is rejected.
+`session/cancel` interrupts only the selected session and produces an idle
+`cancelled` update when the loop stops. `session/close` cancels work and drops
+the session worker.
+
+The initial v2 foundation routes text and reasoning deltas. ACP v2 permission
+callbacks and richer tool updates are intentionally deferred; an approval
+interrupt currently ends the prompt with `refusal`. Upstream labels the v2
+protocol unstable, so opt-in callers should expect the `v2` namespace to track
+official SDK changes.
+
 ## Two integration shapes
 
 `agentkit-acp` exposes the same functionality at two levels:
