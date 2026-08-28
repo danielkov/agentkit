@@ -390,7 +390,7 @@ SessionRecording(
                     kind: Notification,
                     parts: [
                         Text(TextPart(
-                            text: "Background tool call call-bg completed: slow-out",
+                            text: "Background tool results: 1 total, 0 failed, 0 with metadata. call-bg completed: text preview: slow-out",
                             metadata: {},
                         )),
                         Structured(StructuredPart(
@@ -575,7 +575,7 @@ SessionRecording(
             kind: Notification,
             parts: [
                 Text(TextPart(
-                    text: "Background tool call call-bg completed: slow-out",
+                    text: "Background tool results: 1 total, 0 failed, 0 with metadata. call-bg completed: text preview: slow-out",
                     metadata: {},
                 )),
                 Structured(StructuredPart(

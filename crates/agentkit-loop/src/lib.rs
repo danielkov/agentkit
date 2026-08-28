@@ -94,6 +94,9 @@ const INTERRUPTED_METADATA_KEY: &str = "agentkit.interrupted";
 const INTERRUPT_REASON_METADATA_KEY: &str = "agentkit.interrupt_reason";
 const INTERRUPT_STAGE_METADATA_KEY: &str = "agentkit.interrupt_stage";
 const USER_CANCELLED_REASON: &str = "user_cancelled";
+const DETACHED_NOTIFICATION_TEXT_MAX_CHARS: usize = 512;
+const DETACHED_TEXT_PREVIEW_MAX_CHARS: usize = 160;
+const DETACHED_CALL_ID_MAX_CHARS: usize = 80;
 
 /// Metadata key used by adapters to retain provider-native finish reasons.
 pub const PROVIDER_FINISH_REASONS_METADATA_KEY: &str = "agentkit.provider_finish_reasons";
@@ -3192,29 +3195,34 @@ where
                 ))
             })
             .collect::<Vec<_>>();
-        let mut text = String::new();
-        for result in &results {
+        let failed = results.iter().filter(|result| result.is_error).count();
+        let with_metadata = results
+            .iter()
+            .filter(|result| !result.metadata.is_empty())
+            .count();
+        let mut text = format!(
+            "Background tool results: {} total, {failed} failed, {with_metadata} with metadata. ",
+            results.len()
+        );
+        for (index, result) in results.iter().enumerate() {
             self.detached_call_ids.remove(&result.call_id);
             self.interrupted_background_call_ids.remove(&result.call_id);
-            if !text.is_empty() {
-                text.push_str("\n\n");
+            if text.chars().count() >= DETACHED_NOTIFICATION_TEXT_MAX_CHARS {
+                continue;
+            }
+            if index > 0 {
+                text.push_str("; ");
             }
             let label = if result.is_error {
                 "failed"
             } else {
                 "completed"
             };
+            let call_id = truncate_chars(&result.call_id.0, DETACHED_CALL_ID_MAX_CHARS);
             let body = render_tool_output_brief(&result.output);
-            text.push_str(&format!(
-                "Background tool call {} {}: {body}",
-                result.call_id.0, label
-            ));
-            if !result.metadata.is_empty() {
-                let metadata = serde_json::to_string(&result.metadata)
-                    .unwrap_or_else(|error| format!("<metadata serialization failed: {error}>"));
-                text.push_str(&format!("; metadata: {metadata}"));
-            }
+            text.push_str(&format!("{call_id} {label}: {body}"));
         }
+        let text = truncate_chars(&text, DETACHED_NOTIFICATION_TEXT_MAX_CHARS);
         let mut notification_parts = Vec::with_capacity(1 + structured_results.len());
         notification_parts.push(Part::text(text));
         notification_parts.extend(structured_results);
@@ -3239,13 +3247,24 @@ where
 
 fn render_tool_output_brief(output: &ToolOutput) -> String {
     match output {
-        ToolOutput::Text(t) => t.clone(),
-        ToolOutput::Structured(value) => value.to_string(),
-        ToolOutput::Parts(parts) => serde_json::to_string(parts)
-            .unwrap_or_else(|error| format!("<parts serialization failed: {error}>")),
-        ToolOutput::Files(files) => serde_json::to_string(files)
-            .unwrap_or_else(|error| format!("<files serialization failed: {error}>")),
+        ToolOutput::Text(text) => format!(
+            "text preview: {}",
+            truncate_chars(text, DETACHED_TEXT_PREVIEW_MAX_CHARS)
+        ),
+        ToolOutput::Structured(_) => "structured payload".into(),
+        ToolOutput::Parts(parts) => format!("parts payload ({} parts)", parts.len()),
+        ToolOutput::Files(files) => format!("files payload ({} files)", files.len()),
     }
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    let mut chars = text.chars();
+    let mut truncated = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() && max_chars > 0 {
+        truncated.pop();
+        truncated.push('…');
+    }
+    truncated
 }
 
 fn interrupted_metadata(stage: &str) -> MetadataMap {
@@ -6245,7 +6264,8 @@ mod tests {
                 match &turn.items[0].parts[0] {
                     Part::Text(text) => assert_eq!(
                         text.text,
-                        "tool said: Background tool call call-1 completed: background-done"
+                        "tool said: Background tool results: 1 total, 0 failed, 0 with metadata. \
+                         call-1 completed: text preview: background-done"
                     ),
                     other => panic!("unexpected part after resume: {other:?}"),
                 }
@@ -6316,13 +6336,12 @@ mod tests {
         assert_eq!(converted.metadata, item_metadata);
         assert_eq!(structured.value, serde_json::to_value(&result).unwrap());
         assert_eq!(
-            &text.text,
-            &format!(
-                "Background tool call parts-call failed: {}; metadata: {}",
-                serde_json::to_string(&parts).unwrap(),
-                serde_json::to_string(&metadata).unwrap()
-            )
+            text.text,
+            "Background tool results: 1 total, 1 failed, 1 with metadata. \
+             parts-call failed: parts payload (2 parts)"
         );
+        assert!(!text.text.contains("part text"));
+        assert!(!text.text.contains("background"));
     }
 
     #[tokio::test]
@@ -6360,13 +6379,36 @@ mod tests {
         assert_eq!(converted.metadata, item_metadata);
         assert_eq!(structured.value, serde_json::to_value(&result).unwrap());
         assert_eq!(
-            &text.text,
-            &format!(
-                "Background tool call files-call completed: {}; metadata: {}",
-                serde_json::to_string(&files).unwrap(),
-                serde_json::to_string(&result.metadata).unwrap()
-            )
+            text.text,
+            "Background tool results: 1 total, 0 failed, 1 with metadata. \
+             files-call completed: files payload (2 files)"
         );
+        assert!(!text.text.contains("full file body"));
+        assert!(!text.text.contains("remote.json"));
+    }
+
+    #[test]
+    fn detached_result_summaries_are_bounded_and_do_not_serialize_structured_payloads() {
+        let long_text = "é".repeat(DETACHED_TEXT_PREVIEW_MAX_CHARS + 20);
+        let text_summary = render_tool_output_brief(&ToolOutput::Text(long_text.clone()));
+        assert_eq!(
+            text_summary.chars().count(),
+            "text preview: ".chars().count() + DETACHED_TEXT_PREVIEW_MAX_CHARS
+        );
+        assert!(text_summary.ends_with('…'));
+        assert!(!text_summary.contains(&long_text));
+
+        let secret = "structured payload must remain out of notification text";
+        let structured = ToolOutput::Structured(json!({ "secret": secret }));
+        assert_eq!(render_tool_output_brief(&structured), "structured payload");
+
+        let oversized = "x".repeat(DETACHED_NOTIFICATION_TEXT_MAX_CHARS + 20);
+        let bounded = truncate_chars(&oversized, DETACHED_NOTIFICATION_TEXT_MAX_CHARS);
+        assert_eq!(
+            bounded.chars().count(),
+            DETACHED_NOTIFICATION_TEXT_MAX_CHARS
+        );
+        assert!(bounded.ends_with('…'));
     }
 
     #[tokio::test]

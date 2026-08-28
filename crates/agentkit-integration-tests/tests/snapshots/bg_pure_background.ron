@@ -181,7 +181,7 @@ SessionRecording(
                     kind: Notification,
                     parts: [
                         Text(TextPart(
-                            text: "Background tool call call-bg completed: bg-output",
+                            text: "Background tool results: 1 total, 0 failed, 0 with metadata. call-bg completed: text preview: bg-output",
                             metadata: {},
                         )),
                         Structured(StructuredPart(
@@ -314,7 +314,7 @@ SessionRecording(
             kind: Notification,
             parts: [
                 Text(TextPart(
-                    text: "Background tool call call-bg completed: bg-output",
+                    text: "Background tool results: 1 total, 0 failed, 0 with metadata. call-bg completed: text preview: bg-output",
                     metadata: {},
                 )),
                 Structured(StructuredPart(

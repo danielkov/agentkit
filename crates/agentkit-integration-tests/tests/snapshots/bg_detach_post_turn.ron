@@ -302,7 +302,7 @@ SessionRecording(
                     kind: Notification,
                     parts: [
                         Text(TextPart(
-                            text: "Background tool call call-d completed: detach-output",
+                            text: "Background tool results: 1 total, 0 failed, 0 with metadata. call-d completed: text preview: detach-output",
                             metadata: {},
                         )),
                         Structured(StructuredPart(
@@ -449,7 +449,7 @@ SessionRecording(
             kind: Notification,
             parts: [
                 Text(TextPart(
-                    text: "Background tool call call-d completed: detach-output",
+                    text: "Background tool results: 1 total, 0 failed, 0 with metadata. call-d completed: text preview: detach-output",
                     metadata: {},
                 )),
                 Structured(StructuredPart(
