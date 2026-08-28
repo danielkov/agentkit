@@ -727,7 +727,13 @@ mod tests {
                 ))],
             ),
             Item::text(ItemKind::Assistant, "ok, kicked it off"),
-            Item::notification("Slack install completed: ok"),
+            Item::new(
+                ItemKind::Notification,
+                vec![
+                    Part::text("Slack install completed: ok"),
+                    Part::structured(json!({ "typed": true })),
+                ],
+            ),
         ];
         let body = build_request_body(&cfg(), &base_request(transcript)).unwrap();
         let messages = body["messages"].as_array().unwrap();
@@ -737,6 +743,7 @@ mod tests {
         let text = messages[3]["content"][0]["text"].as_str().unwrap();
         assert!(text.starts_with("<system-reminder>"));
         assert!(text.contains("Slack install completed: ok"));
+        assert!(text.contains("\"typed\": true"));
         assert!(text.ends_with("</system-reminder>"));
         // Critical: must NOT leak into top-level system blocks.
         let no_leak = body

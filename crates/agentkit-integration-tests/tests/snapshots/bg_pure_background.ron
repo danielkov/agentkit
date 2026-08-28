@@ -166,8 +166,34 @@ SessionRecording(
                     parts: [
                         ToolResult(ToolResultPart(
                             call_id: ToolCallId("call-bg"),
-                            output: Text("bg-output"),
+                            output: Text("Tool bg-tool is now running in the background. The result will be delivered when it completes."),
                             is_error: false,
+                            metadata: {},
+                        )),
+                    ],
+                    metadata: {},
+                    usage: None,
+                    finish_reason: None,
+                    created_at: None,
+                ),
+                Item(
+                    id: None,
+                    kind: Notification,
+                    parts: [
+                        Text(TextPart(
+                            text: "Background tool results: 1 total, 0 failed, 0 with metadata. call-bg completed: text preview: bg-output",
+                            metadata: {},
+                        )),
+                        Structured(StructuredPart(
+                            value: {
+                                "call_id": "call-bg",
+                                "is_error": false,
+                                "metadata": {},
+                                "output": {
+                                    "Text": "bg-output",
+                                },
+                            },
+                            schema: None,
                             metadata: {},
                         )),
                     ],
@@ -273,8 +299,34 @@ SessionRecording(
             parts: [
                 ToolResult(ToolResultPart(
                     call_id: ToolCallId("call-bg"),
-                    output: Text("bg-output"),
+                    output: Text("Tool bg-tool is now running in the background. The result will be delivered when it completes."),
                     is_error: false,
+                    metadata: {},
+                )),
+            ],
+            metadata: {},
+            usage: None,
+            finish_reason: None,
+            created_at: None,
+        ),
+        Item(
+            id: None,
+            kind: Notification,
+            parts: [
+                Text(TextPart(
+                    text: "Background tool results: 1 total, 0 failed, 0 with metadata. call-bg completed: text preview: bg-output",
+                    metadata: {},
+                )),
+                Structured(StructuredPart(
+                    value: {
+                        "call_id": "call-bg",
+                        "is_error": false,
+                        "metadata": {},
+                        "output": {
+                            "Text": "bg-output",
+                        },
+                    },
+                    schema: None,
                     metadata: {},
                 )),
             ],

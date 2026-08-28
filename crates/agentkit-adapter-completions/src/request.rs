@@ -591,7 +591,13 @@ mod tests {
         let body = build_request_body(
             &TestProvider::lenient(),
             &turn_request(
-                vec![Item::notification("background task done: ok")],
+                vec![Item::new(
+                    ItemKind::Notification,
+                    vec![
+                        Part::text("background task done: ok"),
+                        Part::structured(serde_json::json!({ "typed": true })),
+                    ],
+                )],
                 Vec::new(),
             ),
         )
@@ -604,6 +610,7 @@ mod tests {
         assert!(text.starts_with("<system-reminder>"));
         assert!(text.ends_with("</system-reminder>"));
         assert!(text.contains("background task done: ok"));
+        assert!(text.contains("\"typed\": true"));
     }
 
     #[test]

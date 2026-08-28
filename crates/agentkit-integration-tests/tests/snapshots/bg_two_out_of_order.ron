@@ -390,7 +390,19 @@ SessionRecording(
                     kind: Notification,
                     parts: [
                         Text(TextPart(
-                            text: "Background tool call call-b completed: out-b",
+                            text: "Background tool results: 1 total, 0 failed, 0 with metadata. call-b completed: text preview: out-b",
+                            metadata: {},
+                        )),
+                        Structured(StructuredPart(
+                            value: {
+                                "call_id": "call-b",
+                                "is_error": false,
+                                "metadata": {},
+                                "output": {
+                                    "Text": "out-b",
+                                },
+                            },
+                            schema: None,
                             metadata: {},
                         )),
                     ],
@@ -563,7 +575,19 @@ SessionRecording(
                     kind: Notification,
                     parts: [
                         Text(TextPart(
-                            text: "Background tool call call-b completed: out-b",
+                            text: "Background tool results: 1 total, 0 failed, 0 with metadata. call-b completed: text preview: out-b",
+                            metadata: {},
+                        )),
+                        Structured(StructuredPart(
+                            value: {
+                                "call_id": "call-b",
+                                "is_error": false,
+                                "metadata": {},
+                                "output": {
+                                    "Text": "out-b",
+                                },
+                            },
+                            schema: None,
                             metadata: {},
                         )),
                     ],
@@ -591,7 +615,19 @@ SessionRecording(
                     kind: Notification,
                     parts: [
                         Text(TextPart(
-                            text: "Background tool call call-a completed: out-a",
+                            text: "Background tool results: 1 total, 0 failed, 0 with metadata. call-a completed: text preview: out-a",
+                            metadata: {},
+                        )),
+                        Structured(StructuredPart(
+                            value: {
+                                "call_id": "call-a",
+                                "is_error": false,
+                                "metadata": {},
+                                "output": {
+                                    "Text": "out-a",
+                                },
+                            },
+                            schema: None,
                             metadata: {},
                         )),
                     ],
@@ -764,7 +800,19 @@ SessionRecording(
             kind: Notification,
             parts: [
                 Text(TextPart(
-                    text: "Background tool call call-b completed: out-b",
+                    text: "Background tool results: 1 total, 0 failed, 0 with metadata. call-b completed: text preview: out-b",
+                    metadata: {},
+                )),
+                Structured(StructuredPart(
+                    value: {
+                        "call_id": "call-b",
+                        "is_error": false,
+                        "metadata": {},
+                        "output": {
+                            "Text": "out-b",
+                        },
+                    },
+                    schema: None,
                     metadata: {},
                 )),
             ],
@@ -792,7 +840,19 @@ SessionRecording(
             kind: Notification,
             parts: [
                 Text(TextPart(
-                    text: "Background tool call call-a completed: out-a",
+                    text: "Background tool results: 1 total, 0 failed, 0 with metadata. call-a completed: text preview: out-a",
+                    metadata: {},
+                )),
+                Structured(StructuredPart(
+                    value: {
+                        "call_id": "call-a",
+                        "is_error": false,
+                        "metadata": {},
+                        "output": {
+                            "Text": "out-a",
+                        },
+                    },
+                    schema: None,
                     metadata: {},
                 )),
             ],

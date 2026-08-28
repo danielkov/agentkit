@@ -194,6 +194,14 @@ pub trait TaskManager: Send + Sync {
 
     async fn take_pending_loop_updates(&self) -> Result<PendingLoopUpdates, TaskManagerError>;
 
+    /// Wait until an update is available for delivery back into the agent loop.
+    ///
+    /// The default never resolves because custom managers that do not produce
+    /// out-of-band loop updates have nothing to wake a host for.
+    async fn wait_for_loop_update(&self) -> Result<(), TaskManagerError> {
+        std::future::pending().await
+    }
+
     async fn on_turn_interrupted(&self, turn_id: &TurnId) -> Result<(), TaskManagerError>;
 
     fn handle(&self) -> TaskManagerHandle;
@@ -751,6 +759,23 @@ impl TaskManager for AsyncTaskManager {
         Ok(PendingLoopUpdates {
             resolutions: std::mem::take(&mut state.pending_loop_updates),
         })
+    }
+
+    async fn wait_for_loop_update(&self) -> Result<(), TaskManagerError> {
+        loop {
+            // Register before checking state so an update cannot land between
+            // the empty check and awaiting the notification.
+            let notified = self.inner.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let state = self.inner.state.lock().await;
+                if !state.pending_loop_updates.is_empty() {
+                    return Ok(());
+                }
+            }
+            notified.await;
+        }
     }
 
     async fn on_turn_interrupted(&self, turn_id: &TurnId) -> Result<(), TaskManagerError> {
@@ -1593,6 +1618,67 @@ mod tests {
         let updates = manager.take_pending_loop_updates().await.unwrap();
         assert_eq!(updates.resolutions.len(), 1);
         assert!(handle.drain_ready_items().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn wait_for_loop_update_wakes_without_consuming_host_events() {
+        let release = StdArc::new(Notify::new());
+        let entered = StdArc::new(AtomicBool::new(false));
+        let executor: Arc<dyn ToolExecutor> = Arc::new(TestExecutor::new([(
+            "background",
+            TestBehavior::Block {
+                entered: entered.clone(),
+                release: release.clone(),
+                output: "wake-done",
+            },
+        )]));
+        let manager = AsyncTaskManager::new().routing(NameRoutingPolicy::new([(
+            "background",
+            RoutingDecision::Background,
+        )]));
+        let handle = manager.handle();
+        let request = make_request("background", "turn-1", "call-1");
+
+        manager
+            .start_task(
+                TaskLaunchRequest {
+                    task_id: None,
+                    request: request.clone(),
+                    kind: TaskLaunchKind::Plain,
+                },
+                make_context(executor, &request.turn_id, None),
+            )
+            .await
+            .unwrap();
+        wait_until_entered(entered.as_ref()).await;
+
+        let waiting = manager.wait_for_loop_update();
+        tokio::pin!(waiting);
+        assert!(
+            timeout(Duration::from_millis(20), &mut waiting)
+                .await
+                .is_err()
+        );
+        release.notify_waiters();
+        timeout(Duration::from_secs(1), &mut waiting)
+            .await
+            .expect("loop update wake timed out")
+            .unwrap();
+
+        assert!(matches!(next_event(&handle).await, TaskEvent::Started(_)));
+        assert!(matches!(
+            next_event(&handle).await,
+            TaskEvent::Completed(_, _)
+        ));
+        assert_eq!(
+            manager
+                .take_pending_loop_updates()
+                .await
+                .unwrap()
+                .resolutions
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
