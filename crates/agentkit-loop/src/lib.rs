@@ -1236,7 +1236,7 @@ struct PendingApprovalToolCall {
     request: ApprovalRequest,
     decision: Option<ApprovalDecision>,
     surfaced: bool,
-    turn_id: agentkit_core::TurnId,
+    presentation_turn_id: agentkit_core::TurnId,
     task_id: TaskId,
     call: ToolCallPart,
     tool_request: ToolRequest,
@@ -1791,6 +1791,9 @@ where
     }
 
     fn finish_logical_turn(&mut self, result: &TurnResult) {
+        if self.pending_round_resume.as_ref() == Some(&result.turn_id) {
+            self.pending_round_resume = None;
+        }
         if self.lifecycle.active_turn.as_ref() == Some(&result.turn_id) {
             self.lifecycle.active_turn = None;
             self.emit(AgentEvent::TurnFinished(result.clone()));
@@ -1824,7 +1827,7 @@ where
             request: request.clone(),
             decision: None,
             surfaced: false,
-            turn_id: turn_id.clone(),
+            presentation_turn_id: turn_id.clone(),
             task_id: task.task_id,
             call,
             tool_request: task.tool_request,
@@ -2478,14 +2481,17 @@ where
             ApprovalDecision::Approve => {
                 use tracing::Instrument;
                 self.emit(AgentEvent::ToolExecutionStarted(pending.call.clone()));
-                let dispatch_span =
-                    self.execute_tool_span(&pending.tool_request, &pending.turn_id, "approved");
+                let dispatch_span = self.execute_tool_span(
+                    &pending.tool_request,
+                    &pending.presentation_turn_id,
+                    "approved",
+                );
                 let cancellation = self
                     .cancellation
                     .as_ref()
                     .map(CancellationHandle::checkpoint);
                 self.register_tool_cancellation(&pending.call.id, cancellation.clone());
-                match self
+                let start = self
                     .start_task_via_manager(
                         Some(pending.task_id.clone()),
                         pending.tool_request.clone(),
@@ -2493,8 +2499,40 @@ where
                         cancellation.clone(),
                     )
                     .instrument(dispatch_span.clone())
-                    .await?
-                {
+                    .await;
+                let outcome = match start {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        self.append_tool_result_item(Item {
+                            id: None,
+                            kind: ItemKind::Tool,
+                            parts: vec![Part::ToolResult(ToolResultPart {
+                                call_id: pending.call.id.clone(),
+                                output: ToolOutput::Text(format!(
+                                    "approved task failed to start: {error}"
+                                )),
+                                is_error: true,
+                                metadata: pending.call.metadata.clone(),
+                            })],
+                            metadata: MetadataMap::new(),
+                            usage: None,
+                            finish_reason: None,
+                            created_at: None,
+                        });
+                        let turn_id = pending.tool_request.turn_id.clone();
+                        if let Err(cleanup_error) =
+                            self.task_manager.on_turn_interrupted(&turn_id).await
+                        {
+                            tracing::debug!(
+                                %cleanup_error,
+                                %turn_id,
+                                "failed to clean up turn after approved task start error"
+                            );
+                        }
+                        return Err(error);
+                    }
+                };
+                match outcome {
                     TaskStartOutcome::Ready(resolution) => {
                         let resolution = *resolution;
                         if let TaskResolution::Item(item) = &resolution
@@ -2503,7 +2541,7 @@ where
                             dispatch_span.record("error.type", "tool_error");
                         }
                         if let Some(step) = self.queue_resolution_interrupt(
-                            &pending.turn_id,
+                            &pending.presentation_turn_id,
                             resolution,
                             cancellation,
                         ) {
@@ -2549,7 +2587,7 @@ where
         } else if let Some(step) = self.next_unresolved_approval_interrupt() {
             Ok(step)
         } else {
-            self.drive_turn(pending.turn_id, MutationPoint::AfterToolResult)
+            self.drive_turn(pending.presentation_turn_id, MutationPoint::AfterToolResult)
                 .await
         }
     }
@@ -2711,13 +2749,9 @@ where
                 call_id.0
             )));
         };
-        let finishes_detached_turn = self.detached_call_ids.contains(&call_id);
-        let turn_id = pending.turn_id.clone();
+        let turn_id = pending.presentation_turn_id.clone();
         self.reject_drained_approvals(vec![pending]);
-        if finishes_detached_turn
-            && self.pending_approvals.is_empty()
-            && self.active_tool_round.is_none()
-        {
+        if self.pending_approvals.is_empty() && self.active_tool_round.is_none() {
             let _ = self.finish_cancelled(turn_id, Vec::new())?;
         }
         Ok(())
@@ -2736,19 +2770,34 @@ where
             .pending_approval_order
             .iter()
             .find_map(|call_id| self.pending_approvals.get(call_id))
-            .map(|pending| pending.turn_id.clone())
+            .map(|pending| pending.presentation_turn_id.clone())
         else {
             return Ok(None);
         };
+        let mut seen_turns = HashSet::new();
+        let mut originating_turns = Vec::new();
+        for pending in self.pending_approvals.values() {
+            let originating_turn = pending.tool_request.turn_id.clone();
+            if seen_turns.insert(originating_turn.clone()) {
+                originating_turns.push(originating_turn);
+            }
+        }
+
         let pending = self.drain_pending_approval_items();
         self.active_tool_round = None;
-        let interruption = self
-            .task_manager
-            .on_turn_interrupted(&turn_id)
-            .await
-            .map_err(|error| LoopError::Tool(ToolError::Internal(error.to_string())));
+        let mut cleanup_error = None;
+        for originating_turn in originating_turns {
+            if let Err(error) = self
+                .task_manager
+                .on_turn_interrupted(&originating_turn)
+                .await
+                && cleanup_error.is_none()
+            {
+                cleanup_error = Some(LoopError::Tool(ToolError::Internal(error.to_string())));
+            }
+        }
         self.reject_drained_approvals(pending);
-        if let Err(error) = interruption {
+        if let Some(error) = cleanup_error {
             self.close_interrupted_tool_calls();
             self.finish_logical_turn(&TurnResult {
                 turn_id,
@@ -2797,7 +2846,7 @@ where
                 .pending_approval_order
                 .iter()
                 .find_map(|call_id| self.pending_approvals.get(call_id))
-                .map(|pending| pending.turn_id.clone())
+                .map(|pending| pending.presentation_turn_id.clone())
                 .or_else(|| {
                     self.active_tool_round
                         .as_ref()
@@ -2816,6 +2865,7 @@ where
             Ok(LoopStep::Finished(turn)) => self.finish_logical_turn(turn),
             Err(_) => {
                 if let Some(turn_id) = self.lifecycle.active_turn.clone() {
+                    self.recover_from_next_error().await;
                     self.finish_logical_turn(&TurnResult {
                         turn_id,
                         finish_reason: FinishReason::Error,
@@ -2828,6 +2878,36 @@ where
             _ => {}
         }
         result
+    }
+
+    async fn recover_from_next_error(&mut self) {
+        let mut seen_turns = HashSet::new();
+        let mut interrupted_turns = Vec::new();
+        if let Some(active) = self.active_tool_round.take()
+            && seen_turns.insert(active.turn_id.clone())
+        {
+            interrupted_turns.push(active.turn_id);
+        }
+        if let Some(turn_id) = self.pending_round_resume.take()
+            && seen_turns.insert(turn_id.clone())
+        {
+            interrupted_turns.push(turn_id);
+        }
+        for pending in self.pending_approvals.values() {
+            let turn_id = pending.tool_request.turn_id.clone();
+            if seen_turns.insert(turn_id.clone()) {
+                interrupted_turns.push(turn_id);
+            }
+        }
+
+        let pending = self.drain_pending_approval_items();
+        for turn_id in interrupted_turns {
+            if let Err(error) = self.task_manager.on_turn_interrupted(&turn_id).await {
+                tracing::debug!(%error, %turn_id, "failed to clean up turn after loop error");
+            }
+        }
+        self.reject_drained_approvals(pending);
+        self.close_interrupted_tool_calls();
     }
 
     async fn next_inner(&mut self) -> Result<LoopStep, LoopError> {
@@ -2905,19 +2985,6 @@ where
         self.transcript.push(item);
     }
 
-    /// Append a tool-result Item: emit one [`AgentEvent::ToolResultReceived`]
-    /// per [`Part::ToolResult`] inside the Item, then funnel through
-    /// [`Self::append_item`].
-    ///
-    /// If every `ToolResult` in the item references a `call_id` that was
-    /// already paired with a synthetic detach tool_result, the item is
-    /// converted to a [`ItemKind::Notification`] before appending.
-    /// Without this, we would emit a second `tool_result` for the same
-    /// `tool_use_id` — a provider-schema violation that
-    /// Anthropic/OpenRouter reject as an "orphaned tool_result".
-    /// Observers see [`AgentEvent::ToolExecutionProgress`] for the synthetic
-    /// detach placeholder and see [`AgentEvent::ToolResultReceived`] only for
-    /// the later terminal result.
     fn append_detach_placeholder(&mut self, call_id: ToolCallId, tool_name: &str) {
         self.background_call_ids.insert(call_id.clone());
         let detached_result = ToolResultPart {
@@ -2941,6 +3008,19 @@ where
         self.detached_call_ids.insert(call_id);
     }
 
+    /// Append a tool-result Item: emit one [`AgentEvent::ToolResultReceived`]
+    /// per [`Part::ToolResult`] inside the Item, then funnel through
+    /// [`Self::append_item`].
+    ///
+    /// If every `ToolResult` in the item references a `call_id` that was
+    /// already paired with a synthetic detach tool_result, the item is
+    /// converted to a [`ItemKind::Notification`] before appending.
+    /// Without this, we would emit a second `tool_result` for the same
+    /// `tool_use_id` — a provider-schema violation that
+    /// Anthropic/OpenRouter reject as an "orphaned tool_result".
+    /// Observers see [`AgentEvent::ToolExecutionProgress`] for the synthetic
+    /// detach placeholder and see [`AgentEvent::ToolResultReceived`] only for
+    /// the later terminal result.
     fn append_tool_result_item(&mut self, item: Item) {
         for part in &item.parts {
             if let Part::ToolResult(result) = part {
@@ -4159,17 +4239,72 @@ mod tests {
         events: VecDeque<ModelTurnEvent>,
     }
 
-    struct InterruptFailingTaskManager {
-        inner: SimpleTaskManager,
+    struct TestTaskManager<T> {
+        inner: T,
+        start_error: Option<&'static str>,
+        approved_start_error: Option<&'static str>,
+        pending_update_error: Option<(usize, &'static str)>,
+        pending_update_calls: AtomicUsize,
+        interrupted: Option<StdArc<StdMutex<Vec<agentkit_core::TurnId>>>>,
+        interrupt_error: Option<&'static str>,
+    }
+
+    impl<T> TestTaskManager<T> {
+        fn new(inner: T) -> Self {
+            Self {
+                inner,
+                start_error: None,
+                approved_start_error: None,
+                pending_update_error: None,
+                pending_update_calls: AtomicUsize::new(0),
+                interrupted: None,
+                interrupt_error: None,
+            }
+        }
+
+        fn fail_start(mut self, message: &'static str) -> Self {
+            self.start_error = Some(message);
+            self
+        }
+
+        fn fail_approved_start(mut self, message: &'static str) -> Self {
+            self.approved_start_error = Some(message);
+            self
+        }
+
+        fn fail_pending_update_on(mut self, call: usize, message: &'static str) -> Self {
+            self.pending_update_error = Some((call, message));
+            self
+        }
+
+        fn record_interrupts(
+            mut self,
+            interrupted: StdArc<StdMutex<Vec<agentkit_core::TurnId>>>,
+        ) -> Self {
+            self.interrupted = Some(interrupted);
+            self
+        }
+
+        fn fail_interrupt(mut self, message: &'static str) -> Self {
+            self.interrupt_error = Some(message);
+            self
+        }
     }
 
     #[async_trait]
-    impl TaskManager for InterruptFailingTaskManager {
+    impl<T: TaskManager> TaskManager for TestTaskManager<T> {
         async fn start_task(
             &self,
             request: TaskLaunchRequest,
             ctx: TaskStartContext,
         ) -> Result<TaskStartOutcome, TaskManagerError> {
+            if let Some(message) = self.start_error.or_else(|| {
+                matches!(&request.kind, TaskLaunchKind::Approved(_))
+                    .then_some(self.approved_start_error)
+                    .flatten()
+            }) {
+                return Err(TaskManagerError::Internal(message.into()));
+            }
             self.inner.start_task(request, ctx).await
         }
 
@@ -4182,16 +4317,25 @@ mod tests {
         }
 
         async fn take_pending_loop_updates(&self) -> Result<PendingLoopUpdates, TaskManagerError> {
+            if let Some((call, message)) = self.pending_update_error
+                && self.pending_update_calls.fetch_add(1, Ordering::SeqCst) == call
+            {
+                return Err(TaskManagerError::Internal(message.into()));
+            }
             self.inner.take_pending_loop_updates().await
         }
 
         async fn on_turn_interrupted(
             &self,
-            _turn_id: &agentkit_core::TurnId,
+            turn_id: &agentkit_core::TurnId,
         ) -> Result<(), TaskManagerError> {
-            Err(TaskManagerError::Internal(
-                "interrupt cleanup failed".into(),
-            ))
+            if let Some(interrupted) = &self.interrupted {
+                interrupted.lock().unwrap().push(turn_id.clone());
+            }
+            if let Some(message) = self.interrupt_error {
+                return Err(TaskManagerError::Internal(message.into()));
+            }
+            self.inner.on_turn_interrupted(turn_id).await
         }
 
         fn handle(&self) -> TaskManagerHandle {
@@ -5437,6 +5581,119 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn active_tool_error_repairs_state_and_retry_uses_fresh_lifecycle() {
+        let events = StdArc::new(StdMutex::new(Vec::new()));
+        let interrupted = StdArc::new(StdMutex::new(Vec::new()));
+        let agent = Agent::builder()
+            .model(FakeAdapter)
+            .add_tool_source(ToolRegistry::new().with(EchoTool::default()))
+            .task_manager(
+                TestTaskManager::new(SimpleTaskManager::new())
+                    .fail_start("original start failure")
+                    .record_interrupts(interrupted.clone())
+                    .fail_interrupt("cleanup failure"),
+            )
+            .observer(RecordingObserver {
+                events: events.clone(),
+            })
+            .build()
+            .unwrap();
+        let mut driver = agent
+            .start(SessionConfig::new("session-active-tool-error"))
+            .await
+            .unwrap();
+        driver
+            .submit_input(vec![Item::text(ItemKind::User, "first")])
+            .unwrap();
+
+        let error = driver.next().await.unwrap_err();
+        assert!(error.to_string().contains("original start failure"));
+        assert!(!error.to_string().contains("cleanup failure"));
+        assert!(driver.active_tool_round.is_none());
+        assert!(driver.pending_round_resume.is_none());
+        assert!(unanswered_tool_calls(&driver.snapshot().transcript).is_empty());
+        validate_transcript_invariants(&driver.snapshot().transcript).unwrap();
+        assert_eq!(interrupted.lock().unwrap().len(), 1);
+
+        driver
+            .submit_input(vec![Item::text(ItemKind::User, "retry")])
+            .unwrap();
+        assert!(matches!(
+            driver.next().await.unwrap(),
+            LoopStep::Finished(TurnResult {
+                finish_reason: FinishReason::Completed,
+                ..
+            })
+        ));
+
+        let lifecycle = turn_lifecycle_events(&events.lock().unwrap());
+        assert_eq!(lifecycle.len(), 4, "{lifecycle:?}");
+        assert_eq!(lifecycle[0].0, lifecycle[1].0);
+        assert_eq!(lifecycle[1].1, Some(FinishReason::Error));
+        assert_eq!(lifecycle[2].0, lifecycle[3].0);
+        assert_eq!(lifecycle[3].1, Some(FinishReason::Completed));
+        assert_ne!(lifecycle[0].0, lifecycle[2].0);
+    }
+
+    #[tokio::test]
+    async fn continuation_error_clears_resume_and_retry_uses_fresh_lifecycle() {
+        let events = StdArc::new(StdMutex::new(Vec::new()));
+        let interrupted = StdArc::new(StdMutex::new(Vec::new()));
+        let agent = Agent::builder()
+            .model(FakeAdapter)
+            .add_tool_source(ToolRegistry::new().with(EchoTool::default()))
+            .task_manager(
+                TestTaskManager::new(SimpleTaskManager::new())
+                    .fail_pending_update_on(1, "original continuation failure")
+                    .record_interrupts(interrupted.clone())
+                    .fail_interrupt("cleanup failure"),
+            )
+            .observer(RecordingObserver {
+                events: events.clone(),
+            })
+            .build()
+            .unwrap();
+        let mut driver = agent
+            .start(SessionConfig::new("session-continuation-error"))
+            .await
+            .unwrap();
+        driver
+            .submit_input(vec![Item::text(ItemKind::User, "first")])
+            .unwrap();
+
+        assert!(matches!(
+            driver.next().await.unwrap(),
+            LoopStep::Interrupt(LoopInterrupt::AfterToolResult(_))
+        ));
+        let error = driver.next().await.unwrap_err();
+        assert!(error.to_string().contains("original continuation failure"));
+        assert!(!error.to_string().contains("cleanup failure"));
+        assert!(driver.pending_round_resume.is_none());
+        assert!(driver.active_tool_round.is_none());
+        validate_transcript_invariants(&driver.snapshot().transcript).unwrap();
+        assert_eq!(interrupted.lock().unwrap().len(), 1);
+
+        driver
+            .submit_input(vec![Item::text(ItemKind::User, "retry")])
+            .unwrap();
+        assert!(matches!(
+            driver.next().await.unwrap(),
+            LoopStep::Finished(TurnResult {
+                finish_reason: FinishReason::Completed,
+                ..
+            })
+        ));
+
+        let lifecycle = turn_lifecycle_events(&events.lock().unwrap());
+        assert_eq!(lifecycle.len(), 4, "{lifecycle:?}");
+        assert_eq!(lifecycle[0].0, lifecycle[1].0);
+        assert_eq!(lifecycle[1].1, Some(FinishReason::Error));
+        assert_eq!(lifecycle[2].0, lifecycle[3].0);
+        assert_eq!(lifecycle[3].1, Some(FinishReason::Completed));
+        assert_ne!(lifecycle[0].0, lifecycle[2].0);
+    }
+
     #[test]
     fn pending_input_requires_input_bearing_tail_role() {
         assert!(!transcript_has_pending_input(&[]));
@@ -6117,22 +6374,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelling_detached_background_approval_finishes_logical_turn() {
+    async fn failed_background_approval_cleanup_clears_queued_resume() {
         let events = StdArc::new(StdMutex::new(Vec::new()));
         let entered = StdArc::new(AtomicBool::new(false));
         let release = StdArc::new(Notify::new());
-        let task_manager = AsyncTaskManager::new().routing(NameRoutingPolicy::new([(
+        let inner = AsyncTaskManager::new().routing(NameRoutingPolicy::new([(
             "echo",
-            RoutingDecision::Background,
+            RoutingDecision::ForegroundThenDetachAfter(Duration::from_millis(10)),
         )]));
-        let handle = task_manager.handle();
+        let handle = inner.handle();
         let agent = Agent::builder()
             .model(FakeAdapter)
             .tool_executor(DelayedApprovalExecutor::new(
                 entered.clone(),
                 release.clone(),
             ))
-            .task_manager(task_manager)
+            .task_manager(TestTaskManager::new(inner).fail_interrupt("cleanup failure"))
             .observer(RecordingObserver {
                 events: events.clone(),
             })
@@ -6140,7 +6397,74 @@ mod tests {
             .unwrap();
         let mut driver = agent
             .start(SessionConfig::new(
-                "session-cancel-detached-background-approval",
+                "session-failed-detached-background-approval-cleanup",
+            ))
+            .await
+            .unwrap();
+        driver
+            .submit_input(vec![Item::text(ItemKind::User, "ping")])
+            .unwrap();
+
+        let old_turn_id = match driver.next().await.unwrap() {
+            LoopStep::Interrupt(LoopInterrupt::AfterToolResult(info)) => info.turn_id,
+            other => panic!("unexpected detach step: {other:?}"),
+        };
+        assert_eq!(driver.pending_round_resume.as_ref(), Some(&old_turn_id));
+        driver
+            .submit_input(vec![Item::text(ItemKind::User, "fresh input")])
+            .unwrap();
+        let _ = wait_for_task_event(&handle).await;
+        wait_until_entered(entered.as_ref()).await;
+        release.notify_waiters();
+        wait_until_completed(&handle).await;
+
+        assert!(matches!(
+            driver.next().await.unwrap(),
+            LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(_))
+        ));
+        let error = driver.cancel_pending_approvals().await.unwrap_err();
+        assert!(error.to_string().contains("cleanup failure"));
+
+        assert!(driver.lifecycle.active_turn.is_none());
+        assert!(driver.pending_round_resume.is_none());
+        assert_eq!(driver.snapshot().pending_input.len(), 1);
+        let lifecycle = turn_lifecycle_events(&events.lock().unwrap());
+        let [started, finished] = &lifecycle[lifecycle.len() - 2..] else {
+            panic!("missing terminal lifecycle events: {lifecycle:?}");
+        };
+        assert_eq!(started.0, finished.0);
+        assert_eq!(finished.1, Some(FinishReason::Error));
+        validate_transcript_invariants(&driver.snapshot().transcript).unwrap();
+
+        let fresh_turn = match driver.next().await.unwrap() {
+            LoopStep::Finished(turn) => turn,
+            other => panic!("fresh input did not start a new turn: {other:?}"),
+        };
+        assert_ne!(fresh_turn.turn_id, old_turn_id);
+    }
+
+    #[tokio::test]
+    async fn delayed_background_approval_interrupts_originating_task_turn() {
+        let entered = StdArc::new(AtomicBool::new(false));
+        let release = StdArc::new(Notify::new());
+        let interrupted = StdArc::new(StdMutex::new(Vec::new()));
+        let inner = AsyncTaskManager::new().routing(NameRoutingPolicy::new([(
+            "echo",
+            RoutingDecision::Background,
+        )]));
+        let handle = inner.handle();
+        let agent = Agent::builder()
+            .model(FakeAdapter)
+            .tool_executor(DelayedApprovalExecutor::new(
+                entered.clone(),
+                release.clone(),
+            ))
+            .task_manager(TestTaskManager::new(inner).record_interrupts(interrupted.clone()))
+            .build()
+            .unwrap();
+        let mut driver = agent
+            .start(SessionConfig::new(
+                "session-background-approval-origin-turn",
             ))
             .await
             .unwrap();
@@ -6156,22 +6480,109 @@ mod tests {
         wait_until_entered(entered.as_ref()).await;
         release.notify_waiters();
         wait_until_completed(&handle).await;
+        assert!(matches!(
+            driver.next().await.unwrap(),
+            LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(_))
+        ));
 
-        let call_id = match driver.next().await.unwrap() {
-            LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(pending)) => {
-                pending.request.call_id.expect("approval call id")
-            }
+        let presentation_turn = driver.lifecycle.active_turn.clone().unwrap();
+        let task_turn = driver
+            .pending_approvals
+            .values()
+            .next()
+            .unwrap()
+            .tool_request
+            .turn_id
+            .clone();
+        assert_ne!(presentation_turn, task_turn);
+        assert!(matches!(
+            driver.cancel_pending_approvals().await.unwrap(),
+            Some(LoopStep::Finished(TurnResult {
+                finish_reason: FinishReason::Cancelled,
+                ..
+            }))
+        ));
+        assert_eq!(interrupted.lock().unwrap().as_slice(), &[task_turn]);
+        assert!(driver.lifecycle.active_turn.is_none());
+    }
+
+    #[tokio::test]
+    async fn approved_background_start_error_interrupts_originating_turn() {
+        let events = StdArc::new(StdMutex::new(Vec::new()));
+        let entered = StdArc::new(AtomicBool::new(false));
+        let release = StdArc::new(Notify::new());
+        let interrupted = StdArc::new(StdMutex::new(Vec::new()));
+        let inner = AsyncTaskManager::new().routing(NameRoutingPolicy::new([(
+            "echo",
+            RoutingDecision::Background,
+        )]));
+        let handle = inner.handle();
+        let agent = Agent::builder()
+            .model(FakeAdapter)
+            .tool_executor(DelayedApprovalExecutor::new(
+                entered.clone(),
+                release.clone(),
+            ))
+            .task_manager(
+                TestTaskManager::new(inner)
+                    .fail_approved_start("original approved start failure")
+                    .record_interrupts(interrupted.clone())
+                    .fail_interrupt("cleanup failure"),
+            )
+            .observer(RecordingObserver {
+                events: events.clone(),
+            })
+            .build()
+            .unwrap();
+        let mut driver = agent
+            .start(SessionConfig::new("session-approved-start-error"))
+            .await
+            .unwrap();
+        driver
+            .submit_input(vec![Item::text(ItemKind::User, "ping")])
+            .unwrap();
+
+        assert!(matches!(
+            driver.next().await.unwrap(),
+            LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_))
+        ));
+        let _ = wait_for_task_event(&handle).await;
+        wait_until_entered(entered.as_ref()).await;
+        release.notify_waiters();
+        wait_until_completed(&handle).await;
+        let pending = match driver.next().await.unwrap() {
+            LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(pending)) => pending,
             other => panic!("unexpected delayed approval step: {other:?}"),
         };
-        driver.cancel_pending_approval_for(call_id).unwrap();
+        let task_turn = driver
+            .pending_approvals
+            .values()
+            .next()
+            .unwrap()
+            .tool_request
+            .turn_id
+            .clone();
+        let call_id = pending.request.call_id.clone().expect("approval call id");
+        assert!(driver.detached_call_ids.contains(&call_id));
+        pending.approve(&mut driver).unwrap();
 
+        let error = driver.next().await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("original approved start failure")
+        );
+        assert!(!error.to_string().contains("cleanup failure"));
+        assert_eq!(interrupted.lock().unwrap().as_slice(), &[task_turn]);
         assert!(driver.lifecycle.active_turn.is_none());
-        let lifecycle = turn_lifecycle_events(&events.lock().unwrap());
-        let [started, finished] = &lifecycle[lifecycle.len() - 2..] else {
-            panic!("missing terminal lifecycle events: {lifecycle:?}");
-        };
-        assert_eq!(started.0, finished.0);
-        assert_eq!(finished.1, Some(FinishReason::Cancelled));
+        assert!(!driver.detached_call_ids.contains(&call_id));
+        assert!(!driver.background_call_ids.contains(&call_id));
+        assert!(!driver.tool_cancellations.contains_key(&call_id));
+        assert!(events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolResultReceived(result)
+                if result.call_id == call_id && result.is_error
+        )));
         validate_transcript_invariants(&driver.snapshot().transcript).unwrap();
     }
 
@@ -6761,6 +7172,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelling_sole_foreground_approval_for_call_finishes_turn() {
+        let events = StdArc::new(StdMutex::new(Vec::new()));
+        let agent = Agent::builder()
+            .model(FakeAdapter)
+            .add_tool_source(ToolRegistry::new().with(EchoTool::default()))
+            .permissions(ApproveFsReads)
+            .observer(RecordingObserver {
+                events: events.clone(),
+            })
+            .build()
+            .unwrap();
+        let mut driver = agent
+            .start(SessionConfig::new("session-cancel-foreground-approval-for"))
+            .await
+            .unwrap();
+        driver
+            .submit_input(vec![Item::text(ItemKind::User, "ping")])
+            .unwrap();
+
+        let call_id = match driver.next().await.unwrap() {
+            LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(pending)) => {
+                pending.request.call_id.expect("approval call id")
+            }
+            other => panic!("unexpected loop step: {other:?}"),
+        };
+        driver.cancel_pending_approval_for(call_id).unwrap();
+
+        assert!(driver.lifecycle.active_turn.is_none());
+        assert!(driver.pending_approvals.is_empty());
+        validate_transcript_invariants(&driver.snapshot().transcript).unwrap();
+        let lifecycle = turn_lifecycle_events(&events.lock().unwrap());
+        assert_eq!(lifecycle.len(), 2, "{lifecycle:?}");
+        assert_eq!(lifecycle[0].0, lifecycle[1].0);
+        assert_eq!(lifecycle[1].1, Some(FinishReason::Cancelled));
+    }
+
+    #[tokio::test]
     async fn resolved_approval_runs_even_if_cancellation_also_fired() {
         let controller = CancellationController::new();
         let tools = ToolRegistry::new().with(EchoTool::default());
@@ -6943,9 +7391,10 @@ mod tests {
             .model(FakeAdapter)
             .add_tool_source(ToolRegistry::new().with(EchoTool::default()))
             .permissions(ApproveFsReads)
-            .task_manager(InterruptFailingTaskManager {
-                inner: SimpleTaskManager::new(),
-            })
+            .task_manager(
+                TestTaskManager::new(SimpleTaskManager::new())
+                    .fail_interrupt("interrupt cleanup failed"),
+            )
             .observer(RecordingObserver {
                 events: events.clone(),
             })
@@ -6981,13 +7430,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelling_all_pending_approvals_pairs_every_tool_use() {
+    async fn cancelling_all_pending_approvals_interrupts_every_originating_turn() {
         let events = StdArc::new(StdMutex::new(Vec::new()));
+        let interrupted = StdArc::new(StdMutex::new(Vec::new()));
         let tools = ToolRegistry::new().with(EchoTool::default());
         let agent = Agent::builder()
             .model(DualApprovalAdapter)
             .add_tool_source(tools)
             .permissions(ApproveFsReads)
+            .task_manager(
+                TestTaskManager::new(SimpleTaskManager::new())
+                    .record_interrupts(interrupted.clone()),
+            )
             .observer(RecordingObserver {
                 events: events.clone(),
             })
@@ -7030,6 +7484,21 @@ mod tests {
             }
         }
 
+        let first_origin = driver
+            .pending_approvals
+            .get(&ToolCallId::new("call-1"))
+            .unwrap()
+            .tool_request
+            .turn_id
+            .clone();
+        let second_origin = agentkit_core::TurnId::new("second-originating-turn");
+        driver
+            .pending_approvals
+            .get_mut(&ToolCallId::new("call-2"))
+            .unwrap()
+            .tool_request
+            .turn_id = second_origin.clone();
+
         match driver.cancel_pending_approvals().await.unwrap() {
             Some(LoopStep::Finished(turn)) => {
                 assert_eq!(turn.finish_reason, FinishReason::Cancelled);
@@ -7037,6 +7506,13 @@ mod tests {
             other => panic!("unexpected cancellation result: {other:?}"),
         }
         validate_transcript_invariants(&driver.snapshot().transcript).unwrap();
+        let interrupted = interrupted
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>();
+        assert_eq!(interrupted, HashSet::from([first_origin, second_origin]));
 
         let events = events.lock().unwrap();
         let cancelled = events

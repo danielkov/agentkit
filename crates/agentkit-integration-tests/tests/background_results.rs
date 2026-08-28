@@ -182,7 +182,7 @@ async fn foreground_emits_single_tool_result_no_notification() {
 // ─── case 2: pure Background (control) ────────────────────────────────────
 
 #[tokio::test]
-async fn pure_background_completion_emits_single_tool_result_no_notification() {
+async fn pure_background_emits_detached_placeholder_and_completion_notification() {
     let path = snapshot_path("bg_pure_background.ron");
     let recording = SessionRecording::load_or_seed(&path, || SessionRecording {
         session_id: "pure-bg".into(),

@@ -14,7 +14,7 @@ use agentkit_core::{
     CancellationController, CancellationHandle, DataRef, Delta, FilePart, FinishReason, Item,
     ItemKind, MediaPart, MetadataMap, Modality, Part, PartId, PartKind,
     SessionId as AgentkitSessionId, StructuredPart, TextPart, ToolCallPart, ToolOutput,
-    ToolResultPart, TurnId,
+    ToolResultPart, TurnCancellation, TurnId,
 };
 use agentkit_loop::{
     AgentEvent, LoopInterrupt, LoopObserver, LoopStep, ModelAdapter, ModelSession, ObservedEvent,
@@ -47,12 +47,30 @@ enum ClientMessage {
 #[derive(Clone)]
 struct ClientHandle {
     tx: mpsc::UnboundedSender<ClientMessage>,
+    #[cfg(test)]
+    before_update: Option<Arc<dyn Fn(&wire::SessionUpdate) + Send + Sync>>,
 }
 
 impl ClientHandle {
     fn channel() -> (Self, mpsc::UnboundedReceiver<ClientMessage>) {
         let (tx, rx) = mpsc::unbounded_channel();
-        (Self { tx }, rx)
+        (
+            Self {
+                tx,
+                #[cfg(test)]
+                before_update: None,
+            },
+            rx,
+        )
+    }
+
+    #[cfg(test)]
+    fn channel_with_update_hook(
+        hook: impl Fn(&wire::SessionUpdate) + Send + Sync + 'static,
+    ) -> (Self, mpsc::UnboundedReceiver<ClientMessage>) {
+        let (mut client, rx) = Self::channel();
+        client.before_update = Some(Arc::new(hook));
+        (client, rx)
     }
 
     fn update(
@@ -60,6 +78,10 @@ impl ClientHandle {
         session_id: wire::SessionId,
         update: wire::SessionUpdate,
     ) -> Result<(), AcpRuntimeError> {
+        #[cfg(test)]
+        if let Some(hook) = &self.before_update {
+            hook(&update);
+        }
         self.tx
             .send(ClientMessage::Update(Box::new(
                 wire::UpdateSessionNotification::new(session_id, update),
@@ -113,8 +135,15 @@ struct IntegrationSession {
 
 struct PromptState {
     active_prompt: Arc<AtomicU64>,
-    pending_owner: Option<u64>,
-    turn_owners: HashMap<TurnId, u64>,
+    lifecycle: Arc<Mutex<()>>,
+    pending_owner: Option<PromptOwner>,
+    turn_owners: HashMap<TurnId, PromptOwner>,
+}
+
+#[derive(Clone)]
+struct PromptOwner {
+    id: u64,
+    cancellation: TurnCancellation,
 }
 
 #[derive(Default)]
@@ -203,6 +232,7 @@ impl AcpIntegration {
         &self,
         session_id: &wire::SessionId,
         active_prompt: Arc<AtomicU64>,
+        lifecycle: Arc<Mutex<()>>,
     ) -> Result<(), AcpRuntimeError> {
         let session = self.session(session_id)?;
         *session
@@ -210,6 +240,7 @@ impl AcpIntegration {
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Some(PromptState {
             active_prompt,
+            lifecycle,
             pending_owner: None,
             turn_owners: HashMap::new(),
         });
@@ -220,6 +251,7 @@ impl AcpIntegration {
         &self,
         session_id: &wire::SessionId,
         owner: u64,
+        cancellation: TurnCancellation,
     ) -> Result<wire::MessageId, AcpRuntimeError> {
         let session = self.session(session_id)?;
         {
@@ -230,7 +262,10 @@ impl AcpIntegration {
             let prompt_state = prompt_state.as_mut().ok_or_else(|| {
                 AcpRuntimeError::Sdk("ACP v2 prompt state is not initialized".into())
             })?;
-            prompt_state.pending_owner = Some(owner);
+            prompt_state.pending_owner = Some(PromptOwner {
+                id: owner,
+                cancellation,
+            });
         }
         let sequence = session.next_message.fetch_add(1, Ordering::Relaxed);
         finish_model_message(&session);
@@ -247,12 +282,16 @@ impl AcpIntegration {
                 .unwrap_or_else(|error| error.into_inner())
                 .as_mut()
             {
-                if prompt_state.pending_owner == Some(owner) {
+                if prompt_state
+                    .pending_owner
+                    .as_ref()
+                    .is_some_and(|pending| pending.id == owner)
+                {
                     prompt_state.pending_owner = None;
                 }
                 prompt_state
                     .turn_owners
-                    .retain(|_, turn_owner| *turn_owner != owner);
+                    .retain(|_, turn_owner| turn_owner.id != owner);
             }
             finish_model_message(&session);
         }
@@ -279,6 +318,50 @@ impl AcpIntegration {
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .take();
+        }
+    }
+
+    fn route_turn_finished(
+        session: &IntegrationSession,
+        result: &agentkit_loop::TurnResult,
+        unsupported_approval: Option<(CancellationHandle, u64)>,
+    ) {
+        let prompt_owner = session
+            .prompt_state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_mut()
+            .and_then(|prompt_state| {
+                prompt_state
+                    .turn_owners
+                    .remove(&result.turn_id)
+                    .map(|owner| (Arc::clone(&prompt_state.active_prompt), owner))
+            });
+        let prompt_cancelled = prompt_owner
+            .as_ref()
+            .is_some_and(|(_, owner)| owner.cancellation.is_cancelled());
+        let stop_reason = if prompt_cancelled {
+            wire::StopReason::Cancelled
+        } else {
+            match unsupported_approval {
+                Some((cancellation, generation))
+                    if !cancellation.is_cancelled_since(generation) =>
+                {
+                    error_stop_reason()
+                }
+                _ => finish_reason_to_stop_reason(&result.finish_reason),
+            }
+        };
+        if let Some((active_prompt, owner)) = prompt_owner {
+            release_prompt(&active_prompt, owner.id);
+        }
+        if let Err(error) = session.client.update(
+            session.acp_session_id.clone(),
+            wire::SessionUpdate::StateUpdate(wire::StateUpdate::Idle(
+                wire::IdleStateUpdate::new().stop_reason(stop_reason),
+            )),
+        ) {
+            tracing::debug!(%error, "failed to queue ACP v2 idle update");
         }
     }
 
@@ -323,35 +406,17 @@ impl AcpIntegration {
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
                     .take();
-                let stop_reason = match unsupported_approval {
-                    Some((cancellation, generation))
-                        if !cancellation.is_cancelled_since(generation) =>
-                    {
-                        error_stop_reason()
-                    }
-                    _ => finish_reason_to_stop_reason(&result.finish_reason),
-                };
-                let prompt_owner = session
+                let lifecycle = session
                     .prompt_state
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
-                    .as_mut()
-                    .and_then(|prompt_state| {
-                        prompt_state
-                            .turn_owners
-                            .remove(&result.turn_id)
-                            .map(|owner| (Arc::clone(&prompt_state.active_prompt), owner))
-                    });
-                if let Some((active_prompt, owner)) = prompt_owner {
-                    release_prompt(&active_prompt, owner);
-                }
-                if let Err(error) = session.client.update(
-                    session.acp_session_id.clone(),
-                    wire::SessionUpdate::StateUpdate(wire::StateUpdate::Idle(
-                        wire::IdleStateUpdate::new().stop_reason(stop_reason),
-                    )),
-                ) {
-                    tracing::debug!(%error, "failed to queue ACP v2 idle update");
+                    .as_ref()
+                    .map(|prompt_state| Arc::clone(&prompt_state.lifecycle));
+                if let Some(lifecycle) = lifecycle {
+                    let _lifecycle = lifecycle.lock().unwrap_or_else(|error| error.into_inner());
+                    Self::route_turn_finished(&session, result, unsupported_approval);
+                } else {
+                    Self::route_turn_finished(&session, result, unsupported_approval);
                 }
                 return;
             }
@@ -688,7 +753,7 @@ struct SessionEntry {
     active_prompt: Arc<AtomicU64>,
     next_prompt_owner: AtomicU64,
     closed: AtomicBool,
-    lifecycle: Mutex<()>,
+    lifecycle: Arc<Mutex<()>>,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     drain_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
@@ -697,6 +762,7 @@ enum SessionCommand {
     Prompt {
         request: wire::PromptRequest,
         items: Vec<Item>,
+        prompt_cancellation: TurnCancellation,
         cancellation_generation: u64,
         owner: u64,
         response: oneshot::Sender<Result<oneshot::Sender<()>, AcpRuntimeError>>,
@@ -770,15 +836,17 @@ where
         );
 
         let active_prompt = Arc::new(AtomicU64::new(0));
+        let lifecycle = Arc::new(Mutex::new(()));
         self.integration.bind(
             acp_session_id.clone(),
             agentkit_session_id.clone(),
             client.clone(),
         )?;
-        if let Err(error) = self
-            .integration
-            .install_prompt_state(&acp_session_id, Arc::clone(&active_prompt))
-        {
+        if let Err(error) = self.integration.install_prompt_state(
+            &acp_session_id,
+            Arc::clone(&active_prompt),
+            Arc::clone(&lifecycle),
+        ) {
             let _ = self.integration.unbind(&acp_session_id);
             return Err(error);
         }
@@ -830,7 +898,7 @@ where
             active_prompt,
             next_prompt_owner: AtomicU64::new(1),
             closed: AtomicBool::new(false),
-            lifecycle: Mutex::new(()),
+            lifecycle,
             task: Mutex::new(Some(task)),
             drain_task: Mutex::new(Some(drain_task)),
         });
@@ -935,12 +1003,14 @@ where
                     "session is already running a prompt".into(),
                 ));
             }
-            let cancellation_generation = entry.cancellation.handle().generation();
+            let prompt_cancellation = entry.cancellation.handle().checkpoint();
+            let cancellation_generation = prompt_cancellation.generation();
             if entry
                 .commands
                 .send(SessionCommand::Prompt {
                     request,
                     items,
+                    prompt_cancellation,
                     cancellation_generation,
                     owner,
                     response: tx,
@@ -1091,6 +1161,7 @@ async fn session_worker<S>(
         let SessionCommand::Prompt {
             request,
             items,
+            prompt_cancellation,
             cancellation_generation,
             owner,
             response,
@@ -1106,14 +1177,15 @@ async fn session_worker<S>(
             let _ = response.send(Err(error));
             continue;
         }
-        let user_message_id = match integration.begin_prompt(&session_id, owner) {
-            Ok(message_id) => message_id,
-            Err(error) => {
-                release_prompt(&active_prompt, owner);
-                let _ = response.send(Err(error));
-                continue;
-            }
-        };
+        let user_message_id =
+            match integration.begin_prompt(&session_id, owner, prompt_cancellation) {
+                Ok(message_id) => message_id,
+                Err(error) => {
+                    release_prompt(&active_prompt, owner);
+                    let _ = response.send(Err(error));
+                    continue;
+                }
+            };
         let (start_tx, start_rx) = oneshot::channel();
         if response.send(Ok(start_tx)).is_err() || start_rx.await.is_err() {
             integration.finish_prompt(&session_id, owner);
@@ -2116,9 +2188,16 @@ mod tests {
             .bind(acp_id.clone(), agentkit_id.clone(), client)
             .expect("bind session");
         integration
-            .install_prompt_state(&acp_id, Arc::new(AtomicU64::new(1)))
+            .install_prompt_state(
+                &acp_id,
+                Arc::new(AtomicU64::new(1)),
+                Arc::new(Mutex::new(())),
+            )
             .expect("install prompt state");
-        integration.begin_prompt(&acp_id, 1).expect("begin prompt");
+        let cancellation = CancellationController::new();
+        integration
+            .begin_prompt(&acp_id, 1, cancellation.handle().checkpoint())
+            .expect("begin prompt");
 
         for event in [
             AgentEvent::ContentDelta(Delta::BeginPart {
@@ -2249,19 +2328,106 @@ mod tests {
     }
 
     #[test]
+    fn prompt_cancellation_overrides_terminal_and_unsupported_stop_reasons() {
+        for (index, finish_reason, unsupported_approval) in [
+            (1, FinishReason::Completed, false),
+            (2, FinishReason::Error, false),
+            (3, FinishReason::Completed, true),
+        ] {
+            let integration = AcpIntegration::default();
+            let (client, mut messages) = ClientHandle::channel();
+            let acp_id = wire::SessionId::new(format!("acp-session-{index}"));
+            let agentkit_id = AgentkitSessionId::new(format!("agentkit-session-{index}"));
+            let active_prompt = Arc::new(AtomicU64::new(index));
+            let cancellation = CancellationController::new();
+            let generation = cancellation.handle().generation();
+            integration
+                .bind(acp_id.clone(), agentkit_id.clone(), client)
+                .expect("bind session");
+            integration
+                .install_prompt_state(&acp_id, active_prompt, Arc::new(Mutex::new(())))
+                .expect("install prompt state");
+            integration
+                .begin_prompt(&acp_id, index, cancellation.handle().checkpoint())
+                .expect("begin prompt");
+            let turn_id = TurnId::new(format!("turn-{index}"));
+            integration.route_event(
+                &agentkit_id,
+                AgentEvent::TurnStarted {
+                    session_id: agentkit_id.clone(),
+                    turn_id: turn_id.clone(),
+                },
+            );
+            if unsupported_approval {
+                integration.mark_unsupported_approval(&acp_id, cancellation.handle(), generation);
+            }
+            cancellation.interrupt();
+            integration.route_event(
+                &agentkit_id,
+                AgentEvent::TurnFinished(agentkit_loop::TurnResult {
+                    turn_id,
+                    finish_reason,
+                    items: Vec::new(),
+                    usage: None,
+                    metadata: MetadataMap::new(),
+                }),
+            );
+
+            assert!(matches!(
+                messages.try_recv(),
+                Ok(ClientMessage::Update(notification))
+                    if matches!(
+                        notification.update,
+                        wire::SessionUpdate::StateUpdate(wire::StateUpdate::Running(_))
+                    )
+            ));
+            assert!(matches!(
+                messages.try_recv(),
+                Ok(ClientMessage::Update(notification))
+                    if matches!(
+                        &notification.update,
+                        wire::SessionUpdate::StateUpdate(wire::StateUpdate::Idle(idle))
+                            if idle.stop_reason == Some(wire::StopReason::Cancelled)
+                    )
+            ));
+        }
+    }
+
+    #[test]
     fn idle_is_queued_after_releasing_its_prompt_owner() {
         let integration = AcpIntegration::default();
-        let (client, mut messages) = ClientHandle::channel();
+        let active_prompt = Arc::new(AtomicU64::new(7));
+        let lifecycle = Arc::new(Mutex::new(()));
+        let prompt_at_enqueue = Arc::clone(&active_prompt);
+        let lifecycle_at_enqueue = Arc::clone(&lifecycle);
+        let (client, mut messages) = ClientHandle::channel_with_update_hook(move |update| {
+            if matches!(
+                update,
+                wire::SessionUpdate::StateUpdate(wire::StateUpdate::Idle(_))
+            ) {
+                assert_eq!(
+                    prompt_at_enqueue.load(Ordering::Acquire),
+                    0,
+                    "Idle was enqueued before prompt ownership was released"
+                );
+                assert!(
+                    lifecycle_at_enqueue.try_lock().is_err(),
+                    "Idle was enqueued outside the prompt lifecycle lock"
+                );
+            }
+        });
         let acp_id = wire::SessionId::new("acp-session");
         let agentkit_id = AgentkitSessionId::new("agentkit-session");
-        let active_prompt = Arc::new(AtomicU64::new(7));
         integration
             .bind(acp_id.clone(), agentkit_id.clone(), client)
             .expect("bind session");
         integration
-            .install_prompt_state(&acp_id, Arc::clone(&active_prompt))
+            .install_prompt_state(&acp_id, Arc::clone(&active_prompt), Arc::clone(&lifecycle))
             .expect("install prompt state");
-        integration.begin_prompt(&acp_id, 7).expect("begin prompt");
+        let cancellation = CancellationController::new();
+        integration
+            .begin_prompt(&acp_id, 7, cancellation.handle().checkpoint())
+            .expect("begin prompt");
         let turn_id = TurnId::new("turn-1");
         integration.route_event(
             &agentkit_id,
@@ -2294,6 +2460,85 @@ mod tests {
                 )
             })
         );
+    }
+
+    #[test]
+    fn cancellation_while_turn_finish_waits_for_lifecycle_lock_wins() {
+        let integration = AcpIntegration::default();
+        let active_prompt = Arc::new(AtomicU64::new(9));
+        let lifecycle = Arc::new(Mutex::new(()));
+        let prompt_at_enqueue = Arc::clone(&active_prompt);
+        let lifecycle_at_enqueue = Arc::clone(&lifecycle);
+        let (client, mut messages) = ClientHandle::channel_with_update_hook(move |update| {
+            if matches!(
+                update,
+                wire::SessionUpdate::StateUpdate(wire::StateUpdate::Idle(_))
+            ) {
+                assert_eq!(prompt_at_enqueue.load(Ordering::Acquire), 0);
+                assert!(lifecycle_at_enqueue.try_lock().is_err());
+            }
+        });
+        let acp_id = wire::SessionId::new("acp-race-session");
+        let agentkit_id = AgentkitSessionId::new("agentkit-race-session");
+        integration
+            .bind(acp_id.clone(), agentkit_id.clone(), client)
+            .expect("bind session");
+        integration
+            .install_prompt_state(&acp_id, Arc::clone(&active_prompt), Arc::clone(&lifecycle))
+            .expect("install prompt state");
+        let cancellation = CancellationController::new();
+        integration
+            .begin_prompt(&acp_id, 9, cancellation.handle().checkpoint())
+            .expect("begin prompt");
+        let turn_id = TurnId::new("turn-race");
+        integration.route_event(
+            &agentkit_id,
+            AgentEvent::TurnStarted {
+                session_id: agentkit_id.clone(),
+                turn_id: turn_id.clone(),
+            },
+        );
+
+        let lifecycle_guard = lifecycle.lock().unwrap();
+        let ready = Arc::new(std::sync::Barrier::new(2));
+        let finish_ready = Arc::clone(&ready);
+        let finish_integration = integration.clone();
+        let finish_session = agentkit_id.clone();
+        let finish = std::thread::spawn(move || {
+            finish_ready.wait();
+            finish_integration.route_event(
+                &finish_session,
+                AgentEvent::TurnFinished(agentkit_loop::TurnResult {
+                    turn_id,
+                    finish_reason: FinishReason::Completed,
+                    items: Vec::new(),
+                    usage: None,
+                    metadata: MetadataMap::new(),
+                }),
+            );
+        });
+        ready.wait();
+        cancellation.interrupt();
+        drop(lifecycle_guard);
+        finish.join().expect("turn finish thread");
+
+        assert!(matches!(
+            messages.try_recv(),
+            Ok(ClientMessage::Update(notification))
+                if matches!(
+                    notification.update,
+                    wire::SessionUpdate::StateUpdate(wire::StateUpdate::Running(_))
+                )
+        ));
+        assert!(matches!(
+            messages.try_recv(),
+            Ok(ClientMessage::Update(notification))
+                if matches!(
+                    &notification.update,
+                    wire::SessionUpdate::StateUpdate(wire::StateUpdate::Idle(idle))
+                        if idle.stop_reason == Some(wire::StopReason::Cancelled)
+                )
+        ));
     }
 
     #[test]
