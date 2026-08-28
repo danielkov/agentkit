@@ -184,6 +184,18 @@ SessionRecording(
                             text: "Background tool call call-bg completed: bg-output",
                             metadata: {},
                         )),
+                        Structured(StructuredPart(
+                            value: {
+                                "call_id": "call-bg",
+                                "is_error": false,
+                                "metadata": {},
+                                "output": {
+                                    "Text": "bg-output",
+                                },
+                            },
+                            schema: None,
+                            metadata: {},
+                        )),
                     ],
                     metadata: {},
                     usage: None,
@@ -303,6 +315,18 @@ SessionRecording(
             parts: [
                 Text(TextPart(
                     text: "Background tool call call-bg completed: bg-output",
+                    metadata: {},
+                )),
+                Structured(StructuredPart(
+                    value: {
+                        "call_id": "call-bg",
+                        "is_error": false,
+                        "metadata": {},
+                        "output": {
+                            "Text": "bg-output",
+                        },
+                    },
+                    schema: None,
                     metadata: {},
                 )),
             ],

@@ -393,6 +393,18 @@ SessionRecording(
                             text: "Background tool call call-b completed: out-b",
                             metadata: {},
                         )),
+                        Structured(StructuredPart(
+                            value: {
+                                "call_id": "call-b",
+                                "is_error": false,
+                                "metadata": {},
+                                "output": {
+                                    "Text": "out-b",
+                                },
+                            },
+                            schema: None,
+                            metadata: {},
+                        )),
                     ],
                     metadata: {},
                     usage: None,
@@ -566,6 +578,18 @@ SessionRecording(
                             text: "Background tool call call-b completed: out-b",
                             metadata: {},
                         )),
+                        Structured(StructuredPart(
+                            value: {
+                                "call_id": "call-b",
+                                "is_error": false,
+                                "metadata": {},
+                                "output": {
+                                    "Text": "out-b",
+                                },
+                            },
+                            schema: None,
+                            metadata: {},
+                        )),
                     ],
                     metadata: {},
                     usage: None,
@@ -592,6 +616,18 @@ SessionRecording(
                     parts: [
                         Text(TextPart(
                             text: "Background tool call call-a completed: out-a",
+                            metadata: {},
+                        )),
+                        Structured(StructuredPart(
+                            value: {
+                                "call_id": "call-a",
+                                "is_error": false,
+                                "metadata": {},
+                                "output": {
+                                    "Text": "out-a",
+                                },
+                            },
+                            schema: None,
                             metadata: {},
                         )),
                     ],
@@ -767,6 +803,18 @@ SessionRecording(
                     text: "Background tool call call-b completed: out-b",
                     metadata: {},
                 )),
+                Structured(StructuredPart(
+                    value: {
+                        "call_id": "call-b",
+                        "is_error": false,
+                        "metadata": {},
+                        "output": {
+                            "Text": "out-b",
+                        },
+                    },
+                    schema: None,
+                    metadata: {},
+                )),
             ],
             metadata: {},
             usage: None,
@@ -793,6 +841,18 @@ SessionRecording(
             parts: [
                 Text(TextPart(
                     text: "Background tool call call-a completed: out-a",
+                    metadata: {},
+                )),
+                Structured(StructuredPart(
+                    value: {
+                        "call_id": "call-a",
+                        "is_error": false,
+                        "metadata": {},
+                        "output": {
+                            "Text": "out-a",
+                        },
+                    },
+                    schema: None,
                     metadata: {},
                 )),
             ],

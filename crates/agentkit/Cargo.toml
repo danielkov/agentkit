@@ -4,22 +4,22 @@ homepage.workspace = true
 name = "agentkit"
 readme = "README.md"
 repository.workspace = true
-version = "0.10.9"
+version = "0.10.10"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
 agentkit-capabilities = { version = "0.10.5", path = "../agentkit-capabilities", optional = true }
-agentkit-acp = { version = "0.10.9", path = "../agentkit-acp", optional = true }
+agentkit-acp = { version = "0.10.10", path = "../agentkit-acp", optional = true }
 agentkit-compaction = { version = "0.10.5", path = "../agentkit-compaction", optional = true }
 agentkit-context = { version = "0.10.5", path = "../agentkit-context", optional = true }
 agentkit-core = { version = "0.10.5", path = "../agentkit-core", optional = true }
-agentkit-loop = { version = "0.10.8", path = "../agentkit-loop", optional = true }
+agentkit-loop = { version = "0.10.9", path = "../agentkit-loop", optional = true }
 agentkit-mcp = { version = "0.10.5", path = "../agentkit-mcp", optional = true }
 agentkit-plugins = { version = "0.10.6", path = "../agentkit-plugins", optional = true }
-agentkit-adapter-completions = { version = "0.10.6", path = "../agentkit-adapter-completions", optional = true }
-agentkit-provider-anthropic = { version = "0.10.7", path = "../agentkit-provider-anthropic", optional = true }
+agentkit-adapter-completions = { version = "0.10.7", path = "../agentkit-adapter-completions", optional = true }
+agentkit-provider-anthropic = { version = "0.10.8", path = "../agentkit-provider-anthropic", optional = true }
 agentkit-provider-baseten = { version = "0.10.5", path = "../agentkit-provider-baseten", optional = true }
 agentkit-provider-cerebras = { version = "0.10.6", path = "../agentkit-provider-cerebras", optional = true }
 agentkit-provider-groq = { version = "0.10.5", path = "../agentkit-provider-groq", optional = true }
@@ -29,7 +29,7 @@ agentkit-provider-openai = { version = "0.10.5", path = "../agentkit-provider-op
 agentkit-provider-openrouter = { version = "0.10.7", path = "../agentkit-provider-openrouter", optional = true }
 agentkit-provider-vllm = { version = "0.10.5", path = "../agentkit-provider-vllm", optional = true }
 agentkit-reporting = { version = "0.10.5", path = "../agentkit-reporting", optional = true }
-agentkit-task-manager = { version = "0.10.5", path = "../agentkit-task-manager", optional = true }
+agentkit-task-manager = { version = "0.10.7", path = "../agentkit-task-manager", optional = true }
 agentkit-tool-compose = { version = "0.10.5", path = "../agentkit-tool-compose", optional = true }
 agentkit-tool-fs = { version = "0.10.5", path = "../agentkit-tool-fs", optional = true }
 agentkit-tool-shell = { version = "0.10.5", path = "../agentkit-tool-shell", optional = true }

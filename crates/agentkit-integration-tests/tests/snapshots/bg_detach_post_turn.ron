@@ -305,6 +305,18 @@ SessionRecording(
                             text: "Background tool call call-d completed: detach-output",
                             metadata: {},
                         )),
+                        Structured(StructuredPart(
+                            value: {
+                                "call_id": "call-d",
+                                "is_error": false,
+                                "metadata": {},
+                                "output": {
+                                    "Text": "detach-output",
+                                },
+                            },
+                            schema: None,
+                            metadata: {},
+                        )),
                     ],
                     metadata: {},
                     usage: None,
@@ -438,6 +450,18 @@ SessionRecording(
             parts: [
                 Text(TextPart(
                     text: "Background tool call call-d completed: detach-output",
+                    metadata: {},
+                )),
+                Structured(StructuredPart(
+                    value: {
+                        "call_id": "call-d",
+                        "is_error": false,
+                        "metadata": {},
+                        "output": {
+                            "Text": "detach-output",
+                        },
+                    },
+                    schema: None,
                     metadata: {},
                 )),
             ],

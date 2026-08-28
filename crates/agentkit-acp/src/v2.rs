@@ -17,7 +17,8 @@ use agentkit_core::{
     ToolResultPart, TurnCancellation, TurnId,
 };
 use agentkit_loop::{
-    AgentEvent, LoopInterrupt, LoopObserver, LoopStep, ModelAdapter, ModelSession, ObservedEvent,
+    AgentEvent, LoopError, LoopInterrupt, LoopObserver, LoopStep, ModelAdapter, ModelSession,
+    ObservedEvent,
 };
 use async_trait::async_trait;
 use serde_json::json;
@@ -337,9 +338,10 @@ impl AcpIntegration {
                     .remove(&result.turn_id)
                     .map(|owner| (Arc::clone(&prompt_state.active_prompt), owner))
             });
-        let prompt_cancelled = prompt_owner
-            .as_ref()
-            .is_some_and(|(_, owner)| owner.cancellation.is_cancelled());
+        let Some((active_prompt, owner)) = prompt_owner else {
+            return;
+        };
+        let prompt_cancelled = owner.cancellation.is_cancelled();
         let stop_reason = if prompt_cancelled {
             wire::StopReason::Cancelled
         } else {
@@ -352,9 +354,7 @@ impl AcpIntegration {
                 _ => finish_reason_to_stop_reason(&result.finish_reason),
             }
         };
-        if let Some((active_prompt, owner)) = prompt_owner {
-            release_prompt(&active_prompt, owner.id);
-        }
+        release_prompt(&active_prompt, owner.id);
         if let Err(error) = session.client.update(
             session.acp_session_id.clone(),
             wire::SessionUpdate::StateUpdate(wire::StateUpdate::Idle(
@@ -379,23 +379,27 @@ impl AcpIntegration {
 
         match &event {
             AgentEvent::TurnStarted { turn_id, .. } => {
-                if let Some(prompt_state) = session
+                let prompt_owned = session
                     .prompt_state
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
                     .as_mut()
-                    && let Some(owner) = prompt_state.pending_owner.take()
-                {
-                    prompt_state.turn_owners.insert(turn_id.clone(), owner);
-                }
-                start_model_message(&session);
-                if let Err(error) = session.client.update(
-                    session.acp_session_id.clone(),
-                    wire::SessionUpdate::StateUpdate(wire::StateUpdate::Running(
-                        wire::RunningStateUpdate::new(),
-                    )),
-                ) {
-                    tracing::debug!(%error, "failed to queue ACP v2 running update");
+                    .and_then(|prompt_state| {
+                        let owner = prompt_state.pending_owner.take()?;
+                        prompt_state.turn_owners.insert(turn_id.clone(), owner);
+                        Some(())
+                    })
+                    .is_some();
+                if prompt_owned {
+                    start_model_message(&session);
+                    if let Err(error) = session.client.update(
+                        session.acp_session_id.clone(),
+                        wire::SessionUpdate::StateUpdate(wire::StateUpdate::Running(
+                            wire::RunningStateUpdate::new(),
+                        )),
+                    ) {
+                        tracing::debug!(%error, "failed to queue ACP v2 running update");
+                    }
                 }
                 return;
             }
@@ -411,11 +415,14 @@ impl AcpIntegration {
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
                     .as_ref()
-                    .map(|prompt_state| Arc::clone(&prompt_state.lifecycle));
+                    .and_then(|prompt_state| {
+                        prompt_state
+                            .turn_owners
+                            .contains_key(&result.turn_id)
+                            .then(|| Arc::clone(&prompt_state.lifecycle))
+                    });
                 if let Some(lifecycle) = lifecycle {
                     let _lifecycle = lifecycle.lock().unwrap_or_else(|error| error.into_inner());
-                    Self::route_turn_finished(&session, result, unsupported_approval);
-                } else {
                     Self::route_turn_finished(&session, result, unsupported_approval);
                 }
                 return;
@@ -751,6 +758,8 @@ struct SessionEntry {
     cancellation: CancellationController,
     info: wire::SessionInfo,
     active_prompt: Arc<AtomicU64>,
+    driving_prompt: Arc<AtomicU64>,
+    cancelled_prompt: Arc<AtomicU64>,
     next_prompt_owner: AtomicU64,
     closed: AtomicBool,
     lifecycle: Arc<Mutex<()>>,
@@ -765,7 +774,7 @@ enum SessionCommand {
         prompt_cancellation: TurnCancellation,
         cancellation_generation: u64,
         owner: u64,
-        response: oneshot::Sender<Result<oneshot::Sender<()>, AcpRuntimeError>>,
+        start: oneshot::Receiver<()>,
     },
     Shutdown,
 }
@@ -836,6 +845,8 @@ where
         );
 
         let active_prompt = Arc::new(AtomicU64::new(0));
+        let driving_prompt = Arc::new(AtomicU64::new(0));
+        let cancelled_prompt = Arc::new(AtomicU64::new(0));
         let lifecycle = Arc::new(Mutex::new(()));
         self.integration.bind(
             acp_session_id.clone(),
@@ -876,6 +887,9 @@ where
 
         let (commands, rx) = mpsc::unbounded_channel();
         let worker_active_prompt = Arc::clone(&active_prompt);
+        let worker_driving_prompt = Arc::clone(&driving_prompt);
+        let worker_cancelled_prompt = Arc::clone(&cancelled_prompt);
+        let worker_lifecycle = Arc::clone(&lifecycle);
         let integration = Arc::clone(&self.integration);
         let worker_session_id = acp_session_id.clone();
         let worker_cancellation = cancellation.handle();
@@ -887,6 +901,9 @@ where
                 integration,
                 worker_cancellation,
                 worker_active_prompt,
+                worker_driving_prompt,
+                worker_cancelled_prompt,
+                worker_lifecycle,
                 rx,
             )
             .await;
@@ -896,6 +913,8 @@ where
             cancellation,
             info,
             active_prompt,
+            driving_prompt,
+            cancelled_prompt,
             next_prompt_owner: AtomicU64::new(1),
             closed: AtomicBool::new(false),
             lifecycle,
@@ -979,7 +998,7 @@ where
             .get(&request.session_id)
             .cloned()
             .ok_or_else(|| AcpRuntimeError::SessionNotFound(request.session_id.to_string()))?;
-        let (tx, rx) = oneshot::channel();
+        let (start_tx, start_rx) = oneshot::channel();
         {
             let _lifecycle = entry
                 .lifecycle
@@ -1013,7 +1032,7 @@ where
                     prompt_cancellation,
                     cancellation_generation,
                     owner,
-                    response: tx,
+                    start: start_rx,
                 })
                 .is_err()
             {
@@ -1021,7 +1040,7 @@ where
                 return Err(AcpRuntimeError::ClientClosed);
             }
         }
-        rx.await.map_err(|_| AcpRuntimeError::ClientClosed)?
+        Ok(start_tx)
     }
 
     async fn cancel(
@@ -1039,10 +1058,16 @@ where
                 .lifecycle
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            if !entry.closed.load(Ordering::Acquire)
-                && entry.active_prompt.load(Ordering::Acquire) != 0
-            {
-                entry.cancellation.interrupt();
+            if !entry.closed.load(Ordering::Acquire) {
+                let driving = entry.driving_prompt.load(Ordering::Acquire);
+                if driving != 0 {
+                    entry.cancellation.interrupt();
+                } else {
+                    let queued = entry.active_prompt.load(Ordering::Acquire);
+                    if queued != 0 {
+                        entry.cancelled_prompt.store(queued, Ordering::Release);
+                    }
+                }
             }
         }
         Ok(())
@@ -1146,6 +1171,17 @@ fn release_prompt(active_prompt: &AtomicU64, owner: u64) {
     let _ = active_prompt.compare_exchange(owner, 0, Ordering::AcqRel, Ordering::Acquire);
 }
 
+fn clear_prompt_tracking(
+    active_prompt: &AtomicU64,
+    driving_prompt: &AtomicU64,
+    cancelled_prompt: &AtomicU64,
+    owner: u64,
+) {
+    let _ = driving_prompt.compare_exchange(owner, 0, Ordering::AcqRel, Ordering::Acquire);
+    let _ = cancelled_prompt.compare_exchange(owner, 0, Ordering::AcqRel, Ordering::Acquire);
+    release_prompt(active_prompt, owner);
+}
+
 async fn session_worker<S>(
     session_id: wire::SessionId,
     mut driver: agentkit_loop::LoopDriver<S>,
@@ -1153,57 +1189,122 @@ async fn session_worker<S>(
     integration: Arc<AcpIntegration>,
     cancellation: CancellationHandle,
     active_prompt: Arc<AtomicU64>,
+    driving_prompt: Arc<AtomicU64>,
+    cancelled_prompt: Arc<AtomicU64>,
+    lifecycle: Arc<Mutex<()>>,
     mut commands: mpsc::UnboundedReceiver<SessionCommand>,
 ) where
     S: ModelSession + Send + 'static,
 {
-    while let Some(command) = commands.recv().await {
+    enum SessionAction {
+        Command(Option<SessionCommand>),
+        LoopUpdate(Result<(), LoopError>),
+    }
+
+    // Let one fresh prompt win a race with unrelated background work, then
+    // prefer the deferred update so repeated prompts cannot starve its delivery.
+    let mut prefer_loop_update = false;
+    loop {
+        let action = if prefer_loop_update {
+            tokio::select! {
+                biased;
+                wake = driver.wait_for_loop_update() => SessionAction::LoopUpdate(wake),
+                command = commands.recv() => SessionAction::Command(command),
+            }
+        } else {
+            tokio::select! {
+                biased;
+                command = commands.recv() => SessionAction::Command(command),
+                wake = driver.wait_for_loop_update() => SessionAction::LoopUpdate(wake),
+            }
+        };
+        let command = match action {
+            SessionAction::Command(Some(command)) => command,
+            SessionAction::Command(None) => break,
+            SessionAction::LoopUpdate(wake) => {
+                if let Err(error) = wake {
+                    tracing::debug!(%error, "failed waiting for an ACP v2 loop update");
+                    break;
+                }
+                prefer_loop_update = false;
+                drive_prompt(
+                    &mut driver,
+                    &integration,
+                    &session_id,
+                    &cancellation,
+                    cancellation.generation(),
+                )
+                .await;
+                if let Err(error) = client.flush().await {
+                    tracing::debug!(%error, "failed to flush idle ACP v2 loop update");
+                }
+                continue;
+            }
+        };
         let SessionCommand::Prompt {
             request,
             items,
             prompt_cancellation,
             cancellation_generation,
             owner,
-            response,
+            start,
         } = command
         else {
             break;
         };
-        if let Err(error) = driver
-            .submit_input(items)
-            .map_err(|error| AcpRuntimeError::Loop(error.to_string()))
-        {
-            release_prompt(&active_prompt, owner);
-            let _ = response.send(Err(error));
+        if start.await.is_err() {
+            let _lifecycle = lifecycle.lock().unwrap_or_else(|error| error.into_inner());
+            clear_prompt_tracking(&active_prompt, &driving_prompt, &cancelled_prompt, owner);
+            continue;
+        }
+        let should_start = {
+            let _lifecycle = lifecycle.lock().unwrap_or_else(|error| error.into_inner());
+            let still_active = active_prompt.load(Ordering::Acquire) == owner;
+            let was_cancelled = cancelled_prompt.load(Ordering::Acquire) == owner;
+            if !still_active || was_cancelled {
+                clear_prompt_tracking(&active_prompt, &driving_prompt, &cancelled_prompt, owner);
+                false
+            } else {
+                driving_prompt.store(owner, Ordering::Release);
+                true
+            }
+        };
+        if !should_start {
+            continue;
+        }
+
+        if let Err(error) = driver.submit_input(items) {
+            tracing::debug!(%error, owner, "failed to submit accepted ACP v2 prompt");
+            let _lifecycle = lifecycle.lock().unwrap_or_else(|error| error.into_inner());
+            clear_prompt_tracking(&active_prompt, &driving_prompt, &cancelled_prompt, owner);
             continue;
         }
         let user_message_id =
             match integration.begin_prompt(&session_id, owner, prompt_cancellation) {
                 Ok(message_id) => message_id,
                 Err(error) => {
-                    release_prompt(&active_prompt, owner);
-                    let _ = response.send(Err(error));
+                    tracing::debug!(%error, owner, "failed to begin accepted ACP v2 prompt");
+                    let _lifecycle = lifecycle.lock().unwrap_or_else(|error| error.into_inner());
+                    clear_prompt_tracking(
+                        &active_prompt,
+                        &driving_prompt,
+                        &cancelled_prompt,
+                        owner,
+                    );
                     continue;
                 }
             };
-        let (start_tx, start_rx) = oneshot::channel();
-        if response.send(Ok(start_tx)).is_err() || start_rx.await.is_err() {
-            integration.finish_prompt(&session_id, owner);
-            release_prompt(&active_prompt, owner);
-            continue;
-        }
 
-        if client
-            .update(
-                session_id.clone(),
-                wire::SessionUpdate::UserMessage(
-                    wire::UserMessage::new(user_message_id).content(request.prompt),
-                ),
-            )
-            .is_err()
-        {
+        if let Err(error) = client.update(
+            session_id.clone(),
+            wire::SessionUpdate::UserMessage(
+                wire::UserMessage::new(user_message_id).content(request.prompt),
+            ),
+        ) {
+            tracing::debug!(%error, owner, "failed to publish accepted ACP v2 prompt");
+            let _lifecycle = lifecycle.lock().unwrap_or_else(|error| error.into_inner());
             integration.finish_prompt(&session_id, owner);
-            release_prompt(&active_prompt, owner);
+            clear_prompt_tracking(&active_prompt, &driving_prompt, &cancelled_prompt, owner);
             continue;
         }
 
@@ -1215,11 +1316,15 @@ async fn session_worker<S>(
             cancellation_generation,
         )
         .await;
+        {
+            let _lifecycle = lifecycle.lock().unwrap_or_else(|error| error.into_inner());
+            integration.finish_prompt(&session_id, owner);
+            clear_prompt_tracking(&active_prompt, &driving_prompt, &cancelled_prompt, owner);
+        }
         if let Err(error) = client.flush().await {
             tracing::debug!(%error, "failed to flush ACP v2 output");
         }
-        integration.finish_prompt(&session_id, owner);
-        release_prompt(&active_prompt, owner);
+        prefer_loop_update = true;
     }
 }
 
@@ -1616,6 +1721,7 @@ fn headless_capabilities() -> wire::AgentCapabilities {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
@@ -1624,13 +1730,16 @@ mod tests {
         ItemKind, ToolCallId, ToolOutput, ToolResultPart, TurnCancellation, TurnId,
     };
     use agentkit_integration_tests::mock_model::{MockAdapter, TurnScript};
+    use agentkit_integration_tests::mock_tool::BlockingTool;
     use agentkit_loop::{
-        Agent, LoopError, ModelSession, ModelTurn, ModelTurnEvent, ModelTurnResult, SessionConfig,
+        Agent, ModelSession, ModelTurn, ModelTurnEvent, ModelTurnResult, SessionConfig,
         TurnRequest, TurnResult,
     };
+    use agentkit_task_manager::{AsyncTaskManager, RoutingDecision};
     use agentkit_tools_core::{
         Tool, ToolContext, ToolError, ToolRegistry, ToolRequest, ToolResult, ToolSpec,
     };
+    use tokio::sync::Notify;
 
     #[derive(Clone)]
     struct TestFactory<A> {
@@ -1721,6 +1830,12 @@ mod tests {
         tool: CancellationAwareTool,
     }
 
+    #[derive(Clone)]
+    struct BackgroundToolTestFactory<A> {
+        adapter: A,
+        tool: BlockingTool,
+    }
+
     #[async_trait]
     impl AcpAgentFactory<MockAdapter> for ToolTestFactory {
         async fn start(
@@ -1740,6 +1855,150 @@ mod tests {
                 .start(SessionConfig::new(ctx.agentkit_session_id).with_metadata(ctx.metadata))
                 .await
                 .map_err(|error| AcpRuntimeError::Loop(error.to_string()))
+        }
+    }
+
+    #[async_trait]
+    impl<A> AcpAgentFactory<A> for BackgroundToolTestFactory<A>
+    where
+        A: ModelAdapter + Clone + Send + Sync + 'static,
+        A::Session: Send + 'static,
+    {
+        async fn start(
+            &self,
+            ctx: AcpAgentFactoryContext,
+        ) -> Result<agentkit_loop::LoopDriver<A::Session>, AcpRuntimeError> {
+            Agent::builder()
+                .model(self.adapter.clone())
+                .add_tool_source(ToolRegistry::new().with(self.tool.clone()))
+                .task_manager(
+                    AsyncTaskManager::new().routing(|_: &ToolRequest| RoutingDecision::Background),
+                )
+                .observer(ctx.integration.as_ref().clone())
+                .cancellation(ctx.cancellation)
+                .build()
+                .map_err(|error| AcpRuntimeError::Loop(error.to_string()))?
+                .start(SessionConfig::new(ctx.agentkit_session_id).with_metadata(ctx.metadata))
+                .await
+                .map_err(|error| AcpRuntimeError::Loop(error.to_string()))
+        }
+    }
+
+    struct BlockingInferenceState {
+        scripts: Mutex<VecDeque<TurnScript>>,
+        next_turn: AtomicUsize,
+        blocked_turn: usize,
+        entered: AtomicBool,
+        release: Notify,
+        cancelled: AtomicBool,
+    }
+
+    #[derive(Clone)]
+    struct BlockingInferenceAdapter {
+        state: Arc<BlockingInferenceState>,
+    }
+
+    impl BlockingInferenceAdapter {
+        fn new(scripts: impl IntoIterator<Item = TurnScript>, blocked_turn: usize) -> Self {
+            Self {
+                state: Arc::new(BlockingInferenceState {
+                    scripts: Mutex::new(scripts.into_iter().collect()),
+                    next_turn: AtomicUsize::new(0),
+                    blocked_turn,
+                    entered: AtomicBool::new(false),
+                    release: Notify::new(),
+                    cancelled: AtomicBool::new(false),
+                }),
+            }
+        }
+
+        async fn wait_until_blocked(&self) {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !self.state.entered.load(Ordering::Acquire) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("model inference did not block");
+        }
+
+        fn release(&self) {
+            self.state.release.notify_one();
+        }
+
+        fn was_cancelled(&self) -> bool {
+            self.state.cancelled.load(Ordering::Acquire)
+        }
+    }
+
+    struct BlockingInferenceSession {
+        state: Arc<BlockingInferenceState>,
+    }
+
+    struct BlockingInferenceTurn {
+        state: Arc<BlockingInferenceState>,
+        events: VecDeque<ModelTurnEvent>,
+        blocked: bool,
+    }
+
+    #[async_trait]
+    impl ModelAdapter for BlockingInferenceAdapter {
+        type Session = BlockingInferenceSession;
+
+        async fn start_session(&self, _config: SessionConfig) -> Result<Self::Session, LoopError> {
+            Ok(BlockingInferenceSession {
+                state: Arc::clone(&self.state),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl ModelSession for BlockingInferenceSession {
+        type Turn = BlockingInferenceTurn;
+
+        async fn begin_turn(
+            &mut self,
+            _request: TurnRequest,
+            _cancellation: Option<TurnCancellation>,
+        ) -> Result<Self::Turn, LoopError> {
+            let turn = self.state.next_turn.fetch_add(1, Ordering::AcqRel);
+            let script = self
+                .state
+                .scripts
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or_else(|| LoopError::InvalidState("missing blocking turn script".into()))?;
+            Ok(BlockingInferenceTurn {
+                state: Arc::clone(&self.state),
+                events: script.events.into(),
+                blocked: turn == self.state.blocked_turn,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl ModelTurn for BlockingInferenceTurn {
+        async fn next_event(
+            &mut self,
+            cancellation: Option<TurnCancellation>,
+        ) -> Result<Option<ModelTurnEvent>, LoopError> {
+            if self.blocked {
+                self.blocked = false;
+                self.state.entered.store(true, Ordering::Release);
+                if let Some(cancellation) = cancellation {
+                    tokio::select! {
+                        _ = self.state.release.notified() => {}
+                        _ = cancellation.cancelled() => {
+                            self.state.cancelled.store(true, Ordering::Release);
+                            return Err(LoopError::Cancelled);
+                        }
+                    }
+                } else {
+                    self.state.release.notified().await;
+                }
+            }
+            Ok(self.events.pop_front())
         }
     }
 
@@ -2048,6 +2307,327 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn idle_session_drives_background_completion_without_another_prompt() {
+        let adapter = MockAdapter::new();
+        adapter.enqueue(tool_turn("background-call"));
+        adapter.enqueue(streamed_text("background observed"));
+        let tool = BlockingTool::text("blocking_tool", "background done");
+        let updates = Arc::new(Mutex::new(Vec::new()));
+        let (client_transport, agent_transport) = Channel::duplex();
+
+        let server = tokio::spawn({
+            let factory = BackgroundToolTestFactory {
+                adapter,
+                tool: tool.clone(),
+            };
+            async move {
+                AcpHeadlessRuntime::<MockAdapter>::builder()
+                    .agent_factory(factory)
+                    .serve(agent_transport)
+                    .await
+            }
+        });
+
+        let client = agent_client_protocol::Client
+            .v2()
+            .on_receive_notification(
+                {
+                    let updates = Arc::clone(&updates);
+                    async move |notification: wire::UpdateSessionNotification, _cx| {
+                        updates
+                            .lock()
+                            .unwrap()
+                            .push((notification.session_id, notification.update));
+                        Ok(())
+                    }
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(client_transport, {
+                let updates = Arc::clone(&updates);
+                async move |cx| {
+                    cx.send_request(wire::InitializeRequest::new(
+                        wire::ProtocolVersion::V2,
+                        wire::Implementation::new("test-client", "1"),
+                    ))
+                    .block_task()
+                    .await?;
+                    let cwd = std::env::current_dir()
+                        .map_err(agent_client_protocol::Error::into_internal_error)?;
+                    let session = cx
+                        .send_request(wire::NewSessionRequest::new(cwd))
+                        .block_task()
+                        .await?;
+                    cx.send_request(wire::PromptRequest::new(
+                        session.session_id.clone(),
+                        vec![wire::ContentBlock::Text(wire::TextContent::new(
+                            "start background work",
+                        ))],
+                    ))
+                    .block_task()
+                    .await?;
+                    wait_for_idle(&updates, &session.session_id).await;
+                    tool.wait_until_entered().await;
+                    tool.release();
+
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        loop {
+                            let updates = updates.lock().unwrap();
+                            let completed = updates.iter().any(|(id, update)| {
+                                id == &session.session_id
+                                    && matches!(
+                                        update,
+                                        wire::SessionUpdate::ToolCallUpdate(update)
+                                            if update.tool_call_id.to_string() == "background-call"
+                                                && matches!(
+                                                    update.status,
+                                                    agent_client_protocol::schema::MaybeUndefined::Value(
+                                                        wire::ToolCallStatus::Completed
+                                                    )
+                                                )
+                                    )
+                            });
+                            let message_delivered = updates.iter().any(|(id, update)| {
+                                id == &session.session_id
+                                    && matches!(
+                                        update,
+                                        wire::SessionUpdate::AgentMessageChunk(chunk)
+                                            if matches!(
+                                                &chunk.content,
+                                                wire::ContentBlock::Text(text)
+                                                    if text.text == "background observed"
+                                            )
+                                    )
+                            });
+                            if completed && message_delivered {
+                                break;
+                            }
+                            drop(updates);
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                    })
+                    .await
+                    .expect("background completion was not delivered while idle");
+                    cx.send_request(wire::CloseSessionRequest::new(session.session_id))
+                        .block_task()
+                        .await?;
+                    Ok(())
+                }
+            });
+
+        tokio::time::timeout(Duration::from_secs(5), client)
+            .await
+            .expect("client timed out")
+            .expect("client run");
+        server.abort();
+        let _ = server.await;
+
+        let updates = updates.lock().unwrap();
+        assert_eq!(
+            updates
+                .iter()
+                .filter(|(_, update)| matches!(update, wire::SessionUpdate::UserMessage(_)))
+                .count(),
+            1,
+            "the background continuation must not require or replay a prompt"
+        );
+        assert!(updates.iter().any(|(_, update)| matches!(
+            update,
+            wire::SessionUpdate::AgentMessageChunk(chunk)
+                if matches!(
+                    &chunk.content,
+                    wire::ContentBlock::Text(text) if text.text == "background observed"
+                )
+        )));
+        assert_eq!(
+            updates
+                .iter()
+                .filter(|(_, update)| matches!(
+                    update,
+                    wire::SessionUpdate::StateUpdate(wire::StateUpdate::Running(_))
+                ))
+                .count(),
+            1,
+            "idle background completion must not re-enter Running"
+        );
+        assert_eq!(
+            updates
+                .iter()
+                .filter(|(_, update)| matches!(
+                    update,
+                    wire::SessionUpdate::StateUpdate(wire::StateUpdate::Idle(_))
+                ))
+                .count(),
+            1,
+            "idle background completion must not emit another Idle"
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_prompt_is_acknowledged_without_cancelling_blocked_autonomous_inference() {
+        let adapter = BlockingInferenceAdapter::new(
+            [
+                tool_turn("background-call"),
+                streamed_text("autonomous complete"),
+                streamed_text("queued prompt complete"),
+            ],
+            1,
+        );
+        let tool = BlockingTool::text("blocking_tool", "background done");
+        let updates = Arc::new(Mutex::new(Vec::new()));
+        let (client_transport, agent_transport) = Channel::duplex();
+
+        let server = tokio::spawn({
+            let factory = BackgroundToolTestFactory {
+                adapter: adapter.clone(),
+                tool: tool.clone(),
+            };
+            async move {
+                AcpHeadlessRuntime::<BlockingInferenceAdapter>::builder()
+                    .agent_factory(factory)
+                    .serve(agent_transport)
+                    .await
+            }
+        });
+
+        let client = agent_client_protocol::Client
+            .v2()
+            .on_receive_notification(
+                {
+                    let updates = Arc::clone(&updates);
+                    async move |notification: wire::UpdateSessionNotification, _cx| {
+                        updates
+                            .lock()
+                            .unwrap()
+                            .push((notification.session_id, notification.update));
+                        Ok(())
+                    }
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(client_transport, {
+                let adapter = adapter.clone();
+                let tool = tool.clone();
+                let updates = Arc::clone(&updates);
+                async move |cx| {
+                    cx.send_request(wire::InitializeRequest::new(
+                        wire::ProtocolVersion::V2,
+                        wire::Implementation::new("test-client", "1"),
+                    ))
+                    .block_task()
+                    .await?;
+                    let cwd = std::env::current_dir()
+                        .map_err(agent_client_protocol::Error::into_internal_error)?;
+                    let session = cx
+                        .send_request(wire::NewSessionRequest::new(cwd))
+                        .block_task()
+                        .await?;
+                    cx.send_request(wire::PromptRequest::new(
+                        session.session_id.clone(),
+                        vec![wire::ContentBlock::Text(wire::TextContent::new("start"))],
+                    ))
+                    .block_task()
+                    .await?;
+                    wait_for_idle(&updates, &session.session_id).await;
+                    tool.wait_until_entered().await;
+                    tool.release();
+                    adapter.wait_until_blocked().await;
+
+                    tokio::time::timeout(
+                        Duration::from_millis(500),
+                        cx.send_request(wire::PromptRequest::new(
+                            session.session_id.clone(),
+                            vec![wire::ContentBlock::Text(wire::TextContent::new(
+                                "queued while idle",
+                            ))],
+                        ))
+                        .block_task(),
+                    )
+                    .await
+                    .expect("prompt response waited for autonomous inference")?;
+                    assert_eq!(
+                        updates
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .filter(|(_, update)| matches!(
+                                update,
+                                wire::SessionUpdate::UserMessage(_)
+                            ))
+                            .count(),
+                        1,
+                        "queued prompt update crossed the response gate"
+                    );
+
+                    cx.send_notification(wire::CancelSessionNotification::new(
+                        session.session_id.clone(),
+                    ))?;
+                    cx.send_request(wire::ListSessionsRequest::new())
+                        .block_task()
+                        .await?;
+                    assert!(
+                        tokio::time::timeout(Duration::from_millis(50), async {
+                            while !adapter.was_cancelled() {
+                                tokio::task::yield_now().await;
+                            }
+                        })
+                        .await
+                        .is_err(),
+                        "queued prompt cancellation interrupted autonomous inference"
+                    );
+
+                    adapter.release();
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        loop {
+                            if updates.lock().unwrap().iter().any(|(_, update)| {
+                                matches!(
+                                    update,
+                                    wire::SessionUpdate::AgentMessageChunk(chunk)
+                                        if matches!(
+                                            &chunk.content,
+                                            wire::ContentBlock::Text(text)
+                                                if text.text == "autonomous complete"
+                                        )
+                                )
+                            }) {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                    })
+                    .await
+                    .expect("autonomous inference did not complete");
+                    assert!(!adapter.was_cancelled());
+                    assert_eq!(
+                        updates
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .filter(|(_, update)| matches!(
+                                update,
+                                wire::SessionUpdate::UserMessage(_)
+                            ))
+                            .count(),
+                        1,
+                        "cancelled queued prompt was driven"
+                    );
+
+                    cx.send_request(wire::CloseSessionRequest::new(session.session_id))
+                        .block_task()
+                        .await?;
+                    Ok(())
+                }
+            });
+
+        tokio::time::timeout(Duration::from_secs(5), client)
+            .await
+            .expect("client timed out")
+            .expect("client run");
+        server.abort();
+        let _ = server.await;
+    }
+
     #[test]
     fn v2_tool_updates_include_visible_text_structured_parts_and_files() {
         let outputs = [
@@ -2286,6 +2866,16 @@ mod tests {
         integration
             .bind(acp_id.clone(), agentkit_id.clone(), client)
             .expect("bind session");
+        integration
+            .install_prompt_state(
+                &acp_id,
+                Arc::new(AtomicU64::new(1)),
+                Arc::new(Mutex::new(())),
+            )
+            .expect("install prompt state");
+        integration
+            .begin_prompt(&acp_id, 1, cancellation.handle().checkpoint())
+            .expect("begin prompt");
 
         integration.route_event(
             &agentkit_id,

@@ -4,7 +4,7 @@ homepage.workspace = true
 name = "agentkit-loop"
 readme = "README.md"
 repository.workspace = true
-version = "0.10.8"
+version = "0.10.9"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -15,7 +15,7 @@ otel = ["dep:opentelemetry", "dep:tracing-opentelemetry"]
 
 [dependencies]
 agentkit-core = { version = "0.10.5", path = "../agentkit-core" }
-agentkit-task-manager = { version = "0.10.5", path = "../agentkit-task-manager" }
+agentkit-task-manager = { version = "0.10.7", path = "../agentkit-task-manager" }
 agentkit-tools-core = { version = "0.10.5", path = "../agentkit-tools-core" }
 async-trait.workspace = true
 serde.workspace = true

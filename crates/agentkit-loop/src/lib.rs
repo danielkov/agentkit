@@ -1245,7 +1245,8 @@ struct PendingApprovalToolCall {
 
 #[derive(Clone, Default)]
 struct ActiveToolRound {
-    turn_id: agentkit_core::TurnId,
+    presentation_turn_id: agentkit_core::TurnId,
+    task_turn_id: agentkit_core::TurnId,
     pending_calls: VecDeque<(ToolCallPart, ToolRequest)>,
     cancellation: Option<TurnCancellation>,
     background_pending: bool,
@@ -1372,6 +1373,7 @@ where
             pending_approval_order: VecDeque::new(),
             active_tool_round: None,
             pending_round_resume: None,
+            pending_loop_updates: VecDeque::new(),
             next_turn_index: 1,
             lifecycle: DriverLifecycle::default(),
             background_call_ids: HashSet::new(),
@@ -1646,6 +1648,7 @@ where
     pending_approval_order: VecDeque<ToolCallId>,
     active_tool_round: Option<ActiveToolRound>,
     pending_round_resume: Option<agentkit_core::TurnId>,
+    pending_loop_updates: VecDeque<TaskResolution>,
     next_turn_index: u64,
     lifecycle: DriverLifecycle,
     /// Calls currently running in the background without a transcript result.
@@ -1808,7 +1811,7 @@ where
 
     fn enqueue_pending_approval(
         &mut self,
-        turn_id: &agentkit_core::TurnId,
+        presentation_turn_id: &agentkit_core::TurnId,
         task: TaskApproval,
         cancellation: Option<TurnCancellation>,
     ) {
@@ -1827,7 +1830,7 @@ where
             request: request.clone(),
             decision: None,
             surfaced: false,
-            presentation_turn_id: turn_id.clone(),
+            presentation_turn_id: presentation_turn_id.clone(),
             task_id: task.task_id,
             call,
             tool_request: task.tool_request,
@@ -1881,7 +1884,7 @@ where
 
     fn queue_resolution_interrupt(
         &mut self,
-        turn_id: &agentkit_core::TurnId,
+        presentation_turn_id: &agentkit_core::TurnId,
         resolution: TaskResolution,
         cancellation: Option<TurnCancellation>,
     ) -> Option<LoopStep> {
@@ -1891,18 +1894,25 @@ where
                 None
             }
             TaskResolution::Approval(task) => {
-                self.enqueue_pending_approval(turn_id, task, cancellation);
+                self.enqueue_pending_approval(presentation_turn_id, task, cancellation);
                 self.take_next_unsurfaced_approval_interrupt()
             }
         }
     }
 
-    async fn drain_pending_loop_updates(&mut self) -> Result<(bool, Option<LoopStep>), LoopError> {
-        let PendingLoopUpdates { mut resolutions } = self
+    async fn collect_pending_loop_updates(&mut self) -> Result<(), LoopError> {
+        let PendingLoopUpdates { resolutions } = self
             .task_manager
             .take_pending_loop_updates()
             .await
             .map_err(|error| LoopError::Tool(ToolError::Internal(error.to_string())))?;
+        self.pending_loop_updates.extend(resolutions);
+        Ok(())
+    }
+
+    async fn drain_pending_loop_updates(&mut self) -> Result<(bool, Option<LoopStep>), LoopError> {
+        self.collect_pending_loop_updates().await?;
+        let mut resolutions = std::mem::take(&mut self.pending_loop_updates);
         if !resolutions.is_empty() {
             self.start_logical_turn();
         }
@@ -1990,30 +2000,30 @@ where
     }
 
     async fn continue_active_tool_round(&mut self) -> Result<Option<LoopStep>, LoopError> {
-        let Some(_) = self.active_tool_round.as_ref() else {
+        let Some((presentation_turn_id, task_turn_id, cancellation)) =
+            self.active_tool_round.as_ref().map(|active| {
+                (
+                    active.presentation_turn_id.clone(),
+                    active.task_turn_id.clone(),
+                    active.cancellation.clone(),
+                )
+            })
+        else {
             return Ok(None);
         };
         loop {
-            let turn_id = self
-                .active_tool_round
-                .as_ref()
-                .map(|active| active.turn_id.clone())
-                .ok_or_else(|| LoopError::InvalidState("missing active tool round".into()))?;
-            let cancellation = self
-                .active_tool_round
-                .as_ref()
-                .and_then(|active| active.cancellation.clone());
-
             if cancellation
                 .as_ref()
                 .is_some_and(TurnCancellation::is_cancelled)
             {
                 self.task_manager
-                    .on_turn_interrupted(&turn_id)
+                    .on_turn_interrupted(&task_turn_id)
                     .await
                     .map_err(|error| LoopError::Tool(ToolError::Internal(error.to_string())))?;
                 self.active_tool_round = None;
-                return self.finish_cancelled(turn_id, Vec::new()).map(Some);
+                return self
+                    .finish_cancelled(presentation_turn_id, Vec::new())
+                    .map(Some);
             }
 
             let next_call = self
@@ -2023,7 +2033,8 @@ where
             if let Some((call, tool_request)) = next_call {
                 use tracing::Instrument;
                 self.register_tool_cancellation(&call.id, cancellation.clone());
-                let dispatch_span = self.execute_tool_span(&tool_request, &turn_id, "plain");
+                let dispatch_span =
+                    self.execute_tool_span(&tool_request, &presentation_turn_id, "plain");
                 match self
                     .start_task_via_manager(
                         None,
@@ -2050,7 +2061,11 @@ where
                                 self.append_tool_result_item(item);
                             }
                             TaskResolution::Approval(task) => {
-                                self.enqueue_pending_approval(&turn_id, task, cancellation.clone());
+                                self.enqueue_pending_approval(
+                                    &presentation_turn_id,
+                                    task,
+                                    cancellation.clone(),
+                                );
                             }
                         }
                         continue;
@@ -2070,7 +2085,7 @@ where
 
             match self
                 .task_manager
-                .wait_for_turn(&turn_id, cancellation.clone())
+                .wait_for_turn(&task_turn_id, cancellation.clone())
                 .await
                 .map_err(|error| LoopError::Tool(ToolError::Internal(error.to_string())))?
             {
@@ -2084,7 +2099,11 @@ where
                             self.append_tool_result_item(item);
                         }
                         TaskResolution::Approval(task) => {
-                            self.enqueue_pending_approval(&turn_id, task, cancellation.clone());
+                            self.enqueue_pending_approval(
+                                &presentation_turn_id,
+                                task,
+                                cancellation.clone(),
+                            );
                         }
                     }
                 }
@@ -2101,13 +2120,15 @@ where
                         .is_some_and(TurnCancellation::is_cancelled)
                     {
                         self.task_manager
-                            .on_turn_interrupted(&turn_id)
+                            .on_turn_interrupted(&task_turn_id)
                             .await
                             .map_err(|error| {
                                 LoopError::Tool(ToolError::Internal(error.to_string()))
                             })?;
                         self.active_tool_round = None;
-                        return self.finish_cancelled(turn_id, Vec::new()).map(Some);
+                        return self
+                            .finish_cancelled(presentation_turn_id, Vec::new())
+                            .map(Some);
                     }
                     let active = self.active_tool_round.take().ok_or_else(|| {
                         LoopError::InvalidState("missing active tool round".into())
@@ -2129,10 +2150,10 @@ where
                     // pending_round_resume.
                     let info = ToolRoundInfo {
                         session_id: self.session_id.clone(),
-                        turn_id: turn_id.clone(),
+                        turn_id: presentation_turn_id.clone(),
                         transcript_len: self.transcript.len(),
                     };
-                    self.pending_round_resume = Some(turn_id);
+                    self.pending_round_resume = Some(presentation_turn_id);
                     return Ok(Some(LoopStep::Interrupt(LoopInterrupt::AfterToolResult(
                         info,
                     ))));
@@ -2433,7 +2454,8 @@ where
                 })
                 .collect();
             self.active_tool_round = Some(ActiveToolRound {
-                turn_id: turn_id.clone(),
+                presentation_turn_id: turn_id.clone(),
+                task_turn_id: turn_id.clone(),
                 pending_calls,
                 cancellation: cancellation.clone(),
                 background_pending: false,
@@ -2549,13 +2571,20 @@ where
                         }
                     }
                     TaskStartOutcome::Pending { kind, .. } => {
-                        if kind == agentkit_task_manager::TaskKind::Background
-                            && !self.detached_call_ids.contains(&pending.call.id)
-                        {
+                        if kind == agentkit_task_manager::TaskKind::Background {
                             self.append_detach_placeholder(
                                 pending.call.id.clone(),
                                 &pending.call.name,
                             );
+                        } else {
+                            self.active_tool_round = Some(ActiveToolRound {
+                                presentation_turn_id: pending.presentation_turn_id.clone(),
+                                task_turn_id: pending.tool_request.turn_id.clone(),
+                                pending_calls: VecDeque::new(),
+                                cancellation: cancellation.clone(),
+                                background_pending: false,
+                                foreground_progressed: false,
+                            });
                         }
                     }
                 }
@@ -2820,6 +2849,27 @@ where
         }
     }
 
+    /// Wait until an out-of-band update is available for the loop.
+    ///
+    /// This resolves immediately for updates already collected from the task
+    /// manager but deferred behind fresh input. It does not consume the update;
+    /// call [`next`](Self::next) after it resolves to append and drive the result.
+    pub fn wait_for_loop_update(
+        &self,
+    ) -> impl std::future::Future<Output = Result<(), LoopError>> + Send + 'static {
+        let has_collected_update = !self.pending_loop_updates.is_empty();
+        let task_manager = self.task_manager.clone();
+        async move {
+            if has_collected_update {
+                return Ok(());
+            }
+            task_manager
+                .wait_for_loop_update()
+                .await
+                .map_err(|error| LoopError::Tool(ToolError::Internal(error.to_string())))
+        }
+    }
+
     /// Advance the loop by one step.
     ///
     /// This is the main method for driving the agent.  It processes pending
@@ -2850,7 +2900,7 @@ where
                 .or_else(|| {
                     self.active_tool_round
                         .as_ref()
-                        .map(|active| active.turn_id.clone())
+                        .map(|active| active.presentation_turn_id.clone())
                 })
                 .or_else(|| self.pending_round_resume.clone());
             if let Some(turn_id) = continuation_turn {
@@ -2884,9 +2934,9 @@ where
         let mut seen_turns = HashSet::new();
         let mut interrupted_turns = Vec::new();
         if let Some(active) = self.active_tool_round.take()
-            && seen_turns.insert(active.turn_id.clone())
+            && seen_turns.insert(active.task_turn_id.clone())
         {
-            interrupted_turns.push(active.turn_id);
+            interrupted_turns.push(active.task_turn_id);
         }
         if let Some(turn_id) = self.pending_round_resume.take()
             && seen_turns.insert(turn_id.clone())
@@ -2929,6 +2979,22 @@ where
 
         if let Some(step) = self.continue_active_tool_round().await? {
             return Ok(step);
+        }
+
+        // A newly submitted user turn owns the next logical turn. Drive it
+        // before unrelated background completions so a delayed approval cannot
+        // bind itself to that turn's TurnStarted event. AfterToolResult resumes
+        // remain ordered ahead of fresh input below.
+        if self.pending_round_resume.is_none() && !self.pending_input.is_empty() {
+            // Take updates now to preserve the driver's once-per-step manager
+            // handoff, but defer presenting them until this input turn ends.
+            self.collect_pending_loop_updates().await?;
+            let turn_id = self.start_logical_turn();
+            let drained: Vec<Item> = std::mem::take(&mut self.pending_input);
+            self.extend_transcript(drained);
+            return self
+                .drive_turn(turn_id, MutationPoint::AfterTurnEnded)
+                .await;
         }
 
         let (had_loop_updates, loop_step) = self.drain_pending_loop_updates().await?;
@@ -2987,6 +3053,9 @@ where
 
     fn append_detach_placeholder(&mut self, call_id: ToolCallId, tool_name: &str) {
         self.background_call_ids.insert(call_id.clone());
+        if !self.detached_call_ids.insert(call_id.clone()) {
+            return;
+        }
         let detached_result = ToolResultPart {
             call_id: call_id.clone(),
             output: ToolOutput::Text(format!(
@@ -3005,7 +3074,6 @@ where
             finish_reason: None,
             created_at: None,
         });
-        self.detached_call_ids.insert(call_id);
     }
 
     /// Append a tool-result Item: emit one [`AgentEvent::ToolResultReceived`]
@@ -3097,7 +3165,7 @@ where
         }
     }
 
-    fn maybe_convert_detached(&mut self, item: Item) -> Item {
+    fn maybe_convert_detached(&mut self, mut item: Item) -> Item {
         if !matches!(item.kind, ItemKind::Tool) {
             return item;
         }
@@ -3116,6 +3184,14 @@ where
         {
             return item;
         }
+        let structured_results = results
+            .iter()
+            .map(|result| {
+                Part::structured(serde_json::to_value(result).unwrap_or_else(
+                    |error| serde_json::json!({ "serialization_error": error.to_string() }),
+                ))
+            })
+            .collect::<Vec<_>>();
         let mut text = String::new();
         for result in &results {
             self.detached_call_ids.remove(&result.call_id);
@@ -3133,8 +3209,18 @@ where
                 "Background tool call {} {}: {body}",
                 result.call_id.0, label
             ));
+            if !result.metadata.is_empty() {
+                let metadata = serde_json::to_string(&result.metadata)
+                    .unwrap_or_else(|error| format!("<metadata serialization failed: {error}>"));
+                text.push_str(&format!("; metadata: {metadata}"));
+            }
         }
-        Item::notification(text)
+        let mut notification_parts = Vec::with_capacity(1 + structured_results.len());
+        notification_parts.push(Part::text(text));
+        notification_parts.extend(structured_results);
+        item.kind = ItemKind::Notification;
+        item.parts = notification_parts;
+        item
     }
 
     /// Append several Items in order through [`Self::append_item`].
@@ -3155,8 +3241,10 @@ fn render_tool_output_brief(output: &ToolOutput) -> String {
     match output {
         ToolOutput::Text(t) => t.clone(),
         ToolOutput::Structured(value) => value.to_string(),
-        ToolOutput::Parts(parts) => format!("[{} parts]", parts.len()),
-        ToolOutput::Files(files) => format!("[{} files]", files.len()),
+        ToolOutput::Parts(parts) => serde_json::to_string(parts)
+            .unwrap_or_else(|error| format!("<parts serialization failed: {error}>")),
+        ToolOutput::Files(files) => serde_json::to_string(files)
+            .unwrap_or_else(|error| format!("<files serialization failed: {error}>")),
     }
 }
 
@@ -4346,6 +4434,8 @@ mod tests {
     struct DelayedApprovalExecutor {
         entered: StdArc<AtomicBool>,
         release: StdArc<Notify>,
+        approved_entered: Option<StdArc<AtomicBool>>,
+        approved_release: Option<StdArc<Notify>>,
         cancellation: Option<CancellationController>,
         spec: ToolSpec,
     }
@@ -4355,6 +4445,8 @@ mod tests {
             Self {
                 entered,
                 release,
+                approved_entered: None,
+                approved_release: None,
                 cancellation: None,
                 spec: ToolSpec {
                     name: ToolName::new("echo"),
@@ -4376,6 +4468,16 @@ mod tests {
 
         fn cancelling_on_approval(mut self, controller: CancellationController) -> Self {
             self.cancellation = Some(controller);
+            self
+        }
+
+        fn blocking_after_approval(
+            mut self,
+            entered: StdArc<AtomicBool>,
+            release: StdArc<Notify>,
+        ) -> Self {
+            self.approved_entered = Some(entered);
+            self.approved_release = Some(release);
             self
         }
     }
@@ -4407,6 +4509,31 @@ mod tests {
                     metadata: request.metadata,
                 }),
             )
+        }
+
+        async fn execute_approved(
+            &self,
+            request: ToolRequest,
+            approved_request: &ApprovalRequest,
+            ctx: &mut ToolContext<'_>,
+        ) -> ToolExecutionOutcome {
+            let (Some(entered), Some(release)) = (&self.approved_entered, &self.approved_release)
+            else {
+                return self.execute(request, ctx).await;
+            };
+            let _ = approved_request;
+            entered.store(true, Ordering::SeqCst);
+            release.notified().await;
+            ToolExecutionOutcome::Completed(ToolResult {
+                result: ToolResultPart {
+                    call_id: request.call_id,
+                    output: ToolOutput::Text("approved-ok".into()),
+                    is_error: false,
+                    metadata: MetadataMap::new(),
+                },
+                duration: None,
+                metadata: MetadataMap::new(),
+            })
         }
     }
 
@@ -6153,6 +6280,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn detached_parts_notification_preserves_full_output_and_metadata() {
+        let agent = Agent::builder().model(FakeAdapter).build().unwrap();
+        let mut driver = agent
+            .start(SessionConfig::new("session-detached-parts"))
+            .await
+            .unwrap();
+        let call_id = ToolCallId::new("parts-call");
+        driver.detached_call_ids.insert(call_id.clone());
+        let parts = vec![
+            Part::text("part text"),
+            Part::structured(json!({
+                "nested": [1, 2, 3]
+            })),
+        ];
+        let mut metadata = MetadataMap::new();
+        metadata.insert("source".into(), json!("background"));
+        let result = ToolResultPart {
+            call_id,
+            output: ToolOutput::Parts(parts.clone()),
+            is_error: true,
+            metadata: metadata.clone(),
+        };
+        let mut item_metadata = MetadataMap::new();
+        item_metadata.insert("delivery".into(), json!("deferred"));
+        let item = Item::new(ItemKind::Tool, vec![Part::ToolResult(result.clone())])
+            .with_metadata(item_metadata.clone());
+
+        let converted = driver.maybe_convert_detached(item);
+        let (text, structured) = match converted.parts.as_slice() {
+            [Part::Text(text), Part::Structured(structured)] => (text, structured),
+            other => panic!("unexpected converted parts: {other:?}"),
+        };
+        assert_eq!(converted.kind, ItemKind::Notification);
+        assert_eq!(converted.metadata, item_metadata);
+        assert_eq!(structured.value, serde_json::to_value(&result).unwrap());
+        assert_eq!(
+            &text.text,
+            &format!(
+                "Background tool call parts-call failed: {}; metadata: {}",
+                serde_json::to_string(&parts).unwrap(),
+                serde_json::to_string(&metadata).unwrap()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn detached_files_notification_preserves_full_output() {
+        let agent = Agent::builder().model(FakeAdapter).build().unwrap();
+        let mut driver = agent
+            .start(SessionConfig::new("session-detached-files"))
+            .await
+            .unwrap();
+        let call_id = ToolCallId::new("files-call");
+        driver.detached_call_ids.insert(call_id.clone());
+        let files = vec![
+            agentkit_core::FilePart::named("report.txt", DataRef::inline_text("full file body"))
+                .with_mime_type("text/plain"),
+            agentkit_core::FilePart::named(
+                "remote.json",
+                DataRef::uri("https://example.test/remote.json"),
+            ),
+        ];
+        let mut result_metadata = MetadataMap::new();
+        result_metadata.insert("archive".into(), json!(true));
+        let result = ToolResultPart::success(call_id, ToolOutput::Files(files.clone()))
+            .with_metadata(result_metadata);
+        let mut item_metadata = MetadataMap::new();
+        item_metadata.insert("delivery".into(), json!("deferred"));
+        let item = Item::new(ItemKind::Tool, vec![Part::ToolResult(result.clone())])
+            .with_metadata(item_metadata.clone());
+
+        let converted = driver.maybe_convert_detached(item);
+        let (text, structured) = match converted.parts.as_slice() {
+            [Part::Text(text), Part::Structured(structured)] => (text, structured),
+            other => panic!("unexpected converted files: {other:?}"),
+        };
+        assert_eq!(converted.kind, ItemKind::Notification);
+        assert_eq!(converted.metadata, item_metadata);
+        assert_eq!(structured.value, serde_json::to_value(&result).unwrap());
+        assert_eq!(
+            &text.text,
+            &format!(
+                "Background tool call files-call completed: {}; metadata: {}",
+                serde_json::to_string(&files).unwrap(),
+                serde_json::to_string(&result.metadata).unwrap()
+            )
+        );
+    }
+
+    #[tokio::test]
     async fn detached_tool_placeholder_is_progress_not_terminal_result() {
         let events = StdArc::new(StdMutex::new(Vec::new()));
         let entered = StdArc::new(AtomicBool::new(false));
@@ -6316,6 +6533,205 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn approved_foreground_task_waits_for_result_before_model_continuation() {
+        let entered = StdArc::new(AtomicBool::new(false));
+        let release = StdArc::new(Notify::new());
+        let approved_entered = StdArc::new(AtomicBool::new(false));
+        let approved_release = StdArc::new(Notify::new());
+        let route_count = StdArc::new(AtomicUsize::new(0));
+        let routing_count = route_count.clone();
+        let task_manager = AsyncTaskManager::new().routing(move |_request: &ToolRequest| {
+            if routing_count.fetch_add(1, Ordering::SeqCst) == 0 {
+                RoutingDecision::Background
+            } else {
+                RoutingDecision::Foreground
+            }
+        });
+        let handle = task_manager.handle();
+        let agent = Agent::builder()
+            .model(FakeAdapter)
+            .tool_executor(
+                DelayedApprovalExecutor::new(entered.clone(), release.clone())
+                    .blocking_after_approval(approved_entered.clone(), approved_release.clone()),
+            )
+            .task_manager(task_manager)
+            .build()
+            .unwrap();
+        let mut driver = agent
+            .start(SessionConfig::new("session-approved-foreground"))
+            .await
+            .unwrap();
+        driver
+            .submit_input(vec![Item::text(ItemKind::User, "ping")])
+            .unwrap();
+
+        assert!(matches!(
+            driver.next().await.unwrap(),
+            LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_))
+        ));
+        let task_turn = match wait_for_task_event(&handle).await {
+            TaskEvent::Started(snapshot) => snapshot.turn_id,
+            other => panic!("unexpected task event: {other:?}"),
+        };
+        wait_until_entered(entered.as_ref()).await;
+        release.notify_one();
+        wait_until_completed(&handle).await;
+
+        let pending = match driver.next().await.unwrap() {
+            LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(pending)) => pending,
+            other => panic!("unexpected delayed approval step: {other:?}"),
+        };
+        let presentation_turn = driver.lifecycle.active_turn.clone().unwrap();
+        assert_ne!(presentation_turn, task_turn);
+        pending.approve(&mut driver).unwrap();
+
+        let info = {
+            let next = driver.next();
+            tokio::pin!(next);
+            tokio::select! {
+                () = wait_until_entered(approved_entered.as_ref()) => {}
+                result = &mut next => {
+                    panic!("model continued before approved foreground result: {result:?}")
+                }
+            }
+            assert!(
+                timeout(Duration::from_millis(10), &mut next).await.is_err(),
+                "model continued while approved foreground work was blocked"
+            );
+            approved_release.notify_one();
+            let step = timeout(Duration::from_secs(1), &mut next)
+                .await
+                .expect("approved foreground result was not delivered")
+                .unwrap();
+            match step {
+                LoopStep::Interrupt(LoopInterrupt::AfterToolResult(info)) => info,
+                other => panic!("unexpected approved foreground step: {other:?}"),
+            }
+        };
+        assert_eq!(info.turn_id, presentation_turn);
+
+        let turn = match driver.next().await.unwrap() {
+            LoopStep::Finished(turn) => turn,
+            other => panic!("model did not continue after approved result: {other:?}"),
+        };
+        assert_eq!(turn.finish_reason, FinishReason::Completed);
+        assert_eq!(turn.turn_id, presentation_turn);
+        assert!(driver.snapshot().transcript.iter().any(|item| {
+            item.kind == ItemKind::Notification
+                && item.parts.iter().any(
+                    |part| matches!(part, Part::Text(text) if text.text.contains("approved-ok")),
+                )
+        }));
+    }
+
+    #[tokio::test]
+    async fn approved_foreground_then_detach_waits_and_keeps_one_placeholder() {
+        let entered = StdArc::new(AtomicBool::new(false));
+        let release = StdArc::new(Notify::new());
+        let approved_entered = StdArc::new(AtomicBool::new(false));
+        let approved_release = StdArc::new(Notify::new());
+        let route_count = StdArc::new(AtomicUsize::new(0));
+        let routing_count = route_count.clone();
+        let task_manager = AsyncTaskManager::new().routing(move |_request: &ToolRequest| {
+            if routing_count.fetch_add(1, Ordering::SeqCst) == 0 {
+                RoutingDecision::Background
+            } else {
+                RoutingDecision::ForegroundThenDetachAfter(Duration::from_millis(10))
+            }
+        });
+        let handle = task_manager.handle();
+        let agent = Agent::builder()
+            .model(FakeAdapter)
+            .tool_executor(
+                DelayedApprovalExecutor::new(entered.clone(), release.clone())
+                    .blocking_after_approval(approved_entered.clone(), approved_release.clone()),
+            )
+            .task_manager(task_manager)
+            .build()
+            .unwrap();
+        let mut driver = agent
+            .start(SessionConfig::new("session-approved-foreground-detach"))
+            .await
+            .unwrap();
+        driver
+            .submit_input(vec![Item::text(ItemKind::User, "ping")])
+            .unwrap();
+
+        assert!(matches!(
+            driver.next().await.unwrap(),
+            LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_))
+        ));
+        let _ = wait_for_task_event(&handle).await;
+        wait_until_entered(entered.as_ref()).await;
+        release.notify_one();
+        wait_until_completed(&handle).await;
+
+        let pending = match driver.next().await.unwrap() {
+            LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(pending)) => pending,
+            other => panic!("unexpected delayed approval step: {other:?}"),
+        };
+        let presentation_turn = driver.lifecycle.active_turn.clone().unwrap();
+        pending.approve(&mut driver).unwrap();
+
+        let step = timeout(Duration::from_secs(1), driver.next())
+            .await
+            .expect("approved task did not detach")
+            .unwrap();
+        assert!(approved_entered.load(Ordering::SeqCst));
+        match step {
+            LoopStep::Interrupt(LoopInterrupt::AfterToolResult(info)) => {
+                assert_eq!(info.turn_id, presentation_turn);
+            }
+            other => panic!("unexpected approved detach step: {other:?}"),
+        }
+        let placeholders = driver
+            .snapshot()
+            .transcript
+            .iter()
+            .filter(|item| item.kind == ItemKind::Tool)
+            .flat_map(|item| &item.parts)
+            .filter(|part| {
+                matches!(
+                    part,
+                    Part::ToolResult(result) if result.call_id == ToolCallId::new("call-1")
+                )
+            })
+            .count();
+        assert_eq!(placeholders, 1, "detach appended a second tool result");
+
+        approved_release.notify_one();
+        wait_until_completed(&handle).await;
+        let turn = match driver.next().await.unwrap() {
+            LoopStep::Finished(turn) => turn,
+            other => panic!("model did not continue after detached result: {other:?}"),
+        };
+        assert_eq!(turn.finish_reason, FinishReason::Completed);
+        assert_eq!(turn.turn_id, presentation_turn);
+        let transcript = driver.snapshot().transcript;
+        assert_eq!(
+            transcript
+                .iter()
+                .filter(|item| item.kind == ItemKind::Tool)
+                .flat_map(|item| &item.parts)
+                .filter(|part| {
+                    matches!(
+                        part,
+                        Part::ToolResult(result)
+                            if result.call_id == ToolCallId::new("call-1")
+                    )
+                })
+                .count(),
+            1
+        );
+        assert!(transcript.iter().any(|item| {
+            item.kind == ItemKind::Notification
+                && item.parts.iter().any(
+                    |part| matches!(part, Part::Text(text) if text.text.contains("approved-ok")),
+                )
+        }));
+    }
+
+    #[tokio::test]
     async fn approving_detached_background_call_keeps_one_placeholder() {
         let entered = StdArc::new(AtomicBool::new(false));
         let release = StdArc::new(Notify::new());
@@ -6441,6 +6857,81 @@ mod tests {
             other => panic!("fresh input did not start a new turn: {other:?}"),
         };
         assert_ne!(fresh_turn.turn_id, old_turn_id);
+    }
+
+    #[tokio::test]
+    async fn fresh_input_runs_before_delayed_background_approval() {
+        let entered = StdArc::new(AtomicBool::new(false));
+        let release = StdArc::new(Notify::new());
+        let task_manager = AsyncTaskManager::new().routing(NameRoutingPolicy::new([(
+            "echo",
+            RoutingDecision::Background,
+        )]));
+        let handle = task_manager.handle();
+        let agent = Agent::builder()
+            .model(FakeAdapter)
+            .tool_executor(DelayedApprovalExecutor::new(
+                entered.clone(),
+                release.clone(),
+            ))
+            .task_manager(task_manager)
+            .build()
+            .unwrap();
+        let mut driver = agent
+            .start(SessionConfig::new(
+                "session-input-before-background-approval",
+            ))
+            .await
+            .unwrap();
+        driver
+            .submit_input(vec![Item::text(ItemKind::User, "ping")])
+            .unwrap();
+
+        assert!(matches!(
+            driver.next().await.unwrap(),
+            LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_))
+        ));
+        let _ = wait_for_task_event(&handle).await;
+        wait_until_entered(entered.as_ref()).await;
+        release.notify_waiters();
+        wait_until_completed(&handle).await;
+
+        driver
+            .submit_input(vec![Item::text(ItemKind::User, "fresh input")])
+            .unwrap();
+        let fresh_turn = match driver.next().await.unwrap() {
+            LoopStep::Finished(turn) => turn.turn_id,
+            other => panic!("fresh input was not driven first: {other:?}"),
+        };
+        assert!(driver.pending_approvals.is_empty());
+        assert!(driver.snapshot().pending_input.is_empty());
+        timeout(Duration::from_millis(100), driver.wait_for_loop_update())
+            .await
+            .expect("collected background update did not wake the loop")
+            .unwrap();
+
+        let approval = match driver.next().await.unwrap() {
+            LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(approval)) => approval,
+            other => panic!("delayed approval was not presented separately: {other:?}"),
+        };
+        let approval_turn = driver.lifecycle.active_turn.clone().unwrap();
+        assert_ne!(fresh_turn, approval_turn);
+        assert_eq!(
+            driver
+                .snapshot()
+                .transcript
+                .iter()
+                .filter(|item| {
+                    item.kind == ItemKind::User
+                        && item.parts.iter().any(
+                            |part| matches!(part, Part::Text(text) if text.text == "fresh input"),
+                        )
+                })
+                .count(),
+            1,
+            "fresh input must not be replayed while presenting the approval"
+        );
+        approval.deny(&mut driver).unwrap();
     }
 
     #[tokio::test]
