@@ -1,4 +1,5 @@
 use std::error::Error as StdError;
+use std::time::Duration;
 
 use thiserror::Error;
 
@@ -24,6 +25,15 @@ pub enum HttpError {
     #[error("response body read failed: {0}")]
     Body(#[source] BoxError),
 
+    #[error("{operation} timed out after {timeout:?}")]
+    Timeout {
+        operation: &'static str,
+        timeout: Duration,
+    },
+
+    #[error("response body was truncated (expected {expected} bytes, received {received})")]
+    TruncatedBody { expected: u64, received: u64 },
+
     #[error("{0}")]
     Other(String),
 }
@@ -41,5 +51,14 @@ impl HttpError {
         E: StdError + Send + Sync + 'static,
     {
         Self::Body(Box::new(err))
+    }
+
+    /// Whether the failure is transient at the HTTP transport layer.
+    /// The adapter still decides whether replaying its request is safe.
+    pub fn is_retryable_transport(&self) -> bool {
+        matches!(
+            self,
+            Self::Request(_) | Self::Body(_) | Self::Timeout { .. } | Self::TruncatedBody { .. }
+        )
     }
 }

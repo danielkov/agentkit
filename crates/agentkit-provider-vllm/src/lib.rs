@@ -32,6 +32,7 @@
 use agentkit_adapter_completions::{
     CompletionsAdapter, CompletionsError, CompletionsProvider, CompletionsSession, CompletionsTurn,
 };
+use agentkit_http::{Authentication, AuthenticationProvider, ResilienceConfig};
 use agentkit_loop::{LoopError, ModelAdapter, SessionConfig};
 use async_trait::async_trait;
 use serde::Serialize;
@@ -54,7 +55,7 @@ const DEFAULT_ENDPOINT: &str = "http://localhost:8000/v1/chat/completions";
 ///     .with_base_url("http://gpu-server:8000/v1/chat/completions")
 ///     .with_temperature(0.0);
 /// ```
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct VllmConfig {
     /// HuggingFace model identifier served by the vLLM instance,
     /// e.g. `"meta-llama/Llama-3.1-8B-Instruct"`.
@@ -81,6 +82,22 @@ pub struct VllmConfig {
     /// user/assistant/user/assistant/...`. See
     /// <https://github.com/vllm-project/vllm/issues/6862>.
     pub strict_alternating_roles: bool,
+}
+
+impl std::fmt::Debug for VllmConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VllmConfig")
+            .field("model", &self.model)
+            .field("base_url", &self.base_url)
+            .field("api_key", &"<redacted>")
+            .field("temperature", &self.temperature)
+            .field("max_completion_tokens", &self.max_completion_tokens)
+            .field("top_p", &self.top_p)
+            .field("parallel_tool_calls", &self.parallel_tool_calls)
+            .field("streaming", &self.streaming)
+            .field("strict_alternating_roles", &self.strict_alternating_roles)
+            .finish()
+    }
 }
 
 impl VllmConfig {
@@ -191,7 +208,7 @@ pub struct VllmRequestConfig {
 #[derive(Clone, Debug)]
 pub struct VllmProvider {
     base_url: String,
-    api_key: Option<String>,
+    authentication: Option<Authentication>,
     streaming: bool,
     strict_alternating_roles: bool,
     request_config: VllmRequestConfig,
@@ -201,7 +218,7 @@ impl From<VllmConfig> for VllmProvider {
     fn from(config: VllmConfig) -> Self {
         Self {
             base_url: config.base_url,
-            api_key: config.api_key,
+            authentication: config.api_key.map(Authentication::bearer),
             streaming: config.streaming,
             strict_alternating_roles: config.strict_alternating_roles,
             request_config: VllmRequestConfig {
@@ -232,14 +249,14 @@ impl CompletionsProvider for VllmProvider {
         &self,
         builder: agentkit_http::HttpRequestBuilder,
     ) -> agentkit_http::HttpRequestBuilder {
-        let builder = builder.header(
+        builder.header(
             "User-Agent",
             concat!("agentkit-provider-vllm/", env!("CARGO_PKG_VERSION")),
-        );
-        match &self.api_key {
-            Some(key) => builder.bearer_auth(key),
-            None => builder,
-        }
+        )
+    }
+
+    fn authentication(&self) -> Option<Authentication> {
+        self.authentication.clone()
     }
 
     fn streaming(&self) -> bool {
@@ -285,6 +302,21 @@ impl VllmAdapter {
         let provider = VllmProvider::from(config);
         Ok(Self(CompletionsAdapter::new(provider)?))
     }
+
+    /// Adds or overrides optional server authentication.
+    pub fn with_authentication(self, authentication: impl Into<Authentication>) -> Self {
+        Self(self.0.with_authentication(authentication))
+    }
+
+    /// Adds refresh-capable optional server authentication.
+    pub fn with_authentication_provider<P: AuthenticationProvider>(self, provider: P) -> Self {
+        self.with_authentication(Authentication::new(provider))
+    }
+
+    /// Enables retry and timeout behavior.
+    pub fn with_resilience(self, resilience: ResilienceConfig) -> Self {
+        Self(self.0.with_resilience(resilience))
+    }
 }
 
 #[async_trait]
@@ -306,4 +338,20 @@ pub enum VllmError {
     /// An error from the generic completions adapter.
     #[error(transparent)]
     Completions(#[from] CompletionsError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_debug_redacts_api_key() {
+        let debug = format!(
+            "{:?}",
+            VllmConfig::new("debug-model").with_api_key("vllm-secret")
+        );
+        assert!(!debug.contains("vllm-secret"));
+        assert!(debug.contains("<redacted>"));
+        assert!(debug.contains("debug-model"));
+    }
 }

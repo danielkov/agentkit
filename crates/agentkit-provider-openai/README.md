@@ -9,11 +9,16 @@
 
 OpenAI model adapter for the agentkit agent loop.
 
-This crate provides `OpenAIAdapter` and `OpenAIConfig` for connecting the
-agent loop to the [OpenAI](https://platform.openai.com) chat completions API.
-It handles request translation, response normalization, usage reporting, and
-prompt cache integration for OpenAI-backed sessions. Streaming is enabled by
-default; use `.with_streaming(false)` to force the buffered response path.
+This crate provides two OpenAI adapters:
+
+- `OpenAIChatCompletionsAdapter` for `/v1/chat/completions`. The historical
+  `OpenAIAdapter` name remains a compatibility alias.
+- `OpenAIResponsesAdapter` for the public `/v1/responses` API and configurable
+  private Responses-compatible deployments.
+
+Both adapters translate AgentKit transcripts, tools, usage, and finish reasons.
+Chat-completions streaming is enabled by default; use `.with_streaming(false)`
+to force its buffered response path.
 
 Applications that want an OpenAI-powered agent will usually use this crate
 through the umbrella `agentkit` crate's `provider-openai` feature, or depend on
@@ -28,6 +33,81 @@ Create a config with `OpenAIConfig::new(api_key, model)` and chain `.with_*()` b
 | `OPENAI_API_KEY`  | yes      | --                                           |
 | `OPENAI_MODEL`    | no       | `gpt-4o`                                     |
 | `OPENAI_BASE_URL` | no       | `https://api.openai.com/v1/chat/completions` |
+
+## Authentication and resilience
+
+`OpenAIConfig::new(api_key, model)` and `OpenAIResponsesConfig::new(api_key,
+model)` retain the simple bearer-token constructors. The chat adapter and the
+Responses config also accept a custom `agentkit_http::Authentication` or
+`AuthenticationProvider`; the provider receives the opaque prior authentication
+attempt during the single reactive 401 refresh. The standard static bearer and
+header constructors attach an ephemeral, non-secret binding automatically.
+Custom providers that need Responses continuation replay must attach a stable,
+non-secret credential identity or generation with
+`AuthenticationAttempt::with_binding`. If a reactive refresh changes that
+binding, the adapter fails rather than sending the already encoded, binding-bound
+body. Retries and timeouts are opt-in with
+`.with_resilience(ResilienceConfig)`. Without it,
+transient transport/status/stream failures get one attempt (the one permitted
+401 refresh remains part of authentication).
+
+Responses retries reuse one clone-cheap serialized request body and a
+body-bound idempotency key. Events stream as soon as they are decoded. A failed
+attempt is replayed automatically only before its first event becomes visible.
+After visible output, replay is disabled unless the upstream consumer explicitly
+enables `agentkit_loop::response_attempt` replacement on `SessionConfig` and
+handles its reserved marker by discarding the preceding attempt. Cancellation,
+the logical retry deadline, stream-idle timeout, attempt opening timeout,
+auth/refresh, and backoff remain bounded.
+
+## Responses API
+
+```rust,no_run
+use agentkit_provider_openai::{OpenAIResponsesAdapter, OpenAIResponsesConfig};
+
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let config = OpenAIResponsesConfig::new("sk-...", "gpt-5");
+let adapter = OpenAIResponsesAdapter::new(config)?;
+# let _ = adapter;
+# Ok(())
+# }
+```
+
+For the private ChatGPT Codex-shaped endpoint, inject authentication explicitly:
+
+```rust,no_run
+use agentkit_http::Authentication;
+use agentkit_provider_openai::{OpenAIResponsesAdapter, OpenAIResponsesConfig};
+
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let authentication = Authentication::bearer("short-lived-access-token");
+let config = OpenAIResponsesConfig::chatgpt_private("gpt-5-codex", authentication)
+    .with_endpoint("https://chatgpt.com/backend-api/codex/responses");
+let adapter = OpenAIResponsesAdapter::new(config)?;
+# let _ = adapter;
+# Ok(())
+# }
+```
+
+`with_headers` supplies ordinary non-authentication headers.
+`with_request_policy` can override public/private request-field differences. The
+public and private profiles request encrypted reasoning continuation data by
+default. The private profile downgrades system messages to developer messages,
+defaults `parallel_tool_calls` to `true`,
+omits unsupported `max_output_tokens`, sends `originator`/`session-id`, and
+replays validated `x-codex-turn-state` only within one logical turn and its
+retries. HTTP turn state is accepted only from a successful SSE response; the
+equivalent `response.metadata` headers can update retry context, and all header,
+metadata, and retry values must agree. It does not perform credential discovery
+or model catalog lookups.
+
+Continuation metadata is versioned and bound to the authentication binding,
+model, session, provider item ID, and item kind. Durable encrypted
+reasoning and function-call continuation metadata is emitted and replayed only
+when authentication supplies a binding. Valid metadata for another binding is
+omitted safely; malformed metadata is a protocol error. Audio transcript input
+is rejected explicitly until the adapter supports the complete Responses audio
+shape.
 
 ## Examples
 

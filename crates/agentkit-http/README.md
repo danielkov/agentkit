@@ -50,6 +50,22 @@ let body: serde_json::Value = response.json().await?;
 `request` constructors and is cheap to clone — it holds an `Arc` over the
 underlying client.
 
+## Authentication and resilience
+
+`Authentication` is a cloneable, type-erased handle over an async
+`AuthenticationProvider`. Providers return sensitive headers plus opaque attempt
+state, which lets an adapter perform one reactive 401 refresh without learning
+how credentials are stored. Optional non-secret credential bindings let
+replay-sensitive adapters bind continuation data to an account or credential
+generation. Owned bearer and arbitrary-header credentials are redacted and
+zeroized when dropped.
+
+`ResilienceConfig` is opt-in. It combines a wall-clock retry budget, an optional
+attempt cap and attempt/stream-idle timeouts with capped exponential full-jitter
+backoff and validated `Retry-After`/rate-limit reset hints. Adapters retain
+control of replay safety; configuring resilience on `Http` alone does not replay
+requests.
+
 ## Bring your own client
 
 Any type that implements `HttpClient` plugs in unchanged. This is the seam

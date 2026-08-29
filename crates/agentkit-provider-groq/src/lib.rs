@@ -30,6 +30,7 @@
 use agentkit_adapter_completions::{
     CompletionsAdapter, CompletionsError, CompletionsProvider, CompletionsSession, CompletionsTurn,
 };
+use agentkit_http::{Authentication, AuthenticationProvider, ResilienceConfig};
 use agentkit_loop::{LoopError, ModelAdapter, SessionConfig};
 use async_trait::async_trait;
 use serde::Serialize;
@@ -51,7 +52,7 @@ const DEFAULT_ENDPOINT: &str = "https://api.groq.com/openai/v1/chat/completions"
 ///     .with_temperature(0.0)
 ///     .with_max_completion_tokens(4096);
 /// ```
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct GroqConfig {
     /// Groq API key (starts with `gsk_`).
     pub api_key: String,
@@ -71,6 +72,21 @@ pub struct GroqConfig {
     pub parallel_tool_calls: Option<bool>,
     /// Request SSE streaming responses. Defaults to `true`.
     pub streaming: bool,
+}
+
+impl std::fmt::Debug for GroqConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GroqConfig")
+            .field("api_key", &"<redacted>")
+            .field("model", &self.model)
+            .field("base_url", &self.base_url)
+            .field("temperature", &self.temperature)
+            .field("max_completion_tokens", &self.max_completion_tokens)
+            .field("top_p", &self.top_p)
+            .field("parallel_tool_calls", &self.parallel_tool_calls)
+            .field("streaming", &self.streaming)
+            .finish()
+    }
 }
 
 impl GroqConfig {
@@ -163,7 +179,7 @@ pub struct GroqRequestConfig {
 /// The Groq provider, implementing [`CompletionsProvider`].
 #[derive(Clone, Debug)]
 pub struct GroqProvider {
-    api_key: String,
+    authentication: Authentication,
     base_url: String,
     streaming: bool,
     request_config: GroqRequestConfig,
@@ -172,7 +188,7 @@ pub struct GroqProvider {
 impl From<GroqConfig> for GroqProvider {
     fn from(config: GroqConfig) -> Self {
         Self {
-            api_key: config.api_key,
+            authentication: Authentication::bearer(config.api_key),
             base_url: config.base_url,
             streaming: config.streaming,
             request_config: GroqRequestConfig {
@@ -203,10 +219,14 @@ impl CompletionsProvider for GroqProvider {
         &self,
         builder: agentkit_http::HttpRequestBuilder,
     ) -> agentkit_http::HttpRequestBuilder {
-        builder.bearer_auth(&self.api_key).header(
+        builder.header(
             "User-Agent",
             concat!("agentkit-provider-groq/", env!("CARGO_PKG_VERSION")),
         )
+    }
+
+    fn authentication(&self) -> Option<Authentication> {
+        Some(self.authentication.clone())
     }
 
     fn streaming(&self) -> bool {
@@ -246,6 +266,21 @@ impl GroqAdapter {
         let provider = GroqProvider::from(config);
         Ok(Self(CompletionsAdapter::new(provider)?))
     }
+
+    /// Overrides the default API-key authentication.
+    pub fn with_authentication(self, authentication: impl Into<Authentication>) -> Self {
+        Self(self.0.with_authentication(authentication))
+    }
+
+    /// Overrides authentication with a custom refresh-capable provider.
+    pub fn with_authentication_provider<P: AuthenticationProvider>(self, provider: P) -> Self {
+        self.with_authentication(Authentication::new(provider))
+    }
+
+    /// Enables retry and timeout behavior.
+    pub fn with_resilience(self, resilience: ResilienceConfig) -> Self {
+        Self(self.0.with_resilience(resilience))
+    }
 }
 
 #[async_trait]
@@ -267,4 +302,17 @@ pub enum GroqError {
     /// An error from the generic completions adapter.
     #[error(transparent)]
     Completions(#[from] CompletionsError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_debug_redacts_api_key() {
+        let debug = format!("{:?}", GroqConfig::new("groq-secret", "debug-model"));
+        assert!(!debug.contains("groq-secret"));
+        assert!(debug.contains("<redacted>"));
+        assert!(debug.contains("debug-model"));
+    }
 }

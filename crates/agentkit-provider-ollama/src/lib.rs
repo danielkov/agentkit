@@ -34,6 +34,7 @@
 use agentkit_adapter_completions::{
     CompletionsAdapter, CompletionsError, CompletionsProvider, CompletionsSession, CompletionsTurn,
 };
+use agentkit_http::{Authentication, AuthenticationProvider, ResilienceConfig};
 use agentkit_loop::{LoopError, ModelAdapter, SessionConfig};
 use async_trait::async_trait;
 use serde::Serialize;
@@ -278,6 +279,21 @@ impl OllamaAdapter {
     pub fn new(config: OllamaConfig) -> Result<Self, OllamaError> {
         let provider = OllamaProvider::from(config);
         Ok(Self(CompletionsAdapter::new(provider)?))
+    }
+
+    /// Adds optional authentication for a protected Ollama endpoint.
+    pub fn with_authentication(self, authentication: impl Into<Authentication>) -> Self {
+        Self(self.0.with_authentication(authentication))
+    }
+
+    /// Adds refresh-capable authentication for a protected Ollama endpoint.
+    pub fn with_authentication_provider<P: AuthenticationProvider>(self, provider: P) -> Self {
+        self.with_authentication(Authentication::new(provider))
+    }
+
+    /// Enables retry and timeout behavior.
+    pub fn with_resilience(self, resilience: ResilienceConfig) -> Self {
+        Self(self.0.with_resilience(resilience))
     }
 }
 

@@ -177,14 +177,18 @@ version = "0.10.5"
 dependencies = [
  "async-trait",
  "bytes",
+ "fastrand",
+ "futures-timer",
  "futures-util",
  "http",
+ "httpdate",
  "reqwest",
  "reqwest-middleware",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]
@@ -356,9 +360,14 @@ dependencies = [
  "agentkit-http",
  "agentkit-loop",
  "async-trait",
+ "base64 0.22.1",
+ "futures-util",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "tokio",
+ "zeroize",
 ]
 
 [[package]]

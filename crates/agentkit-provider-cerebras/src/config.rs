@@ -340,7 +340,7 @@ impl CompressionConfig {
 ///
 /// Build one with [`CerebrasConfig::new`] or [`CerebrasConfig::from_env`],
 /// then refine via the `with_*` methods.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct CerebrasConfig {
     // --- auth & transport ---
     /// `Authorization: Bearer <api_key>`.
@@ -423,6 +423,50 @@ pub struct CerebrasConfig {
     /// Compression configuration.
     #[cfg(feature = "compression")]
     pub compression: Option<CompressionConfig>,
+}
+
+impl std::fmt::Debug for CerebrasConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = f.debug_struct("CerebrasConfig");
+        debug
+            .field("api_key", &"<redacted>")
+            .field("base_url", &self.base_url)
+            .field("version_patch", &self.version_patch)
+            .field(
+                "extra_header_names",
+                &self
+                    .extra_headers
+                    .iter()
+                    .map(|(name, _)| name)
+                    .collect::<Vec<_>>(),
+            )
+            .field("model", &self.model)
+            .field("max_completion_tokens", &self.max_completion_tokens)
+            .field("min_tokens", &self.min_tokens)
+            .field("temperature", &self.temperature)
+            .field("top_p", &self.top_p)
+            .field("frequency_penalty", &self.frequency_penalty)
+            .field("presence_penalty", &self.presence_penalty)
+            .field("stop", &self.stop)
+            .field("seed", &self.seed)
+            .field("logprobs", &self.logprobs)
+            .field("top_logprobs", &self.top_logprobs)
+            .field("tool_choice", &self.tool_choice)
+            .field("parallel_tool_calls", &self.parallel_tool_calls)
+            .field("tool_strict", &self.tool_strict)
+            .field("output_format", &self.output_format)
+            .field("reasoning", &self.reasoning)
+            .field("streaming", &self.streaming);
+        #[cfg(feature = "predicted-outputs")]
+        debug.field("prediction", &self.prediction);
+        #[cfg(feature = "service-tiers")]
+        debug
+            .field("service_tier", &self.service_tier)
+            .field("queue_threshold_ms", &self.queue_threshold_ms);
+        #[cfg(feature = "compression")]
+        debug.field("compression", &self.compression);
+        debug.finish_non_exhaustive()
+    }
 }
 
 impl CerebrasConfig {
@@ -735,6 +779,20 @@ impl CerebrasConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_debug_redacts_api_key_and_extra_header_values() {
+        let mut config = CerebrasConfig::new("cerebras-secret", "debug-model").unwrap();
+        config
+            .extra_headers
+            .push(("x-private".into(), "header-secret".into()));
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("cerebras-secret"));
+        assert!(!debug.contains("header-secret"));
+        assert!(debug.contains("<redacted>"));
+        assert!(debug.contains("debug-model"));
+        assert!(debug.contains("x-private"));
+    }
 
     #[test]
     fn rejects_empty_api_key() {

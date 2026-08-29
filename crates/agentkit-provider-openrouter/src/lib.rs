@@ -35,6 +35,7 @@ use agentkit_adapter_completions::{
     CompletionsAdapter, CompletionsError, CompletionsProvider, CompletionsSession, CompletionsTurn,
 };
 use agentkit_core::{CostUsage, Item, ItemKind, MetadataMap, Part, Usage};
+use agentkit_http::{Authentication, AuthenticationProvider, ResilienceConfig};
 use agentkit_loop::{
     LoopError, ModelAdapter, PromptCacheBreakpoint, PromptCacheMode, PromptCacheRequest,
     PromptCacheRetention, PromptCacheStrategy, SessionConfig, TurnRequest,
@@ -62,7 +63,7 @@ const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 ///     .with_max_completion_tokens(4096)
 ///     .with_app_name("my-agent");
 /// ```
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct OpenRouterConfig {
     /// OpenRouter API key (starts with `sk-or-`).
     pub api_key: String,
@@ -92,6 +93,24 @@ pub struct OpenRouterConfig {
     pub streaming: bool,
     /// Arbitrary extra fields merged into the request body.
     pub extra_body: MetadataMap,
+}
+
+impl std::fmt::Debug for OpenRouterConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenRouterConfig")
+            .field("api_key", &"<redacted>")
+            .field("model", &self.model)
+            .field("base_url", &self.base_url)
+            .field("app_name", &self.app_name)
+            .field("site_url", &self.site_url)
+            .field("max_completion_tokens", &self.max_completion_tokens)
+            .field("temperature", &self.temperature)
+            .field("parallel_tool_calls", &self.parallel_tool_calls)
+            .field("reasoning_effort", &self.reasoning_effort)
+            .field("streaming", &self.streaming)
+            .field("extra_body", &self.extra_body)
+            .finish()
+    }
 }
 
 impl OpenRouterConfig {
@@ -303,7 +322,7 @@ impl Serialize for ReasoningEffort {
 /// The OpenRouter provider, implementing [`CompletionsProvider`].
 #[derive(Clone, Debug)]
 pub struct OpenRouterProvider {
-    api_key: String,
+    authentication: Authentication,
     base_url: String,
     app_name: Option<String>,
     site_url: Option<String>,
@@ -314,7 +333,7 @@ pub struct OpenRouterProvider {
 impl From<OpenRouterConfig> for OpenRouterProvider {
     fn from(config: OpenRouterConfig) -> Self {
         Self {
-            api_key: config.api_key,
+            authentication: Authentication::bearer(config.api_key),
             base_url: config.base_url,
             app_name: config.app_name,
             site_url: config.site_url,
@@ -352,7 +371,7 @@ impl CompletionsProvider for OpenRouterProvider {
         &self,
         builder: agentkit_http::HttpRequestBuilder,
     ) -> agentkit_http::HttpRequestBuilder {
-        let mut builder = builder.bearer_auth(&self.api_key).header(
+        let mut builder = builder.header(
             "User-Agent",
             concat!("agentkit-provider-openrouter/", env!("CARGO_PKG_VERSION")),
         );
@@ -363,6 +382,10 @@ impl CompletionsProvider for OpenRouterProvider {
             builder = builder.header("HTTP-Referer", site_url);
         }
         builder
+    }
+
+    fn authentication(&self) -> Option<Authentication> {
+        Some(self.authentication.clone())
     }
 
     fn streaming(&self) -> bool {
@@ -872,6 +895,21 @@ impl OpenRouterAdapter {
         let provider = OpenRouterProvider::from(config);
         Ok(Self(CompletionsAdapter::new(provider)?))
     }
+
+    /// Overrides the default API-key authentication.
+    pub fn with_authentication(self, authentication: impl Into<Authentication>) -> Self {
+        Self(self.0.with_authentication(authentication))
+    }
+
+    /// Overrides authentication with a custom refresh-capable provider.
+    pub fn with_authentication_provider<P: AuthenticationProvider>(self, provider: P) -> Self {
+        self.with_authentication(Authentication::new(provider))
+    }
+
+    /// Enables retry and timeout behavior.
+    pub fn with_resilience(self, resilience: ResilienceConfig) -> Self {
+        Self(self.0.with_resilience(resilience))
+    }
 }
 
 #[async_trait]
@@ -910,6 +948,17 @@ mod tests {
     use agentkit_core::{Item, ItemKind, MetadataMap, Part, SessionId, TextPart, TurnId};
 
     use super::*;
+
+    #[test]
+    fn config_debug_redacts_api_key() {
+        let debug = format!(
+            "{:?}",
+            OpenRouterConfig::new("openrouter-secret", "debug-model")
+        );
+        assert!(!debug.contains("openrouter-secret"));
+        assert!(debug.contains("<redacted>"));
+        assert!(debug.contains("debug-model"));
+    }
 
     #[test]
     fn adapter_reports_provider_name_without_starting_a_session() {

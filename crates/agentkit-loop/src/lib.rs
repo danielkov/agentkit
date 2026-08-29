@@ -61,6 +61,8 @@
 //! # }
 //! ```
 
+pub mod response_attempt;
+
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 

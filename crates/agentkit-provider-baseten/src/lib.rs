@@ -7,6 +7,7 @@
 use agentkit_adapter_completions::{
     CompletionsAdapter, CompletionsError, CompletionsProvider, CompletionsSession, CompletionsTurn,
 };
+use agentkit_http::{Authentication, AuthenticationProvider, ResilienceConfig};
 use agentkit_loop::{LoopError, ModelAdapter, SessionConfig};
 use async_trait::async_trait;
 use serde::Serialize;
@@ -18,7 +19,7 @@ const DEFAULT_ENDPOINT: &str = "https://inference.baseten.co/v1/chat/completions
 ///
 /// Use a Baseten Model API slug such as `"openai/gpt-oss-120b"`, or the
 /// served model name from a dedicated deployment.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct BasetenConfig {
     /// Baseten workspace API key.
     pub api_key: String,
@@ -38,6 +39,22 @@ pub struct BasetenConfig {
     pub parallel_tool_calls: Option<bool>,
     /// Request SSE streaming responses. Defaults to `true`.
     pub streaming: bool,
+}
+
+impl std::fmt::Debug for BasetenConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BasetenConfig")
+            .field("api_key", &"<redacted>")
+            .field("model", &self.model)
+            .field("base_url", &self.base_url)
+            .field("temperature", &self.temperature)
+            .field("max_tokens", &self.max_tokens)
+            .field("top_p", &self.top_p)
+            .field("top_k", &self.top_k)
+            .field("parallel_tool_calls", &self.parallel_tool_calls)
+            .field("streaming", &self.streaming)
+            .finish()
+    }
 }
 
 impl BasetenConfig {
@@ -141,7 +158,7 @@ pub struct BasetenRequestConfig {
 /// Baseten implementation of [`CompletionsProvider`].
 #[derive(Clone, Debug)]
 pub struct BasetenProvider {
-    api_key: String,
+    authentication: Authentication,
     base_url: String,
     streaming: bool,
     request_config: BasetenRequestConfig,
@@ -150,7 +167,7 @@ pub struct BasetenProvider {
 impl From<BasetenConfig> for BasetenProvider {
     fn from(config: BasetenConfig) -> Self {
         Self {
-            api_key: config.api_key,
+            authentication: Authentication::bearer(config.api_key),
             base_url: config.base_url,
             streaming: config.streaming,
             request_config: BasetenRequestConfig {
@@ -184,10 +201,14 @@ impl CompletionsProvider for BasetenProvider {
         &self,
         builder: agentkit_http::HttpRequestBuilder,
     ) -> agentkit_http::HttpRequestBuilder {
-        builder.bearer_auth(&self.api_key).header(
+        builder.header(
             "User-Agent",
             concat!("agentkit-provider-baseten/", env!("CARGO_PKG_VERSION")),
         )
+    }
+
+    fn authentication(&self) -> Option<Authentication> {
+        Some(self.authentication.clone())
     }
 
     fn streaming(&self) -> bool {
@@ -211,6 +232,21 @@ impl BasetenAdapter {
         Ok(Self(CompletionsAdapter::new(BasetenProvider::from(
             config,
         ))?))
+    }
+
+    /// Overrides the default API-key authentication.
+    pub fn with_authentication(self, authentication: impl Into<Authentication>) -> Self {
+        Self(self.0.with_authentication(authentication))
+    }
+
+    /// Overrides authentication with a custom refresh-capable provider.
+    pub fn with_authentication_provider<P: AuthenticationProvider>(self, provider: P) -> Self {
+        self.with_authentication(Authentication::new(provider))
+    }
+
+    /// Enables retry and timeout behavior.
+    pub fn with_resilience(self, resilience: ResilienceConfig) -> Self {
+        Self(self.0.with_resilience(resilience))
     }
 }
 
@@ -238,6 +274,14 @@ pub enum BasetenError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_debug_redacts_api_key() {
+        let debug = format!("{:?}", BasetenConfig::new("baseten-secret", "debug-model"));
+        assert!(!debug.contains("baseten-secret"));
+        assert!(debug.contains("<redacted>"));
+        assert!(debug.contains("debug-model"));
+    }
 
     #[test]
     fn defaults_to_model_api_with_streaming() {

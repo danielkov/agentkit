@@ -207,6 +207,31 @@ pub struct AnthropicConfig {
     pub streaming: bool,
 }
 
+impl std::fmt::Debug for AnthropicConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AnthropicConfig")
+            .field("api_key", &"<redacted>")
+            .field("auth_token", &"<redacted>")
+            .field("base_url", &self.base_url)
+            .field("anthropic_version", &self.anthropic_version)
+            .field("anthropic_beta", &self.anthropic_beta)
+            .field("model", &self.model)
+            .field("max_tokens", &self.max_tokens)
+            .field("temperature", &self.temperature)
+            .field("top_p", &self.top_p)
+            .field("top_k", &self.top_k)
+            .field("stop_sequences", &self.stop_sequences)
+            .field("thinking", &self.thinking)
+            .field("service_tier", &self.service_tier)
+            .field("tool_choice", &self.tool_choice)
+            .field("disable_parallel_tool_use", &self.disable_parallel_tool_use)
+            .field("output_format", &self.output_format)
+            .field("output_effort", &self.output_effort)
+            .field("streaming", &self.streaming)
+            .finish_non_exhaustive()
+    }
+}
+
 impl AnthropicConfig {
     /// Creates a new configuration using an API key.
     pub fn new(

@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agentkit_core::{MetadataMap, SessionId, TurnCancellation, TurnId};
-use agentkit_http::{BodyStream, Http};
+use agentkit_http::{Authentication, BodyStream, Http, ResilienceConfig};
 use agentkit_loop::TurnRequest;
 use agentkit_tools_core::ToolSpec;
 use bytes::Bytes;
@@ -21,6 +21,7 @@ use futures_util::future::{Either, select};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
+use crate::RequestExecutor;
 use crate::config::{CerebrasConfig, OutputFormat, ReasoningConfig};
 use crate::error::CerebrasError;
 use crate::files::{FilePurpose, FilesClient};
@@ -163,6 +164,8 @@ impl ChatOverrides {
 pub struct BatchClient<'a> {
     http: &'a Http,
     config: Arc<CerebrasConfig>,
+    authentication: Authentication,
+    resilience: Option<ResilienceConfig>,
 }
 
 /// Outcome of a terminal poll in [`BatchClient::wait`].
@@ -189,7 +192,30 @@ impl<'a> BatchClient<'a> {
     /// Builds a new client — normally constructed via
     /// [`crate::CerebrasAdapter::batches`].
     pub fn new(http: &'a Http, config: Arc<CerebrasConfig>) -> Self {
-        Self { http, config }
+        let authentication = Authentication::bearer(config.api_key.clone());
+        Self::new_with_policy(http, config, authentication, None)
+    }
+
+    pub(crate) fn new_with_policy(
+        http: &'a Http,
+        config: Arc<CerebrasConfig>,
+        authentication: Authentication,
+        resilience: Option<ResilienceConfig>,
+    ) -> Self {
+        Self {
+            http,
+            config,
+            authentication,
+            resilience,
+        }
+    }
+
+    fn executor(&self) -> RequestExecutor {
+        RequestExecutor::new(
+            self.http,
+            self.authentication.clone(),
+            self.resilience.clone(),
+        )
     }
 
     /// Assembles the JSONL input via [`crate::request::build_chat_body`],
@@ -242,13 +268,18 @@ impl<'a> BatchClient<'a> {
             }
         }
 
-        let file = FilesClient::new(self.http, self.config.clone())
-            .upload(
-                &format!("batch-{}.jsonl", line_count),
-                Bytes::from(jsonl),
-                FilePurpose::Batch,
-            )
-            .await?;
+        let file = FilesClient::new_with_policy(
+            self.http,
+            self.config.clone(),
+            self.authentication.clone(),
+            self.resilience.clone(),
+        )
+        .upload(
+            &format!("batch-{}.jsonl", line_count),
+            Bytes::from(jsonl),
+            FilePurpose::Batch,
+        )
+        .await?;
 
         self.create(&file.id, metadata).await
     }
@@ -267,11 +298,10 @@ impl<'a> BatchClient<'a> {
             "metadata": metadata,
         });
         let response = self
-            .http
-            .post(&url)
-            .bearer_auth(&self.config.api_key)
-            .json(&body)
-            .send()
+            .executor()
+            // Creating a batch has no documented idempotency key, so apply
+            // authentication and timeouts but do not retry the POST.
+            .execute_buffered_without_retries(|| self.http.post(&url).json(&body))
             .await?;
         if !response.status().is_success() {
             let status = response.status().as_u16();
@@ -285,10 +315,8 @@ impl<'a> BatchClient<'a> {
     pub async fn list(&self) -> Result<Vec<BatchJob>, CerebrasError> {
         let url = format!("{}/batches", self.config.base_url);
         let response = self
-            .http
-            .get(&url)
-            .bearer_auth(&self.config.api_key)
-            .send()
+            .executor()
+            .execute_buffered(|| self.http.get(&url))
             .await?;
         if !response.status().is_success() {
             let status = response.status().as_u16();
@@ -303,10 +331,8 @@ impl<'a> BatchClient<'a> {
     pub async fn retrieve(&self, id: &str) -> Result<BatchJob, CerebrasError> {
         let url = format!("{}/batches/{id}", self.config.base_url);
         let response = self
-            .http
-            .get(&url)
-            .bearer_auth(&self.config.api_key)
-            .send()
+            .executor()
+            .execute_buffered(|| self.http.get(&url))
             .await?;
         if !response.status().is_success() {
             let status = response.status().as_u16();
@@ -320,10 +346,9 @@ impl<'a> BatchClient<'a> {
     pub async fn cancel(&self, id: &str) -> Result<BatchJob, CerebrasError> {
         let url = format!("{}/batches/{id}/cancel", self.config.base_url);
         let response = self
-            .http
-            .post(&url)
-            .bearer_auth(&self.config.api_key)
-            .send()
+            .executor()
+            // The API does not expose an idempotency key for cancellation.
+            .execute_buffered_without_retries(|| self.http.post(&url))
             .await?;
         if !response.status().is_success() {
             let status = response.status().as_u16();
@@ -347,7 +372,12 @@ impl<'a> BatchClient<'a> {
         loop {
             let job = self.retrieve(id).await?;
             if job.status.is_terminal() {
-                let files = crate::files::FilesClient::new(self.http, self.config.clone());
+                let files = crate::files::FilesClient::new_with_policy(
+                    self.http,
+                    self.config.clone(),
+                    self.authentication.clone(),
+                    self.resilience.clone(),
+                );
                 let outputs = match &job.output_file_id {
                     Some(fid) => Some(files.content(fid).await?),
                     None => None,

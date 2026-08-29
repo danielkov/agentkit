@@ -32,6 +32,7 @@
 use agentkit_adapter_completions::{
     CompletionsAdapter, CompletionsError, CompletionsProvider, CompletionsSession, CompletionsTurn,
 };
+use agentkit_http::{Authentication, AuthenticationProvider, ResilienceConfig};
 use agentkit_loop::{LoopError, ModelAdapter, SessionConfig};
 use async_trait::async_trait;
 use serde::Serialize;
@@ -53,7 +54,7 @@ const DEFAULT_ENDPOINT: &str = "https://api.mistral.ai/v1/chat/completions";
 ///     .with_temperature(0.0)
 ///     .with_max_tokens(4096);
 /// ```
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct MistralConfig {
     /// Mistral API key.
     pub api_key: String,
@@ -81,6 +82,22 @@ pub struct MistralConfig {
     /// `Conversation roles must alternate user/assistant/user/assistant/...`.
     /// See <https://github.com/vllm-project/vllm/issues/6862>.
     pub strict_alternating_roles: bool,
+}
+
+impl std::fmt::Debug for MistralConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MistralConfig")
+            .field("api_key", &"<redacted>")
+            .field("model", &self.model)
+            .field("base_url", &self.base_url)
+            .field("temperature", &self.temperature)
+            .field("max_tokens", &self.max_tokens)
+            .field("top_p", &self.top_p)
+            .field("parallel_tool_calls", &self.parallel_tool_calls)
+            .field("streaming", &self.streaming)
+            .field("strict_alternating_roles", &self.strict_alternating_roles)
+            .finish()
+    }
 }
 
 impl MistralConfig {
@@ -185,7 +202,7 @@ pub struct MistralRequestConfig {
 /// The Mistral provider, implementing [`CompletionsProvider`].
 #[derive(Clone, Debug)]
 pub struct MistralProvider {
-    api_key: String,
+    authentication: Authentication,
     base_url: String,
     streaming: bool,
     strict_alternating_roles: bool,
@@ -195,7 +212,7 @@ pub struct MistralProvider {
 impl From<MistralConfig> for MistralProvider {
     fn from(config: MistralConfig) -> Self {
         Self {
-            api_key: config.api_key,
+            authentication: Authentication::bearer(config.api_key),
             base_url: config.base_url,
             streaming: config.streaming,
             strict_alternating_roles: config.strict_alternating_roles,
@@ -227,10 +244,14 @@ impl CompletionsProvider for MistralProvider {
         &self,
         builder: agentkit_http::HttpRequestBuilder,
     ) -> agentkit_http::HttpRequestBuilder {
-        builder.bearer_auth(&self.api_key).header(
+        builder.header(
             "User-Agent",
             concat!("agentkit-provider-mistral/", env!("CARGO_PKG_VERSION")),
         )
+    }
+
+    fn authentication(&self) -> Option<Authentication> {
+        Some(self.authentication.clone())
     }
 
     fn streaming(&self) -> bool {
@@ -274,6 +295,21 @@ impl MistralAdapter {
         let provider = MistralProvider::from(config);
         Ok(Self(CompletionsAdapter::new(provider)?))
     }
+
+    /// Overrides the default API-key authentication.
+    pub fn with_authentication(self, authentication: impl Into<Authentication>) -> Self {
+        Self(self.0.with_authentication(authentication))
+    }
+
+    /// Overrides authentication with a custom refresh-capable provider.
+    pub fn with_authentication_provider<P: AuthenticationProvider>(self, provider: P) -> Self {
+        self.with_authentication(Authentication::new(provider))
+    }
+
+    /// Enables retry and timeout behavior.
+    pub fn with_resilience(self, resilience: ResilienceConfig) -> Self {
+        Self(self.0.with_resilience(resilience))
+    }
 }
 
 #[async_trait]
@@ -295,4 +331,17 @@ pub enum MistralError {
     /// An error from the generic completions adapter.
     #[error(transparent)]
     Completions(#[from] CompletionsError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_debug_redacts_api_key() {
+        let debug = format!("{:?}", MistralConfig::new("mistral-secret", "debug-model"));
+        assert!(!debug.contains("mistral-secret"));
+        assert!(debug.contains("<redacted>"));
+        assert!(debug.contains("debug-model"));
+    }
 }
