@@ -22,7 +22,7 @@ Use it when OpenRouter is the backing model provider for your agent runtime.
 
 ## Configuration
 
-Create a config with `OpenRouterConfig::new(api_key, model)` and chain `.with_*()` builders for optional parameters. Streaming is enabled by default; use `.with_streaming(false)` to force the buffered response path. Alternatively, `OpenRouterConfig::from_env()` reads from environment variables:
+Create a config with `OpenRouterConfig::new(authentication, model)` and chain `.with_*()` builders for optional parameters. Streaming is enabled by default; use `.with_streaming(false)` to force the buffered response path. Alternatively, `OpenRouterConfig::from_env()` reads from environment variables:
 
 | Variable                           | Required | Default                                         |
 | ---------------------------------- | -------- | ----------------------------------------------- |
@@ -33,6 +33,18 @@ Create a config with `OpenRouterConfig::new(api_key, model)` and chain `.with_*(
 | `OPENROUTER_SITE_URL`              | no       | --                                              |
 | `OPENROUTER_MAX_COMPLETION_TOKENS` | no       | --                                              |
 | `OPENROUTER_TEMPERATURE`           | no       | --                                              |
+
+## Authentication and resilience
+
+`OpenRouterConfig` stores credentials as a first-class
+`agentkit_http::Authentication`. A bare string passed to
+`OpenRouterConfig::new` or `.with_authentication(...)` is shorthand for bearer
+authentication. Use `.with_authentication_provider(...)` for a custom
+refresh-capable `AuthenticationProvider`.
+
+Resilience is opt-in: `resilience` is an `Option<ResilienceConfig>` that
+defaults to `None`. Calling `.with_resilience(...)` enables retries and
+timeouts; leaving it as `None` preserves the existing single-attempt behavior.
 
 ## Examples
 

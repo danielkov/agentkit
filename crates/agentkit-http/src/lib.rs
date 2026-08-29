@@ -37,6 +37,7 @@ mod tests {
     use async_trait::async_trait;
     use bytes::Bytes;
     use futures_util::stream;
+    use std::borrow::Cow;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -142,17 +143,48 @@ mod tests {
         assert!(debug.contains("binding_present: true"));
         assert!(second.headers()[header::AUTHORIZATION].is_sensitive());
 
-        let bearer: Authentication = String::from("owned-secret").into();
-        let attempt = bearer.authenticate(None).await.unwrap();
-        assert_eq!(
-            attempt.headers()[header::AUTHORIZATION],
-            "Bearer owned-secret"
-        );
-        assert!(attempt.headers()[header::AUTHORIZATION].is_sensitive());
-        assert!(attempt.binding().is_some());
-        assert_eq!(attempt.clone().binding(), attempt.binding());
-        assert!(!attempt.binding().unwrap().contains("owned-secret"));
-        assert!(format!("{attempt:?}").contains("binding_present: true"));
+        let borrowed_source = String::from("borrowed-secret");
+        let borrowed: Authentication = borrowed_source.as_str().into();
+        drop(borrowed_source);
+
+        let borrowed_string_source = String::from("borrowed-string-secret");
+        let borrowed_string: Authentication = (&borrowed_string_source).into();
+        drop(borrowed_string_source);
+
+        let cow_borrowed_source = String::from("cow-borrowed-secret");
+        let cow_borrowed: Authentication = Cow::Borrowed(cow_borrowed_source.as_str()).into();
+        drop(cow_borrowed_source);
+
+        let bearers = [
+            (String::from("string-secret").into(), "string-secret"),
+            (
+                String::from("box-secret").into_boxed_str().into(),
+                "box-secret",
+            ),
+            (Arc::<str>::from("arc-secret").into(), "arc-secret"),
+            (
+                Cow::<'static, str>::Owned(String::from("cow-owned-secret")).into(),
+                "cow-owned-secret",
+            ),
+            (borrowed, "borrowed-secret"),
+            (borrowed_string, "borrowed-string-secret"),
+            (cow_borrowed, "cow-borrowed-secret"),
+            ("static-secret".into(), "static-secret"),
+        ];
+        for (bearer, secret) in bearers {
+            let attempt = bearer.authenticate(None).await.unwrap();
+            assert_eq!(
+                attempt.headers()[header::AUTHORIZATION].to_str().unwrap(),
+                format!("Bearer {secret}")
+            );
+            assert!(attempt.headers()[header::AUTHORIZATION].is_sensitive());
+            assert!(attempt.binding().is_some());
+            assert_eq!(attempt.clone().binding(), attempt.binding());
+            assert!(!attempt.binding().unwrap().contains(secret));
+            let debug = format!("{bearer:?} {attempt:?}");
+            assert!(!debug.contains(secret));
+            assert!(debug.contains("binding_present: true"));
+        }
 
         let header = Authentication::header(
             HeaderName::from_static("x-api-key"),

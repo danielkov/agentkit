@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 
+use agentkit_http::{Authentication, AuthenticationProvider, ResilienceConfig};
 use serde_json::{Map, Value, json};
 
 use crate::error::BuildError;
@@ -343,10 +344,13 @@ impl CompressionConfig {
 #[derive(Clone)]
 pub struct CerebrasConfig {
     // --- auth & transport ---
-    /// `Authorization: Bearer <api_key>`.
-    pub api_key: String,
+    /// Authentication used for every Cerebras API surface. Strings become bearer authentication.
+    pub authentication: Authentication,
     /// Endpoint base URL.
     pub base_url: String,
+    /// Optional retry and timeout policy shared by chat, files, batches, and models.
+    /// `None` preserves the original single-attempt, no-timeout behavior.
+    pub resilience: Option<ResilienceConfig>,
     /// `X-Cerebras-Version-Patch` header. `None` opts into the current API
     /// default.
     pub version_patch: Option<u32>,
@@ -429,8 +433,9 @@ impl std::fmt::Debug for CerebrasConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut debug = f.debug_struct("CerebrasConfig");
         debug
-            .field("api_key", &"<redacted>")
+            .field("authentication", &"<redacted>")
             .field("base_url", &self.base_url)
+            .field("resilience", &self.resilience)
             .field("version_patch", &self.version_patch)
             .field(
                 "extra_header_names",
@@ -470,15 +475,16 @@ impl std::fmt::Debug for CerebrasConfig {
 }
 
 impl CerebrasConfig {
-    /// Creates a new configuration with the given API key and model.
-    pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Result<Self, BuildError> {
-        let api_key = api_key.into();
-        if api_key.is_empty() {
-            return Err(BuildError::MissingEnv("CEREBRAS_API_KEY"));
-        }
+    /// Creates a new configuration with the given authentication and model.
+    /// String authentication values become bearer tokens.
+    pub fn new(
+        authentication: impl Into<Authentication>,
+        model: impl Into<String>,
+    ) -> Result<Self, BuildError> {
         Ok(Self {
-            api_key,
+            authentication: authentication.into(),
             base_url: DEFAULT_BASE_URL.into(),
+            resilience: None,
             version_patch: DEFAULT_VERSION_PATCH,
             extra_headers: Vec::new(),
             extra_body: None,
@@ -524,6 +530,9 @@ impl CerebrasConfig {
     pub fn from_env() -> Result<Self, BuildError> {
         let api_key = std::env::var("CEREBRAS_API_KEY")
             .map_err(|_| BuildError::MissingEnv("CEREBRAS_API_KEY"))?;
+        if api_key.is_empty() {
+            return Err(BuildError::MissingEnv("CEREBRAS_API_KEY"));
+        }
         let model = std::env::var("CEREBRAS_MODEL")
             .map_err(|_| BuildError::MissingEnv("CEREBRAS_MODEL"))?;
         let mut config = Self::new(api_key, model)?;
@@ -614,6 +623,29 @@ impl CerebrasConfig {
     }
 
     // --- Builder methods ---
+
+    /// Replaces authentication for every Cerebras API surface.
+    pub fn with_authentication(mut self, authentication: impl Into<Authentication>) -> Self {
+        self.authentication = authentication.into();
+        self
+    }
+
+    /// Compatibility builder for bearer API-key authentication.
+    pub fn with_api_key(self, api_key: impl Into<Authentication>) -> Self {
+        self.with_authentication(api_key)
+    }
+
+    /// Uses a custom refresh-capable authentication provider.
+    pub fn with_authentication_provider<P: AuthenticationProvider>(mut self, provider: P) -> Self {
+        self.authentication = Authentication::new(provider);
+        self
+    }
+
+    /// Enables request retries and timeouts for every Cerebras API surface.
+    pub fn with_resilience(mut self, resilience: ResilienceConfig) -> Self {
+        self.resilience = Some(resilience);
+        self
+    }
 
     /// Overrides the endpoint base URL.
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
@@ -781,7 +813,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn config_debug_redacts_api_key_and_extra_header_values() {
+    fn config_debug_redacts_authentication_and_extra_header_values() {
         let mut config = CerebrasConfig::new("cerebras-secret", "debug-model").unwrap();
         config
             .extra_headers
@@ -795,9 +827,12 @@ mod tests {
     }
 
     #[test]
-    fn rejects_empty_api_key() {
-        let err = CerebrasConfig::new("", "gpt-oss-120b").unwrap_err();
-        assert!(matches!(err, BuildError::MissingEnv(_)));
+    fn config_accepts_first_class_authentication_and_resilience() {
+        let config = CerebrasConfig::new(Authentication::bearer("secret"), "gpt-oss-120b")
+            .unwrap()
+            .with_resilience(ResilienceConfig::default());
+        assert!(config.resilience.is_some());
+        assert!(!format!("{config:?}").contains("secret"));
     }
 
     #[test]

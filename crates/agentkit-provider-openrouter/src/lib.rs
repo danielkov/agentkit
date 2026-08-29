@@ -65,8 +65,8 @@ const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 /// ```
 #[derive(Clone)]
 pub struct OpenRouterConfig {
-    /// OpenRouter API key (starts with `sk-or-`).
-    pub api_key: String,
+    /// Authentication applied to each request. Bare strings use bearer authentication.
+    pub authentication: Authentication,
     /// Model identifier, e.g. `"anthropic/claude-sonnet-4"` or `"openrouter/auto"`.
     pub model: String,
     /// Chat completions endpoint URL. Defaults to the OpenRouter production URL.
@@ -91,6 +91,8 @@ pub struct OpenRouterConfig {
     pub reasoning_effort: Option<ReasoningEffort>,
     /// Request SSE streaming responses. Defaults to `true`.
     pub streaming: bool,
+    /// Optional retry and timeout policy. `None` preserves single-attempt behavior.
+    pub resilience: Option<ResilienceConfig>,
     /// Arbitrary extra fields merged into the request body.
     pub extra_body: MetadataMap,
 }
@@ -98,7 +100,7 @@ pub struct OpenRouterConfig {
 impl std::fmt::Debug for OpenRouterConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OpenRouterConfig")
-            .field("api_key", &"<redacted>")
+            .field("authentication", &"<redacted>")
             .field("model", &self.model)
             .field("base_url", &self.base_url)
             .field("app_name", &self.app_name)
@@ -108,16 +110,19 @@ impl std::fmt::Debug for OpenRouterConfig {
             .field("parallel_tool_calls", &self.parallel_tool_calls)
             .field("reasoning_effort", &self.reasoning_effort)
             .field("streaming", &self.streaming)
+            .field("resilience", &self.resilience)
             .field("extra_body", &self.extra_body)
             .finish()
     }
 }
 
 impl OpenRouterConfig {
-    /// Creates a new configuration with the given API key and model identifier.
-    pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
+    /// Creates a new configuration with the given authentication and model identifier.
+    ///
+    /// Bare strings are treated as bearer tokens.
+    pub fn new(authentication: impl Into<Authentication>, model: impl Into<String>) -> Self {
         Self {
-            api_key: api_key.into(),
+            authentication: authentication.into(),
             model: model.into(),
             base_url: DEFAULT_BASE_URL.into(),
             app_name: None,
@@ -127,8 +132,26 @@ impl OpenRouterConfig {
             parallel_tool_calls: None,
             reasoning_effort: None,
             streaming: true,
+            resilience: None,
             extra_body: MetadataMap::new(),
         }
+    }
+
+    /// Replaces the configured authentication.
+    pub fn with_authentication(mut self, authentication: impl Into<Authentication>) -> Self {
+        self.authentication = authentication.into();
+        self
+    }
+
+    /// Uses a custom refresh-capable authentication provider.
+    pub fn with_authentication_provider<P: AuthenticationProvider>(self, provider: P) -> Self {
+        self.with_authentication(Authentication::new(provider))
+    }
+
+    /// Enables request and pre-visible-output retries and timeouts.
+    pub fn with_resilience(mut self, resilience: ResilienceConfig) -> Self {
+        self.resilience = Some(resilience);
+        self
     }
 
     /// Requests a reasoning effort level from reasoning-capable models.
@@ -323,6 +346,7 @@ impl Serialize for ReasoningEffort {
 #[derive(Clone, Debug)]
 pub struct OpenRouterProvider {
     authentication: Authentication,
+    resilience: Option<ResilienceConfig>,
     base_url: String,
     app_name: Option<String>,
     site_url: Option<String>,
@@ -333,7 +357,8 @@ pub struct OpenRouterProvider {
 impl From<OpenRouterConfig> for OpenRouterProvider {
     fn from(config: OpenRouterConfig) -> Self {
         Self {
-            authentication: Authentication::bearer(config.api_key),
+            authentication: config.authentication,
+            resilience: config.resilience,
             base_url: config.base_url,
             app_name: config.app_name,
             site_url: config.site_url,
@@ -386,6 +411,10 @@ impl CompletionsProvider for OpenRouterProvider {
 
     fn authentication(&self) -> Option<Authentication> {
         Some(self.authentication.clone())
+    }
+
+    fn resilience_config(&self) -> Option<ResilienceConfig> {
+        self.resilience.clone()
     }
 
     fn streaming(&self) -> bool {
@@ -958,6 +987,18 @@ mod tests {
         assert!(!debug.contains("openrouter-secret"));
         assert!(debug.contains("<redacted>"));
         assert!(debug.contains("debug-model"));
+    }
+
+    #[test]
+    fn config_resilience_reaches_provider() {
+        let default_provider = OpenRouterProvider::from(OpenRouterConfig::new("key", "model"));
+        assert_eq!(default_provider.resilience_config(), None);
+
+        let resilience = ResilienceConfig::no_retries();
+        let provider = OpenRouterProvider::from(
+            OpenRouterConfig::new("key", "model").with_resilience(resilience.clone()),
+        );
+        assert_eq!(provider.resilience_config(), Some(resilience));
     }
 
     #[test]

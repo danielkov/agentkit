@@ -1,4 +1,5 @@
 use std::any::Any;
+use std::borrow::Cow;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -89,6 +90,10 @@ pub trait AuthenticationProvider: Send + Sync + 'static {
 }
 
 /// Clone-cheap, type-erased authentication provider handle.
+///
+/// Converting a bare `String`, `Box<str>`, `Arc<str>`, `Cow<str>`, or `&str`
+/// into `Authentication` creates bearer authentication. Borrowed strings are
+/// copied into owned storage whose bytes are zeroized on drop.
 #[derive(Clone)]
 pub struct Authentication {
     inner: Arc<dyn AuthenticationProvider>,
@@ -118,9 +123,12 @@ impl Authentication {
         Self::new(StaticAuthentication::bearer(token.into().into_bytes()))
     }
 
-    /// Creates bearer authentication without allocating retained token storage.
+    /// Creates bearer authentication from a static token.
+    ///
+    /// This compatibility helper copies the token into owned storage whose bytes
+    /// are overwritten when the last handle is dropped.
     pub fn bearer_static(token: &'static str) -> Self {
-        Self::new(StaticAuthentication::bearer_static(token))
+        Self::bearer(token.to_owned())
     }
 
     /// Creates authentication using one arbitrary secret header.
@@ -132,8 +140,10 @@ impl Authentication {
     }
 
     /// Creates authentication using one arbitrary static secret header.
+    ///
+    /// This compatibility helper copies the value into owned zeroizing storage.
     pub fn header_static(name: HeaderName, value: &'static str) -> Self {
-        Self::new(StaticAuthentication::header_static(name, value))
+        Self::header(name, value.to_owned())
     }
 }
 
@@ -148,9 +158,37 @@ impl From<String> for Authentication {
         Self::bearer(token)
     }
 }
-impl From<&'static str> for Authentication {
-    fn from(token: &'static str) -> Self {
-        Self::bearer_static(token)
+
+impl From<Box<str>> for Authentication {
+    fn from(token: Box<str>) -> Self {
+        Self::bearer(token.into_string())
+    }
+}
+
+impl From<Arc<str>> for Authentication {
+    fn from(token: Arc<str>) -> Self {
+        Self::bearer(token.as_ref().to_owned())
+    }
+}
+
+impl<'a> From<Cow<'a, str>> for Authentication {
+    fn from(token: Cow<'a, str>) -> Self {
+        match token {
+            Cow::Owned(token) => Self::bearer(token),
+            Cow::Borrowed(token) => Self::bearer(token.to_owned()),
+        }
+    }
+}
+
+impl From<&str> for Authentication {
+    fn from(token: &str) -> Self {
+        Self::bearer(token.to_owned())
+    }
+}
+
+impl From<&String> for Authentication {
+    fn from(token: &String) -> Self {
+        Self::bearer(token.to_owned())
     }
 }
 
@@ -166,14 +204,9 @@ impl From<HeaderMap> for Authentication {
     }
 }
 
-enum SecretValue {
-    Owned(Zeroizing<Vec<u8>>),
-    Static(&'static str),
-}
-
 struct StaticAuthentication {
     name: HeaderName,
-    value: SecretValue,
+    value: Zeroizing<Vec<u8>>,
     bearer: bool,
     binding: Arc<str>,
 }
@@ -196,15 +229,7 @@ impl StaticAuthentication {
     fn bearer(value: Vec<u8>) -> Self {
         Self {
             name: header::AUTHORIZATION,
-            value: SecretValue::Owned(Zeroizing::new(value)),
-            bearer: true,
-            binding: static_authentication_binding(),
-        }
-    }
-    fn bearer_static(value: &'static str) -> Self {
-        Self {
-            name: header::AUTHORIZATION,
-            value: SecretValue::Static(value),
+            value: Zeroizing::new(value),
             bearer: true,
             binding: static_authentication_binding(),
         }
@@ -212,25 +237,13 @@ impl StaticAuthentication {
     fn header(name: HeaderName, value: Vec<u8>) -> Self {
         Self {
             name,
-            value: SecretValue::Owned(Zeroizing::new(value)),
+            value: Zeroizing::new(value),
             bearer: false,
             binding: static_authentication_binding(),
         }
     }
-    fn header_static(name: HeaderName, value: &'static str) -> Self {
-        Self {
-            name,
-            value: SecretValue::Static(value),
-            bearer: false,
-            binding: static_authentication_binding(),
-        }
-    }
-
     fn value(&self) -> Result<HeaderValue, HttpError> {
-        let bytes = match &self.value {
-            SecretValue::Owned(value) => value.as_slice(),
-            SecretValue::Static(value) => value.as_bytes(),
-        };
+        let bytes = self.value.as_slice();
         let rendered = if self.bearer {
             let mut rendered = Zeroizing::new(Vec::with_capacity(7 + bytes.len()));
             rendered.extend_from_slice(b"Bearer ");

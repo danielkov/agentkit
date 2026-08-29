@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use agentkit_http::{Authentication, Http, ResilienceConfig};
+use agentkit_http::Http;
 use serde::{Deserialize, Serialize};
 
 use crate::RequestExecutor;
@@ -16,30 +16,13 @@ use crate::error::CerebrasError;
 pub struct ModelsClient<'a> {
     http: &'a Http,
     config: Arc<CerebrasConfig>,
-    authentication: Authentication,
-    resilience: Option<ResilienceConfig>,
 }
 
 impl<'a> ModelsClient<'a> {
     /// Builds a new client. Normally constructed via
     /// [`crate::CerebrasAdapter::models`].
     pub fn new(http: &'a Http, config: Arc<CerebrasConfig>) -> Self {
-        let authentication = Authentication::bearer(config.api_key.clone());
-        Self::new_with_policy(http, config, authentication, None)
-    }
-
-    pub(crate) fn new_with_policy(
-        http: &'a Http,
-        config: Arc<CerebrasConfig>,
-        authentication: Authentication,
-        resilience: Option<ResilienceConfig>,
-    ) -> Self {
-        Self {
-            http,
-            config,
-            authentication,
-            resilience,
-        }
+        Self { http, config }
     }
 
     /// `GET /v1/models` — list every model visible to the API key.
@@ -47,8 +30,8 @@ impl<'a> ModelsClient<'a> {
         let url = format!("{}/models", self.config.base_url);
         let executor = RequestExecutor::new(
             self.http,
-            self.authentication.clone(),
-            self.resilience.clone(),
+            self.config.authentication.clone(),
+            self.config.resilience.clone(),
         );
         let response = executor.execute_buffered(|| self.http.get(&url)).await?;
         if !response.status().is_success() {
@@ -65,8 +48,8 @@ impl<'a> ModelsClient<'a> {
         let url = format!("{}/models/{id}", self.config.base_url);
         let executor = RequestExecutor::new(
             self.http,
-            self.authentication.clone(),
-            self.resilience.clone(),
+            self.config.authentication.clone(),
+            self.config.resilience.clone(),
         );
         let response = executor.execute_buffered(|| self.http.get(&url)).await?;
         if !response.status().is_success() {

@@ -26,7 +26,7 @@ it directly when assembling a smaller runtime.
 
 ## Configuration
 
-Create a config with `OpenAIConfig::new(api_key, model)` and chain `.with_*()` builders for optional parameters. Alternatively, `OpenAIConfig::from_env()` reads from environment variables:
+Create a config with `OpenAIConfig::new(authentication, model)` and chain `.with_*()` builders for optional parameters. Alternatively, `OpenAIConfig::from_env()` reads from environment variables:
 
 | Variable          | Required | Default                                      |
 | ----------------- | -------- | -------------------------------------------- |
@@ -36,9 +36,11 @@ Create a config with `OpenAIConfig::new(api_key, model)` and chain `.with_*()` b
 
 ## Authentication and resilience
 
-`OpenAIConfig::new(api_key, model)` and `OpenAIResponsesConfig::new(api_key,
-model)` retain the simple bearer-token constructors. The chat adapter and the
-Responses config also accept a custom `agentkit_http::Authentication` or
+`OpenAIConfig` and `OpenAIResponsesConfig` store credentials as first-class
+`agentkit_http::Authentication` values. A bare string passed to either `new`
+constructor or `.with_authentication(...)` is shorthand for bearer
+authentication. Both configs and adapters provide
+`.with_authentication_provider(...)` for a custom refresh-capable
 `AuthenticationProvider`; the provider receives the opaque prior authentication
 attempt during the single reactive 401 refresh. The standard static bearer and
 header constructors attach an ephemeral, non-secret binding automatically.
@@ -46,10 +48,11 @@ Custom providers that need Responses continuation replay must attach a stable,
 non-secret credential identity or generation with
 `AuthenticationAttempt::with_binding`. If a reactive refresh changes that
 binding, the adapter fails rather than sending the already encoded, binding-bound
-body. Retries and timeouts are opt-in with
-`.with_resilience(ResilienceConfig)`. Without it,
-transient transport/status/stream failures get one attempt (the one permitted
-401 refresh remains part of authentication).
+body. Resilience is stored as `Option<ResilienceConfig>` and defaults to
+`None`. Calling `.with_resilience(...)` opts into retries and timeouts; leaving
+it as `None` preserves the existing single-attempt behavior for transient
+transport/status/stream failures (the one permitted 401 refresh remains part
+of authentication).
 
 Responses retries reuse one clone-cheap serialized request body and a
 body-bound idempotency key. Events stream as soon as they are decoded. A failed

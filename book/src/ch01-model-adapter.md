@@ -287,12 +287,14 @@ No `messages` array. No `choices` wrapper. No `tool_calls`. A completely differe
 ```rust
 pub struct AcmeAdapter {
     client: Client,
-    api_key: String,
+    authentication: Authentication,
+    resilience: Option<ResilienceConfig>,
 }
 
 pub struct AcmeSession {
     client: Client,
-    api_key: String,
+    authentication: Authentication,
+    resilience: Option<ResilienceConfig>,
 }
 
 #[async_trait]
@@ -302,7 +304,8 @@ impl ModelAdapter for AcmeAdapter {
     async fn start_session(&self, _config: SessionConfig) -> Result<AcmeSession, LoopError> {
         Ok(AcmeSession {
             client: self.client.clone(),
-            api_key: self.api_key.clone(),
+            authentication: self.authentication.clone(),
+            resilience: self.resilience.clone(),
         })
     }
 }
@@ -348,10 +351,15 @@ impl ModelSession for AcmeSession {
             "config": { "temperature": 0.5, "max_tokens": 256 },
         });
 
-        let resp: AcmeResponse = self.client
+        let authentication = self.authentication.authenticate(None).await
+            .map_err(|e| LoopError::Provider(e.to_string()))?;
+        let mut request = self.client
             .post("https://api.acme.ai/v1/generate")
-            .bearer_auth(&self.api_key)
-            .json(&body)
+            .json(&body);
+        for (name, value) in authentication.headers() {
+            request = request.header(name, value);
+        }
+        let resp: AcmeResponse = request
             .send().await
             .map_err(|e| LoopError::Provider(e.to_string()))?
             .json().await
@@ -619,9 +627,9 @@ This is the complete provider. All of the transcript conversion, tool call seria
 
 Not all OpenAI-compatible providers are identical. The three hooks exist for providers that need to customise the standard request/response flow.
 
-OpenRouter uses all three:
+OpenRouter uses all three, while exposing its first-class credential through `authentication()`:
 
-1. **`preprocess_request`** — adds bearer auth, `X-Title`, and `HTTP-Referer` headers
+1. **`preprocess_request`** — adds `X-Title` and `HTTP-Referer` headers
 2. **`preprocess_response`** — the API sometimes returns HTTP 200 with an error payload instead of a proper error status; the hook parses these and converts them to errors before the adapter attempts normal deserialization
 3. **`postprocess_response`** — extracts the `cost` field from the usage object (OpenRouter-specific, not part of the standard format) and adds `openrouter.model` and `openrouter.refusal` to the item metadata
 
@@ -633,11 +641,15 @@ impl CompletionsProvider for OpenRouterProvider {
     fn endpoint_url(&self) -> &str { &self.base_url }
     fn config(&self) -> &OpenRouterRequestConfig { &self.request_config }
 
+    fn authentication(&self) -> Option<Authentication> {
+        Some(self.authentication.clone())
+    }
+
     fn preprocess_request(
         &self,
         builder: agentkit_http::HttpRequestBuilder,
     ) -> agentkit_http::HttpRequestBuilder {
-        let mut builder = builder.bearer_auth(&self.api_key);
+        let mut builder = builder;
         if let Some(app_name) = &self.app_name {
             builder = builder.header("X-Title", app_name);
         }

@@ -28,6 +28,19 @@ Create a config with `VllmConfig::new(model)` and chain `.with_*()` builders for
 | `VLLM_BASE_URL` | no       | `http://localhost:8000/v1/chat/completions` |
 | `VLLM_API_KEY`  | no       | --                                          |
 
+## Authentication and resilience
+
+`VllmConfig::new` leaves its first-class
+`Option<agentkit_http::Authentication>` as `None`. For a protected server, a
+bare string passed to `.with_authentication(...)` is shorthand for bearer
+authentication. Use `.with_authentication_provider(...)` for a custom
+refresh-capable `AuthenticationProvider`. `VLLM_API_KEY` uses the same bearer
+authentication when read by `from_env()`.
+
+Resilience is also opt-in: `resilience` is an `Option<ResilienceConfig>` that
+defaults to `None`. Calling `.with_resilience(...)` enables retries and
+timeouts; leaving it as `None` preserves the existing single-attempt behavior.
+
 ## Examples
 
 ### Minimal chat agent
@@ -62,7 +75,7 @@ use agentkit_provider_vllm::{VllmAdapter, VllmConfig};
 
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
 let config = VllmConfig::new("meta-llama/Llama-3.1-8B-Instruct")
-    .with_api_key("my-secret-key")
+    .with_authentication("my-secret-key")
     .with_temperature(0.0)
     .with_max_completion_tokens(4096);
 

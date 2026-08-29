@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use agentkit_http::{Authentication, BodyStream, Http, ResilienceConfig};
+use agentkit_http::{BodyStream, Http};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
@@ -52,37 +52,20 @@ pub struct FileObject {
 pub struct FilesClient<'a> {
     http: &'a Http,
     config: Arc<CerebrasConfig>,
-    authentication: Authentication,
-    resilience: Option<ResilienceConfig>,
 }
 
 impl<'a> FilesClient<'a> {
     /// Builds a new client — typically constructed via
     /// [`crate::CerebrasAdapter::files`].
     pub fn new(http: &'a Http, config: Arc<CerebrasConfig>) -> Self {
-        let authentication = Authentication::bearer(config.api_key.clone());
-        Self::new_with_policy(http, config, authentication, None)
-    }
-
-    pub(crate) fn new_with_policy(
-        http: &'a Http,
-        config: Arc<CerebrasConfig>,
-        authentication: Authentication,
-        resilience: Option<ResilienceConfig>,
-    ) -> Self {
-        Self {
-            http,
-            config,
-            authentication,
-            resilience,
-        }
+        Self { http, config }
     }
 
     fn executor(&self) -> RequestExecutor {
         RequestExecutor::new(
             self.http,
-            self.authentication.clone(),
-            self.resilience.clone(),
+            self.config.authentication.clone(),
+            self.config.resilience.clone(),
         )
     }
 
@@ -234,7 +217,9 @@ fn build_multipart(
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use agentkit_http::{HttpClient, HttpError, HttpRequest, HttpResponse, StatusCode};
+    use agentkit_http::{
+        HttpClient, HttpError, HttpRequest, HttpResponse, ResilienceConfig, StatusCode,
+    };
     use async_trait::async_trait;
 
     use super::*;
@@ -307,17 +292,13 @@ mod tests {
         let config = Arc::new(
             CerebrasConfig::new("secret", "test-model")
                 .unwrap()
-                .with_base_url("https://example.test"),
+                .with_base_url("https://example.test")
+                .with_resilience(ResilienceConfig {
+                    max_retries: 3,
+                    ..ResilienceConfig::default()
+                }),
         );
-        let files = FilesClient::new_with_policy(
-            &http,
-            config,
-            Authentication::bearer("secret"),
-            Some(ResilienceConfig {
-                max_retries: 3,
-                ..ResilienceConfig::default()
-            }),
-        );
+        let files = FilesClient::new(&http, config);
 
         assert!(files.delete("file-1").await.is_err());
         assert_eq!(client.calls.load(Ordering::SeqCst), 1);

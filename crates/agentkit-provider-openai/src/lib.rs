@@ -69,8 +69,8 @@ const DEFAULT_ENDPOINT: &str = "https://api.openai.com/v1/chat/completions";
 /// ```
 #[derive(Clone)]
 pub struct OpenAIConfig {
-    /// OpenAI API key (starts with `sk-`).
-    pub api_key: String,
+    /// Authentication applied to each request. Bare strings use bearer authentication.
+    pub authentication: Authentication,
     /// Model identifier, e.g. `"gpt-4o"` or `"gpt-4o-mini"`.
     pub model: String,
     /// Chat completions endpoint URL. Defaults to the OpenAI production URL.
@@ -91,13 +91,15 @@ pub struct OpenAIConfig {
     pub parallel_tool_calls: Option<bool>,
     /// Request SSE streaming responses. Defaults to `true`.
     pub streaming: bool,
+    /// Optional retry and timeout policy. `None` preserves single-attempt behavior.
+    pub resilience: Option<ResilienceConfig>,
 }
 
 impl fmt::Debug for OpenAIConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("OpenAIConfig")
-            .field("api_key", &"<redacted>")
+            .field("authentication", &"<redacted>")
             .field("model", &self.model)
             .field("base_url", &self.base_url)
             .field("temperature", &self.temperature)
@@ -107,15 +109,18 @@ impl fmt::Debug for OpenAIConfig {
             .field("presence_penalty", &self.presence_penalty)
             .field("parallel_tool_calls", &self.parallel_tool_calls)
             .field("streaming", &self.streaming)
+            .field("resilience", &self.resilience)
             .finish()
     }
 }
 
 impl OpenAIConfig {
-    /// Creates a new configuration with the given API key and model identifier.
-    pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
+    /// Creates a new configuration with the given authentication and model identifier.
+    ///
+    /// Bare strings are treated as bearer tokens.
+    pub fn new(authentication: impl Into<Authentication>, model: impl Into<String>) -> Self {
         Self {
-            api_key: api_key.into(),
+            authentication: authentication.into(),
             model: model.into(),
             base_url: DEFAULT_ENDPOINT.into(),
             temperature: None,
@@ -125,7 +130,25 @@ impl OpenAIConfig {
             presence_penalty: None,
             parallel_tool_calls: None,
             streaming: true,
+            resilience: None,
         }
+    }
+
+    /// Replaces the configured authentication.
+    pub fn with_authentication(mut self, authentication: impl Into<Authentication>) -> Self {
+        self.authentication = authentication.into();
+        self
+    }
+
+    /// Uses a custom refresh-capable authentication provider.
+    pub fn with_authentication_provider<P: AuthenticationProvider>(self, provider: P) -> Self {
+        self.with_authentication(Authentication::new(provider))
+    }
+
+    /// Enables request and pre-visible-output retries and timeouts.
+    pub fn with_resilience(mut self, resilience: ResilienceConfig) -> Self {
+        self.resilience = Some(resilience);
+        self
     }
 
     /// Overrides the default chat completions endpoint URL.
@@ -222,6 +245,7 @@ pub struct OpenAIRequestConfig {
 #[derive(Clone, Debug)]
 pub struct OpenAIProvider {
     authentication: Authentication,
+    resilience: Option<ResilienceConfig>,
     base_url: String,
     streaming: bool,
     request_config: OpenAIRequestConfig,
@@ -230,7 +254,8 @@ pub struct OpenAIProvider {
 impl From<OpenAIConfig> for OpenAIProvider {
     fn from(config: OpenAIConfig) -> Self {
         Self {
-            authentication: Authentication::bearer(config.api_key),
+            authentication: config.authentication,
+            resilience: config.resilience,
             base_url: config.base_url,
             streaming: config.streaming,
             request_config: OpenAIRequestConfig {
@@ -278,6 +303,10 @@ impl CompletionsProvider for OpenAIProvider {
 
     fn authentication(&self) -> Option<Authentication> {
         Some(self.authentication.clone())
+    }
+
+    fn resilience_config(&self) -> Option<ResilienceConfig> {
+        self.resilience.clone()
     }
 
     fn streaming(&self) -> bool {
@@ -447,6 +476,18 @@ mod tests {
         let debug = format!("{:?}", OpenAIConfig::new("super-secret", "gpt-test"));
         assert!(!debug.contains("super-secret"));
         assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn openai_config_resilience_reaches_provider() {
+        let default_provider = OpenAIProvider::from(OpenAIConfig::new("sk-test", "gpt-test"));
+        assert_eq!(default_provider.resilience_config(), None);
+
+        let resilience = ResilienceConfig::no_retries();
+        let provider = OpenAIProvider::from(
+            OpenAIConfig::new("sk-test", "gpt-test").with_resilience(resilience.clone()),
+        );
+        assert_eq!(provider.resilience_config(), Some(resilience));
     }
 
     #[test]

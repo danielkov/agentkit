@@ -87,8 +87,6 @@ use crate::stream::{EventTranslator, SseDecoder};
 pub struct CerebrasAdapter {
     client: Http,
     config: Arc<CerebrasConfig>,
-    authentication: Authentication,
-    resilience: Option<ResilienceConfig>,
     last_rate_limit: Arc<Mutex<Option<RateLimitSnapshot>>>,
 }
 
@@ -107,19 +105,16 @@ impl CerebrasAdapter {
     /// Creates a new adapter using a pre-configured [`Http`] client.
     pub fn with_client(config: CerebrasConfig, client: Http) -> Result<Self, CerebrasError> {
         config.validate()?;
-        let authentication = Authentication::bearer(config.api_key.clone());
         Ok(Self {
             client,
             config: Arc::new(config),
-            authentication,
-            resilience: None,
             last_rate_limit: Arc::new(Mutex::new(None)),
         })
     }
 
-    /// Overrides the configured bearer-token authentication.
+    /// Overrides the configured authentication.
     pub fn with_authentication(mut self, authentication: impl Into<Authentication>) -> Self {
-        self.authentication = authentication.into();
+        Arc::make_mut(&mut self.config).authentication = authentication.into();
         self
     }
 
@@ -130,7 +125,7 @@ impl CerebrasAdapter {
 
     /// Enables request and pre-visible-output stream retries and timeouts.
     pub fn with_resilience(mut self, resilience: ResilienceConfig) -> Self {
-        self.resilience = Some(resilience);
+        Arc::make_mut(&mut self.config).resilience = Some(resilience);
         self
     }
 
@@ -141,34 +136,19 @@ impl CerebrasAdapter {
 
     /// Returns a typed client over `/v1/models`.
     pub fn models(&self) -> ModelsClient<'_> {
-        ModelsClient::new_with_policy(
-            &self.client,
-            self.config.clone(),
-            self.authentication.clone(),
-            self.resilience.clone(),
-        )
+        ModelsClient::new(&self.client, self.config.clone())
     }
 
     /// Returns a typed client over the Batch API.
     #[cfg(feature = "batch")]
     pub fn batches(&self) -> BatchClient<'_> {
-        BatchClient::new_with_policy(
-            &self.client,
-            self.config.clone(),
-            self.authentication.clone(),
-            self.resilience.clone(),
-        )
+        BatchClient::new(&self.client, self.config.clone())
     }
 
     /// Returns a typed client over the Files API.
     #[cfg(feature = "batch")]
     pub fn files(&self) -> FilesClient<'_> {
-        FilesClient::new_with_policy(
-            &self.client,
-            self.config.clone(),
-            self.authentication.clone(),
-            self.resilience.clone(),
-        )
+        FilesClient::new(&self.client, self.config.clone())
     }
 }
 
@@ -176,8 +156,6 @@ impl CerebrasAdapter {
 pub struct CerebrasSession {
     client: Http,
     config: Arc<CerebrasConfig>,
-    authentication: Authentication,
-    resilience: Option<ResilienceConfig>,
     rate_limit_slot: Arc<Mutex<Option<RateLimitSnapshot>>>,
     _session_config: SessionConfig,
 }
@@ -638,8 +616,6 @@ impl ModelAdapter for CerebrasAdapter {
         Ok(CerebrasSession {
             client: self.client.clone(),
             config: self.config.clone(),
-            authentication: self.authentication.clone(),
-            resilience: self.resilience.clone(),
             rate_limit_slot: self.last_rate_limit.clone(),
             _session_config: config,
         })
@@ -699,8 +675,8 @@ impl ModelSession for CerebrasSession {
             let inference_request = InferenceRequest {
                 executor: RequestExecutor::new(
                     &self.client,
-                    self.authentication.clone(),
-                    self.resilience.clone(),
+                    config.authentication.clone(),
+                    config.resilience.clone(),
                 ),
                 config: config.clone(),
                 body,
@@ -715,11 +691,11 @@ impl ModelSession for CerebrasSession {
                 let status = response.status();
                 if config.streaming && status.is_success() {
                     let integrity = TruncatedStreamDetector::from_headers(response.headers());
-                    let idle_timeout = self
+                    let idle_timeout = config
                         .resilience
                         .as_ref()
                         .and_then(|resilience| resilience.stream_idle_timeout);
-                    let replay = self.resilience.as_ref().and_then(|resilience| {
+                    let replay = config.resilience.as_ref().and_then(|resilience| {
                         (resilience.max_retries > 0).then(|| {
                             let inference_request = inference_request.clone();
                             Box::new(move || {
@@ -737,7 +713,7 @@ impl ModelSession for CerebrasSession {
                             pending: VecDeque::new(),
                             eof: false,
                             visible_output: false,
-                            detect_truncation: self.resilience.is_some(),
+                            detect_truncation: config.resilience.is_some(),
                             idle_timeout,
                             deadline: inference_request.executor.deadline.clone(),
                             integrity,

@@ -63,6 +63,10 @@ pub struct OllamaConfig {
     pub model: String,
     /// Chat completions endpoint URL. Defaults to `http://localhost:11434/v1/chat/completions`.
     pub base_url: String,
+    /// Optional authentication for protected endpoints. Strings become bearer authentication.
+    pub authentication: Option<Authentication>,
+    /// Optional retry and timeout policy. `None` preserves single-attempt behavior.
+    pub resilience: Option<ResilienceConfig>,
     /// Sampling temperature (0.0 = deterministic, higher = more creative).
     pub temperature: Option<f32>,
     /// Maximum number of tokens to generate (Ollama's equivalent of `max_completion_tokens`).
@@ -89,6 +93,8 @@ impl OllamaConfig {
         Self {
             model: model.into(),
             base_url: DEFAULT_ENDPOINT.into(),
+            authentication: None,
+            resilience: None,
             temperature: None,
             num_predict: None,
             top_k: None,
@@ -97,6 +103,24 @@ impl OllamaConfig {
             streaming: true,
             strict_alternating_roles: false,
         }
+    }
+
+    /// Sets authentication for a protected Ollama endpoint.
+    pub fn with_authentication(mut self, authentication: impl Into<Authentication>) -> Self {
+        self.authentication = Some(authentication.into());
+        self
+    }
+
+    /// Uses a custom refresh-capable authentication provider.
+    pub fn with_authentication_provider<P: AuthenticationProvider>(mut self, provider: P) -> Self {
+        self.authentication = Some(Authentication::new(provider));
+        self
+    }
+
+    /// Enables request retries and timeouts.
+    pub fn with_resilience(mut self, resilience: ResilienceConfig) -> Self {
+        self.resilience = Some(resilience);
+        self
     }
 
     /// Overrides the default chat completions endpoint URL.
@@ -191,6 +215,8 @@ pub struct OllamaRequestConfig {
 #[derive(Clone, Debug)]
 pub struct OllamaProvider {
     base_url: String,
+    authentication: Option<Authentication>,
+    resilience: Option<ResilienceConfig>,
     streaming: bool,
     strict_alternating_roles: bool,
     request_config: OllamaRequestConfig,
@@ -200,6 +226,8 @@ impl From<OllamaConfig> for OllamaProvider {
     fn from(config: OllamaConfig) -> Self {
         Self {
             base_url: config.base_url,
+            authentication: config.authentication,
+            resilience: config.resilience,
             streaming: config.streaming,
             strict_alternating_roles: config.strict_alternating_roles,
             request_config: OllamaRequestConfig {
@@ -235,6 +263,14 @@ impl CompletionsProvider for OllamaProvider {
             "User-Agent",
             concat!("agentkit-provider-ollama/", env!("CARGO_PKG_VERSION")),
         )
+    }
+
+    fn authentication(&self) -> Option<Authentication> {
+        self.authentication.clone()
+    }
+
+    fn resilience_config(&self) -> Option<ResilienceConfig> {
+        self.resilience.clone()
     }
 
     fn streaming(&self) -> bool {
@@ -316,4 +352,24 @@ pub enum OllamaError {
     /// An error from the generic completions adapter.
     #[error(transparent)]
     Completions(#[from] CompletionsError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn authentication_and_resilience_are_optional_and_propagate() {
+        let default_provider = OllamaProvider::from(OllamaConfig::new("model"));
+        assert!(default_provider.authentication().is_none());
+        assert!(default_provider.resilience_config().is_none());
+
+        let config = OllamaConfig::new("model")
+            .with_authentication("ollama-secret")
+            .with_resilience(ResilienceConfig::default());
+        assert!(!format!("{config:?}").contains("ollama-secret"));
+        let provider = OllamaProvider::from(config);
+        assert!(provider.authentication().is_some());
+        assert!(provider.resilience_config().is_some());
+    }
 }

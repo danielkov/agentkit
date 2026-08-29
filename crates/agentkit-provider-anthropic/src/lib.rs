@@ -57,8 +57,9 @@ use futures_util::future::{BoxFuture, Either, select};
 use crate::stream::{EventTranslator, SseDecoder};
 
 pub use crate::config::{
-    AnthropicConfig, AnthropicMcpServer, DEFAULT_ANTHROPIC_VERSION, DEFAULT_ENDPOINT, OutputEffort,
-    OutputFormat, ServiceTier, ThinkingConfig, ToolChoice,
+    AnthropicApiKey, AnthropicAuthToken, AnthropicConfig, AnthropicMcpServer,
+    DEFAULT_ANTHROPIC_VERSION, DEFAULT_ENDPOINT, OutputEffort, OutputFormat, ServiceTier,
+    ThinkingConfig, ToolChoice,
 };
 pub use crate::error::AnthropicError;
 pub use crate::server_tool::{
@@ -74,8 +75,6 @@ pub use crate::server_tool::{
 pub struct AnthropicAdapter {
     client: Http,
     config: Arc<AnthropicConfig>,
-    authentication: Option<Authentication>,
-    resilience: Option<ResilienceConfig>,
 }
 
 impl AnthropicAdapter {
@@ -91,18 +90,15 @@ impl AnthropicAdapter {
 
     /// Creates a new adapter using a pre-configured [`Http`] client.
     pub fn with_client(config: AnthropicConfig, client: Http) -> Self {
-        let authentication = default_authentication(&config);
         Self {
             client,
             config: Arc::new(config),
-            authentication,
-            resilience: None,
         }
     }
 
     /// Overrides the configured `x-api-key` or bearer-token authentication.
     pub fn with_authentication(mut self, authentication: impl Into<Authentication>) -> Self {
-        self.authentication = Some(authentication.into());
+        Arc::make_mut(&mut self.config).authentication = authentication.into();
         self
     }
 
@@ -113,7 +109,7 @@ impl AnthropicAdapter {
 
     /// Enables request and pre-visible-output stream retries and timeouts.
     pub fn with_resilience(mut self, resilience: ResilienceConfig) -> Self {
-        self.resilience = Some(resilience);
+        Arc::make_mut(&mut self.config).resilience = Some(resilience);
         self
     }
 }
@@ -396,8 +392,8 @@ impl ModelAdapter for AnthropicAdapter {
         Ok(AnthropicSession {
             client: self.client.clone(),
             config: self.config.clone(),
-            authentication: self.authentication.clone(),
-            resilience: self.resilience.clone(),
+            authentication: Some(self.config.authentication.clone()),
+            resilience: self.config.resilience.clone(),
             _session_config: config,
         })
     }
@@ -687,18 +683,6 @@ async fn next_streaming_event(
     }
 }
 
-fn default_authentication(config: &AnthropicConfig) -> Option<Authentication> {
-    if let Some(token) = &config.auth_token {
-        return Some(Authentication::bearer(token.clone()));
-    }
-    config.api_key.as_ref().map(|key| {
-        Authentication::header(
-            agentkit_http::HeaderName::from_static("x-api-key"),
-            key.clone(),
-        )
-    })
-}
-
 fn collect_beta_flags(config: &AnthropicConfig) -> BTreeSet<String> {
     let mut betas: BTreeSet<String> = config.anthropic_beta.iter().cloned().collect();
     for tool in &config.server_tools {
@@ -767,13 +751,17 @@ mod tests {
 
     #[test]
     fn config_debug_redacts_api_key_and_auth_token() {
-        let mut config = AnthropicConfig::new("anthropic-secret", "debug-model", 1024).unwrap();
-        config.auth_token = Some("bearer-secret".into());
-        let debug = format!("{config:?}");
-        assert!(!debug.contains("anthropic-secret"));
-        assert!(!debug.contains("bearer-secret"));
-        assert!(debug.contains("<redacted>"));
-        assert!(debug.contains("debug-model"));
+        let api_key = AnthropicConfig::new("anthropic-secret", "debug-model", 1024).unwrap();
+        assert_eq!(api_key.resilience, None);
+        let auth_token =
+            AnthropicConfig::with_auth_token("bearer-secret", "debug-model", 1024).unwrap();
+
+        for debug in [format!("{api_key:?}"), format!("{auth_token:?}")] {
+            assert!(!debug.contains("anthropic-secret"));
+            assert!(!debug.contains("bearer-secret"));
+            assert!(debug.contains("<redacted>"));
+            assert!(debug.contains("debug-model"));
+        }
     }
 
     #[test]
@@ -849,12 +837,38 @@ mod tests {
 
     #[tokio::test]
     async fn default_authentication_preserves_anthropic_header_schemes() {
+        let borrowed_key = String::from("borrowed-key");
+        let key_configs = [
+            AnthropicConfig::new("secret-key", "claude-opus-4-7", 1024).unwrap(),
+            AnthropicConfig::new(&borrowed_key, "claude-opus-4-7", 1024).unwrap(),
+            AnthropicConfig::new(Box::<str>::from("boxed-key"), "claude-opus-4-7", 1024).unwrap(),
+            AnthropicConfig::new(
+                std::sync::Arc::<str>::from("arc-key"),
+                "claude-opus-4-7",
+                1024,
+            )
+            .unwrap(),
+            AnthropicConfig::new(
+                std::borrow::Cow::Borrowed("cow-key"),
+                "claude-opus-4-7",
+                1024,
+            )
+            .unwrap(),
+        ];
+        for key_config in key_configs {
+            let key_attempt = key_config.authentication.authenticate(None).await.unwrap();
+            assert!(key_attempt.headers().get("x-api-key").is_some());
+            assert!(
+                key_attempt
+                    .headers()
+                    .get(agentkit_http::header::AUTHORIZATION)
+                    .is_none()
+            );
+            assert!(key_attempt.headers()["x-api-key"].is_sensitive());
+        }
+
         let key_config = AnthropicConfig::new("secret-key", "claude-opus-4-7", 1024).unwrap();
-        let key_attempt = default_authentication(&key_config)
-            .unwrap()
-            .authenticate(None)
-            .await
-            .unwrap();
+        let key_attempt = key_config.authentication.authenticate(None).await.unwrap();
         assert_eq!(key_attempt.headers()["x-api-key"], "secret-key");
         assert!(
             key_attempt
@@ -866,8 +880,8 @@ mod tests {
 
         let token_config =
             AnthropicConfig::with_auth_token("secret-token", "claude-opus-4-7", 1024).unwrap();
-        let token_attempt = default_authentication(&token_config)
-            .unwrap()
+        let token_attempt = token_config
+            .authentication
             .authenticate(None)
             .await
             .unwrap();
@@ -877,6 +891,37 @@ mod tests {
         );
         assert!(token_attempt.headers().get("x-api-key").is_none());
         assert!(token_attempt.headers()[agentkit_http::header::AUTHORIZATION].is_sensitive());
+
+        let borrowed_token = String::from("borrowed-token");
+        for token_config in [
+            AnthropicConfig::with_auth_token(&borrowed_token, "claude-opus-4-7", 1024).unwrap(),
+            AnthropicConfig::with_auth_token(
+                Box::<str>::from("boxed-token"),
+                "claude-opus-4-7",
+                1024,
+            )
+            .unwrap(),
+            AnthropicConfig::with_auth_token(
+                std::sync::Arc::<str>::from("arc-token"),
+                "claude-opus-4-7",
+                1024,
+            )
+            .unwrap(),
+            AnthropicConfig::with_auth_token(
+                std::borrow::Cow::Borrowed("cow-token"),
+                "claude-opus-4-7",
+                1024,
+            )
+            .unwrap(),
+        ] {
+            let token_attempt = token_config
+                .authentication
+                .authenticate(None)
+                .await
+                .unwrap();
+            assert!(token_attempt.headers().get("x-api-key").is_none());
+            assert!(token_attempt.headers()[agentkit_http::header::AUTHORIZATION].is_sensitive());
+        }
     }
 
     #[test]

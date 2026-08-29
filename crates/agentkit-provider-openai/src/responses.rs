@@ -163,9 +163,11 @@ impl fmt::Debug for OpenAIResponsesConfig {
 }
 
 impl OpenAIResponsesConfig {
-    /// Creates a public Responses configuration using bearer authentication.
-    pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
-        Self::public(model, Authentication::bearer(api_key.into()))
+    /// Creates a public Responses configuration using the given authentication.
+    ///
+    /// Bare strings are treated as bearer tokens.
+    pub fn new(authentication: impl Into<Authentication>, model: impl Into<String>) -> Self {
+        Self::public(model, authentication)
     }
 
     /// Creates a public Responses configuration with injectable authentication.

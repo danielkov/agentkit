@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agentkit_core::{MetadataMap, SessionId, TurnCancellation, TurnId};
-use agentkit_http::{Authentication, BodyStream, Http, ResilienceConfig};
+use agentkit_http::{BodyStream, Http};
 use agentkit_loop::TurnRequest;
 use agentkit_tools_core::ToolSpec;
 use bytes::Bytes;
@@ -164,8 +164,6 @@ impl ChatOverrides {
 pub struct BatchClient<'a> {
     http: &'a Http,
     config: Arc<CerebrasConfig>,
-    authentication: Authentication,
-    resilience: Option<ResilienceConfig>,
 }
 
 /// Outcome of a terminal poll in [`BatchClient::wait`].
@@ -192,29 +190,14 @@ impl<'a> BatchClient<'a> {
     /// Builds a new client — normally constructed via
     /// [`crate::CerebrasAdapter::batches`].
     pub fn new(http: &'a Http, config: Arc<CerebrasConfig>) -> Self {
-        let authentication = Authentication::bearer(config.api_key.clone());
-        Self::new_with_policy(http, config, authentication, None)
-    }
-
-    pub(crate) fn new_with_policy(
-        http: &'a Http,
-        config: Arc<CerebrasConfig>,
-        authentication: Authentication,
-        resilience: Option<ResilienceConfig>,
-    ) -> Self {
-        Self {
-            http,
-            config,
-            authentication,
-            resilience,
-        }
+        Self { http, config }
     }
 
     fn executor(&self) -> RequestExecutor {
         RequestExecutor::new(
             self.http,
-            self.authentication.clone(),
-            self.resilience.clone(),
+            self.config.authentication.clone(),
+            self.config.resilience.clone(),
         )
     }
 
@@ -268,18 +251,13 @@ impl<'a> BatchClient<'a> {
             }
         }
 
-        let file = FilesClient::new_with_policy(
-            self.http,
-            self.config.clone(),
-            self.authentication.clone(),
-            self.resilience.clone(),
-        )
-        .upload(
-            &format!("batch-{}.jsonl", line_count),
-            Bytes::from(jsonl),
-            FilePurpose::Batch,
-        )
-        .await?;
+        let file = FilesClient::new(self.http, self.config.clone())
+            .upload(
+                &format!("batch-{}.jsonl", line_count),
+                Bytes::from(jsonl),
+                FilePurpose::Batch,
+            )
+            .await?;
 
         self.create(&file.id, metadata).await
     }
@@ -372,12 +350,7 @@ impl<'a> BatchClient<'a> {
         loop {
             let job = self.retrieve(id).await?;
             if job.status.is_terminal() {
-                let files = crate::files::FilesClient::new_with_policy(
-                    self.http,
-                    self.config.clone(),
-                    self.authentication.clone(),
-                    self.resilience.clone(),
-                );
+                let files = crate::files::FilesClient::new(self.http, self.config.clone());
                 let outputs = match &job.output_file_id {
                     Some(fid) => Some(files.content(fid).await?),
                     None => None,

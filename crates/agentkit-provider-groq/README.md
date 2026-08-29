@@ -18,13 +18,25 @@ buffered response path.
 
 ## Configuration
 
-Create a config with `GroqConfig::new(api_key, model)` and chain `.with_*()` builders for optional parameters. Alternatively, `GroqConfig::from_env()` reads from environment variables:
+Create a config with `GroqConfig::new(authentication, model)` and chain `.with_*()` builders for optional parameters. Alternatively, `GroqConfig::from_env()` reads from environment variables:
 
 | Variable        | Required | Default                                           |
 | --------------- | -------- | ------------------------------------------------- |
 | `GROQ_API_KEY`  | yes      | --                                                |
 | `GROQ_MODEL`    | no       | `llama-3.1-8b-instant`                            |
 | `GROQ_BASE_URL` | no       | `https://api.groq.com/openai/v1/chat/completions` |
+
+## Authentication and resilience
+
+`GroqConfig` stores credentials as a first-class
+`agentkit_http::Authentication`. A bare string passed to `GroqConfig::new` or
+`.with_authentication(...)` is shorthand for bearer authentication. Use
+`.with_authentication_provider(...)` for a custom refresh-capable
+`AuthenticationProvider`.
+
+Resilience is opt-in: `resilience` is an `Option<ResilienceConfig>` that
+defaults to `None`. Calling `.with_resilience(...)` enables retries and
+timeouts; leaving it as `None` preserves the existing single-attempt behavior.
 
 ## Examples
 

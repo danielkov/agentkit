@@ -54,12 +54,14 @@ const DEFAULT_ENDPOINT: &str = "https://api.groq.com/openai/v1/chat/completions"
 /// ```
 #[derive(Clone)]
 pub struct GroqConfig {
-    /// Groq API key (starts with `gsk_`).
-    pub api_key: String,
+    /// Authentication used for API requests. String values become bearer authentication.
+    pub authentication: Authentication,
     /// Model identifier, e.g. `"llama-3.3-70b-versatile"` or `"llama-3.1-8b-instant"`.
     pub model: String,
     /// Chat completions endpoint URL. Defaults to the Groq production URL.
     pub base_url: String,
+    /// Optional retry and timeout policy. `None` preserves single-attempt behavior.
+    pub resilience: Option<ResilienceConfig>,
     /// Sampling temperature (0.0 = deterministic, higher = more creative).
     pub temperature: Option<f32>,
     /// Maximum number of completion tokens the model may generate.
@@ -77,9 +79,10 @@ pub struct GroqConfig {
 impl std::fmt::Debug for GroqConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GroqConfig")
-            .field("api_key", &"<redacted>")
+            .field("authentication", &"<redacted>")
             .field("model", &self.model)
             .field("base_url", &self.base_url)
+            .field("resilience", &self.resilience)
             .field("temperature", &self.temperature)
             .field("max_completion_tokens", &self.max_completion_tokens)
             .field("top_p", &self.top_p)
@@ -90,18 +93,42 @@ impl std::fmt::Debug for GroqConfig {
 }
 
 impl GroqConfig {
-    /// Creates a new configuration with the given API key and model identifier.
-    pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
+    /// Creates a new configuration with the given authentication and model identifier.
+    pub fn new(authentication: impl Into<Authentication>, model: impl Into<String>) -> Self {
         Self {
-            api_key: api_key.into(),
+            authentication: authentication.into(),
             model: model.into(),
             base_url: DEFAULT_ENDPOINT.into(),
+            resilience: None,
             temperature: None,
             max_completion_tokens: None,
             top_p: None,
             parallel_tool_calls: None,
             streaming: true,
         }
+    }
+
+    /// Replaces request authentication. String values become bearer authentication.
+    pub fn with_authentication(mut self, authentication: impl Into<Authentication>) -> Self {
+        self.authentication = authentication.into();
+        self
+    }
+
+    /// Compatibility builder for bearer API-key authentication.
+    pub fn with_api_key(self, api_key: impl Into<Authentication>) -> Self {
+        self.with_authentication(api_key)
+    }
+
+    /// Uses a custom refresh-capable authentication provider.
+    pub fn with_authentication_provider<P: AuthenticationProvider>(mut self, provider: P) -> Self {
+        self.authentication = Authentication::new(provider);
+        self
+    }
+
+    /// Enables request retries and timeouts.
+    pub fn with_resilience(mut self, resilience: ResilienceConfig) -> Self {
+        self.resilience = Some(resilience);
+        self
     }
 
     /// Overrides the default chat completions endpoint URL.
@@ -180,6 +207,7 @@ pub struct GroqRequestConfig {
 #[derive(Clone, Debug)]
 pub struct GroqProvider {
     authentication: Authentication,
+    resilience: Option<ResilienceConfig>,
     base_url: String,
     streaming: bool,
     request_config: GroqRequestConfig,
@@ -188,7 +216,8 @@ pub struct GroqProvider {
 impl From<GroqConfig> for GroqProvider {
     fn from(config: GroqConfig) -> Self {
         Self {
-            authentication: Authentication::bearer(config.api_key),
+            authentication: config.authentication,
+            resilience: config.resilience,
             base_url: config.base_url,
             streaming: config.streaming,
             request_config: GroqRequestConfig {
@@ -227,6 +256,10 @@ impl CompletionsProvider for GroqProvider {
 
     fn authentication(&self) -> Option<Authentication> {
         Some(self.authentication.clone())
+    }
+
+    fn resilience_config(&self) -> Option<ResilienceConfig> {
+        self.resilience.clone()
     }
 
     fn streaming(&self) -> bool {
@@ -309,7 +342,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn config_debug_redacts_api_key() {
+    fn config_authentication_and_resilience_reach_provider() {
+        let provider = GroqProvider::from(
+            GroqConfig::new("secret", "model").with_resilience(ResilienceConfig::default()),
+        );
+        assert!(provider.authentication().is_some());
+        assert!(provider.resilience_config().is_some());
+    }
+
+    #[test]
+    fn config_debug_redacts_authentication() {
         let debug = format!("{:?}", GroqConfig::new("groq-secret", "debug-model"));
         assert!(!debug.contains("groq-secret"));
         assert!(debug.contains("<redacted>"));

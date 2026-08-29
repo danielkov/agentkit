@@ -57,8 +57,10 @@ underlying client.
 state, which lets an adapter perform one reactive 401 refresh without learning
 how credentials are stored. Optional non-secret credential bindings let
 replay-sensitive adapters bind continuation data to an account or credential
-generation. Owned bearer and arbitrary-header credentials are redacted and
-zeroized when dropped.
+generation. Bare `String`, `Box<str>`, `Arc<str>`, `Cow<str>`, and `&str` values
+convert into bearer authentication; borrowed values are copied into owned
+zeroizing storage. Bearer and arbitrary-header credentials remain redacted, and
+owned credential storage is zeroized when dropped.
 
 `ResilienceConfig` is opt-in. It combines a wall-clock retry budget, an optional
 attempt cap and attempt/stream-idle timeouts with capped exponential full-jitter

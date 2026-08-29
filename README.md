@@ -122,9 +122,25 @@ Shell:
 
 The filesystem crate also supports session-scoped read-before-write enforcement through `FileSystemToolResources` and `FileSystemToolPolicy`.
 
+## Provider authentication and resilience
+
+Provider configs use `agentkit_http::Authentication` as their first-class
+credential type. For Baseten, Cerebras, Groq, Mistral, OpenAI, OpenRouter, and
+authenticated Ollama/vLLM endpoints, passing a bare string to an authentication
+argument is shorthand for bearer authentication. Custom refresh-capable
+credentials can be installed with `.with_authentication_provider(...)`.
+Anthropic is the exception: `AnthropicConfig::new(...)` sends `x-api-key`, while
+`AnthropicConfig::with_auth_token(...)` explicitly selects a bearer auth token.
+Ollama and vLLM authentication is optional.
+
+Provider resilience is also opt-in. Configs store
+`Option<agentkit_http::ResilienceConfig>` and default to `None`; call
+`.with_resilience(...)` to enable retries and timeouts. Leaving it as `None`
+preserves the existing single-attempt behavior.
+
 ## Quick start
 
-1. Set your OpenRouter API key and model — either through environment variables or directly in code via `OpenRouterConfig::new(api_key, model)`.
+1. Set your OpenRouter API key and model — either through environment variables or directly in code via `OpenRouterConfig::new(authentication, model)`.
 2. Run one of the examples.
 
 Example commands:
