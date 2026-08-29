@@ -31,12 +31,16 @@ use zeroize::{Zeroize, Zeroizing};
 
 const PUBLIC_ENDPOINT: &str = "https://api.openai.com/v1/responses";
 const PRIVATE_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
-const MAX_EVENT_BYTES: usize = 1024 * 1024;
-const MAX_ATTEMPT_BYTES: usize = 16 * 1024 * 1024;
+const DEFAULT_MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
+const DEFAULT_MAX_ATTEMPT_BYTES: usize = 16 * 1024 * 1024;
+const DEFAULT_MAX_WIRE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_TEXT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ITEMS: usize = 100_000;
 const CONTINUATION_METADATA: &str = "openai.responses.continuation.v1";
 const CONTINUATION_SCHEMA_VERSION: u64 = 3;
+const LEGACY_CONTINUATION_METADATA: &str = "openai.subscription.v1";
+const LEGACY_CONTINUATION_SCHEMA_VERSION: u64 = 1;
+const GENERATED_IMAGE_METADATA: &str = "openai.subscription.generated_image.v1";
 const X_CODEX_TURN_STATE: &str = "x-codex-turn-state";
 const MAX_CACHE_KEY_BYTES: usize = 256;
 
@@ -48,6 +52,29 @@ pub enum OpenAIResponsesProfile {
     /// `https://chatgpt.com/backend-api/codex/responses`, with its narrower field policy.
     ChatGptPrivate,
 }
+
+/// Bounds serialized requests and streamed response bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OpenAIResponsesLimits {
+    /// Maximum serialized JSON request body size.
+    pub max_request_bytes: usize,
+    /// Maximum wire bytes accepted from one response attempt.
+    pub max_attempt_bytes: usize,
+    /// Maximum aggregate wire bytes accepted across all attempts for one logical turn.
+    pub max_wire_bytes: usize,
+}
+
+impl Default for OpenAIResponsesLimits {
+    fn default() -> Self {
+        Self {
+            max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
+            max_attempt_bytes: DEFAULT_MAX_ATTEMPT_BYTES,
+            max_wire_bytes: DEFAULT_MAX_WIRE_BYTES,
+        }
+    }
+}
+
+type LegacyContinuationAuthenticator = Arc<dyn Fn(&Value, &str) -> bool + Send + Sync + 'static>;
 
 /// Controls fields whose support differs between Responses deployments.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -95,6 +122,10 @@ pub struct OpenAIResponsesConfig {
     pub parallel_tool_calls: Option<bool>,
     authentication: Authentication,
     resilience: Option<ResilienceConfig>,
+    limits: OpenAIResponsesLimits,
+    user_agent: Option<String>,
+    originator: Option<String>,
+    legacy_continuation_authenticator: Option<LegacyContinuationAuthenticator>,
 }
 
 impl fmt::Debug for OpenAIResponsesConfig {
@@ -111,6 +142,16 @@ impl fmt::Debug for OpenAIResponsesConfig {
             .field("parallel_tool_calls", &self.parallel_tool_calls)
             .field("authentication", &"<redacted>")
             .field("resilience", &self.resilience)
+            .field("limits", &self.limits)
+            .field("user_agent", &self.user_agent)
+            .field("originator", &self.originator)
+            .field(
+                "legacy_continuation_authenticator",
+                &self
+                    .legacy_continuation_authenticator
+                    .as_ref()
+                    .map(|_| "<callback>"),
+            )
             .finish()
     }
 }
@@ -134,6 +175,10 @@ impl OpenAIResponsesConfig {
             parallel_tool_calls: None,
             authentication: authentication.into(),
             resilience: None,
+            limits: OpenAIResponsesLimits::default(),
+            user_agent: None,
+            originator: None,
+            legacy_continuation_authenticator: None,
         }
     }
 
@@ -153,6 +198,10 @@ impl OpenAIResponsesConfig {
             parallel_tool_calls: Some(true),
             authentication: authentication.into(),
             resilience: None,
+            limits: OpenAIResponsesLimits::default(),
+            user_agent: None,
+            originator: None,
+            legacy_continuation_authenticator: None,
         }
     }
 
@@ -200,6 +249,40 @@ impl OpenAIResponsesConfig {
     /// Opts into retries and stream/attempt timeouts. `None` means no transient retry.
     pub fn with_resilience(mut self, resilience: ResilienceConfig) -> Self {
         self.resilience = Some(resilience);
+        self
+    }
+
+    /// Overrides serialized request and response wire-byte limits.
+    pub fn with_limits(mut self, limits: OpenAIResponsesLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    /// Overrides the adapter's default HTTP user agent.
+    pub fn with_user_agent(mut self, user_agent: impl Into<String>) -> Self {
+        self.user_agent = Some(user_agent.into());
+        self
+    }
+
+    /// Sets or overrides the Responses `originator` header.
+    pub fn with_originator(mut self, originator: impl Into<String>) -> Self {
+        self.originator = Some(originator.into());
+        self
+    }
+
+    /// Enables safe replay of Kit's legacy `openai.subscription.v1` metadata.
+    ///
+    /// The callback receives the legacy `account_binding` object and the current
+    /// authentication binding. The adapter validates every other schema, model,
+    /// session, item, and kind field itself and writes only current metadata.
+    pub fn with_legacy_subscription_continuation_authenticator<F>(
+        mut self,
+        authenticator: F,
+    ) -> Self
+    where
+        F: Fn(&Value, &str) -> bool + Send + Sync + 'static,
+    {
+        self.legacy_continuation_authenticator = Some(Arc::new(authenticator));
         self
     }
 
@@ -350,6 +433,7 @@ impl ModelSession for OpenAIResponsesSession {
                 deadline,
                 retries: 0,
                 refreshed: false,
+                wire_bytes: 0,
             },
             replacement_enabled,
             cancellation.as_ref(),
@@ -441,7 +525,15 @@ impl OpenAIResponsesTurn {
             if self.pending_reopen {
                 self.reopen(cancellation).await?;
             }
-            if let Some(event) = self.attempt.as_mut().and_then(LiveAttempt::pop_event) {
+            let expired_attempt_timeout = self
+                .attempt
+                .as_ref()
+                .and_then(|attempt| attempt.deadline.as_ref())
+                .filter(|deadline| deadline.started_at.elapsed() >= deadline.budget)
+                .map(|deadline| deadline.budget);
+            if expired_attempt_timeout.is_none()
+                && let Some(event) = self.attempt.as_mut().and_then(LiveAttempt::pop_event)
+            {
                 self.attempt_output_emitted = true;
                 if matches!(event, ModelTurnEvent::Finished(_)) {
                     self.finished = true;
@@ -452,12 +544,15 @@ impl OpenAIResponsesTurn {
                 return Ok(None);
             }
 
-            let pending = self
-                .attempt
-                .as_mut()
-                .expect("live attempt is open")
-                .decoder
-                .process_pending();
+            let pending = if let Some(timeout) = expired_attempt_timeout {
+                Err(attempt_timeout_failure(timeout))
+            } else {
+                self.attempt
+                    .as_mut()
+                    .expect("live attempt is open")
+                    .decoder
+                    .process_pending()
+            };
             let result = if let Err(failure) = pending {
                 Err(failure)
             } else if self
@@ -485,23 +580,65 @@ impl OpenAIResponsesTurn {
                     .resilience
                     .as_ref()
                     .and_then(|config| config.stream_idle_timeout);
-                let timeout = match (idle_timeout, remaining) {
-                    (Some(idle), Some(remaining)) => Some(idle.min(remaining)),
-                    (Some(idle), None) => Some(idle),
-                    (None, Some(remaining)) => Some(remaining),
-                    (None, None) => None,
-                };
+                let attempt_remaining = self
+                    .attempt
+                    .as_ref()
+                    .and_then(|attempt| attempt.deadline.as_ref())
+                    .map(|deadline| {
+                        deadline
+                            .budget
+                            .saturating_sub(deadline.started_at.elapsed())
+                    });
+                let timeout = [idle_timeout, remaining, attempt_remaining]
+                    .into_iter()
+                    .flatten()
+                    .min();
                 let chunk = {
                     let attempt = self.attempt.as_mut().expect("live attempt is open");
                     cancellable(next_body_chunk(&mut attempt.body, timeout), cancellation).await
                 };
                 match chunk {
                     Err(error) => Err(nonretryable(error)),
-                    Ok(Err(error)) => Err(transport_failure(error)),
+                    Ok(Err(error)) => {
+                        if self.context.deadline.as_ref().is_some_and(|deadline| {
+                            deadline.started_at.elapsed() >= deadline.budget
+                        }) {
+                            Err(nonretryable(http_loop_error(HttpError::Timeout {
+                                operation: "logical request retry budget",
+                                timeout: self
+                                    .context
+                                    .deadline
+                                    .as_ref()
+                                    .expect("checked logical deadline")
+                                    .budget,
+                            })))
+                        } else if let Some(timeout) = self
+                            .attempt
+                            .as_ref()
+                            .and_then(|attempt| attempt.deadline.as_ref())
+                            .filter(|deadline| deadline.started_at.elapsed() >= deadline.budget)
+                            .map(|deadline| deadline.budget)
+                        {
+                            Err(attempt_timeout_failure(timeout))
+                        } else {
+                            Err(transport_failure(error))
+                        }
+                    }
                     Ok(Ok(Some(chunk))) => {
-                        let attempt = self.attempt.as_mut().expect("live attempt is open");
-                        attempt.truncated.observe(&chunk);
-                        attempt.decoder.push(&chunk)
+                        if let Some(total) = self.context.wire_bytes.checked_add(chunk.len()) {
+                            self.context.wire_bytes = total;
+                            if total > self.context.config.limits.max_wire_bytes {
+                                Err(protocol_failure(
+                                    "Responses logical turn exceeds configured wire-byte limit",
+                                ))
+                            } else {
+                                let attempt = self.attempt.as_mut().expect("live attempt is open");
+                                attempt.truncated.observe(&chunk);
+                                attempt.decoder.push(&chunk)
+                            }
+                        } else {
+                            Err(protocol_failure("Responses wire-byte count overflowed"))
+                        }
                     }
                     Ok(Ok(None)) => {
                         let attempt = self.attempt.as_mut().expect("live attempt is open");
@@ -615,7 +752,16 @@ fn encode_request_bound(
         body.insert("max_output_tokens".into(), Value::from(value));
     }
     apply_prompt_cache(&mut body, request, config.profile)?;
-    Ok(Value::Object(body))
+    let value = Value::Object(body);
+    let encoded =
+        Zeroizing::new(serde_json::to_vec(&value).map_err(OpenAIResponsesError::Serialize)?);
+    if encoded.len() > config.limits.max_request_bytes {
+        return Err(invalid_request(format!(
+            "Responses serialized request exceeds {} bytes",
+            config.limits.max_request_bytes
+        )));
+    }
+    Ok(value)
 }
 
 fn encode_item(
@@ -683,7 +829,7 @@ fn encode_item(
                 validate_tool_name(&call.name)?;
                 let continuation = continuation_from_metadata(
                     &call.metadata,
-                    &config.model,
+                    config,
                     session_id,
                     authentication_binding,
                     "function_call",
@@ -703,12 +849,12 @@ fn encode_item(
             Part::ToolResult(result) => output.push(json!({
                 "type": "function_call_output",
                 "call_id": result.call_id.0,
-                "output": encode_tool_output(&result.output)?
+                "output": encode_tool_output(&result.output, config.profile)?
             })),
             Part::Reasoning(reasoning) => {
                 if let Some(continuation) = continuation_from_metadata(
                     &reasoning.metadata,
-                    &config.model,
+                    config,
                     session_id,
                     authentication_binding,
                     "reasoning",
@@ -725,12 +871,23 @@ fn encode_item(
                 // converted into ordinary assistant text.
             }
             Part::Media(media) => {
-                if role == "assistant" || role == "tool" {
+                if role == "assistant" {
+                    let generated =
+                        generated_image_item(media, config, session_id, authentication_binding)?;
+                    if let Some(generated) = generated {
+                        output.push(generated);
+                    } else {
+                        return Err(invalid_request(
+                            "assistant media is not a persisted Responses generated image",
+                        ));
+                    }
+                } else if role == "tool" {
                     return Err(invalid_request(
-                        "assistant/tool media is unsupported by Responses",
+                        "tool item media must be carried by a tool result",
                     ));
+                } else {
+                    content.push(encode_media(media, config.profile)?);
                 }
-                content.push(encode_media(media)?);
             }
             Part::File(_) | Part::Custom(_) => {
                 return Err(invalid_request(
@@ -773,7 +930,11 @@ fn validate_part_role(role: ItemKind, part: &Part) -> Result<(), OpenAIResponses
         ItemKind::User => matches!(part, Part::Text(_) | Part::Structured(_) | Part::Media(_)),
         ItemKind::Assistant => matches!(
             part,
-            Part::Text(_) | Part::Structured(_) | Part::ToolCall(_) | Part::Reasoning(_)
+            Part::Text(_)
+                | Part::Structured(_)
+                | Part::ToolCall(_)
+                | Part::Reasoning(_)
+                | Part::Media(_)
         ),
         ItemKind::Tool => matches!(part, Part::ToolResult(_)),
     };
@@ -862,48 +1023,159 @@ fn apply_prompt_cache(
     Ok(())
 }
 
-fn encode_media(media: &MediaPart) -> Result<Value, OpenAIResponsesError> {
+fn encode_media(
+    media: &MediaPart,
+    profile: OpenAIResponsesProfile,
+) -> Result<Value, OpenAIResponsesError> {
     let expected = match media.modality {
         Modality::Image => "image/",
+        Modality::Audio if profile == OpenAIResponsesProfile::ChatGptPrivate => "audio/",
         Modality::Audio => {
             return Err(invalid_request(
-                "Responses audio input is not supported by this adapter",
+                "public Responses audio input is not supported by this adapter",
             ));
         }
         Modality::Video | Modality::Binary => {
             return Err(invalid_request(
-                "Responses supports only image and audio media input",
+                "Responses supports only image and private-profile audio media input",
             ));
         }
     };
     if !media.mime_type.starts_with(expected) || media.mime_type.contains(['\r', '\n', ';', ',']) {
         return Err(invalid_request("Responses media has an invalid MIME type"));
     }
-    let url = match &media.data {
-        DataRef::InlineBytes(bytes) => {
-            format!("data:{};base64,{}", media.mime_type, STANDARD.encode(bytes))
-        }
-        DataRef::InlineText(text) if text.starts_with("data:") => text.clone(),
-        DataRef::InlineText(text) => format!("data:{};base64,{text}", media.mime_type),
-        DataRef::Uri(uri)
-            if !uri.is_empty() && uri.len() <= MAX_TEXT_BYTES && !uri.contains(['\r', '\n']) =>
-        {
-            uri.clone()
-        }
-        DataRef::Uri(_) => {
-            return Err(invalid_request(
-                "Responses media URI is outside canonical bounds",
-            ));
-        }
-        DataRef::Handle(_) => {
-            return Err(invalid_request("Responses cannot resolve artifact handles"));
-        }
-    };
+    let url = media_data_url(media)?;
     Ok(match media.modality {
-        Modality::Image => json!({"type": "input_image", "image_url": url, "detail": "high"}),
-        Modality::Audio => unreachable!("rejected above"),
+        Modality::Image => {
+            json!({"type": "input_image", "image_url": url, "detail": "high"})
+        }
+        Modality::Audio => json!({"type": "input_audio", "audio_url": url}),
         Modality::Video | Modality::Binary => unreachable!("rejected above"),
     })
+}
+
+fn media_data_url(media: &MediaPart) -> Result<String, OpenAIResponsesError> {
+    match &media.data {
+        DataRef::InlineBytes(bytes) => Ok(format!(
+            "data:{};base64,{}",
+            media.mime_type,
+            STANDARD.encode(bytes)
+        )),
+        DataRef::InlineText(text) if text.starts_with("data:") => {
+            validate_data_url(text, &media.mime_type)?;
+            Ok(text.clone())
+        }
+        DataRef::InlineText(text) => {
+            validate_base64(text, "inline media")?;
+            Ok(format!("data:{};base64,{text}", media.mime_type))
+        }
+        DataRef::Uri(uri) if uri.starts_with("data:") => {
+            validate_data_url(uri, &media.mime_type)?;
+            Ok(uri.clone())
+        }
+        DataRef::Uri(uri)
+            if media.modality == Modality::Image
+                && uri.len() <= MAX_TEXT_BYTES
+                && reqwest::Url::parse(uri)
+                    .is_ok_and(|url| matches!(url.scheme(), "http" | "https")) =>
+        {
+            Ok(uri.clone())
+        }
+        DataRef::Uri(_) => Err(invalid_request(
+            "Responses cannot read this media URI; use inline bytes or an HTTP(S) image URL",
+        )),
+        DataRef::Handle(_) => Err(invalid_request(
+            "Responses cannot resolve media handles; use inline bytes",
+        )),
+    }
+}
+
+fn validate_data_url(value: &str, mime_type: &str) -> Result<(), OpenAIResponsesError> {
+    let payload = value
+        .strip_prefix(&format!("data:{mime_type};base64,"))
+        .filter(|payload| !payload.is_empty())
+        .ok_or_else(|| invalid_request("Responses media data URL is not canonical base64"))?;
+    validate_base64(payload, "media data URL")
+}
+
+fn validate_base64(value: &str, field: &str) -> Result<(), OpenAIResponsesError> {
+    let decoded = STANDARD
+        .decode(value)
+        .map_err(|_| invalid_request(format!("Responses {field} is not valid base64")))?;
+    if decoded.is_empty() || STANDARD.encode(&decoded) != value {
+        return Err(invalid_request(format!(
+            "Responses {field} is not canonical base64"
+        )));
+    }
+    Ok(())
+}
+
+fn generated_image_item(
+    media: &MediaPart,
+    config: &OpenAIResponsesConfig,
+    session_id: &str,
+    authentication_binding: Option<&str>,
+) -> Result<Option<Value>, OpenAIResponsesError> {
+    let Some(metadata) = media.metadata.get(GENERATED_IMAGE_METADATA) else {
+        return Ok(None);
+    };
+    let metadata = metadata
+        .as_object()
+        .filter(|metadata| (2..=3).contains(&metadata.len()))
+        .ok_or_else(|| protocol_error("generated image metadata is malformed"))?;
+    let item_id = bounded_metadata_string(metadata.get("item_id"), "generated image item_id")?;
+    if metadata.get("status").and_then(Value::as_str) != Some("completed")
+        || media.modality != Modality::Image
+        || media.mime_type != "image/png"
+    {
+        return Err(protocol_error("generated image metadata is invalid"));
+    }
+    let Some(continuation) = continuation_from_metadata(
+        &media.metadata,
+        config,
+        session_id,
+        authentication_binding,
+        "image_generation_call",
+        false,
+    )?
+    else {
+        return Ok(None);
+    };
+    if continuation.item_id != item_id {
+        return Err(protocol_error(
+            "generated image continuation item binding is invalid",
+        ));
+    }
+    let revised_prompt = metadata
+        .get("revised_prompt")
+        .filter(|value| !value.is_null())
+        .map(|value| bounded_metadata_string(Some(value), "generated image revised prompt"))
+        .transpose()?;
+    let result = match &media.data {
+        DataRef::InlineBytes(bytes) if !bytes.is_empty() => STANDARD.encode(bytes),
+        DataRef::InlineText(text) if !text.starts_with("data:") => {
+            validate_base64(text, "persisted generated image result")?;
+            text.clone()
+        }
+        DataRef::InlineText(text) => {
+            validate_data_url(text, "image/png")?;
+            text.split_once(',')
+                .map(|(_, payload)| payload.to_owned())
+                .ok_or_else(|| protocol_error("persisted generated image data URL is malformed"))?
+        }
+        DataRef::Uri(_) | DataRef::Handle(_) | DataRef::InlineBytes(_) => {
+            return Err(invalid_request(
+                "Responses cannot replay a generated image without inline bytes",
+            ));
+        }
+    };
+    Ok(Some(json!({
+        "id": item_id,
+        "type": "image_generation_call",
+        "status": "completed",
+        "revised_prompt": revised_prompt,
+        "result": result,
+    })))
 }
 
 struct Continuation<'a> {
@@ -913,14 +1185,21 @@ struct Continuation<'a> {
 
 fn continuation_from_metadata<'a>(
     metadata: &'a MetadataMap,
-    model: &str,
+    config: &OpenAIResponsesConfig,
     session_id: &str,
     authentication_binding: Option<&str>,
     expected_kind: &str,
     encrypted_required: bool,
 ) -> Result<Option<Continuation<'a>>, OpenAIResponsesError> {
     let Some(raw) = metadata.get(CONTINUATION_METADATA) else {
-        return Ok(None);
+        return legacy_continuation_from_metadata(
+            metadata,
+            config,
+            session_id,
+            authentication_binding,
+            expected_kind,
+            encrypted_required,
+        );
     };
     let object = raw
         .as_object()
@@ -929,7 +1208,7 @@ fn continuation_from_metadata<'a>(
     if object.len() != expected_len
         || object.get("schema_version").and_then(Value::as_u64) != Some(CONTINUATION_SCHEMA_VERSION)
         || object.get("kind").and_then(Value::as_str) != Some(expected_kind)
-        || object.get("model").and_then(Value::as_str) != Some(model)
+        || object.get("model").and_then(Value::as_str) != Some(&*config.model)
         || object.get("session_id").and_then(Value::as_str) != Some(session_id)
     {
         return Err(protocol_error(
@@ -950,6 +1229,86 @@ fn continuation_from_metadata<'a>(
         ));
     }
     if authentication_binding != Some(metadata_binding) {
+        return Ok(None);
+    }
+    Ok(Some(Continuation {
+        item_id,
+        encrypted_content,
+    }))
+}
+
+fn legacy_continuation_from_metadata<'a>(
+    metadata: &'a MetadataMap,
+    config: &OpenAIResponsesConfig,
+    session_id: &str,
+    authentication_binding: Option<&str>,
+    expected_kind: &str,
+    encrypted_required: bool,
+) -> Result<Option<Continuation<'a>>, OpenAIResponsesError> {
+    let Some(raw) = metadata.get(LEGACY_CONTINUATION_METADATA) else {
+        return Ok(None);
+    };
+    if config.profile != OpenAIResponsesProfile::ChatGptPrivate {
+        return Ok(None);
+    }
+    let Some(authentication_binding) = authentication_binding else {
+        return Ok(None);
+    };
+    let Some(authenticator) = &config.legacy_continuation_authenticator else {
+        return Ok(None);
+    };
+    let object = raw
+        .as_object()
+        .ok_or_else(|| protocol_error("legacy Responses continuation metadata is not an object"))?;
+    let expected_len = if encrypted_required { 9 } else { 8 };
+    if object.len() != expected_len
+        || object.get("schema_version").and_then(Value::as_u64)
+            != Some(LEGACY_CONTINUATION_SCHEMA_VERSION)
+        || object.get("kind").and_then(Value::as_str) != Some(expected_kind)
+        || object.get("model").and_then(Value::as_str) != Some(&*config.model)
+        || object.get("session_id").and_then(Value::as_str) != Some(session_id)
+        || object.get("output_index").and_then(Value::as_u64).is_none()
+    {
+        return Err(protocol_error(
+            "legacy Responses continuation metadata binding is invalid",
+        ));
+    }
+    let account_binding = object
+        .get("account_binding")
+        .and_then(Value::as_object)
+        .filter(|binding| binding.len() == 2)
+        .ok_or_else(|| protocol_error("legacy Responses account binding is invalid"))?;
+    let digest = bounded_metadata_string(
+        account_binding.get("account_id_digest"),
+        "legacy account digest",
+    )?;
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(protocol_error("legacy Responses account digest is invalid"));
+    }
+    bounded_metadata_string(
+        account_binding.get("login_generation"),
+        "legacy login generation",
+    )?;
+    bounded_metadata_string(object.get("response_id"), "legacy response_id")?;
+    let item_id = bounded_metadata_string(object.get("item_id"), "legacy item_id")?;
+    let encrypted_content = object.get("encrypted_content").and_then(Value::as_str);
+    if encrypted_required
+        && encrypted_content.is_none_or(|value| value.is_empty() || value.len() > MAX_TEXT_BYTES)
+    {
+        return Err(protocol_error(
+            "legacy Responses encrypted continuation is invalid",
+        ));
+    }
+    if !authenticator(
+        object
+            .get("account_binding")
+            .expect("validated legacy account binding"),
+        authentication_binding,
+    ) {
         return Ok(None);
     }
     Ok(Some(Continuation {
@@ -1004,18 +1363,63 @@ fn protocol_error(message: impl Into<String>) -> OpenAIResponsesError {
     OpenAIResponsesError::Protocol(message.into())
 }
 
-fn encode_tool_output(output: &ToolOutput) -> Result<String, OpenAIResponsesError> {
+fn encode_tool_output(
+    output: &ToolOutput,
+    profile: OpenAIResponsesProfile,
+) -> Result<Value, OpenAIResponsesError> {
+    if profile == OpenAIResponsesProfile::Public {
+        return match output {
+            ToolOutput::Text(value) => Ok(Value::String(value.clone())),
+            ToolOutput::Structured(value) => serde_json::to_string(value)
+                .map(Value::String)
+                .map_err(OpenAIResponsesError::Serialize),
+            ToolOutput::Parts(parts) => serde_json::to_string(parts)
+                .map(Value::String)
+                .map_err(OpenAIResponsesError::Serialize),
+            ToolOutput::Files(files) => serde_json::to_string(files)
+                .map(Value::String)
+                .map_err(OpenAIResponsesError::Serialize),
+        };
+    }
     match output {
-        ToolOutput::Text(value) => Ok(value.clone()),
-        ToolOutput::Structured(value) => {
-            serde_json::to_string(value).map_err(OpenAIResponsesError::Serialize)
+        ToolOutput::Text(value) => Ok(Value::String(value.clone())),
+        ToolOutput::Structured(value) => serde_json::to_string(value)
+            .map(Value::String)
+            .map_err(OpenAIResponsesError::Serialize),
+        ToolOutput::Parts(parts) if parts.iter().any(|part| matches!(part, Part::Media(_))) => {
+            parts
+                .iter()
+                .map(|part| match part {
+                    Part::Text(text) => Ok(json!({"type": "input_text", "text": text.text})),
+                    Part::Structured(value) => Ok(json!({
+                        "type": "input_text",
+                        "text": serde_json::to_string(&value.value)
+                            .map_err(OpenAIResponsesError::Serialize)?,
+                    })),
+                    Part::Media(media) => encode_media(media, profile),
+                    _ => Err(invalid_request(
+                        "private Responses tool output contains unsupported content",
+                    )),
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map(Value::Array)
         }
-        ToolOutput::Parts(parts) => {
-            serde_json::to_string(parts).map_err(OpenAIResponsesError::Serialize)
-        }
-        ToolOutput::Files(files) => {
-            serde_json::to_string(files).map_err(OpenAIResponsesError::Serialize)
-        }
+        ToolOutput::Parts(parts) => parts
+            .iter()
+            .map(|part| match part {
+                Part::Text(text) => Ok(text.text.clone()),
+                Part::Structured(value) => {
+                    serde_json::to_string(&value.value).map_err(OpenAIResponsesError::Serialize)
+                }
+                _ => Err(invalid_request(
+                    "private Responses tool output contains unsupported content",
+                )),
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(|parts| Value::String(parts.join("\n"))),
+        ToolOutput::Files(_) => Err(invalid_request(
+            "private Responses file tool output is unsupported",
+        )),
     }
 }
 
@@ -1105,12 +1509,14 @@ struct ResponsesRequestContext {
     deadline: Option<LogicalDeadline>,
     retries: usize,
     refreshed: bool,
+    wire_bytes: usize,
 }
 
 struct LiveAttempt {
     body: agentkit_http::BodyStream,
     truncated: TruncatedStreamDetector,
     decoder: ResponsesSseDecoder,
+    deadline: Option<LogicalDeadline>,
     eof: bool,
     closed: bool,
 }
@@ -1129,19 +1535,24 @@ async fn open_live_attempt(
     cancellation: Option<&TurnCancellation>,
 ) -> Result<LiveAttempt, LoopError> {
     loop {
+        let attempt_timeout = context
+            .config
+            .resilience
+            .as_ref()
+            .and_then(|config| config.attempt_timeout);
+        let attempt_deadline = attempt_timeout.map(LogicalDeadline::new);
         let result = attempt_with_timeout(
             send_live_attempt(context, cancellation),
-            context
-                .config
-                .resilience
-                .as_ref()
-                .and_then(|config| config.attempt_timeout),
+            attempt_timeout,
             context.deadline.as_ref(),
             cancellation,
         )
         .await;
         match result {
-            Ok(attempt) => return Ok(attempt),
+            Ok(mut attempt) => {
+                attempt.deadline = attempt_deadline;
+                return Ok(attempt);
+            }
             Err(failure) if is_unauthorized(&failure.error) && !context.refreshed => {
                 let binding = context.auth.binding().map(str::to_owned);
                 let refreshed = cancellable(
@@ -1215,18 +1626,32 @@ async fn send_live_attempt(
     let mut headers = context.config.headers.clone();
     headers.insert("accept", HeaderValue::from_static("text/event-stream"));
     headers.insert("content-type", HeaderValue::from_static("application/json"));
-    headers.insert(
-        "user-agent",
-        HeaderValue::from_static(concat!(
-            "agentkit-provider-openai/",
-            env!("CARGO_PKG_VERSION")
-        )),
-    );
+    if let Some(user_agent) = &context.config.user_agent {
+        headers.insert(
+            "user-agent",
+            HeaderValue::from_str(user_agent)
+                .map_err(|_| protocol_failure("invalid user-agent header"))?,
+        );
+    } else {
+        headers
+            .entry("user-agent")
+            .or_insert(HeaderValue::from_static(concat!(
+                "agentkit-provider-openai/",
+                env!("CARGO_PKG_VERSION")
+            )));
+    }
     headers.insert(
         "idempotency-key",
         HeaderValue::from_str(&context.idempotency_key)
             .map_err(|_| protocol_failure("invalid idempotency key"))?,
     );
+    if let Some(originator) = &context.config.originator {
+        headers.insert(
+            "originator",
+            HeaderValue::from_str(originator)
+                .map_err(|_| protocol_failure("invalid originator header"))?,
+        );
+    }
     let sent_turn_state = if context.config.profile == OpenAIResponsesProfile::ChatGptPrivate {
         headers.remove(X_CODEX_TURN_STATE);
         headers
@@ -1277,7 +1702,9 @@ async fn send_live_attempt(
             error: Box::new(LoopError::Provider(format!(
                 "OpenAI Responses returned HTTP {status}"
             ))),
-            retryable: is_retryable_status(status),
+            retryable: is_retryable_status(status)
+                || (context.config.profile == OpenAIResponsesProfile::ChatGptPrivate
+                    && status.as_u16() == 529),
             headers: retry_headers(response.headers()),
         });
     }
@@ -1312,13 +1739,26 @@ async fn send_live_attempt(
         decoder: ResponsesSseDecoder::with_policy(
             &context.config.model,
             &context.session_id,
+            context.config.profile,
             context.config.request_policy.include_encrypted_reasoning,
             context.auth.binding(),
             context.turn_state.clone(),
+            context.config.limits.max_attempt_bytes,
         ),
+        deadline: None,
         eof: false,
         closed: false,
     })
+}
+
+fn attempt_timeout_failure(timeout: Duration) -> AttemptFailure {
+    AttemptFailure {
+        error: Box::new(LoopError::Provider(format!(
+            "Responses attempt timed out after {timeout:?}"
+        ))),
+        retryable: true,
+        headers: None,
+    }
 }
 
 async fn attempt_with_timeout<F, T>(
@@ -1353,13 +1793,7 @@ where
                     timeout: deadline.expect("budget timeout has deadline").budget,
                 })))
             }
-            Either::Right((_, _)) => Err(AttemptFailure {
-                error: Box::new(LoopError::Provider(format!(
-                    "Responses attempt timed out after {timeout:?}"
-                ))),
-                retryable: true,
-                headers: None,
-            }),
+            Either::Right((_, _)) => Err(attempt_timeout_failure(timeout)),
         }
     };
     match cancellable(timed, cancellation).await {
@@ -1376,6 +1810,7 @@ struct ResponsesSseDecoder {
     buffer: Zeroizing<Vec<u8>>,
     buffer_start: usize,
     received: usize,
+    max_attempt_bytes: usize,
     state: ResponsesState,
 }
 
@@ -1385,44 +1820,53 @@ impl ResponsesSseDecoder {
         Self::with_policy(
             model,
             session_id,
+            OpenAIResponsesProfile::Public,
             true,
             Some("test-authentication-binding"),
             Arc::new(Mutex::new(None)),
+            DEFAULT_MAX_ATTEMPT_BYTES,
         )
     }
 
     fn with_policy(
         model: &str,
         session_id: &str,
+        profile: OpenAIResponsesProfile,
         require_encrypted_reasoning: bool,
         authentication_binding: Option<&str>,
         turn_state: Arc<Mutex<Option<HeaderValue>>>,
+        max_attempt_bytes: usize,
     ) -> Self {
         Self {
             buffer: Zeroizing::new(Vec::new()),
             buffer_start: 0,
             received: 0,
+            max_attempt_bytes,
             state: ResponsesState::new(
                 model,
                 session_id,
+                profile,
                 require_encrypted_reasoning,
                 authentication_binding,
                 turn_state,
+                max_attempt_bytes,
             ),
         }
     }
 
     fn push(&mut self, bytes: &[u8]) -> Result<(), AttemptFailure> {
         self.received = self.received.saturating_add(bytes.len());
-        if self.received > MAX_ATTEMPT_BYTES {
-            return Err(protocol_failure("Responses SSE attempt exceeds 16 MiB"));
+        if self.received > self.max_attempt_bytes {
+            return Err(protocol_failure(
+                "Responses SSE attempt exceeds configured byte limit",
+            ));
         }
         if self.buffer_start != 0 {
             self.buffer[..self.buffer_start].zeroize();
             self.buffer.drain(..self.buffer_start);
             self.buffer_start = 0;
         }
-        zeroizing_extend(&mut self.buffer, bytes, MAX_ATTEMPT_BYTES)?;
+        zeroizing_extend(&mut self.buffer, bytes, self.max_attempt_bytes)?;
         self.process_pending()
     }
 
@@ -1430,14 +1874,18 @@ impl ResponsesSseDecoder {
         while self.state.events.is_empty() {
             let Some((relative_end, delimiter)) = frame_end(&self.buffer[self.buffer_start..])
             else {
-                if self.buffer.len().saturating_sub(self.buffer_start) > MAX_EVENT_BYTES {
-                    return Err(protocol_failure("Responses SSE event exceeds 1 MiB"));
+                if self.buffer.len().saturating_sub(self.buffer_start) > self.max_attempt_bytes {
+                    return Err(protocol_failure(
+                        "Responses SSE event exceeds configured byte limit",
+                    ));
                 }
                 return Ok(());
             };
             let end = self.buffer_start + relative_end;
-            if end - self.buffer_start > MAX_EVENT_BYTES {
-                return Err(protocol_failure("Responses SSE event exceeds 1 MiB"));
+            if end - self.buffer_start > self.max_attempt_bytes {
+                return Err(protocol_failure(
+                    "Responses SSE event exceeds configured byte limit",
+                ));
             }
             let mut frame = Zeroizing::new(self.buffer[self.buffer_start..end].to_vec());
             self.buffer_start = end + delimiter;
@@ -1450,8 +1898,10 @@ impl ResponsesSseDecoder {
     fn process_all_pending(&mut self) -> Result<(), AttemptFailure> {
         while let Some((relative_end, delimiter)) = frame_end(&self.buffer[self.buffer_start..]) {
             let end = self.buffer_start + relative_end;
-            if end - self.buffer_start > MAX_EVENT_BYTES {
-                return Err(protocol_failure("Responses SSE event exceeds 1 MiB"));
+            if end - self.buffer_start > self.max_attempt_bytes {
+                return Err(protocol_failure(
+                    "Responses SSE event exceeds configured byte limit",
+                ));
             }
             let mut frame = Zeroizing::new(self.buffer[self.buffer_start..end].to_vec());
             self.buffer_start = end + delimiter;
@@ -1548,6 +1998,8 @@ struct PartAccumulator {
 
 struct ResponsesState {
     requested_model: String,
+    profile: OpenAIResponsesProfile,
+    max_attempt_bytes: usize,
     session_id: String,
     authentication_binding: Option<String>,
     turn_state: Arc<Mutex<Option<HeaderValue>>>,
@@ -1578,18 +2030,23 @@ struct ResponsesState {
     finish_reason: Option<FinishReason>,
     provider_finish_reason: Option<String>,
     tool_call: bool,
+    next_media: usize,
 }
 
 impl ResponsesState {
     fn new(
         model: &str,
         session_id: &str,
+        profile: OpenAIResponsesProfile,
         require_encrypted_reasoning: bool,
         authentication_binding: Option<&str>,
         turn_state: Arc<Mutex<Option<HeaderValue>>>,
+        max_attempt_bytes: usize,
     ) -> Self {
         Self {
             requested_model: model.to_owned(),
+            profile,
+            max_attempt_bytes,
             session_id: session_id.to_owned(),
             authentication_binding: authentication_binding.map(str::to_owned),
             turn_state,
@@ -1620,6 +2077,7 @@ impl ResponsesState {
             finish_reason: None,
             provider_finish_reason: None,
             tool_call: false,
+            next_media: 0,
         }
     }
 
@@ -1693,10 +2151,7 @@ impl ResponsesState {
                     .or_else(|| value.get("code"))
                     .and_then(Value::as_str)
                     .unwrap_or("unknown");
-                let retryable = matches!(
-                    code,
-                    "server_error" | "rate_limit_exceeded" | "temporarily_unavailable"
-                );
+                let retryable = stream_failure_retryable(self.profile, value, kind);
                 Err(AttemptFailure {
                     error: Box::new(LoopError::Provider(format!(
                         "OpenAI Responses stream failed ({code})"
@@ -1728,6 +2183,7 @@ impl ResponsesState {
                 }
                 Ok(())
             }
+            _ if self.profile == OpenAIResponsesProfile::ChatGptPrivate => Ok(()),
             _ => Err(protocol_failure("unsupported Responses SSE event kind")),
         }
     }
@@ -1807,7 +2263,12 @@ impl ResponsesState {
         let id = bounded_id(item.get("id"))?;
         let index = nonnegative(value, "output_index")?;
         let kind = item.get("type").and_then(Value::as_str);
-        if kind.is_some_and(|kind| !matches!(kind, "message" | "reasoning" | "function_call")) {
+        if kind.is_some_and(|kind| {
+            !matches!(
+                kind,
+                "message" | "reasoning" | "function_call" | "image_generation_call"
+            )
+        }) {
             return Err(protocol_failure("unsupported Responses output item"));
         }
         if !self.seen_ids.insert(id.to_owned()) {
@@ -2146,6 +2607,79 @@ impl ResponsesState {
                 self.output.insert(
                     output_index,
                     provider_item(item_id, vec![Part::ToolCall(call)]),
+                );
+            }
+            Some("image_generation_call") => {
+                let status = bounded_nonempty_field(item, "status")?;
+                if status != "completed" {
+                    return Err(protocol_failure("image generation did not complete"));
+                }
+                let result = item
+                    .get("result")
+                    .and_then(Value::as_str)
+                    .filter(|result| !result.is_empty() && result.len() <= self.max_attempt_bytes)
+                    .ok_or_else(|| {
+                        protocol_failure("generated image result is outside configured byte bounds")
+                    })?;
+                let bytes = STANDARD
+                    .decode(result)
+                    .map_err(|_| protocol_failure("generated image result is not valid base64"))?;
+                if bytes.is_empty() || STANDARD.encode(&bytes) != result {
+                    return Err(protocol_failure(
+                        "generated image result is not canonical base64",
+                    ));
+                }
+                let revised_prompt = item
+                    .get("revised_prompt")
+                    .filter(|value| !value.is_null())
+                    .map(|_| bounded_field(item, "revised_prompt"))
+                    .transpose()?;
+                let response_id = self
+                    .response_id
+                    .as_deref()
+                    .expect("created response has ID");
+                let mut metadata = continuation_metadata(
+                    &self.requested_model,
+                    &self.session_id,
+                    self.authentication_binding.as_deref(),
+                    response_id,
+                    item_id,
+                    output_index,
+                    "image_generation_call",
+                    None,
+                );
+                metadata.insert(
+                    GENERATED_IMAGE_METADATA.to_owned(),
+                    json!({
+                        "item_id": item_id,
+                        "status": status,
+                        "revised_prompt": revised_prompt,
+                    }),
+                );
+                let media =
+                    MediaPart::new(Modality::Image, "image/png", DataRef::InlineBytes(bytes))
+                        .with_metadata(metadata);
+                self.next_media += 1;
+                let placeholder_id = PartId::new(format!("generated-image-{output_index}"));
+                push_event(
+                    &mut self.events,
+                    &mut self.event_count,
+                    ModelTurnEvent::Delta(Delta::BeginPart {
+                        part_id: placeholder_id.clone(),
+                        kind: PartKind::Text,
+                    }),
+                )?;
+                push_event(
+                    &mut self.events,
+                    &mut self.event_count,
+                    ModelTurnEvent::Delta(Delta::AppendText {
+                        part_id: placeholder_id,
+                        chunk: format!("[Image #{}]", self.next_media),
+                    }),
+                )?;
+                self.output.insert(
+                    output_index,
+                    provider_item(item_id, vec![Part::Media(media)]),
                 );
             }
             Some("reasoning") => {
@@ -2682,6 +3216,69 @@ fn protocol_failure(message: &str) -> AttemptFailure {
     nonretryable(LoopError::Provider(message.into()))
 }
 
+fn stream_failure_retryable(profile: OpenAIResponsesProfile, value: &Value, kind: &str) -> bool {
+    let error = if kind == "response.failed" {
+        value.pointer("/response/error").unwrap_or(&Value::Null)
+    } else {
+        value.get("error").unwrap_or(value)
+    };
+    let code = error
+        .get("code")
+        .or_else(|| value.get("code"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    if profile == OpenAIResponsesProfile::Public {
+        return matches!(
+            code,
+            "server_error" | "rate_limit_exceeded" | "temporarily_unavailable"
+        );
+    }
+    let error_type = error
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let status = error
+        .get("status")
+        .or_else(|| value.get("status"))
+        .or_else(|| value.pointer("/response/status_code"))
+        .and_then(Value::as_u64);
+    let authentication = status.is_some_and(|status| status == 401 || status == 403)
+        || [code, error_type].iter().any(|value| {
+            matches!(
+                *value,
+                "authentication_error"
+                    | "invalid_api_key"
+                    | "invalid_authentication"
+                    | "unauthorized"
+            )
+        });
+    let permanent = status.is_some_and(|status| {
+        matches!(
+            status,
+            400 | 402 | 403 | 404 | 405 | 406 | 410 | 413 | 415 | 422 | 501 | 505
+        )
+    }) || [code, error_type].iter().any(|value| {
+        [
+            "billing",
+            "content_policy",
+            "deactivated",
+            "insufficient",
+            "invalid",
+            "not_found",
+            "not_supported",
+            "permission",
+            "quota",
+            "unsupported",
+        ]
+        .iter()
+        .any(|marker| value.contains(marker))
+    });
+    !authentication
+        && !permanent
+        && status
+            .is_none_or(|status| matches!(status, 408 | 425 | 429 | 500 | 502 | 503 | 504 | 529))
+}
+
 fn nonretryable(error: LoopError) -> AttemptFailure {
     AttemptFailure {
         error: Box::new(error),
@@ -2755,6 +3352,30 @@ mod tests {
                 response.headers,
                 request.url,
                 Box::pin(stream::once(async move { Ok(body) })),
+            ))
+        }
+    }
+
+    struct ActiveStreamClient {
+        requests: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl HttpClient for ActiveStreamClient {
+        async fn execute(&self, request: HttpRequest) -> Result<HttpResponse, HttpError> {
+            self.requests.fetch_add(1, Ordering::SeqCst);
+            let body = stream::unfold((), |_| async {
+                sleep(Duration::from_millis(1)).await;
+                Some((
+                    Ok(agentkit_http::Bytes::from_static(b": keepalive\n\n")),
+                    (),
+                ))
+            });
+            Ok(HttpResponse::new(
+                StatusCode::OK,
+                sse_headers(),
+                request.url,
+                Box::pin(body),
             ))
         }
     }
@@ -3215,9 +3836,11 @@ data: {"type":"response.completed","sequence_number":18,"response":{"id":"resp-1
         let mut decoder = ResponsesSseDecoder::with_policy(
             "gpt-test",
             "session",
+            OpenAIResponsesProfile::Public,
             true,
             None,
             Arc::new(Mutex::new(None)),
+            DEFAULT_MAX_ATTEMPT_BYTES,
         );
         decoder.push(SUCCESS.as_bytes()).unwrap();
         let events = decoder.finish().unwrap();
@@ -3249,9 +3872,11 @@ data: {"type":"response.completed","sequence_number":18,"response":{"id":"resp-1
         let mut decoder = ResponsesSseDecoder::with_policy(
             "gpt-test",
             "session",
+            OpenAIResponsesProfile::Public,
             false,
             Some("test-authentication-binding"),
             Arc::new(Mutex::new(None)),
+            DEFAULT_MAX_ATTEMPT_BYTES,
         );
         decoder.push(wire.as_bytes()).unwrap();
         let events = decoder.finish().unwrap();
@@ -3774,6 +4399,305 @@ data: {"type":"response.completed","sequence_number":18,"response":{"id":"resp-1
             .unwrap();
         assert!(session.begin_turn(request(), None).await.is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(client.requests.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn private_audio_and_media_tool_outputs_preserve_multimodal_content() {
+        let config =
+            OpenAIResponsesConfig::chatgpt_private("gpt-test", Authentication::bearer("secret"));
+        let mut audio = request();
+        audio.transcript = vec![Item::new(
+            ItemKind::User,
+            vec![Part::media(
+                Modality::Audio,
+                "audio/wav",
+                DataRef::InlineBytes(vec![1, 2, 3]),
+            )],
+        )];
+        let encoded = config.encode_request(&audio).unwrap();
+        assert_eq!(encoded["input"][0]["content"][0]["type"], "input_audio");
+        assert_eq!(
+            encoded["input"][0]["content"][0]["audio_url"],
+            "data:audio/wav;base64,AQID"
+        );
+
+        let mut tool = request();
+        tool.transcript = vec![Item::new(
+            ItemKind::Tool,
+            vec![Part::ToolResult(agentkit_core::ToolResultPart::success(
+                "call-1",
+                ToolOutput::parts(vec![
+                    Part::text("screenshot"),
+                    Part::media(
+                        Modality::Image,
+                        "image/png",
+                        DataRef::InlineBytes(vec![1, 2, 3]),
+                    ),
+                ]),
+            ))],
+        )];
+        let encoded = config.encode_request(&tool).unwrap();
+        let output = encoded["input"][0]["output"].as_array().unwrap();
+        assert_eq!(output[0]["type"], "input_text");
+        assert_eq!(output[1]["type"], "input_image");
+    }
+
+    #[test]
+    fn media_validation_rejects_noncanonical_base64_and_unsafe_uris() {
+        let config = OpenAIResponsesConfig::new("secret", "gpt-test");
+        for data in [
+            DataRef::InlineText("%%%".into()),
+            DataRef::Uri("file:///tmp/private.png".into()),
+            DataRef::Uri("custom://artifact/image".into()),
+            DataRef::Uri("data:image/jpeg;base64,AQID".into()),
+        ] {
+            let mut invalid = request();
+            invalid.transcript = vec![Item::new(
+                ItemKind::User,
+                vec![Part::media(Modality::Image, "image/png", data)],
+            )];
+            assert!(config.encode_request(&invalid).is_err());
+        }
+        let mut valid = request();
+        valid.transcript = vec![Item::new(
+            ItemKind::User,
+            vec![Part::media(
+                Modality::Image,
+                "image/png",
+                DataRef::Uri("https://example.com/image.png".into()),
+            )],
+        )];
+        assert!(config.encode_request(&valid).is_ok());
+    }
+
+    #[test]
+    fn generated_image_output_is_persisted_and_replayed() {
+        let wire = concat!(
+            "event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":1,\"response\":{\"id\":\"resp-image\",\"model\":\"gpt-test\"}}\n\n",
+            "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"sequence_number\":2,\"output_index\":0,\"item\":{\"id\":\"image-1\",\"type\":\"image_generation_call\"}}\n\n",
+            "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"sequence_number\":3,\"output_index\":0,\"item\":{\"id\":\"image-1\",\"type\":\"image_generation_call\",\"status\":\"completed\",\"revised_prompt\":\"safer prompt\",\"result\":\"AQID\"}}\n\n",
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"sequence_number\":4,\"response\":{\"id\":\"resp-image\",\"model\":\"gpt-test\",\"status\":\"completed\"}}\n\n",
+        );
+        let mut decoder = ResponsesSseDecoder::with_policy(
+            "gpt-test",
+            "session",
+            OpenAIResponsesProfile::ChatGptPrivate,
+            true,
+            Some("test-authentication-binding"),
+            Arc::new(Mutex::new(None)),
+            DEFAULT_MAX_ATTEMPT_BYTES,
+        );
+        decoder.push(wire.as_bytes()).unwrap();
+        let events = decoder.finish().unwrap();
+        let result = events
+            .iter()
+            .find_map(|event| match event {
+                ModelTurnEvent::Finished(result) => Some(result),
+                _ => None,
+            })
+            .unwrap();
+        let Part::Media(media) = &result.output_items[0].parts[0] else {
+            panic!("generated image was not persisted as media");
+        };
+        assert_eq!(media.data, DataRef::InlineBytes(vec![1, 2, 3]));
+        assert!(media.metadata.contains_key(CONTINUATION_METADATA));
+        assert!(!media.metadata.contains_key(LEGACY_CONTINUATION_METADATA));
+
+        let replay = TurnRequest {
+            transcript: result.output_items.clone(),
+            ..request()
+        };
+        let config =
+            OpenAIResponsesConfig::chatgpt_private("gpt-test", Authentication::bearer("secret"));
+        let encoded =
+            encode_request_bound(&config, &replay, Some("test-authentication-binding")).unwrap();
+        assert_eq!(encoded["input"][0]["type"], "image_generation_call");
+        assert_eq!(encoded["input"][0]["result"], "AQID");
+    }
+
+    #[test]
+    fn private_unknown_events_are_ignored_and_statusless_failures_retry_unless_permanent() {
+        let unknown = b"event: response.future_hint\ndata: {\"type\":\"response.future_hint\",\"sequence_number\":1}\n\n";
+        let mut private = ResponsesSseDecoder::with_policy(
+            "gpt-test",
+            "session",
+            OpenAIResponsesProfile::ChatGptPrivate,
+            true,
+            Some("binding"),
+            Arc::new(Mutex::new(None)),
+            DEFAULT_MAX_ATTEMPT_BYTES,
+        );
+        assert!(private.push(unknown).is_ok());
+        let mut public = ResponsesSseDecoder::new("gpt-test", "session");
+        assert!(public.push(unknown).is_err());
+
+        assert!(stream_failure_retryable(
+            OpenAIResponsesProfile::ChatGptPrivate,
+            &json!({"type": "error", "error": {"type": "brand_new_error", "code": "never_seen_before"}}),
+            "error",
+        ));
+        assert!(!stream_failure_retryable(
+            OpenAIResponsesProfile::ChatGptPrivate,
+            &json!({"type": "error", "error": {"type": "invalid_request_error", "code": "invalid_prompt"}}),
+            "error",
+        ));
+    }
+
+    #[test]
+    fn legacy_subscription_continuation_requires_all_bindings() {
+        let legacy = json!({
+            "schema_version": 1,
+            "account_binding": {
+                "account_id_digest": "a".repeat(64),
+                "login_generation": "generation-1",
+            },
+            "model": "gpt-test",
+            "session_id": "session",
+            "response_id": "resp-1",
+            "item_id": "call-item-1",
+            "output_index": 0,
+            "kind": "function_call",
+        });
+        let call = ToolCallPart::new("call-1", "tool", json!({})).with_metadata(MetadataMap::from(
+            [(LEGACY_CONTINUATION_METADATA.into(), legacy)],
+        ));
+        let replay = TurnRequest {
+            transcript: vec![Item::new(ItemKind::Assistant, vec![Part::ToolCall(call)])],
+            ..request()
+        };
+        let config =
+            OpenAIResponsesConfig::chatgpt_private("gpt-test", Authentication::bearer("secret"))
+                .with_legacy_subscription_continuation_authenticator(|account, current| {
+                    current == "current-binding" && account["login_generation"] == "generation-1"
+                });
+        let encoded = encode_request_bound(&config, &replay, Some("current-binding")).unwrap();
+        assert_eq!(encoded["input"][0]["id"], "call-item-1");
+        let not_bound = encode_request_bound(&config, &replay, Some("other-binding")).unwrap();
+        assert!(not_bound["input"][0].get("id").is_none());
+
+        let public = OpenAIResponsesConfig::new("secret", "gpt-test")
+            .with_legacy_subscription_continuation_authenticator(|_, _| true);
+        let public = encode_request_bound(&public, &replay, Some("current-binding")).unwrap();
+        assert!(public["input"][0].get("id").is_none());
+    }
+
+    #[test]
+    fn serialized_request_limit_is_configurable() {
+        let config =
+            OpenAIResponsesConfig::new("secret", "gpt-test").with_limits(OpenAIResponsesLimits {
+                max_request_bytes: 16,
+                ..OpenAIResponsesLimits::default()
+            });
+        assert!(config.encode_request(&request()).is_err());
+    }
+
+    #[tokio::test]
+    async fn private_http_529_retries_and_custom_attribution_is_sent() {
+        let status_529 = StatusCode::from_u16(529).unwrap();
+        let client = Arc::new(ScriptedClient {
+            responses: Mutex::new(VecDeque::from([
+                WireResponse {
+                    status: status_529,
+                    headers: HeaderMap::new(),
+                    body: "",
+                },
+                WireResponse {
+                    status: StatusCode::OK,
+                    headers: sse_headers(),
+                    body: SUCCESS,
+                },
+            ])),
+            requests: Mutex::new(Vec::new()),
+        });
+        let config =
+            OpenAIResponsesConfig::chatgpt_private("gpt-test", Authentication::bearer("secret"))
+                .with_user_agent("kit/test")
+                .with_originator("kit")
+                .with_resilience(ResilienceConfig {
+                    max_retries: 1,
+                    retry_budget: Duration::from_secs(1),
+                    attempt_timeout: None,
+                    stream_idle_timeout: None,
+                    initial_backoff: Duration::ZERO,
+                    max_backoff: Duration::ZERO,
+                });
+        let adapter = OpenAIResponsesAdapter::with_client(config, Http::from_arc(client.clone()));
+        let mut session = adapter
+            .start_session(SessionConfig::new("session"))
+            .await
+            .unwrap();
+        session.begin_turn(request(), None).await.unwrap();
+        let requests = client.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].headers["user-agent"], "kit/test");
+        assert_eq!(requests[0].headers["originator"], "kit");
+    }
+
+    #[tokio::test]
+    async fn attempt_deadline_bounds_continuously_active_stream() {
+        let client = Arc::new(ActiveStreamClient {
+            requests: AtomicUsize::new(0),
+        });
+        let config =
+            OpenAIResponsesConfig::new("secret", "gpt-test").with_resilience(ResilienceConfig {
+                max_retries: 0,
+                retry_budget: Duration::from_secs(1),
+                attempt_timeout: Some(Duration::from_millis(10)),
+                stream_idle_timeout: Some(Duration::from_millis(100)),
+                initial_backoff: Duration::ZERO,
+                max_backoff: Duration::ZERO,
+            });
+        let adapter = OpenAIResponsesAdapter::with_client(config, Http::from_arc(client.clone()));
+        let mut session = adapter
+            .start_session(SessionConfig::new("session"))
+            .await
+            .unwrap();
+        let mut turn = session.begin_turn(request(), None).await.unwrap();
+        let error = turn.next_event(None).await.unwrap_err();
+        assert!(error.to_string().contains("attempt timed out"));
+        assert_eq!(client.requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn aggregate_wire_limit_spans_retries() {
+        let client = Arc::new(ScriptedClient {
+            responses: Mutex::new(VecDeque::from([
+                WireResponse {
+                    status: StatusCode::OK,
+                    headers: sse_headers(),
+                    body: "1234567890",
+                },
+                WireResponse {
+                    status: StatusCode::OK,
+                    headers: sse_headers(),
+                    body: "1234567890",
+                },
+            ])),
+            requests: Mutex::new(Vec::new()),
+        });
+        let config = OpenAIResponsesConfig::new("secret", "gpt-test")
+            .with_limits(OpenAIResponsesLimits {
+                max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
+                max_attempt_bytes: 16,
+                max_wire_bytes: 15,
+            })
+            .with_resilience(ResilienceConfig {
+                max_retries: 3,
+                retry_budget: Duration::from_secs(1),
+                attempt_timeout: None,
+                stream_idle_timeout: None,
+                initial_backoff: Duration::ZERO,
+                max_backoff: Duration::ZERO,
+            });
+        let adapter = OpenAIResponsesAdapter::with_client(config, Http::from_arc(client.clone()));
+        let mut session = adapter
+            .start_session(SessionConfig::new("session"))
+            .await
+            .unwrap();
+        let mut turn = session.begin_turn(request(), None).await.unwrap();
+        let error = turn.next_event(None).await.unwrap_err();
+        assert!(error.to_string().contains("wire-byte limit"));
         assert_eq!(client.requests.lock().unwrap().len(), 2);
     }
 }

@@ -56,9 +56,11 @@ body-bound idempotency key. Events stream as soon as they are decoded. A failed
 attempt is replayed automatically only before its first event becomes visible.
 After visible output, replay is disabled unless the upstream consumer explicitly
 enables `agentkit_loop::response_attempt` replacement on `SessionConfig` and
-handles its reserved marker by discarding the preceding attempt. Cancellation,
-the logical retry deadline, stream-idle timeout, attempt opening timeout,
-auth/refresh, and backoff remain bounded.
+handles its reserved marker by discarding the preceding attempt. Cancellation, the logical retry deadline, stream-idle timeout, absolute
+per-attempt deadline (including stream reads), auth/refresh, and backoff remain
+bounded. Responses default to a 32 MiB serialized request limit, 16 MiB per
+attempt, and 64 MiB aggregate wire limit across retries; override these with
+`OpenAIResponsesLimits` and `.with_limits(...)`.
 
 ## Responses API
 
@@ -90,7 +92,8 @@ let adapter = OpenAIResponsesAdapter::new(config)?;
 ```
 
 `with_headers` supplies ordinary non-authentication headers.
-`with_request_policy` can override public/private request-field differences. The
+`with_user_agent` and `with_originator` provide explicit request attribution,
+and `with_request_policy` can override public/private request-field differences. The
 public and private profiles request encrypted reasoning continuation data by
 default. The private profile downgrades system messages to developer messages,
 defaults `parallel_tool_calls` to `true`,
@@ -102,12 +105,17 @@ metadata, and retry values must agree. It does not perform credential discovery
 or model catalog lookups.
 
 Continuation metadata is versioned and bound to the authentication binding,
-model, session, provider item ID, and item kind. Durable encrypted
-reasoning and function-call continuation metadata is emitted and replayed only
-when authentication supplies a binding. Valid metadata for another binding is
-omitted safely; malformed metadata is a protocol error. Audio transcript input
-is rejected explicitly until the adapter supports the complete Responses audio
-shape.
+model, session, provider item ID, and item kind. Durable encrypted reasoning,
+function-call, and generated-image continuation metadata is emitted and replayed
+only when authentication supplies a binding. Valid metadata for another binding
+is omitted safely; malformed metadata is a protocol error. Private deployments
+that need to resume Kit's legacy `openai.subscription.v1` schema can install a
+credential-binding validator with
+`with_legacy_subscription_continuation_authenticator`; AgentKit validates the
+remaining schema/model/session fields and emits only current continuation
+metadata. The private profile accepts image/audio transcript inputs and
+media-bearing tool outputs. The public profile continues to reject the private
+audio shape.
 
 ## Examples
 
