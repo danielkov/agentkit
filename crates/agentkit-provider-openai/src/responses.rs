@@ -34,8 +34,8 @@ const PRIVATE_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses"
 const DEFAULT_MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
 const DEFAULT_MAX_ATTEMPT_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_MAX_WIRE_BYTES: usize = 64 * 1024 * 1024;
-const MAX_TEXT_BYTES: usize = 8 * 1024 * 1024;
-const MAX_ITEMS: usize = 100_000;
+const DEFAULT_MAX_TEXT_BYTES: usize = 8 * 1024 * 1024;
+const DEFAULT_MAX_ITEMS: usize = 100_000;
 const CONTINUATION_METADATA: &str = "openai.responses.continuation.v1";
 const CONTINUATION_SCHEMA_VERSION: u64 = 3;
 const LEGACY_CONTINUATION_METADATA: &str = "openai.subscription.v1";
@@ -53,7 +53,7 @@ pub enum OpenAIResponsesProfile {
     ChatGptPrivate,
 }
 
-/// Bounds serialized requests and streamed response bytes.
+/// Bounds serialized requests, streamed responses, counts, and individual fields.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OpenAIResponsesLimits {
     /// Maximum serialized JSON request body size.
@@ -62,6 +62,10 @@ pub struct OpenAIResponsesLimits {
     pub max_attempt_bytes: usize,
     /// Maximum aggregate wire bytes accepted across all attempts for one logical turn.
     pub max_wire_bytes: usize,
+    /// Maximum number of request items/tools, response indexes, or SSE events.
+    pub max_items: usize,
+    /// Maximum bytes accepted in any text, reasoning, ciphertext, or media field.
+    pub max_text_bytes: usize,
 }
 
 impl Default for OpenAIResponsesLimits {
@@ -70,6 +74,8 @@ impl Default for OpenAIResponsesLimits {
             max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
             max_attempt_bytes: DEFAULT_MAX_ATTEMPT_BYTES,
             max_wire_bytes: DEFAULT_MAX_WIRE_BYTES,
+            max_items: DEFAULT_MAX_ITEMS,
+            max_text_bytes: DEFAULT_MAX_TEXT_BYTES,
         }
     }
 }
@@ -252,7 +258,7 @@ impl OpenAIResponsesConfig {
         self
     }
 
-    /// Overrides serialized request and response wire-byte limits.
+    /// Overrides request, response, item/event, and per-field limits.
     pub fn with_limits(mut self, limits: OpenAIResponsesLimits) -> Self {
         self.limits = limits;
         self
@@ -314,6 +320,7 @@ pub struct OpenAIResponsesAdapter {
 
 impl OpenAIResponsesAdapter {
     pub fn new(config: OpenAIResponsesConfig) -> Result<Self, OpenAIResponsesError> {
+        validate_limits(config.limits)?;
         let client = reqwest::Client::builder()
             .build()
             .map(Http::new)
@@ -694,7 +701,10 @@ fn encode_request_bound(
     request: &TurnRequest,
     authentication_binding: Option<&str>,
 ) -> Result<Value, OpenAIResponsesError> {
-    if request.transcript.len() > MAX_ITEMS || request.available_tools.len() > MAX_ITEMS {
+    validate_limits(config.limits)?;
+    if request.transcript.len() > config.limits.max_items
+        || request.available_tools.len() > config.limits.max_items
+    {
         return Err(OpenAIResponsesError::InvalidRequest(
             "too many transcript items or tools".into(),
         ));
@@ -702,18 +712,27 @@ fn encode_request_bound(
     let session_id = request.session_id.to_string();
     let mut input = Vec::new();
     for item in &request.transcript {
-        input.extend(encode_item(
-            config,
-            &session_id,
-            authentication_binding,
-            item,
-        )?);
+        let encoded = encode_item(config, &session_id, authentication_binding, item)?;
+        if input.len().saturating_add(encoded.len()) > config.limits.max_items {
+            return Err(invalid_request(
+                "Responses transcript expands beyond the configured item limit",
+            ));
+        }
+        input.extend(encoded);
     }
     let tools = request
         .available_tools
         .iter()
         .map(|tool| {
             validate_tool_name(&tool.name.0)?;
+            validate_request_field(
+                &tool.description,
+                config.limits.max_text_bytes,
+                "tool description",
+            )?;
+            let schema = serde_json::to_string(&tool.input_schema)
+                .map_err(OpenAIResponsesError::Serialize)?;
+            validate_request_field(&schema, config.limits.max_text_bytes, "tool input schema")?;
             Ok(json!({
                 "type": "function",
                 "name": tool.name.0,
@@ -770,6 +789,11 @@ fn encode_item(
     authentication_binding: Option<&str>,
     item: &Item,
 ) -> Result<Vec<Value>, OpenAIResponsesError> {
+    if item.parts.len() > config.limits.max_items {
+        return Err(invalid_request(
+            "Responses transcript item has too many parts",
+        ));
+    }
     let role = match item.kind {
         ItemKind::System if !config.request_policy.downgrade_system_to_developer => "system",
         ItemKind::System | ItemKind::Developer | ItemKind::Context => "developer",
@@ -791,6 +815,7 @@ fn encode_item(
         if text.is_empty() {
             return Ok(Vec::new());
         }
+        validate_request_field(&text, config.limits.max_text_bytes, "message text")?;
         return Ok(vec![json!({
             "type": "message",
             "role": role,
@@ -812,6 +837,7 @@ fn encode_item(
                     }
                     _ => text.text.clone(),
                 };
+                validate_request_field(&text, config.limits.max_text_bytes, "message text")?;
                 content.push(json!({
                     "type": if role == "assistant" { "output_text" } else { "input_text" },
                     "text": text
@@ -820,6 +846,11 @@ fn encode_item(
             Part::Structured(value) => {
                 let text =
                     serde_json::to_string(&value.value).map_err(OpenAIResponsesError::Serialize)?;
+                validate_request_field(
+                    &text,
+                    config.limits.max_text_bytes,
+                    "structured message text",
+                )?;
                 content.push(json!({
                     "type": if role == "assistant" { "output_text" } else { "input_text" },
                     "text": text
@@ -835,11 +866,18 @@ fn encode_item(
                     "function_call",
                     false,
                 )?;
+                let arguments =
+                    serde_json::to_string(&call.input).map_err(OpenAIResponsesError::Serialize)?;
+                validate_request_field(
+                    &arguments,
+                    config.limits.max_text_bytes,
+                    "function arguments",
+                )?;
                 let mut value = json!({
                     "type": "function_call",
                     "call_id": call.id.0,
                     "name": call.name,
-                    "arguments": serde_json::to_string(&call.input).map_err(OpenAIResponsesError::Serialize)?
+                    "arguments": arguments
                 });
                 if let Some(continuation) = continuation {
                     value["id"] = Value::String(continuation.item_id.to_owned());
@@ -849,7 +887,7 @@ fn encode_item(
             Part::ToolResult(result) => output.push(json!({
                 "type": "function_call_output",
                 "call_id": result.call_id.0,
-                "output": encode_tool_output(&result.output, config.profile)?
+                "output": encode_tool_output(&result.output, config)?
             })),
             Part::Reasoning(reasoning) => {
                 if let Some(continuation) = continuation_from_metadata(
@@ -886,7 +924,7 @@ fn encode_item(
                         "tool item media must be carried by a tool result",
                     ));
                 } else {
-                    content.push(encode_media(media, config.profile)?);
+                    content.push(encode_media(media, config)?);
                 }
             }
             Part::File(_) | Part::Custom(_) => {
@@ -1025,8 +1063,9 @@ fn apply_prompt_cache(
 
 fn encode_media(
     media: &MediaPart,
-    profile: OpenAIResponsesProfile,
+    config: &OpenAIResponsesConfig,
 ) -> Result<Value, OpenAIResponsesError> {
+    let profile = config.profile;
     let expected = match media.modality {
         Modality::Image => "image/",
         Modality::Audio if profile == OpenAIResponsesProfile::ChatGptPrivate => "audio/",
@@ -1044,7 +1083,7 @@ fn encode_media(
     if !media.mime_type.starts_with(expected) || media.mime_type.contains(['\r', '\n', ';', ',']) {
         return Err(invalid_request("Responses media has an invalid MIME type"));
     }
-    let url = media_data_url(media)?;
+    let url = media_data_url(media, config.limits.max_text_bytes)?;
     Ok(match media.modality {
         Modality::Image => {
             json!({"type": "input_image", "image_url": url, "detail": "high"})
@@ -1054,8 +1093,11 @@ fn encode_media(
     })
 }
 
-fn media_data_url(media: &MediaPart) -> Result<String, OpenAIResponsesError> {
-    match &media.data {
+fn media_data_url(
+    media: &MediaPart,
+    max_text_bytes: usize,
+) -> Result<String, OpenAIResponsesError> {
+    let url = match &media.data {
         DataRef::InlineBytes(bytes) => Ok(format!(
             "data:{};base64,{}",
             media.mime_type,
@@ -1075,7 +1117,7 @@ fn media_data_url(media: &MediaPart) -> Result<String, OpenAIResponsesError> {
         }
         DataRef::Uri(uri)
             if media.modality == Modality::Image
-                && uri.len() <= MAX_TEXT_BYTES
+                && uri.len() <= max_text_bytes
                 && reqwest::Url::parse(uri)
                     .is_ok_and(|url| matches!(url.scheme(), "http" | "https")) =>
         {
@@ -1087,7 +1129,9 @@ fn media_data_url(media: &MediaPart) -> Result<String, OpenAIResponsesError> {
         DataRef::Handle(_) => Err(invalid_request(
             "Responses cannot resolve media handles; use inline bytes",
         )),
-    }
+    }?;
+    validate_request_field(&url, max_text_bytes, "media")?;
+    Ok(url)
 }
 
 fn validate_data_url(value: &str, mime_type: &str) -> Result<(), OpenAIResponsesError> {
@@ -1149,7 +1193,17 @@ fn generated_image_item(
     let revised_prompt = metadata
         .get("revised_prompt")
         .filter(|value| !value.is_null())
-        .map(|value| bounded_metadata_string(Some(value), "generated image revised prompt"))
+        .map(|value| {
+            let value = value.as_str().ok_or_else(|| {
+                protocol_error("Responses generated image revised prompt is invalid")
+            })?;
+            validate_request_field(
+                value,
+                config.limits.max_text_bytes,
+                "generated image revised prompt",
+            )?;
+            Ok(value)
+        })
         .transpose()?;
     let result = match &media.data {
         DataRef::InlineBytes(bytes) if !bytes.is_empty() => STANDARD.encode(bytes),
@@ -1169,6 +1223,11 @@ fn generated_image_item(
             ));
         }
     };
+    validate_request_field(
+        &result,
+        config.limits.max_text_bytes,
+        "persisted generated image result",
+    )?;
     Ok(Some(json!({
         "id": item_id,
         "type": "image_generation_call",
@@ -1222,7 +1281,8 @@ fn continuation_from_metadata<'a>(
     let item_id = bounded_metadata_string(object.get("item_id"), "item_id")?;
     let encrypted_content = object.get("encrypted_content").and_then(Value::as_str);
     if encrypted_required
-        && encrypted_content.is_none_or(|value| value.is_empty() || value.len() > MAX_TEXT_BYTES)
+        && encrypted_content
+            .is_none_or(|value| value.is_empty() || value.len() > config.limits.max_text_bytes)
     {
         return Err(protocol_error(
             "Responses encrypted continuation is invalid",
@@ -1297,7 +1357,8 @@ fn legacy_continuation_from_metadata<'a>(
     let item_id = bounded_metadata_string(object.get("item_id"), "legacy item_id")?;
     let encrypted_content = object.get("encrypted_content").and_then(Value::as_str);
     if encrypted_required
-        && encrypted_content.is_none_or(|value| value.is_empty() || value.len() > MAX_TEXT_BYTES)
+        && encrypted_content
+            .is_none_or(|value| value.is_empty() || value.len() > config.limits.max_text_bytes)
     {
         return Err(protocol_error(
             "legacy Responses encrypted continuation is invalid",
@@ -1355,6 +1416,62 @@ fn continuation_metadata(
     MetadataMap::from([(CONTINUATION_METADATA.into(), value)])
 }
 
+fn validate_request_field(
+    value: &str,
+    max_text_bytes: usize,
+    field: &str,
+) -> Result<(), OpenAIResponsesError> {
+    if value.len() > max_text_bytes {
+        return Err(invalid_request(format!(
+            "Responses {field} exceeds {max_text_bytes} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_request_value(
+    value: &Value,
+    max_text_bytes: usize,
+    field: &str,
+) -> Result<(), OpenAIResponsesError> {
+    match value {
+        Value::String(value) => validate_request_field(value, max_text_bytes, field),
+        Value::Array(values) => {
+            for value in values {
+                validate_request_value(value, max_text_bytes, field)?;
+            }
+            Ok(())
+        }
+        Value::Object(values) => {
+            for value in values.values() {
+                validate_request_value(value, max_text_bytes, field)?;
+            }
+            Ok(())
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => Ok(()),
+    }
+}
+
+fn validate_limits(limits: OpenAIResponsesLimits) -> Result<(), OpenAIResponsesError> {
+    if limits.max_request_bytes == 0
+        || limits.max_attempt_bytes == 0
+        || limits.max_wire_bytes == 0
+        || limits.max_items == 0
+        || limits.max_text_bytes == 0
+    {
+        return Err(invalid_request("Responses limits must be non-zero"));
+    }
+    if limits.max_text_bytes > limits.max_request_bytes
+        || limits.max_text_bytes > limits.max_attempt_bytes
+        || limits.max_attempt_bytes > limits.max_wire_bytes
+    {
+        return Err(invalid_request(
+            "Responses limits are inconsistent: text bytes must fit request and attempt bounds, and attempt bytes must fit the aggregate wire bound",
+        ));
+    }
+    Ok(())
+}
+
 fn invalid_request(message: impl Into<String>) -> OpenAIResponsesError {
     OpenAIResponsesError::InvalidRequest(message.into())
 }
@@ -1365,10 +1482,10 @@ fn protocol_error(message: impl Into<String>) -> OpenAIResponsesError {
 
 fn encode_tool_output(
     output: &ToolOutput,
-    profile: OpenAIResponsesProfile,
+    config: &OpenAIResponsesConfig,
 ) -> Result<Value, OpenAIResponsesError> {
-    if profile == OpenAIResponsesProfile::Public {
-        return match output {
+    let value = if config.profile == OpenAIResponsesProfile::Public {
+        match output {
             ToolOutput::Text(value) => Ok(Value::String(value.clone())),
             ToolOutput::Structured(value) => serde_json::to_string(value)
                 .map(Value::String)
@@ -1379,48 +1496,51 @@ fn encode_tool_output(
             ToolOutput::Files(files) => serde_json::to_string(files)
                 .map(Value::String)
                 .map_err(OpenAIResponsesError::Serialize),
-        };
-    }
-    match output {
-        ToolOutput::Text(value) => Ok(Value::String(value.clone())),
-        ToolOutput::Structured(value) => serde_json::to_string(value)
-            .map(Value::String)
-            .map_err(OpenAIResponsesError::Serialize),
-        ToolOutput::Parts(parts) if parts.iter().any(|part| matches!(part, Part::Media(_))) => {
-            parts
+        }
+    } else {
+        match output {
+            ToolOutput::Text(value) => Ok(Value::String(value.clone())),
+            ToolOutput::Structured(value) => serde_json::to_string(value)
+                .map(Value::String)
+                .map_err(OpenAIResponsesError::Serialize),
+            ToolOutput::Parts(parts) if parts.iter().any(|part| matches!(part, Part::Media(_))) => {
+                parts
+                    .iter()
+                    .map(|part| match part {
+                        Part::Text(text) => Ok(json!({"type": "input_text", "text": text.text})),
+                        Part::Structured(value) => Ok(json!({
+                            "type": "input_text",
+                            "text": serde_json::to_string(&value.value)
+                                .map_err(OpenAIResponsesError::Serialize)?,
+                        })),
+                        Part::Media(media) => encode_media(media, config),
+                        _ => Err(invalid_request(
+                            "private Responses tool output contains unsupported content",
+                        )),
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(Value::Array)
+            }
+            ToolOutput::Parts(parts) => parts
                 .iter()
                 .map(|part| match part {
-                    Part::Text(text) => Ok(json!({"type": "input_text", "text": text.text})),
-                    Part::Structured(value) => Ok(json!({
-                        "type": "input_text",
-                        "text": serde_json::to_string(&value.value)
-                            .map_err(OpenAIResponsesError::Serialize)?,
-                    })),
-                    Part::Media(media) => encode_media(media, profile),
+                    Part::Text(text) => Ok(text.text.clone()),
+                    Part::Structured(value) => {
+                        serde_json::to_string(&value.value).map_err(OpenAIResponsesError::Serialize)
+                    }
                     _ => Err(invalid_request(
                         "private Responses tool output contains unsupported content",
                     )),
                 })
                 .collect::<Result<Vec<_>, _>>()
-                .map(Value::Array)
+                .map(|parts| Value::String(parts.join("\n"))),
+            ToolOutput::Files(_) => Err(invalid_request(
+                "private Responses file tool output is unsupported",
+            )),
         }
-        ToolOutput::Parts(parts) => parts
-            .iter()
-            .map(|part| match part {
-                Part::Text(text) => Ok(text.text.clone()),
-                Part::Structured(value) => {
-                    serde_json::to_string(&value.value).map_err(OpenAIResponsesError::Serialize)
-                }
-                _ => Err(invalid_request(
-                    "private Responses tool output contains unsupported content",
-                )),
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map(|parts| Value::String(parts.join("\n"))),
-        ToolOutput::Files(_) => Err(invalid_request(
-            "private Responses file tool output is unsupported",
-        )),
-    }
+    }?;
+    validate_request_value(&value, config.limits.max_text_bytes, "tool output")?;
+    Ok(value)
 }
 
 #[derive(Clone, Debug)]
@@ -1743,7 +1863,7 @@ async fn send_live_attempt(
             context.config.request_policy.include_encrypted_reasoning,
             context.auth.binding(),
             context.turn_state.clone(),
-            context.config.limits.max_attempt_bytes,
+            context.config.limits,
         ),
         deadline: None,
         eof: false,
@@ -1824,7 +1944,7 @@ impl ResponsesSseDecoder {
             true,
             Some("test-authentication-binding"),
             Arc::new(Mutex::new(None)),
-            DEFAULT_MAX_ATTEMPT_BYTES,
+            OpenAIResponsesLimits::default(),
         )
     }
 
@@ -1835,13 +1955,13 @@ impl ResponsesSseDecoder {
         require_encrypted_reasoning: bool,
         authentication_binding: Option<&str>,
         turn_state: Arc<Mutex<Option<HeaderValue>>>,
-        max_attempt_bytes: usize,
+        limits: OpenAIResponsesLimits,
     ) -> Self {
         Self {
             buffer: Zeroizing::new(Vec::new()),
             buffer_start: 0,
             received: 0,
-            max_attempt_bytes,
+            max_attempt_bytes: limits.max_attempt_bytes,
             state: ResponsesState::new(
                 model,
                 session_id,
@@ -1849,7 +1969,7 @@ impl ResponsesSseDecoder {
                 require_encrypted_reasoning,
                 authentication_binding,
                 turn_state,
-                max_attempt_bytes,
+                limits,
             ),
         }
     }
@@ -1999,7 +2119,7 @@ struct PartAccumulator {
 struct ResponsesState {
     requested_model: String,
     profile: OpenAIResponsesProfile,
-    max_attempt_bytes: usize,
+    limits: OpenAIResponsesLimits,
     session_id: String,
     authentication_binding: Option<String>,
     turn_state: Arc<Mutex<Option<HeaderValue>>>,
@@ -2011,6 +2131,7 @@ struct ResponsesState {
     response_model: Option<String>,
     events: VecDeque<ModelTurnEvent>,
     event_count: usize,
+    sse_event_count: usize,
     output: BTreeMap<u64, Item>,
     item_indices: BTreeMap<String, u64>,
     item_types: BTreeMap<String, String>,
@@ -2041,12 +2162,12 @@ impl ResponsesState {
         require_encrypted_reasoning: bool,
         authentication_binding: Option<&str>,
         turn_state: Arc<Mutex<Option<HeaderValue>>>,
-        max_attempt_bytes: usize,
+        limits: OpenAIResponsesLimits,
     ) -> Self {
         Self {
             requested_model: model.to_owned(),
             profile,
-            max_attempt_bytes,
+            limits,
             session_id: session_id.to_owned(),
             authentication_binding: authentication_binding.map(str::to_owned),
             turn_state,
@@ -2058,6 +2179,7 @@ impl ResponsesState {
             response_model: None,
             events: VecDeque::new(),
             event_count: 0,
+            sse_event_count: 0,
             output: BTreeMap::new(),
             item_indices: BTreeMap::new(),
             item_types: BTreeMap::new(),
@@ -2082,6 +2204,12 @@ impl ResponsesState {
     }
 
     fn consume(&mut self, kind: &str, value: &Value) -> Result<(), AttemptFailure> {
+        if self.sse_event_count >= self.limits.max_items {
+            return Err(protocol_failure(
+                "Responses attempt produced too many SSE events",
+            ));
+        }
+        self.sse_event_count += 1;
         if self.terminal {
             return Err(protocol_failure(
                 "Responses event followed a terminal event",
@@ -2261,7 +2389,7 @@ impl ResponsesState {
             .and_then(Value::as_object)
             .ok_or_else(|| protocol_failure("output_item.added omitted item"))?;
         let id = bounded_id(item.get("id"))?;
-        let index = nonnegative(value, "output_index")?;
+        let index = nonnegative(value, "output_index", self.limits.max_items)?;
         let kind = item.get("type").and_then(Value::as_str);
         if kind.is_some_and(|kind| {
             !matches!(
@@ -2291,13 +2419,16 @@ impl ResponsesState {
     ) -> Result<(String, u64), AttemptFailure> {
         self.require_created()?;
         let id = bounded_id(value.get("item_id"))?;
-        let output_index = nonnegative(value, "output_index")?;
+        let output_index = nonnegative(value, "output_index", self.limits.max_items)?;
         if self.item_indices.get(id).copied() != Some(output_index) {
             return Err(protocol_failure(
                 "content event refers to an unknown or inconsistent output item",
             ));
         }
-        Ok((id.to_owned(), nonnegative(value, index_field)?))
+        Ok((
+            id.to_owned(),
+            nonnegative(value, index_field, self.limits.max_items)?,
+        ))
     }
 
     fn section_added(&mut self, value: &Value, reasoning: bool) -> Result<(), AttemptFailure> {
@@ -2392,7 +2523,7 @@ impl ResponsesState {
                 "Responses text delta preceded content-part add",
             ));
         }
-        let delta = bounded_field(value, "delta")?;
+        let delta = bounded_field(value, "delta", self.limits.max_text_bytes)?;
         let target = if reasoning {
             &mut self.reasoning
         } else {
@@ -2409,6 +2540,7 @@ impl ResponsesState {
             },
             &mut self.events,
             &mut self.event_count,
+            self.limits,
         )
     }
 
@@ -2429,11 +2561,13 @@ impl ResponsesState {
                 "Responses text done preceded content-part add",
             ));
         }
-        if let Some(completed) = value
-            .get("text")
-            .or_else(|| value.get("refusal"))
-            .and_then(Value::as_str)
-        {
+        if let Some(completed) = value.get("text").or_else(|| value.get("refusal")) {
+            let completed = completed
+                .as_str()
+                .filter(|completed| completed.len() <= self.limits.max_text_bytes)
+                .ok_or_else(|| {
+                    protocol_failure("Responses completed text is outside configured bounds")
+                })?;
             let target = if reasoning {
                 &self.reasoning
             } else {
@@ -2465,13 +2599,14 @@ impl ResponsesState {
         append_bounded(
             &mut self.function_arguments,
             &id,
-            bounded_field(value, "delta")?,
+            bounded_field(value, "delta", self.limits.max_text_bytes)?,
+            self.limits.max_text_bytes,
         )
     }
 
     fn arguments_done(&mut self, value: &Value) -> Result<(), AttemptFailure> {
         let id = bounded_id(value.get("item_id"))?.to_owned();
-        let output_index = nonnegative(value, "output_index")?;
+        let output_index = nonnegative(value, "output_index", self.limits.max_items)?;
         if self.item_indices.get(&id).copied() != Some(output_index)
             || !self.argument_done.insert(id.clone())
         {
@@ -2479,15 +2614,22 @@ impl ResponsesState {
                 "function arguments done is inconsistent or duplicate",
             ));
         }
-        if let Some(arguments) = value.get("arguments").and_then(Value::as_str)
-            && self
+        if let Some(arguments) = value.get("arguments") {
+            let arguments = arguments
+                .as_str()
+                .filter(|arguments| arguments.len() <= self.limits.max_text_bytes)
+                .ok_or_else(|| {
+                    protocol_failure("Responses function arguments are outside configured bounds")
+                })?;
+            if self
                 .function_arguments
                 .get(&id)
                 .is_some_and(|streamed| streamed != arguments)
-        {
-            return Err(protocol_failure(
-                "function arguments done changed streamed arguments",
-            ));
+            {
+                return Err(protocol_failure(
+                    "function arguments done changed streamed arguments",
+                ));
+            }
         }
         Ok(())
     }
@@ -2503,7 +2645,7 @@ impl ResponsesState {
                 "output item completed without add or completed twice",
             ));
         }
-        let output_index = nonnegative(value, "output_index")?;
+        let output_index = nonnegative(value, "output_index", self.limits.max_items)?;
         if self.item_indices.get(id).copied() != Some(output_index) {
             return Err(protocol_failure("completed output item index changed"));
         }
@@ -2526,6 +2668,11 @@ impl ResponsesState {
                     .get("content")
                     .and_then(Value::as_array)
                     .ok_or_else(|| protocol_failure("output message content is malformed"))?;
+                if content.len() > self.limits.max_items {
+                    return Err(protocol_failure(
+                        "output message has too many content parts",
+                    ));
+                }
                 let mut parts = Vec::new();
                 for (index, raw) in content.iter().enumerate() {
                     let key = (item_id.to_owned(), index as u64);
@@ -2539,9 +2686,9 @@ impl ResponsesState {
                         ));
                     }
                     let text = if content_type == Some("refusal") {
-                        bounded_field(raw, "refusal")?
+                        bounded_field(raw, "refusal", self.limits.max_text_bytes)?
                     } else {
-                        bounded_field(raw, "text")?
+                        bounded_field(raw, "text", self.limits.max_text_bytes)?
                     };
                     let streamed = self.text.remove(&key);
                     if streamed
@@ -2558,6 +2705,7 @@ impl ResponsesState {
                             &mut self.events,
                             &mut self.event_count,
                             ModelTurnEvent::Delta(Delta::CommitPart { part: part.clone() }),
+                            self.limits.max_items,
                         )?;
                     }
                     parts.push(part);
@@ -2566,14 +2714,14 @@ impl ResponsesState {
                     .insert(output_index, provider_item(item_id, parts));
             }
             Some("function_call") => {
-                let call_id = bounded_nonempty_field(item, "call_id")?;
+                let call_id = bounded_nonempty_field(item, "call_id", self.limits.max_text_bytes)?;
                 if !self.seen_call_ids.insert(call_id.to_owned()) {
                     return Err(protocol_failure("duplicate function call ID"));
                 }
-                let name = bounded_nonempty_field(item, "name")?;
+                let name = bounded_nonempty_field(item, "name", self.limits.max_text_bytes)?;
                 validate_tool_name(name)
                     .map_err(|error| protocol_failure(&format!("provider returned {error}")))?;
-                let arguments = bounded_field(item, "arguments")?;
+                let arguments = bounded_field(item, "arguments", self.limits.max_text_bytes)?;
                 if let Some(streamed) = self.function_arguments.remove(item_id)
                     && (streamed != arguments || !self.argument_done.contains(item_id))
                 {
@@ -2610,14 +2758,16 @@ impl ResponsesState {
                 );
             }
             Some("image_generation_call") => {
-                let status = bounded_nonempty_field(item, "status")?;
+                let status = bounded_nonempty_field(item, "status", self.limits.max_text_bytes)?;
                 if status != "completed" {
                     return Err(protocol_failure("image generation did not complete"));
                 }
                 let result = item
                     .get("result")
                     .and_then(Value::as_str)
-                    .filter(|result| !result.is_empty() && result.len() <= self.max_attempt_bytes)
+                    .filter(|result| {
+                        !result.is_empty() && result.len() <= self.limits.max_text_bytes
+                    })
                     .ok_or_else(|| {
                         protocol_failure("generated image result is outside configured byte bounds")
                     })?;
@@ -2632,7 +2782,7 @@ impl ResponsesState {
                 let revised_prompt = item
                     .get("revised_prompt")
                     .filter(|value| !value.is_null())
-                    .map(|_| bounded_field(item, "revised_prompt"))
+                    .map(|_| bounded_field(item, "revised_prompt", self.limits.max_text_bytes))
                     .transpose()?;
                 let response_id = self
                     .response_id
@@ -2668,6 +2818,7 @@ impl ResponsesState {
                         part_id: placeholder_id.clone(),
                         kind: PartKind::Text,
                     }),
+                    self.limits.max_items,
                 )?;
                 push_event(
                     &mut self.events,
@@ -2676,6 +2827,7 @@ impl ResponsesState {
                         part_id: placeholder_id,
                         chunk: format!("[Image #{}]", self.next_media),
                     }),
+                    self.limits.max_items,
                 )?;
                 self.output.insert(
                     output_index,
@@ -2687,10 +2839,15 @@ impl ResponsesState {
                     .get("summary")
                     .and_then(Value::as_array)
                     .ok_or_else(|| protocol_failure("reasoning summary is malformed"))?;
+                if summaries.len() > self.limits.max_items {
+                    return Err(protocol_failure(
+                        "reasoning output has too many summary parts",
+                    ));
+                }
                 let encrypted = item
                     .get("encrypted_content")
                     .and_then(Value::as_str)
-                    .filter(|value| !value.is_empty() && value.len() <= MAX_TEXT_BYTES);
+                    .filter(|value| !value.is_empty() && value.len() <= self.limits.max_text_bytes);
                 if self.require_encrypted_reasoning && encrypted.is_none() {
                     return Err(protocol_failure(
                         "encrypted reasoning is missing or outside bounds",
@@ -2707,7 +2864,7 @@ impl ResponsesState {
                             "reasoning summary lifecycle is incomplete",
                         ));
                     }
-                    let text = bounded_field(raw, "text")?;
+                    let text = bounded_field(raw, "text", self.limits.max_text_bytes)?;
                     let streamed = self.reasoning.remove(&key);
                     if streamed
                         .as_ref()
@@ -2724,6 +2881,7 @@ impl ResponsesState {
                             ModelTurnEvent::Delta(Delta::CommitPart {
                                 part: Part::Reasoning(ReasoningPart::summary(text)),
                             }),
+                            self.limits.max_items,
                         )?;
                     }
                     summary_texts.push(text);
@@ -2833,6 +2991,7 @@ impl ResponsesState {
                 &mut self.events,
                 &mut self.event_count,
                 ModelTurnEvent::Delta(Delta::CommitPart { part: part.clone() }),
+                self.limits.max_items,
             )?;
             self.output
                 .insert(index, provider_item(&item_id, vec![part]));
@@ -2856,11 +3015,13 @@ impl ResponsesState {
                 ModelTurnEvent::Delta(Delta::CommitPart {
                     part: Part::ToolCall(call.clone()),
                 }),
+                self.limits.max_items,
             )?;
             push_event(
                 &mut self.events,
                 &mut self.event_count,
                 ModelTurnEvent::ToolCall(call),
+                self.limits.max_items,
             )?;
         }
         if let Some(usage) = self.usage.clone() {
@@ -2868,6 +3029,7 @@ impl ResponsesState {
                 &mut self.events,
                 &mut self.event_count,
                 ModelTurnEvent::Usage(usage),
+                self.limits.max_items,
             )?;
         }
         let mut metadata = MetadataMap::from([(
@@ -2886,6 +3048,7 @@ impl ResponsesState {
                 model: self.response_model.clone(),
                 response_id: self.response_id.clone(),
             }),
+            self.limits.max_items,
         )?;
         Ok(())
     }
@@ -2905,7 +3068,7 @@ impl ResponsesState {
                 headers: None,
             });
         }
-        if self.events.len() > MAX_ITEMS {
+        if self.events.len() > self.limits.max_items {
             return Err(protocol_failure(
                 "Responses attempt produced too many events",
             ));
@@ -2930,8 +3093,9 @@ fn push_event(
     events: &mut VecDeque<ModelTurnEvent>,
     event_count: &mut usize,
     event: ModelTurnEvent,
+    max_items: usize,
 ) -> Result<(), AttemptFailure> {
-    if *event_count >= MAX_ITEMS {
+    if *event_count >= max_items {
         return Err(protocol_failure(
             "Responses attempt produced too many events",
         ));
@@ -2948,6 +3112,7 @@ fn append_part(
     kind: PartKind,
     events: &mut VecDeque<ModelTurnEvent>,
     event_count: &mut usize,
+    limits: OpenAIResponsesLimits,
 ) -> Result<(), AttemptFailure> {
     if !parts.contains_key(&key) {
         let id = PartId::new(format!(
@@ -2964,6 +3129,7 @@ fn append_part(
                 part_id: id.clone(),
                 kind,
             }),
+            limits.max_items,
         )?;
         parts.insert(
             key.clone(),
@@ -2974,8 +3140,10 @@ fn append_part(
         );
     }
     let part = parts.get_mut(&key).expect("inserted part accumulator");
-    if part.text.len().saturating_add(delta.len()) > MAX_TEXT_BYTES {
-        return Err(protocol_failure("Responses streamed content exceeds 8 MiB"));
+    if part.text.len().saturating_add(delta.len()) > limits.max_text_bytes {
+        return Err(protocol_failure(
+            "Responses streamed content exceeds configured text bounds",
+        ));
     }
     part.text.push_str(delta);
     push_event(
@@ -2985,14 +3153,15 @@ fn append_part(
             part_id: part.id.clone(),
             chunk: delta.to_owned(),
         }),
+        limits.max_items,
     )
 }
 
-fn nonnegative(value: &Value, field: &str) -> Result<u64, AttemptFailure> {
+fn nonnegative(value: &Value, field: &str, max_items: usize) -> Result<u64, AttemptFailure> {
     value
         .get(field)
         .and_then(Value::as_u64)
-        .filter(|value| *value < MAX_ITEMS as u64)
+        .filter(|value| *value < max_items as u64)
         .ok_or_else(|| protocol_failure("Responses index is missing or outside bounds"))
 }
 
@@ -3003,8 +3172,12 @@ fn bounded_id(value: Option<&Value>) -> Result<&str, AttemptFailure> {
         .ok_or_else(|| protocol_failure("Responses ID is missing or outside bounds"))
 }
 
-fn bounded_nonempty_field<'a>(value: &'a Value, field: &str) -> Result<&'a str, AttemptFailure> {
-    bounded_field(value, field).and_then(|value| {
+fn bounded_nonempty_field<'a>(
+    value: &'a Value,
+    field: &str,
+    max_text_bytes: usize,
+) -> Result<&'a str, AttemptFailure> {
+    bounded_field(value, field, max_text_bytes).and_then(|value| {
         if value.is_empty() {
             Err(protocol_failure("Responses field is empty"))
         } else {
@@ -3142,11 +3315,15 @@ fn parse_usage(value: &Value) -> Usage {
     Usage::new(tokens)
 }
 
-fn bounded_field<'a>(value: &'a Value, field: &str) -> Result<&'a str, AttemptFailure> {
+fn bounded_field<'a>(
+    value: &'a Value,
+    field: &str,
+    max_text_bytes: usize,
+) -> Result<&'a str, AttemptFailure> {
     value
         .get(field)
         .and_then(Value::as_str)
-        .filter(|value| value.len() <= MAX_TEXT_BYTES)
+        .filter(|value| value.len() <= max_text_bytes)
         .ok_or_else(|| protocol_failure("Responses text field is missing or too large"))
 }
 
@@ -3154,10 +3331,13 @@ fn append_bounded(
     target: &mut BTreeMap<String, String>,
     id: &str,
     delta: &str,
+    max_text_bytes: usize,
 ) -> Result<(), AttemptFailure> {
     let value = target.entry(id.to_owned()).or_default();
-    if value.len().saturating_add(delta.len()) > MAX_TEXT_BYTES {
-        return Err(protocol_failure("Responses output exceeds 8 MiB"));
+    if value.len().saturating_add(delta.len()) > max_text_bytes {
+        return Err(protocol_failure(
+            "Responses output exceeds configured text bounds",
+        ));
     }
     value.push_str(delta);
     Ok(())
@@ -3840,7 +4020,7 @@ data: {"type":"response.completed","sequence_number":18,"response":{"id":"resp-1
             true,
             None,
             Arc::new(Mutex::new(None)),
-            DEFAULT_MAX_ATTEMPT_BYTES,
+            OpenAIResponsesLimits::default(),
         );
         decoder.push(SUCCESS.as_bytes()).unwrap();
         let events = decoder.finish().unwrap();
@@ -3876,7 +4056,7 @@ data: {"type":"response.completed","sequence_number":18,"response":{"id":"resp-1
             false,
             Some("test-authentication-binding"),
             Arc::new(Mutex::new(None)),
-            DEFAULT_MAX_ATTEMPT_BYTES,
+            OpenAIResponsesLimits::default(),
         );
         decoder.push(wire.as_bytes()).unwrap();
         let events = decoder.finish().unwrap();
@@ -4486,7 +4666,7 @@ data: {"type":"response.completed","sequence_number":18,"response":{"id":"resp-1
             true,
             Some("test-authentication-binding"),
             Arc::new(Mutex::new(None)),
-            DEFAULT_MAX_ATTEMPT_BYTES,
+            OpenAIResponsesLimits::default(),
         );
         decoder.push(wire.as_bytes()).unwrap();
         let events = decoder.finish().unwrap();
@@ -4514,6 +4694,14 @@ data: {"type":"response.completed","sequence_number":18,"response":{"id":"resp-1
             encode_request_bound(&config, &replay, Some("test-authentication-binding")).unwrap();
         assert_eq!(encoded["input"][0]["type"], "image_generation_call");
         assert_eq!(encoded["input"][0]["result"], "AQID");
+
+        let bounded = config.with_limits(OpenAIResponsesLimits {
+            max_text_bytes: 3,
+            ..OpenAIResponsesLimits::default()
+        });
+        assert!(
+            encode_request_bound(&bounded, &replay, Some("test-authentication-binding")).is_err()
+        );
     }
 
     #[test]
@@ -4526,7 +4714,7 @@ data: {"type":"response.completed","sequence_number":18,"response":{"id":"resp-1
             true,
             Some("binding"),
             Arc::new(Mutex::new(None)),
-            DEFAULT_MAX_ATTEMPT_BYTES,
+            OpenAIResponsesLimits::default(),
         );
         assert!(private.push(unknown).is_ok());
         let mut public = ResponsesSseDecoder::new("gpt-test", "session");
@@ -4587,9 +4775,96 @@ data: {"type":"response.completed","sequence_number":18,"response":{"id":"resp-1
         let config =
             OpenAIResponsesConfig::new("secret", "gpt-test").with_limits(OpenAIResponsesLimits {
                 max_request_bytes: 16,
+                max_text_bytes: 8,
                 ..OpenAIResponsesLimits::default()
             });
         assert!(config.encode_request(&request()).is_err());
+    }
+
+    #[test]
+    fn item_and_text_defaults_preserve_public_bounds() {
+        let limits = OpenAIResponsesLimits::default();
+        assert_eq!(limits.max_items, 100_000);
+        assert_eq!(limits.max_text_bytes, 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn zero_and_inconsistent_limits_are_rejected() {
+        for limits in [
+            OpenAIResponsesLimits {
+                max_items: 0,
+                ..OpenAIResponsesLimits::default()
+            },
+            OpenAIResponsesLimits {
+                max_text_bytes: DEFAULT_MAX_REQUEST_BYTES + 1,
+                ..OpenAIResponsesLimits::default()
+            },
+            OpenAIResponsesLimits {
+                max_attempt_bytes: DEFAULT_MAX_WIRE_BYTES + 1,
+                ..OpenAIResponsesLimits::default()
+            },
+        ] {
+            let config = OpenAIResponsesConfig::new("secret", "gpt-test").with_limits(limits);
+            assert!(OpenAIResponsesAdapter::new(config).is_err());
+        }
+    }
+
+    #[test]
+    fn request_item_and_text_limits_are_configurable() {
+        let mut too_many = request();
+        too_many
+            .transcript
+            .push(Item::text(ItemKind::User, "again"));
+        let item_bounded =
+            OpenAIResponsesConfig::new("secret", "gpt-test").with_limits(OpenAIResponsesLimits {
+                max_items: 1,
+                ..OpenAIResponsesLimits::default()
+            });
+        assert!(item_bounded.encode_request(&too_many).is_err());
+
+        let text_bounded =
+            OpenAIResponsesConfig::new("secret", "gpt-test").with_limits(OpenAIResponsesLimits {
+                max_text_bytes: 4,
+                ..OpenAIResponsesLimits::default()
+            });
+        assert!(text_bounded.encode_request(&request()).is_err());
+    }
+
+    #[test]
+    fn sse_event_index_and_text_limits_are_configurable() {
+        let decoder = |limits| {
+            ResponsesSseDecoder::with_policy(
+                "gpt-test",
+                "session",
+                OpenAIResponsesProfile::Public,
+                true,
+                Some("test-authentication-binding"),
+                Arc::new(Mutex::new(None)),
+                limits,
+            )
+        };
+
+        let mut event_bounded = decoder(OpenAIResponsesLimits {
+            max_items: 3,
+            ..OpenAIResponsesLimits::default()
+        });
+        assert!(event_bounded.push(SUCCESS.as_bytes()).is_err());
+
+        let outside_index = concat!(
+            "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\",\"model\":\"gpt-test\"}}\n\n",
+            "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"id\":\"msg-1\",\"type\":\"message\"}}\n\n",
+        );
+        let mut index_bounded = decoder(OpenAIResponsesLimits {
+            max_items: 1,
+            ..OpenAIResponsesLimits::default()
+        });
+        assert!(index_bounded.push(outside_index.as_bytes()).is_err());
+
+        let mut text_bounded = decoder(OpenAIResponsesLimits {
+            max_text_bytes: 4,
+            ..OpenAIResponsesLimits::default()
+        });
+        assert!(text_bounded.push(SUCCESS.as_bytes()).is_err());
     }
 
     #[tokio::test]
@@ -4679,8 +4954,10 @@ data: {"type":"response.completed","sequence_number":18,"response":{"id":"resp-1
         let config = OpenAIResponsesConfig::new("secret", "gpt-test")
             .with_limits(OpenAIResponsesLimits {
                 max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
-                max_attempt_bytes: 16,
+                max_attempt_bytes: 10,
                 max_wire_bytes: 15,
+                max_items: DEFAULT_MAX_ITEMS,
+                max_text_bytes: 8,
             })
             .with_resilience(ResilienceConfig {
                 max_retries: 3,

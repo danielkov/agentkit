@@ -59,8 +59,13 @@ enables `agentkit_loop::response_attempt` replacement on `SessionConfig` and
 handles its reserved marker by discarding the preceding attempt. Cancellation, the logical retry deadline, stream-idle timeout, absolute
 per-attempt deadline (including stream reads), auth/refresh, and backoff remain
 bounded. Responses default to a 32 MiB serialized request limit, 16 MiB per
-attempt, and 64 MiB aggregate wire limit across retries; override these with
-`OpenAIResponsesLimits` and `.with_limits(...)`.
+attempt, and 64 MiB aggregate wire limit across retries. Requests and responses
+also default to at most 100,000 items/events and 8 MiB per text, reasoning,
+ciphertext, or media field. Override these with `OpenAIResponsesLimits` and
+`.with_limits(...)`; for example, a host can set `max_items` to `10_000` and
+`max_text_bytes` to `1024 * 1024` while retaining the default aggregate bounds.
+Limits must be non-zero; the per-field bound must fit both request and attempt
+bounds, and the per-attempt bound must fit the aggregate wire bound.
 
 ## Responses API
 
