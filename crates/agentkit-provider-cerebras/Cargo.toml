@@ -7,7 +7,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-version = "0.10.6"
+version = "0.10.7"
 
 [features]
 default = ["streaming"]
@@ -20,7 +20,7 @@ experimental = ["service-tiers", "predicted-outputs", "batch"]
 
 [dependencies]
 agentkit-core = { version = "0.10.5", path = "../agentkit-core" }
-agentkit-http = { version = "0.10.5", path = "../agentkit-http" }
+agentkit-http = { version = "0.10.6", path = "../agentkit-http" }
 agentkit-loop = { version = "0.10.7", path = "../agentkit-loop" }
 agentkit-tools-core = { version = "0.10.5", path = "../agentkit-tools-core" }
 async-trait.workspace = true
