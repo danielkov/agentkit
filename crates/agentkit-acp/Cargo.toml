@@ -14,6 +14,10 @@ default = ["stdio"]
 stdio = []
 unstable-acp = ["agent-client-protocol/unstable"]
 protocol-v2 = ["agent-client-protocol/unstable_protocol_v2"]
+unstable-inject = [
+    "protocol-v2",
+    "agent-client-protocol/unstable_session_inject",
+]
 
 [dependencies]
 agent-client-protocol = "=2.0.0"
@@ -28,6 +32,7 @@ tokio = { workspace = true, features = ["sync", "time"] }
 tracing.workspace = true
 
 [dev-dependencies]
+futures-util.workspace = true
 agentkit-integration-tests = { path = "../agentkit-integration-tests" }
 agentkit-task-manager = { path = "../agentkit-task-manager" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

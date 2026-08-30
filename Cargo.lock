@@ -11,8 +11,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 [[package]]
 name = "agent-client-protocol"
 version = "2.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6d87bc7769eba641753ba5dc52f73ec3765d51022c6753bf040967125ddc86a8"
+source = "git+https://github.com/danielkov/rust-sdk?rev=2f039993d1d6ed8da35b38c31f54a7cbb7338c70#2f039993d1d6ed8da35b38c31f54a7cbb7338c70"
 dependencies = [
  "agent-client-protocol-derive",
  "agent-client-protocol-schema",
@@ -35,8 +34,7 @@ dependencies = [
 [[package]]
 name = "agent-client-protocol-derive"
 version = "2.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3abd4080f51e4f24f5042beb7fb7a66ede29a2dc1c2582c329532e1c27264ddc"
+source = "git+https://github.com/danielkov/rust-sdk?rev=2f039993d1d6ed8da35b38c31f54a7cbb7338c70#2f039993d1d6ed8da35b38c31f54a7cbb7338c70"
 dependencies = [
  "quote",
  "syn 3.0.3",
@@ -44,13 +42,11 @@ dependencies = [
 
 [[package]]
 name = "agent-client-protocol-schema"
-version = "1.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d5c231915b4ab578c722eca2d1bd7df4d300bfd6cac3b8e9f0d1e3ddc95b187c"
+version = "1.7.0"
+source = "git+https://github.com/danielkov/agent-client-protocol?rev=6e7e044f9464c4fd652d90699a09e9edc8b3bbad#6e7e044f9464c4fd652d90699a09e9edc8b3bbad"
 dependencies = [
  "anyhow",
  "derive_more",
- "diffy",
  "schemars 1.2.2",
  "serde",
  "serde_json",
@@ -102,6 +98,7 @@ dependencies = [
  "agentkit-tools-core",
  "async-trait",
  "base64 0.22.1",
+ "futures-util",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
@@ -1239,15 +1236,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "56254986775e3233ffa9c4d7d3faaf6d36a2c09d30b20687e9f88bc8bafc16c8"
 
 [[package]]
-name = "diffy"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "10aec8f7f9393bd6a4f2762be0ceb012d3cbe2478987258cc9960de148561914"
-dependencies = [
- "hashbrown 0.17.1",
-]
-
-[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1416,12 +1404,6 @@ dependencies = [
  "crc32fast",
  "miniz_oxide",
 ]
-
-[[package]]
-name = "foldhash"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "form_urlencoded"
@@ -1629,9 +1611,6 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
-dependencies = [
- "foldhash",
-]
 
 [[package]]
 name = "hashlink"
