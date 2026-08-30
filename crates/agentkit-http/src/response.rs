@@ -14,6 +14,17 @@ pub struct HttpResponse {
     body: BodyStream,
 }
 
+impl std::fmt::Debug for HttpResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpResponse")
+            .field("status", &self.status)
+            .field("header_names", &self.headers.keys().collect::<Vec<_>>())
+            .field("final_url", &self.final_url)
+            .field("body", &"<stream>")
+            .finish()
+    }
+}
+
 impl HttpResponse {
     pub fn new(
         status: StatusCode,

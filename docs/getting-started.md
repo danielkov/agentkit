@@ -47,10 +47,7 @@ Then:
 
 ```rust
 let mut driver = agent
-    .start(SessionConfig {
-        session_id: SessionId::new("demo"),
-        metadata: MetadataMap::new(),
-    })
+    .start(SessionConfig::new("demo"))
     .await?;
 
 driver.submit_input(vec![system_item, user_item])?;

@@ -42,6 +42,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 | `ANTHROPIC_VERSION`    | no       | `2023-06-01`                                |
 | `ANTHROPIC_BETA`       | no       | comma-separated list of anthropic-beta tags |
 
+## Authentication and resilience
+
+`AnthropicConfig` stores credentials as a first-class
+`agentkit_http::Authentication`. Unlike the other provider constructors,
+`AnthropicConfig::new("...", model, max_tokens)` treats its string as an
+Anthropic API key and sends it in `x-api-key`. To send a bearer token in
+`Authorization`, use the explicit
+`AnthropicConfig::with_auth_token("...", model, max_tokens)` constructor. Use
+`AnthropicConfig::from_authentication(...)` or `.with_authentication(...)` for
+an existing `Authentication`, and `.with_authentication_provider(...)` for a
+custom refresh-capable `AuthenticationProvider`.
+
+Resilience is opt-in: `resilience` is an `Option<ResilienceConfig>` that
+defaults to `None`. Calling `.with_resilience(...)` enables retries and
+timeouts; leaving it as `None` preserves the existing single-attempt behavior.
+
 ## Server tools
 
 Known server tools (`WebSearchTool`, `WebFetchTool`, `CodeExecutionTool`, etc.)

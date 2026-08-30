@@ -338,7 +338,7 @@ fn print_show(config: &CerebrasConfig) {
     json.insert("model".into(), json!(config.model));
     json.insert("base_url".into(), json!(config.base_url));
     json.insert("streaming".into(), json!(config.streaming));
-    json.insert("api_key".into(), json!("***redacted***"));
+    json.insert("authentication".into(), json!("***redacted***"));
     if let Some(v) = config.version_patch {
         json.insert("version_patch".into(), json!(v));
     }

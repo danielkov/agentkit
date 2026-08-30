@@ -28,6 +28,18 @@ let adapter = BasetenAdapter::new(config)?;
 | `BASETEN_MODEL` | yes | -- |
 | `BASETEN_BASE_URL` | no | `https://inference.baseten.co/v1/chat/completions` |
 
+## Authentication and resilience
+
+`BasetenConfig` stores credentials as a first-class
+`agentkit_http::Authentication`. A bare string passed to `BasetenConfig::new`
+or `.with_authentication(...)` is shorthand for bearer authentication. Use
+`.with_authentication_provider(...)` for a custom refresh-capable
+`AuthenticationProvider`.
+
+Resilience is opt-in: `resilience` is an `Option<ResilienceConfig>` that
+defaults to `None`. Calling `.with_resilience(...)` enables retries and
+timeouts; leaving it as `None` preserves the existing single-attempt behavior.
+
 To use an OpenAI-compatible dedicated deployment, set `BASETEN_BASE_URL` to
 the full endpoint, for example:
 

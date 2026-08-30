@@ -1,3 +1,7 @@
+use std::borrow::Cow;
+use std::sync::Arc;
+
+use agentkit_http::{Authentication, AuthenticationProvider, HeaderName, ResilienceConfig};
 use serde_json::{Value, json};
 
 use crate::error::AnthropicError;
@@ -7,6 +11,115 @@ use crate::server_tool::ServerToolHandle;
 pub const DEFAULT_ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
 /// Default `anthropic-version` header.
 pub const DEFAULT_ANTHROPIC_VERSION: &str = "2023-06-01";
+
+/// Anthropic API-key authentication for the `x-api-key` header.
+#[derive(Clone, Debug)]
+pub struct AnthropicApiKey(Authentication);
+
+impl AnthropicApiKey {
+    /// Wraps an Anthropic API key without retaining it as a plain config string.
+    pub fn new(api_key: impl Into<String>) -> Self {
+        Self(Authentication::header(
+            HeaderName::from_static("x-api-key"),
+            api_key,
+        ))
+    }
+}
+
+impl From<String> for AnthropicApiKey {
+    fn from(api_key: String) -> Self {
+        Self::new(api_key)
+    }
+}
+
+impl From<&str> for AnthropicApiKey {
+    fn from(api_key: &str) -> Self {
+        Self::new(api_key)
+    }
+}
+
+impl From<&String> for AnthropicApiKey {
+    fn from(api_key: &String) -> Self {
+        Self::new(api_key)
+    }
+}
+
+impl From<Box<str>> for AnthropicApiKey {
+    fn from(api_key: Box<str>) -> Self {
+        Self::new(api_key)
+    }
+}
+
+impl From<Arc<str>> for AnthropicApiKey {
+    fn from(api_key: Arc<str>) -> Self {
+        Self::new(api_key.as_ref())
+    }
+}
+
+impl<'a> From<Cow<'a, str>> for AnthropicApiKey {
+    fn from(api_key: Cow<'a, str>) -> Self {
+        Self::new(api_key)
+    }
+}
+
+impl From<AnthropicApiKey> for Authentication {
+    fn from(api_key: AnthropicApiKey) -> Self {
+        api_key.0
+    }
+}
+
+/// Anthropic bearer authentication for the `Authorization` header.
+#[derive(Clone, Debug)]
+pub struct AnthropicAuthToken(Authentication);
+
+impl AnthropicAuthToken {
+    /// Wraps an Anthropic auth token without retaining it as a plain config string.
+    pub fn new(auth_token: impl Into<String>) -> Self {
+        Self(Authentication::bearer(auth_token))
+    }
+}
+
+impl From<String> for AnthropicAuthToken {
+    fn from(auth_token: String) -> Self {
+        Self::new(auth_token)
+    }
+}
+
+impl From<&str> for AnthropicAuthToken {
+    fn from(auth_token: &str) -> Self {
+        Self::new(auth_token)
+    }
+}
+
+impl From<&String> for AnthropicAuthToken {
+    fn from(auth_token: &String) -> Self {
+        Self::new(auth_token)
+    }
+}
+
+impl From<Box<str>> for AnthropicAuthToken {
+    fn from(auth_token: Box<str>) -> Self {
+        Self::new(auth_token)
+    }
+}
+
+impl From<Arc<str>> for AnthropicAuthToken {
+    fn from(auth_token: Arc<str>) -> Self {
+        Self::new(auth_token.as_ref())
+    }
+}
+
+impl<'a> From<Cow<'a, str>> for AnthropicAuthToken {
+    fn from(auth_token: Cow<'a, str>) -> Self {
+        Self::new(auth_token)
+    }
+}
+
+impl From<AnthropicAuthToken> for Authentication {
+    fn from(auth_token: AnthropicAuthToken) -> Self {
+        auth_token.0
+    }
+}
 
 /// Extended thinking configuration.
 #[derive(Clone, Debug)]
@@ -143,10 +256,8 @@ pub struct AnthropicMcpServer(pub Value);
 /// argument — the Messages API rejects requests without it.
 #[derive(Clone)]
 pub struct AnthropicConfig {
-    /// Anthropic API key (`x-api-key` header).
-    pub api_key: Option<String>,
-    /// OAuth / bearer token; if set, takes precedence over `api_key`.
-    pub auth_token: Option<String>,
+    /// Authentication applied to each request.
+    pub authentication: Authentication,
 
     /// Endpoint URL. Defaults to the Anthropic production endpoint.
     pub base_url: String,
@@ -205,47 +316,57 @@ pub struct AnthropicConfig {
     /// [`AnthropicConfig::with_streaming`] for debugging or when an upstream
     /// proxy doesn't forward SSE bodies.
     pub streaming: bool,
+    /// Optional retry and timeout policy. `None` preserves single-attempt behavior.
+    pub resilience: Option<ResilienceConfig>,
+}
+
+impl std::fmt::Debug for AnthropicConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AnthropicConfig")
+            .field("authentication", &"<redacted>")
+            .field("base_url", &self.base_url)
+            .field("anthropic_version", &self.anthropic_version)
+            .field("anthropic_beta", &self.anthropic_beta)
+            .field("model", &self.model)
+            .field("max_tokens", &self.max_tokens)
+            .field("temperature", &self.temperature)
+            .field("top_p", &self.top_p)
+            .field("top_k", &self.top_k)
+            .field("stop_sequences", &self.stop_sequences)
+            .field("thinking", &self.thinking)
+            .field("service_tier", &self.service_tier)
+            .field("tool_choice", &self.tool_choice)
+            .field("disable_parallel_tool_use", &self.disable_parallel_tool_use)
+            .field("output_format", &self.output_format)
+            .field("output_effort", &self.output_effort)
+            .field("streaming", &self.streaming)
+            .field("resilience", &self.resilience)
+            .finish_non_exhaustive()
+    }
 }
 
 impl AnthropicConfig {
-    /// Creates a new configuration using an API key.
+    /// Creates a new configuration using `x-api-key` authentication.
     pub fn new(
-        api_key: impl Into<String>,
+        api_key: impl Into<AnthropicApiKey>,
         model: impl Into<String>,
         max_tokens: u32,
     ) -> Result<Self, AnthropicError> {
-        if max_tokens == 0 {
-            return Err(AnthropicError::InvalidMaxTokens);
-        }
-        Ok(Self {
-            api_key: Some(api_key.into()),
-            auth_token: None,
-            base_url: DEFAULT_ENDPOINT.into(),
-            anthropic_version: DEFAULT_ANTHROPIC_VERSION.into(),
-            anthropic_beta: Vec::new(),
-            model: model.into(),
-            max_tokens,
-            temperature: None,
-            top_p: None,
-            top_k: None,
-            stop_sequences: None,
-            thinking: None,
-            service_tier: None,
-            metadata_user_id: None,
-            tool_choice: None,
-            disable_parallel_tool_use: None,
-            server_tools: Vec::new(),
-            container: None,
-            output_format: None,
-            output_effort: None,
-            mcp_servers: Vec::new(),
-            streaming: true,
-        })
+        Self::from_authentication(api_key.into(), model, max_tokens)
     }
 
     /// Creates a new configuration using a bearer auth token.
     pub fn with_auth_token(
-        auth_token: impl Into<String>,
+        auth_token: impl Into<AnthropicAuthToken>,
+        model: impl Into<String>,
+        max_tokens: u32,
+    ) -> Result<Self, AnthropicError> {
+        Self::from_authentication(auth_token.into(), model, max_tokens)
+    }
+
+    /// Creates a new configuration using arbitrary authentication.
+    pub fn from_authentication(
+        authentication: impl Into<Authentication>,
         model: impl Into<String>,
         max_tokens: u32,
     ) -> Result<Self, AnthropicError> {
@@ -253,8 +374,7 @@ impl AnthropicConfig {
             return Err(AnthropicError::InvalidMaxTokens);
         }
         Ok(Self {
-            api_key: None,
-            auth_token: Some(auth_token.into()),
+            authentication: authentication.into(),
             base_url: DEFAULT_ENDPOINT.into(),
             anthropic_version: DEFAULT_ANTHROPIC_VERSION.into(),
             anthropic_beta: Vec::new(),
@@ -275,6 +395,7 @@ impl AnthropicConfig {
             output_effort: None,
             mcp_servers: Vec::new(),
             streaming: true,
+            resilience: None,
         })
     }
 
@@ -321,6 +442,23 @@ impl AnthropicConfig {
     }
 
     // --- Builder methods ---
+
+    /// Replaces the configured authentication.
+    pub fn with_authentication(mut self, authentication: impl Into<Authentication>) -> Self {
+        self.authentication = authentication.into();
+        self
+    }
+
+    /// Uses a custom refresh-capable authentication provider.
+    pub fn with_authentication_provider<P: AuthenticationProvider>(self, provider: P) -> Self {
+        self.with_authentication(Authentication::new(provider))
+    }
+
+    /// Enables request and pre-visible-output retries and timeouts.
+    pub fn with_resilience(mut self, resilience: ResilienceConfig) -> Self {
+        self.resilience = Some(resilience);
+        self
+    }
 
     /// Overrides the endpoint URL.
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {

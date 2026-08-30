@@ -32,6 +32,7 @@
 use agentkit_adapter_completions::{
     CompletionsAdapter, CompletionsError, CompletionsProvider, CompletionsSession, CompletionsTurn,
 };
+use agentkit_http::{Authentication, AuthenticationProvider, ResilienceConfig};
 use agentkit_loop::{LoopError, ModelAdapter, SessionConfig};
 use async_trait::async_trait;
 use serde::Serialize;
@@ -53,14 +54,16 @@ const DEFAULT_ENDPOINT: &str = "https://api.mistral.ai/v1/chat/completions";
 ///     .with_temperature(0.0)
 ///     .with_max_tokens(4096);
 /// ```
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct MistralConfig {
-    /// Mistral API key.
-    pub api_key: String,
+    /// Authentication used for API requests. String values become bearer authentication.
+    pub authentication: Authentication,
     /// Model identifier, e.g. `"mistral-large-latest"` or `"mistral-small-latest"`.
     pub model: String,
     /// Chat completions endpoint URL. Defaults to the Mistral production URL.
     pub base_url: String,
+    /// Optional retry and timeout policy. `None` preserves single-attempt behavior.
+    pub resilience: Option<ResilienceConfig>,
     /// Sampling temperature (0.0 = deterministic, higher = more creative).
     pub temperature: Option<f32>,
     /// Maximum number of tokens the model may generate. Mistral uses `max_tokens`
@@ -83,13 +86,31 @@ pub struct MistralConfig {
     pub strict_alternating_roles: bool,
 }
 
+impl std::fmt::Debug for MistralConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MistralConfig")
+            .field("authentication", &"<redacted>")
+            .field("model", &self.model)
+            .field("base_url", &self.base_url)
+            .field("resilience", &self.resilience)
+            .field("temperature", &self.temperature)
+            .field("max_tokens", &self.max_tokens)
+            .field("top_p", &self.top_p)
+            .field("parallel_tool_calls", &self.parallel_tool_calls)
+            .field("streaming", &self.streaming)
+            .field("strict_alternating_roles", &self.strict_alternating_roles)
+            .finish()
+    }
+}
+
 impl MistralConfig {
-    /// Creates a new configuration with the given API key and model identifier.
-    pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
+    /// Creates a new configuration with the given authentication and model identifier.
+    pub fn new(authentication: impl Into<Authentication>, model: impl Into<String>) -> Self {
         Self {
-            api_key: api_key.into(),
+            authentication: authentication.into(),
             model: model.into(),
             base_url: DEFAULT_ENDPOINT.into(),
+            resilience: None,
             temperature: None,
             max_tokens: None,
             top_p: None,
@@ -97,6 +118,29 @@ impl MistralConfig {
             streaming: true,
             strict_alternating_roles: true,
         }
+    }
+
+    /// Replaces request authentication. String values become bearer authentication.
+    pub fn with_authentication(mut self, authentication: impl Into<Authentication>) -> Self {
+        self.authentication = authentication.into();
+        self
+    }
+
+    /// Compatibility builder for bearer API-key authentication.
+    pub fn with_api_key(self, api_key: impl Into<Authentication>) -> Self {
+        self.with_authentication(api_key)
+    }
+
+    /// Uses a custom refresh-capable authentication provider.
+    pub fn with_authentication_provider<P: AuthenticationProvider>(mut self, provider: P) -> Self {
+        self.authentication = Authentication::new(provider);
+        self
+    }
+
+    /// Enables request retries and timeouts.
+    pub fn with_resilience(mut self, resilience: ResilienceConfig) -> Self {
+        self.resilience = Some(resilience);
+        self
     }
 
     /// Overrides the default chat completions endpoint URL.
@@ -185,7 +229,8 @@ pub struct MistralRequestConfig {
 /// The Mistral provider, implementing [`CompletionsProvider`].
 #[derive(Clone, Debug)]
 pub struct MistralProvider {
-    api_key: String,
+    authentication: Authentication,
+    resilience: Option<ResilienceConfig>,
     base_url: String,
     streaming: bool,
     strict_alternating_roles: bool,
@@ -195,7 +240,8 @@ pub struct MistralProvider {
 impl From<MistralConfig> for MistralProvider {
     fn from(config: MistralConfig) -> Self {
         Self {
-            api_key: config.api_key,
+            authentication: config.authentication,
+            resilience: config.resilience,
             base_url: config.base_url,
             streaming: config.streaming,
             strict_alternating_roles: config.strict_alternating_roles,
@@ -227,10 +273,18 @@ impl CompletionsProvider for MistralProvider {
         &self,
         builder: agentkit_http::HttpRequestBuilder,
     ) -> agentkit_http::HttpRequestBuilder {
-        builder.bearer_auth(&self.api_key).header(
+        builder.header(
             "User-Agent",
             concat!("agentkit-provider-mistral/", env!("CARGO_PKG_VERSION")),
         )
+    }
+
+    fn authentication(&self) -> Option<Authentication> {
+        Some(self.authentication.clone())
+    }
+
+    fn resilience_config(&self) -> Option<ResilienceConfig> {
+        self.resilience.clone()
     }
 
     fn streaming(&self) -> bool {
@@ -274,6 +328,21 @@ impl MistralAdapter {
         let provider = MistralProvider::from(config);
         Ok(Self(CompletionsAdapter::new(provider)?))
     }
+
+    /// Overrides the default API-key authentication.
+    pub fn with_authentication(self, authentication: impl Into<Authentication>) -> Self {
+        Self(self.0.with_authentication(authentication))
+    }
+
+    /// Overrides authentication with a custom refresh-capable provider.
+    pub fn with_authentication_provider<P: AuthenticationProvider>(self, provider: P) -> Self {
+        self.with_authentication(Authentication::new(provider))
+    }
+
+    /// Enables retry and timeout behavior.
+    pub fn with_resilience(self, resilience: ResilienceConfig) -> Self {
+        Self(self.0.with_resilience(resilience))
+    }
 }
 
 #[async_trait]
@@ -295,4 +364,26 @@ pub enum MistralError {
     /// An error from the generic completions adapter.
     #[error(transparent)]
     Completions(#[from] CompletionsError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_authentication_and_resilience_reach_provider() {
+        let provider = MistralProvider::from(
+            MistralConfig::new("secret", "model").with_resilience(ResilienceConfig::default()),
+        );
+        assert!(provider.authentication().is_some());
+        assert!(provider.resilience_config().is_some());
+    }
+
+    #[test]
+    fn config_debug_redacts_authentication() {
+        let debug = format!("{:?}", MistralConfig::new("mistral-secret", "debug-model"));
+        assert!(!debug.contains("mistral-secret"));
+        assert!(debug.contains("<redacted>"));
+        assert!(debug.contains("debug-model"));
+    }
 }

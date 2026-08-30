@@ -9,6 +9,7 @@ use agentkit_http::{BodyStream, Http};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
+use crate::RequestExecutor;
 use crate::config::CerebrasConfig;
 use crate::error::CerebrasError;
 
@@ -60,6 +61,14 @@ impl<'a> FilesClient<'a> {
         Self { http, config }
     }
 
+    fn executor(&self) -> RequestExecutor {
+        RequestExecutor::new(
+            self.http,
+            self.config.authentication.clone(),
+            self.config.resilience.clone(),
+        )
+    }
+
     /// Uploads a JSONL batch file. Returns the created [`FileObject`].
     pub async fn upload(
         &self,
@@ -78,12 +87,15 @@ impl<'a> FilesClient<'a> {
         let body = build_multipart(&boundary, filename, bytes.into(), purpose);
         let content_type = format!("multipart/form-data; boundary={boundary}");
         let response = self
-            .http
-            .post(&url)
-            .bearer_auth(&self.config.api_key)
-            .header("Content-Type", content_type)
-            .body(body)
-            .send()
+            .executor()
+            // Uploads have no stable provider idempotency contract. Bound the
+            // call, including auth and body reads, but never retry the POST.
+            .execute_buffered_without_retries(|| {
+                self.http
+                    .post(&url)
+                    .header("Content-Type", content_type.clone())
+                    .body(body.clone())
+            })
             .await?;
         if !response.status().is_success() {
             let status = response.status().as_u16();
@@ -97,10 +109,8 @@ impl<'a> FilesClient<'a> {
     pub async fn list(&self) -> Result<Vec<FileObject>, CerebrasError> {
         let url = format!("{}/files", self.config.base_url);
         let response = self
-            .http
-            .get(&url)
-            .bearer_auth(&self.config.api_key)
-            .send()
+            .executor()
+            .execute_buffered(|| self.http.get(&url))
             .await?;
         if !response.status().is_success() {
             let status = response.status().as_u16();
@@ -115,10 +125,8 @@ impl<'a> FilesClient<'a> {
     pub async fn retrieve(&self, id: &str) -> Result<FileObject, CerebrasError> {
         let url = format!("{}/files/{id}", self.config.base_url);
         let response = self
-            .http
-            .get(&url)
-            .bearer_auth(&self.config.api_key)
-            .send()
+            .executor()
+            .execute_buffered(|| self.http.get(&url))
             .await?;
         if !response.status().is_success() {
             let status = response.status().as_u16();
@@ -129,37 +137,42 @@ impl<'a> FilesClient<'a> {
     }
 
     /// Streams a file's content (batch output or error reports).
+    ///
+    /// With resilience enabled, opening this idempotent GET may be retried. The
+    /// returned stream enforces the same logical deadline, configured idle
+    /// timeout, and content-length truncation detection. It reports stream
+    /// failures directly and never replays after the stream is returned.
     pub async fn content(&self, id: &str) -> Result<BodyStream, CerebrasError> {
         let url = format!("{}/files/{id}/content", self.config.base_url);
-        let response = self
-            .http
-            .get(&url)
-            .bearer_auth(&self.config.api_key)
-            .send()
-            .await?;
+        let executor = self.executor();
+        let response = executor.execute(|| self.http.get(&url)).await?;
         if !response.status().is_success() {
             let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
+            let body = executor
+                .read_response_text(response)
+                .await
+                .unwrap_or_default();
             return Err(CerebrasError::Status { status, body });
         }
-        Ok(response.bytes_stream())
+        Ok(executor.guard_body_stream(response))
     }
 
-    /// Deletes a file.
+    /// Deletes a file without replaying the request or buffering a successful response.
     pub async fn delete(&self, id: &str) -> Result<(), CerebrasError> {
         let url = format!("{}/files/{id}", self.config.base_url);
-        let response = self
-            .http
-            .delete(&url)
-            .bearer_auth(&self.config.api_key)
-            .send()
+        let executor = self.executor();
+        let response = executor
+            .execute_without_retries(|| self.http.delete(&url))
             .await?;
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(CerebrasError::Status { status, body });
+        if response.status().is_success() {
+            return Ok(());
         }
-        Ok(())
+        let status = response.status().as_u16();
+        let body = executor
+            .read_response_text(response)
+            .await
+            .unwrap_or_default();
+        Err(CerebrasError::Status { status, body })
     }
 }
 
@@ -202,7 +215,36 @@ fn build_multipart(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use agentkit_http::{
+        HttpClient, HttpError, HttpRequest, HttpResponse, ResilienceConfig, StatusCode,
+    };
+    use async_trait::async_trait;
+
     use super::*;
+
+    struct DeleteClient {
+        calls: AtomicUsize,
+        fail_first: bool,
+    }
+
+    #[async_trait]
+    impl HttpClient for DeleteClient {
+        async fn execute(&self, request: HttpRequest) -> Result<HttpResponse, HttpError> {
+            assert_eq!(request.method, agentkit_http::Method::DELETE);
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail_first && call == 0 {
+                return Err(HttpError::request(std::io::Error::other("disconnected")));
+            }
+            Ok(HttpResponse::new(
+                StatusCode::NO_CONTENT,
+                agentkit_http::HeaderMap::new(),
+                request.url,
+                Box::pin(futures_util::stream::pending()),
+            ))
+        }
+    }
 
     #[test]
     fn multipart_body_has_purpose_and_file_parts() {
@@ -219,5 +261,46 @@ mod tests {
         assert!(text.contains("filename=\"x.jsonl\""));
         assert!(text.contains("{}\n"));
         assert!(text.trim_end().ends_with("--BND--"));
+    }
+
+    #[tokio::test]
+    async fn delete_returns_without_buffering_a_success_body() {
+        let client = Arc::new(DeleteClient {
+            calls: AtomicUsize::new(0),
+            fail_first: false,
+        });
+        let http = Http::from_arc(client.clone());
+        let config = Arc::new(
+            CerebrasConfig::new("secret", "test-model")
+                .unwrap()
+                .with_base_url("https://example.test"),
+        );
+        let files = FilesClient::new(&http, config);
+
+        files.delete("file-1").await.unwrap();
+
+        assert_eq!(client.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn delete_does_not_replay_transport_failures() {
+        let client = Arc::new(DeleteClient {
+            calls: AtomicUsize::new(0),
+            fail_first: true,
+        });
+        let http = Http::from_arc(client.clone());
+        let config = Arc::new(
+            CerebrasConfig::new("secret", "test-model")
+                .unwrap()
+                .with_base_url("https://example.test")
+                .with_resilience(ResilienceConfig {
+                    max_retries: 3,
+                    ..ResilienceConfig::default()
+                }),
+        );
+        let files = FilesClient::new(&http, config);
+
+        assert!(files.delete("file-1").await.is_err());
+        assert_eq!(client.calls.load(Ordering::SeqCst), 1);
     }
 }

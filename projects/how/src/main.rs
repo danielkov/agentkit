@@ -472,16 +472,12 @@ async fn run_agent(
     prompt: String,
     cancellation: CancellationController,
 ) -> Result<Vec<String>, AgentError> {
-    let config = OpenRouterConfig::from_env()
+    let mut config = OpenRouterConfig::from_env()
         .map_err(|e| AgentError::Other(e.into()))?
         .with_temperature(0.0);
-    let config = if model != DEFAULT_MODEL {
-        OpenRouterConfig::new(config.api_key.clone(), &model)
-            .with_temperature(0.0)
-            .with_base_url(config.base_url.clone())
-    } else {
-        config
-    };
+    if model != DEFAULT_MODEL {
+        config.model.clone_from(&model);
+    }
 
     let adapter = OpenRouterAdapter::new(config).map_err(|e| AgentError::Other(e.into()))?;
     let tools = ToolRegistry::new().with(IsAvailableTool);

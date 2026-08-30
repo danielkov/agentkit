@@ -8,6 +8,7 @@ use std::sync::Arc;
 use agentkit_http::Http;
 use serde::{Deserialize, Serialize};
 
+use crate::RequestExecutor;
 use crate::config::CerebrasConfig;
 use crate::error::CerebrasError;
 
@@ -27,12 +28,12 @@ impl<'a> ModelsClient<'a> {
     /// `GET /v1/models` — list every model visible to the API key.
     pub async fn list(&self) -> Result<Vec<ModelObject>, CerebrasError> {
         let url = format!("{}/models", self.config.base_url);
-        let response = self
-            .http
-            .get(&url)
-            .bearer_auth(&self.config.api_key)
-            .send()
-            .await?;
+        let executor = RequestExecutor::new(
+            self.http,
+            self.config.authentication.clone(),
+            self.config.resilience.clone(),
+        );
+        let response = executor.execute_buffered(|| self.http.get(&url)).await?;
         if !response.status().is_success() {
             let status = response.status().as_u16();
             let body = response.text().await.unwrap_or_default();
@@ -45,12 +46,12 @@ impl<'a> ModelsClient<'a> {
     /// `GET /v1/models/{id}` — fetch a single model object.
     pub async fn retrieve(&self, id: &str) -> Result<ModelObject, CerebrasError> {
         let url = format!("{}/models/{id}", self.config.base_url);
-        let response = self
-            .http
-            .get(&url)
-            .bearer_auth(&self.config.api_key)
-            .send()
-            .await?;
+        let executor = RequestExecutor::new(
+            self.http,
+            self.config.authentication.clone(),
+            self.config.resilience.clone(),
+        );
+        let response = executor.execute_buffered(|| self.http.get(&url)).await?;
         if !response.status().is_success() {
             let status = response.status().as_u16();
             let body = response.text().await.unwrap_or_default();

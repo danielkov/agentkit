@@ -50,11 +50,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 | `batch`               | Files + Batch async bulk inference API                      |
 | `experimental`        | Enables all preview/private-preview features                |
 
-## Retry
+## Authentication and resilience
 
-`agentkit-http` is a trait façade without a retry layer. Callers wanting retry
-build their `Http` with the `reqwest-middleware-client` feature +
-`reqwest-retry` and pass it via `CerebrasAdapter::with_client`.
+`CerebrasConfig` stores credentials as a first-class
+`agentkit_http::Authentication`. A bare string passed to `CerebrasConfig::new`
+or `.with_authentication(...)` is shorthand for bearer authentication. Use
+`.with_authentication_provider(...)` for a custom refresh-capable
+`AuthenticationProvider`. The adapter shares this authentication across chat,
+files, batches, and models requests; clients returned by `.files()`,
+`.batches()`, and `.models()` use the same config.
+
+Resilience is opt-in and shared across those APIs too. `resilience` is an
+`Option<ResilienceConfig>` that defaults to `None`. Calling
+`.with_resilience(...)` enables retries and timeouts; leaving it as `None`
+preserves the existing single-attempt behavior.
 
 ## Metadata keys
 

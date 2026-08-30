@@ -26,10 +26,21 @@
 //! }
 //! ```
 
+mod responses;
+
+pub use responses::{
+    OpenAIResponsesAdapter, OpenAIResponsesConfig, OpenAIResponsesError, OpenAIResponsesLimits,
+    OpenAIResponsesProfile, OpenAIResponsesRequestPolicy, OpenAIResponsesSession,
+    OpenAIResponsesTurn,
+};
+
+use std::fmt;
+
 use agentkit_adapter_completions::{
     CompletionsAdapter, CompletionsError, CompletionsProvider, CompletionsSession, CompletionsTurn,
 };
 use agentkit_core::{MetadataMap, Usage};
+use agentkit_http::{Authentication, AuthenticationProvider, ResilienceConfig};
 use agentkit_loop::{
     LoopError, ModelAdapter, PromptCacheMode, PromptCacheRetention, PromptCacheStrategy,
     SessionConfig, TurnRequest,
@@ -56,10 +67,10 @@ const DEFAULT_ENDPOINT: &str = "https://api.openai.com/v1/chat/completions";
 ///     .with_temperature(0.0)
 ///     .with_max_completion_tokens(4096);
 /// ```
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct OpenAIConfig {
-    /// OpenAI API key (starts with `sk-`).
-    pub api_key: String,
+    /// Authentication applied to each request. Bare strings use bearer authentication.
+    pub authentication: Authentication,
     /// Model identifier, e.g. `"gpt-4o"` or `"gpt-4o-mini"`.
     pub model: String,
     /// Chat completions endpoint URL. Defaults to the OpenAI production URL.
@@ -80,13 +91,36 @@ pub struct OpenAIConfig {
     pub parallel_tool_calls: Option<bool>,
     /// Request SSE streaming responses. Defaults to `true`.
     pub streaming: bool,
+    /// Optional retry and timeout policy. `None` preserves single-attempt behavior.
+    pub resilience: Option<ResilienceConfig>,
+}
+
+impl fmt::Debug for OpenAIConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OpenAIConfig")
+            .field("authentication", &"<redacted>")
+            .field("model", &self.model)
+            .field("base_url", &self.base_url)
+            .field("temperature", &self.temperature)
+            .field("max_completion_tokens", &self.max_completion_tokens)
+            .field("top_p", &self.top_p)
+            .field("frequency_penalty", &self.frequency_penalty)
+            .field("presence_penalty", &self.presence_penalty)
+            .field("parallel_tool_calls", &self.parallel_tool_calls)
+            .field("streaming", &self.streaming)
+            .field("resilience", &self.resilience)
+            .finish()
+    }
 }
 
 impl OpenAIConfig {
-    /// Creates a new configuration with the given API key and model identifier.
-    pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
+    /// Creates a new configuration with the given authentication and model identifier.
+    ///
+    /// Bare strings are treated as bearer tokens.
+    pub fn new(authentication: impl Into<Authentication>, model: impl Into<String>) -> Self {
         Self {
-            api_key: api_key.into(),
+            authentication: authentication.into(),
             model: model.into(),
             base_url: DEFAULT_ENDPOINT.into(),
             temperature: None,
@@ -96,7 +130,25 @@ impl OpenAIConfig {
             presence_penalty: None,
             parallel_tool_calls: None,
             streaming: true,
+            resilience: None,
         }
+    }
+
+    /// Replaces the configured authentication.
+    pub fn with_authentication(mut self, authentication: impl Into<Authentication>) -> Self {
+        self.authentication = authentication.into();
+        self
+    }
+
+    /// Uses a custom refresh-capable authentication provider.
+    pub fn with_authentication_provider<P: AuthenticationProvider>(self, provider: P) -> Self {
+        self.with_authentication(Authentication::new(provider))
+    }
+
+    /// Enables request and pre-visible-output retries and timeouts.
+    pub fn with_resilience(mut self, resilience: ResilienceConfig) -> Self {
+        self.resilience = Some(resilience);
+        self
     }
 
     /// Overrides the default chat completions endpoint URL.
@@ -192,7 +244,8 @@ pub struct OpenAIRequestConfig {
 /// The OpenAI provider, implementing [`CompletionsProvider`].
 #[derive(Clone, Debug)]
 pub struct OpenAIProvider {
-    api_key: String,
+    authentication: Authentication,
+    resilience: Option<ResilienceConfig>,
     base_url: String,
     streaming: bool,
     request_config: OpenAIRequestConfig,
@@ -201,7 +254,8 @@ pub struct OpenAIProvider {
 impl From<OpenAIConfig> for OpenAIProvider {
     fn from(config: OpenAIConfig) -> Self {
         Self {
-            api_key: config.api_key,
+            authentication: config.authentication,
+            resilience: config.resilience,
             base_url: config.base_url,
             streaming: config.streaming,
             request_config: OpenAIRequestConfig {
@@ -214,6 +268,13 @@ impl From<OpenAIConfig> for OpenAIProvider {
                 parallel_tool_calls: config.parallel_tool_calls,
             },
         }
+    }
+}
+
+pub(crate) fn prompt_cache_retention_value(retention: PromptCacheRetention) -> &'static str {
+    match retention {
+        PromptCacheRetention::Default | PromptCacheRetention::Short => "in_memory",
+        PromptCacheRetention::Extended => "24h",
     }
 }
 
@@ -234,10 +295,18 @@ impl CompletionsProvider for OpenAIProvider {
         &self,
         builder: agentkit_http::HttpRequestBuilder,
     ) -> agentkit_http::HttpRequestBuilder {
-        builder.bearer_auth(&self.api_key).header(
+        builder.header(
             "User-Agent",
             concat!("agentkit-provider-openai/", env!("CARGO_PKG_VERSION")),
         )
+    }
+
+    fn authentication(&self) -> Option<Authentication> {
+        Some(self.authentication.clone())
+    }
+
+    fn resilience_config(&self) -> Option<ResilienceConfig> {
+        self.resilience.clone()
     }
 
     fn streaming(&self) -> bool {
@@ -270,11 +339,10 @@ impl CompletionsProvider for OpenAIProvider {
         }
 
         if let Some(retention) = cache.retention {
-            let value = match retention {
-                PromptCacheRetention::Default | PromptCacheRetention::Short => "in_memory",
-                PromptCacheRetention::Extended => "24h",
-            };
-            body.insert("prompt_cache_retention".into(), Value::String(value.into()));
+            body.insert(
+                "prompt_cache_retention".into(),
+                Value::String(prompt_cache_retention_value(retention).into()),
+            );
         }
 
         if matches!(cache.strategy, PromptCacheStrategy::Explicit { .. })
@@ -327,25 +395,47 @@ impl CompletionsProvider for OpenAIProvider {
 /// # }
 /// ```
 #[derive(Clone)]
-pub struct OpenAIAdapter(CompletionsAdapter<OpenAIProvider>);
+pub struct OpenAIChatCompletionsAdapter(CompletionsAdapter<OpenAIProvider>);
 
-/// An active session with the OpenAI API.
-pub type OpenAISession = CompletionsSession<OpenAIProvider>;
+/// Compatibility alias for the chat-completions adapter.
+pub type OpenAIAdapter = OpenAIChatCompletionsAdapter;
 
-/// A completed turn from the OpenAI API.
-pub type OpenAITurn = CompletionsTurn;
+/// An active chat-completions session with the OpenAI API.
+pub type OpenAIChatCompletionsSession = CompletionsSession<OpenAIProvider>;
+/// Compatibility alias for an active chat-completions session.
+pub type OpenAISession = OpenAIChatCompletionsSession;
 
-impl OpenAIAdapter {
+/// A chat-completions turn from the OpenAI API.
+pub type OpenAIChatCompletionsTurn = CompletionsTurn;
+/// Compatibility alias for a chat-completions turn.
+pub type OpenAITurn = OpenAIChatCompletionsTurn;
+
+impl OpenAIChatCompletionsAdapter {
     /// Creates a new adapter from the given configuration.
     pub fn new(config: OpenAIConfig) -> Result<Self, OpenAIError> {
         let provider = OpenAIProvider::from(config);
         Ok(Self(CompletionsAdapter::new(provider)?))
     }
+
+    /// Overrides the API-key authentication with an arbitrary authentication handle.
+    pub fn with_authentication(self, authentication: impl Into<Authentication>) -> Self {
+        Self(self.0.with_authentication(authentication))
+    }
+
+    /// Overrides authentication with a custom refresh-capable provider.
+    pub fn with_authentication_provider<P: AuthenticationProvider>(self, provider: P) -> Self {
+        self.with_authentication(Authentication::new(provider))
+    }
+
+    /// Enables request and pre-visible-output retries and timeouts.
+    pub fn with_resilience(self, resilience: ResilienceConfig) -> Self {
+        Self(self.0.with_resilience(resilience))
+    }
 }
 
 #[async_trait]
-impl ModelAdapter for OpenAIAdapter {
-    type Session = OpenAISession;
+impl ModelAdapter for OpenAIChatCompletionsAdapter {
+    type Session = OpenAIChatCompletionsSession;
 
     async fn start_session(&self, config: SessionConfig) -> Result<Self::Session, LoopError> {
         self.0.start_session(config).await
@@ -379,6 +469,25 @@ mod tests {
             cache,
             metadata: MetadataMap::new(),
         }
+    }
+
+    #[test]
+    fn openai_config_debug_redacts_api_key() {
+        let debug = format!("{:?}", OpenAIConfig::new("super-secret", "gpt-test"));
+        assert!(!debug.contains("super-secret"));
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn openai_config_resilience_reaches_provider() {
+        let default_provider = OpenAIProvider::from(OpenAIConfig::new("sk-test", "gpt-test"));
+        assert_eq!(default_provider.resilience_config(), None);
+
+        let resilience = ResilienceConfig::no_retries();
+        let provider = OpenAIProvider::from(
+            OpenAIConfig::new("sk-test", "gpt-test").with_resilience(resilience.clone()),
+        );
+        assert_eq!(provider.resilience_config(), Some(resilience));
     }
 
     #[test]

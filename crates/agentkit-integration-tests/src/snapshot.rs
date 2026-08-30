@@ -308,7 +308,9 @@ fn normalise_recording(recording: &mut SessionRecording) {
                     result.output_items.iter_mut().for_each(normalise_item);
                     canonicalise_metadata(&mut result.metadata);
                 }
-                ModelTurnEvent::Delta(_) | ModelTurnEvent::Usage(_) => {}
+                ModelTurnEvent::Delta(_)
+                | ModelTurnEvent::Usage(_)
+                | ModelTurnEvent::ResponseAttemptSuperseded => {}
             }
         }
     }

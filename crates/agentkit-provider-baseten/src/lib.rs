@@ -7,6 +7,7 @@
 use agentkit_adapter_completions::{
     CompletionsAdapter, CompletionsError, CompletionsProvider, CompletionsSession, CompletionsTurn,
 };
+use agentkit_http::{Authentication, AuthenticationProvider, ResilienceConfig};
 use agentkit_loop::{LoopError, ModelAdapter, SessionConfig};
 use async_trait::async_trait;
 use serde::Serialize;
@@ -18,14 +19,16 @@ const DEFAULT_ENDPOINT: &str = "https://inference.baseten.co/v1/chat/completions
 ///
 /// Use a Baseten Model API slug such as `"openai/gpt-oss-120b"`, or the
 /// served model name from a dedicated deployment.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct BasetenConfig {
-    /// Baseten workspace API key.
-    pub api_key: String,
+    /// Authentication used for API requests. String values become bearer authentication.
+    pub authentication: Authentication,
     /// Model API slug or dedicated deployment's served model name.
     pub model: String,
     /// Full chat completions endpoint URL.
     pub base_url: String,
+    /// Optional retry and timeout policy. `None` preserves single-attempt behavior.
+    pub resilience: Option<ResilienceConfig>,
     /// Sampling temperature.
     pub temperature: Option<f32>,
     /// Maximum number of generated tokens.
@@ -40,13 +43,31 @@ pub struct BasetenConfig {
     pub streaming: bool,
 }
 
+impl std::fmt::Debug for BasetenConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BasetenConfig")
+            .field("authentication", &"<redacted>")
+            .field("model", &self.model)
+            .field("base_url", &self.base_url)
+            .field("resilience", &self.resilience)
+            .field("temperature", &self.temperature)
+            .field("max_tokens", &self.max_tokens)
+            .field("top_p", &self.top_p)
+            .field("top_k", &self.top_k)
+            .field("parallel_tool_calls", &self.parallel_tool_calls)
+            .field("streaming", &self.streaming)
+            .finish()
+    }
+}
+
 impl BasetenConfig {
     /// Creates a configuration for Baseten's shared Model API endpoint.
-    pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
+    pub fn new(authentication: impl Into<Authentication>, model: impl Into<String>) -> Self {
         Self {
-            api_key: api_key.into(),
+            authentication: authentication.into(),
             model: model.into(),
             base_url: DEFAULT_ENDPOINT.into(),
+            resilience: None,
             temperature: None,
             max_tokens: None,
             top_p: None,
@@ -54,6 +75,29 @@ impl BasetenConfig {
             parallel_tool_calls: None,
             streaming: true,
         }
+    }
+
+    /// Replaces request authentication. String values become bearer authentication.
+    pub fn with_authentication(mut self, authentication: impl Into<Authentication>) -> Self {
+        self.authentication = authentication.into();
+        self
+    }
+
+    /// Compatibility builder for bearer API-key authentication.
+    pub fn with_api_key(self, api_key: impl Into<Authentication>) -> Self {
+        self.with_authentication(api_key)
+    }
+
+    /// Uses a custom refresh-capable authentication provider.
+    pub fn with_authentication_provider<P: AuthenticationProvider>(mut self, provider: P) -> Self {
+        self.authentication = Authentication::new(provider);
+        self
+    }
+
+    /// Enables request retries and timeouts.
+    pub fn with_resilience(mut self, resilience: ResilienceConfig) -> Self {
+        self.resilience = Some(resilience);
+        self
     }
 
     /// Overrides the full chat completions endpoint URL.
@@ -141,7 +185,8 @@ pub struct BasetenRequestConfig {
 /// Baseten implementation of [`CompletionsProvider`].
 #[derive(Clone, Debug)]
 pub struct BasetenProvider {
-    api_key: String,
+    authentication: Authentication,
+    resilience: Option<ResilienceConfig>,
     base_url: String,
     streaming: bool,
     request_config: BasetenRequestConfig,
@@ -150,7 +195,8 @@ pub struct BasetenProvider {
 impl From<BasetenConfig> for BasetenProvider {
     fn from(config: BasetenConfig) -> Self {
         Self {
-            api_key: config.api_key,
+            authentication: config.authentication,
+            resilience: config.resilience,
             base_url: config.base_url,
             streaming: config.streaming,
             request_config: BasetenRequestConfig {
@@ -184,10 +230,18 @@ impl CompletionsProvider for BasetenProvider {
         &self,
         builder: agentkit_http::HttpRequestBuilder,
     ) -> agentkit_http::HttpRequestBuilder {
-        builder.bearer_auth(&self.api_key).header(
+        builder.header(
             "User-Agent",
             concat!("agentkit-provider-baseten/", env!("CARGO_PKG_VERSION")),
         )
+    }
+
+    fn authentication(&self) -> Option<Authentication> {
+        Some(self.authentication.clone())
+    }
+
+    fn resilience_config(&self) -> Option<ResilienceConfig> {
+        self.resilience.clone()
     }
 
     fn streaming(&self) -> bool {
@@ -211,6 +265,21 @@ impl BasetenAdapter {
         Ok(Self(CompletionsAdapter::new(BasetenProvider::from(
             config,
         ))?))
+    }
+
+    /// Overrides the default API-key authentication.
+    pub fn with_authentication(self, authentication: impl Into<Authentication>) -> Self {
+        Self(self.0.with_authentication(authentication))
+    }
+
+    /// Overrides authentication with a custom refresh-capable provider.
+    pub fn with_authentication_provider<P: AuthenticationProvider>(self, provider: P) -> Self {
+        self.with_authentication(Authentication::new(provider))
+    }
+
+    /// Enables retry and timeout behavior.
+    pub fn with_resilience(self, resilience: ResilienceConfig) -> Self {
+        Self(self.0.with_resilience(resilience))
     }
 }
 
@@ -238,6 +307,23 @@ pub enum BasetenError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_authentication_and_resilience_reach_provider() {
+        let provider = BasetenProvider::from(
+            BasetenConfig::new("secret", "model").with_resilience(ResilienceConfig::default()),
+        );
+        assert!(provider.authentication().is_some());
+        assert!(provider.resilience_config().is_some());
+    }
+
+    #[test]
+    fn config_debug_redacts_authentication() {
+        let debug = format!("{:?}", BasetenConfig::new("baseten-secret", "debug-model"));
+        assert!(!debug.contains("baseten-secret"));
+        assert!(debug.contains("<redacted>"));
+        assert!(debug.contains("debug-model"));
+    }
 
     #[test]
     fn defaults_to_model_api_with_streaming() {

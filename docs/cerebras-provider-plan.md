@@ -293,7 +293,7 @@ struct ChoiceState {
 #[derive(Clone)]
 pub struct CerebrasConfig {
     // auth & transport
-    pub api_key: String,
+    pub authentication: Authentication,              // strings become bearer auth
     pub base_url: String,                          // default: https://api.cerebras.ai/v1
     pub version_patch: Option<u32>,                // X-Cerebras-Version-Patch
     pub extra_headers: Vec<(String, String)>,      // SDK-style passthrough
@@ -329,6 +329,8 @@ pub struct CerebrasConfig {
 
     // stream
     pub streaming: bool,                           // default true
+    pub resilience: Option<ResilienceConfig>,       // default None (single attempt)
+
 
     // preview-gated
     #[cfg(feature = "predicted-outputs")] pub prediction: Option<Prediction>,
@@ -338,11 +340,9 @@ pub struct CerebrasConfig {
 }
 ```
 
-Builder: one `with_*` per field (mirrors anthropic). `from_env()` reads `CEREBRAS_API_KEY` (required), `CEREBRAS_MODEL` (required), `CEREBRAS_BASE_URL`, `CEREBRAS_VERSION_PATCH`, `CEREBRAS_MAX_COMPLETION_TOKENS`.
+Builder: one `with_*` per field (mirrors anthropic), including `with_authentication`, `with_authentication_provider`, and opt-in `with_resilience`. `from_env()` reads `CEREBRAS_API_KEY` (required and rejected when empty before conversion to bearer authentication), `CEREBRAS_MODEL` (required), `CEREBRAS_BASE_URL`, `CEREBRAS_VERSION_PATCH`, `CEREBRAS_MAX_COMPLETION_TOKENS`. The adapter shares one `Arc<CerebrasConfig>` across chat, files, batch, and models so every surface uses the same authentication and resilience policy.
 
 ### 6.1 Validation (constructor / builder)
-
-- `api_key` non-empty.
 - `top_logprobs` ∈ 0..=20; requires `logprobs == Some(true)`.
 - `stop.len() ≤ 4`.
 - `temperature` ∈ 0.0..=2.0.
@@ -612,7 +612,7 @@ Interactive REPL. Primary demo of the turn-loop path. Deps: `agentkit-core`, `ag
 | Command               | Effect                                                                                                                                                                   |
 | --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `/set <flag> <value>` | Live-rebuild config for the _next_ turn (covers every CLI flag)                                                                                                          |
-| `/show`               | Dumps effective `CerebrasConfig` as JSON (redacts api_key)                                                                                                               |
+| `/show`               | Dumps effective `CerebrasConfig` as JSON (redacts authentication)                                                                                                               |
 | `/usage`              | Prints last turn's `TokenUsage` + every `cerebras.*` metadata key (cached tokens, accepted/rejected prediction tokens, time_info, service_tier_used, system_fingerprint) |
 | `/ratelimit`          | Prints `CerebrasAdapter::last_rate_limit()` (`x-ratelimit-*` snapshot)                                                                                                   |
 | `/headers`            | Prints request headers used on the last turn (redacted auth) — verifies `Content-Type`, `Content-Encoding`, `X-Cerebras-Version-Patch`, `queue_threshold`                |
@@ -625,7 +625,7 @@ Interactive REPL. Primary demo of the turn-loop path. Deps: `agentkit-core`, `ag
 
 **Banner on startup**: prints every effective knob (redacted key) so a screenshot proves the run exercised the intended config. Mirrors `anthropic-chat`'s `print_banner` shape.
 
-**Stream decoding**: the REPL prints `delta.content` incrementally, annotates `delta.reasoning` chunks in a distinct colour, shows tool-call assembly live, and prints the terminal `Usage`/`time_info`. Covers every `ModelTurnEvent` variant.
+**Stream decoding**: the REPL prints `delta.content` incrementally, annotates `delta.reasoning` chunks in a distinct colour, shows tool-call assembly live, and prints the terminal `Usage`/`time_info`. Its exhaustive `ModelTurnEvent` handling also covers `ResponseAttemptSuperseded`; if a future adapter emits that capability-gated marker, the REPL discards all deltas, tool calls, usage, and reconstruction state from the preceding attempt before rendering replacement output.
 
 #### 11.1.2 `examples/cerebras-batch/`
 

@@ -15,9 +15,10 @@ OpenAI-compatible chat completions endpoint. It handles request translation and
 response normalization for Ollama-backed sessions. Streaming is enabled by
 default; use `.with_streaming(false)` to force the buffered response path.
 
-No API key is required — Ollama runs locally and does not authenticate requests
+Authentication is optional because Ollama does not authenticate local requests
 by default. You need a running Ollama server (e.g. `ollama serve`) with your
-desired model pulled (e.g. `ollama pull llama3.1:8b`).
+desired model pulled (e.g. `ollama pull llama3.1:8b`). Protected remote
+endpoints can opt into authentication as described below.
 
 ## Configuration
 
@@ -27,6 +28,18 @@ Create a config with `OllamaConfig::new(model)` and chain `.with_*()` builders f
 | ----------------- | -------- | -------------------------------------------- |
 | `OLLAMA_MODEL`    | yes      | --                                           |
 | `OLLAMA_BASE_URL` | no       | `http://localhost:11434/v1/chat/completions` |
+
+## Authentication and resilience
+
+`OllamaConfig::new` leaves its first-class
+`Option<agentkit_http::Authentication>` as `None`. For a protected endpoint, a
+bare string passed to `.with_authentication(...)` is shorthand for bearer
+authentication. Use `.with_authentication_provider(...)` for a custom
+refresh-capable `AuthenticationProvider`.
+
+Resilience is also opt-in: `resilience` is an `Option<ResilienceConfig>` that
+defaults to `None`. Calling `.with_resilience(...)` enables retries and
+timeouts; leaving it as `None` preserves the existing single-attempt behavior.
 
 ## Examples
 

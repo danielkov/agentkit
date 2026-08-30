@@ -21,6 +21,7 @@ use futures_util::future::{Either, select};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
+use crate::RequestExecutor;
 use crate::config::{CerebrasConfig, OutputFormat, ReasoningConfig};
 use crate::error::CerebrasError;
 use crate::files::{FilePurpose, FilesClient};
@@ -192,6 +193,14 @@ impl<'a> BatchClient<'a> {
         Self { http, config }
     }
 
+    fn executor(&self) -> RequestExecutor {
+        RequestExecutor::new(
+            self.http,
+            self.config.authentication.clone(),
+            self.config.resilience.clone(),
+        )
+    }
+
     /// Assembles the JSONL input via [`crate::request::build_chat_body`],
     /// uploads it, and submits a batch job. Per-line overrides layer on top
     /// of the adapter's base config.
@@ -267,11 +276,10 @@ impl<'a> BatchClient<'a> {
             "metadata": metadata,
         });
         let response = self
-            .http
-            .post(&url)
-            .bearer_auth(&self.config.api_key)
-            .json(&body)
-            .send()
+            .executor()
+            // Creating a batch has no documented idempotency key, so apply
+            // authentication and timeouts but do not retry the POST.
+            .execute_buffered_without_retries(|| self.http.post(&url).json(&body))
             .await?;
         if !response.status().is_success() {
             let status = response.status().as_u16();
@@ -285,10 +293,8 @@ impl<'a> BatchClient<'a> {
     pub async fn list(&self) -> Result<Vec<BatchJob>, CerebrasError> {
         let url = format!("{}/batches", self.config.base_url);
         let response = self
-            .http
-            .get(&url)
-            .bearer_auth(&self.config.api_key)
-            .send()
+            .executor()
+            .execute_buffered(|| self.http.get(&url))
             .await?;
         if !response.status().is_success() {
             let status = response.status().as_u16();
@@ -303,10 +309,8 @@ impl<'a> BatchClient<'a> {
     pub async fn retrieve(&self, id: &str) -> Result<BatchJob, CerebrasError> {
         let url = format!("{}/batches/{id}", self.config.base_url);
         let response = self
-            .http
-            .get(&url)
-            .bearer_auth(&self.config.api_key)
-            .send()
+            .executor()
+            .execute_buffered(|| self.http.get(&url))
             .await?;
         if !response.status().is_success() {
             let status = response.status().as_u16();
@@ -320,10 +324,9 @@ impl<'a> BatchClient<'a> {
     pub async fn cancel(&self, id: &str) -> Result<BatchJob, CerebrasError> {
         let url = format!("{}/batches/{id}/cancel", self.config.base_url);
         let response = self
-            .http
-            .post(&url)
-            .bearer_auth(&self.config.api_key)
-            .send()
+            .executor()
+            // The API does not expose an idempotency key for cancellation.
+            .execute_buffered_without_retries(|| self.http.post(&url))
             .await?;
         if !response.status().is_success() {
             let status = response.status().as_u16();
