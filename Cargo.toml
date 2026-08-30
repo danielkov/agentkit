@@ -60,6 +60,10 @@ repository = "https://github.com/danielkov/agentkit"
 rust-version = "1.92"
 version = "0.10.5"
 
+# Intentionally unpublishable until the upstream SDK releases session injection.
+[patch.crates-io]
+agent-client-protocol = { git = "https://github.com/danielkov/rust-sdk", rev = "2f039993d1d6ed8da35b38c31f54a7cbb7338c70" }
+
 [workspace.dependencies]
 async-trait = "0.1.89"
 dotenvy = "0.15.7"

@@ -1,10 +1,16 @@
 # agentkit-acp design
 
 > **Implementation status:** Root APIs and default features implement stable ACP
-> v1. Version 0.10.8 also provides an opt-in ACP v2 runtime foundation under
-> `agentkit_acp::v2`; enable it with `protocol-v2`. It uses only the official
-> `agent-client-protocol` 2.0.0 `unstable_protocol_v2` feature. See the crate
-> README or book chapter for the supported v2 lifecycle and current limits.
+> v1. Version 0.10.11 also provides an opt-in ACP v2 runtime foundation under
+> `agentkit_acp::v2`; enable it with `protocol-v2`. It currently uses a workspace-
+> patched `agent-client-protocol` fork with `unstable_protocol_v2`. The additive
+> `unstable-inject` feature enables steer-only injection and mandatory revoke.
+> Receipt-committed injections survive cancellation for the next valid boundary;
+> close may discard them. Delivered-ID history is lifetime-capped at 4,096
+> accepts per session. V2 running/idle state follows loop turn lifecycle, and
+> autonomous task wakeups, cancellation, and logical prompt cleanup use that
+> same authoritative state. See the crate README or book chapter for the
+> supported v2 lifecycle and current limits.
 
 ## Purpose
 
@@ -37,7 +43,7 @@ There is already an official Rust ACP SDK:
 - `agent-client-protocol-schema`
 - `agent-client-protocol-rmcp`
 
-So agentkit should not build a parallel protocol crate by default. A separate `racp` crate only makes sense if the official SDK becomes unsuitable. The first implementation should mirror `agentkit-mcp`: re-export upstream wire types and make agentkit own only the lifecycle and conversion glue.
+So agentkit should not build a parallel protocol crate by default. The current implementation uses a commit-pinned source fork of that SDK for experimental session injection; it still re-exports the SDK wire types and owns only the lifecycle and conversion glue. A separate `racp` crate would make sense only if the SDK API became unsuitable.
 
 ## Non-goals
 
@@ -52,7 +58,7 @@ So agentkit should not build a parallel protocol crate by default. A separate `r
 - long-term session persistence
 - policy storage for remembered approval choices
 
-The crate integrates agentkit into ACP. It should not fork ACP or turn agentkit into a single opinionated coding-agent product.
+The crate integrates agentkit into ACP. Its pinned SDK source fork must not become a divergent ACP protocol, and the crate must not turn agentkit into a single opinionated coding-agent product.
 
 ## Dependencies
 
@@ -60,7 +66,8 @@ Recommended initial crate:
 
 ```toml
 [dependencies]
-agent-client-protocol = "2.0.0"
+# Registry-shaped so every workspace consumer resolves one patched type identity.
+agent-client-protocol = "=2.0.0"
 agentkit-core = { path = "../agentkit-core", version = "0.10.5" }
 agentkit-loop = { path = "../agentkit-loop", version = "0.10.7" }
 agentkit-tools-core = { path = "../agentkit-tools-core", version = "0.10.5" }
@@ -71,11 +78,19 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }
 
+[patch.crates-io]
+# Intentionally unpublishable until these SDK APIs are released upstream.
+agent-client-protocol = { git = "https://github.com/danielkov/rust-sdk", rev = "2f039993d1d6ed8da35b38c31f54a7cbb7338c70" }
+
 [features]
 default = ["stdio"]
 stdio = []
 unstable-acp = ["agent-client-protocol/unstable"]
 protocol-v2 = ["agent-client-protocol/unstable_protocol_v2"]
+unstable-inject = [
+    "protocol-v2",
+    "agent-client-protocol/unstable_session_inject",
+]
 ```
 
 The umbrella crate should later add:
@@ -727,6 +742,6 @@ The key should be explicit and policy-owned. A good default key should include:
 - ACP introduction: <https://agentclientprotocol.com/get-started/introduction>
 - ACP Rust SDK: <https://agentclientprotocol.com/libraries/rust>
 - ACP protocol docs: <https://agentclientprotocol.com/protocol/v1/overview>
-- Rust crate docs: <https://docs.rs/agent-client-protocol/2.0.0/agent_client_protocol/>
+- ACP Rust SDK fork used by this crate: <https://github.com/danielkov/rust-sdk>
 - Existing MCP integration design: [`mcp.md`](./mcp.md)
 - Agentkit permission design: [`permissions.md`](./permissions.md)
