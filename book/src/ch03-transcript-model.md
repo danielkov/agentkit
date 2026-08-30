@@ -49,18 +49,23 @@ pub enum ItemKind {
 
 The variants are ordered: `System < Developer < User < Assistant < Tool < Context`. This ordering is used by compaction strategies that need to sort or prioritise items by role.
 
-Role mapping to provider wire formats:
+Role mapping depends on the OpenAI API and profile. Chat Completions uses:
 
-| agentkit `ItemKind` | OpenAI role   | What it carries                    |
-| ------------------- | ------------- | ---------------------------------- |
-| `System`            | `"system"`    | Hardcoded application instructions |
-| `Developer`         | `"system"`    | Developer-level instructions       |
-| `User`              | `"user"`      | End-user messages                  |
-| `Assistant`         | `"assistant"` | Model-generated text + tool calls  |
-| `Tool`              | `"tool"`      | Tool execution results             |
-| `Context`           | `"system"`    | Project context (AGENTS.md, etc.)  |
+| agentkit `ItemKind` | Chat Completions role | What it carries                    |
+| ------------------- | --------------------- | ---------------------------------- |
+| `System`            | `"system"`            | Hardcoded application instructions |
+| `Developer`         | `"developer"`         | Developer-level instructions       |
+| `User`              | `"user"`              | End-user messages                  |
+| `Assistant`         | `"assistant"`         | Model-generated text + tool calls  |
+| `Tool`              | `"tool"`              | Tool execution results             |
+| `Context`           | `"system"`            | Project context (AGENTS.md, etc.)  |
 
-System, Developer, and Context all map to `"system"` in the OpenAI wire format, but they carry different semantic intent. The distinction matters for compaction: system items are never trimmed, context items may be refreshed, and developer items sit between the two. Collapsing them into a single kind would lose information that compaction strategies need.
+For the Responses API, the public profile keeps System and Context items as
+`system`; the private profile sends both as `developer`. Context content is
+encoded unchanged, without consumer-specific prose. These kinds retain distinct
+semantic intent even when a provider maps them to the same role. The distinction
+matters for compaction: system items are never trimmed, context items may be
+refreshed, and developer items sit between the two.
 
 ### Why item-based, not message-based
 

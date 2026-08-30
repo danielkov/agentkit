@@ -38,9 +38,7 @@ const DEFAULT_MAX_TEXT_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_MAX_ITEMS: usize = 100_000;
 const CONTINUATION_METADATA: &str = "openai.responses.continuation.v1";
 const CONTINUATION_SCHEMA_VERSION: u64 = 3;
-const LEGACY_CONTINUATION_METADATA: &str = "openai.subscription.v1";
-const LEGACY_CONTINUATION_SCHEMA_VERSION: u64 = 1;
-const GENERATED_IMAGE_METADATA: &str = "openai.subscription.generated_image.v1";
+const GENERATED_IMAGE_METADATA: &str = "openai.responses.generated_image.v1";
 const X_CODEX_TURN_STATE: &str = "x-codex-turn-state";
 const MAX_CACHE_KEY_BYTES: usize = 256;
 
@@ -79,8 +77,6 @@ impl Default for OpenAIResponsesLimits {
         }
     }
 }
-
-type LegacyContinuationAuthenticator = Arc<dyn Fn(&Value, &str) -> bool + Send + Sync + 'static>;
 
 /// Controls fields whose support differs between Responses deployments.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -131,7 +127,6 @@ pub struct OpenAIResponsesConfig {
     limits: OpenAIResponsesLimits,
     user_agent: Option<String>,
     originator: Option<String>,
-    legacy_continuation_authenticator: Option<LegacyContinuationAuthenticator>,
 }
 
 impl fmt::Debug for OpenAIResponsesConfig {
@@ -151,13 +146,6 @@ impl fmt::Debug for OpenAIResponsesConfig {
             .field("limits", &self.limits)
             .field("user_agent", &self.user_agent)
             .field("originator", &self.originator)
-            .field(
-                "legacy_continuation_authenticator",
-                &self
-                    .legacy_continuation_authenticator
-                    .as_ref()
-                    .map(|_| "<callback>"),
-            )
             .finish()
     }
 }
@@ -165,12 +153,15 @@ impl fmt::Debug for OpenAIResponsesConfig {
 impl OpenAIResponsesConfig {
     /// Creates a public Responses configuration using the given authentication.
     ///
+    /// The argument order is `(authentication, model)`, matching [`crate::OpenAIConfig::new`].
     /// Bare strings are treated as bearer tokens.
     pub fn new(authentication: impl Into<Authentication>, model: impl Into<String>) -> Self {
         Self::public(model, authentication)
     }
 
     /// Creates a public Responses configuration with injectable authentication.
+    ///
+    /// Unlike [`Self::new`], the profile-specific constructors take `(model, authentication)`.
     pub fn public(model: impl Into<String>, authentication: impl Into<Authentication>) -> Self {
         Self {
             model: model.into(),
@@ -186,11 +177,13 @@ impl OpenAIResponsesConfig {
             limits: OpenAIResponsesLimits::default(),
             user_agent: None,
             originator: None,
-            legacy_continuation_authenticator: None,
         }
     }
 
     /// Creates a private ChatGPT Codex Responses configuration.
+    ///
+    /// Profile-specific constructors take `(model, authentication)`; [`Self::new`] takes
+    /// `(authentication, model)` for compatibility with [`crate::OpenAIConfig::new`].
     pub fn chatgpt_private(
         model: impl Into<String>,
         authentication: impl Into<Authentication>,
@@ -209,7 +202,6 @@ impl OpenAIResponsesConfig {
             limits: OpenAIResponsesLimits::default(),
             user_agent: None,
             originator: None,
-            legacy_continuation_authenticator: None,
         }
     }
 
@@ -278,23 +270,12 @@ impl OpenAIResponsesConfig {
         self
     }
 
-    /// Enables safe replay of Kit's legacy `openai.subscription.v1` metadata.
-    ///
-    /// The callback receives the legacy `account_binding` object and the current
-    /// authentication binding. The adapter validates every other schema, model,
-    /// session, item, and kind field itself and writes only current metadata.
-    pub fn with_legacy_subscription_continuation_authenticator<F>(
-        mut self,
-        authenticator: F,
-    ) -> Self
-    where
-        F: Fn(&Value, &str) -> bool + Send + Sync + 'static,
-    {
-        self.legacy_continuation_authenticator = Some(Arc::new(authenticator));
-        self
-    }
-
     /// Encodes only the transport-neutral JSON request.
+    ///
+    /// This synchronous helper does not resolve authentication and therefore has no
+    /// authentication binding. It rejects adapter-emitted continuation metadata instead of
+    /// silently dropping bound function-call IDs, reasoning, or generated-image state. Submit
+    /// the request through [`OpenAIResponsesAdapter`] when continuation replay is required.
     pub fn encode_request(&self, request: &TurnRequest) -> Result<Value, OpenAIResponsesError> {
         encode_request(self, request)
     }
@@ -429,7 +410,10 @@ impl ModelSession for OpenAIResponsesSession {
             &request.turn_id.to_string(),
             &body,
         );
-        let replacement_enabled = agentkit_loop::response_attempt::enabled(&self.session);
+        let supersession_enabled = self
+            .session
+            .consumer_capabilities
+            .response_attempt_supersession;
         OpenAIResponsesTurn::open(
             ResponsesRequestContext {
                 client: self.client.clone(),
@@ -444,7 +428,7 @@ impl ModelSession for OpenAIResponsesSession {
                 refreshed: false,
                 wire_bytes: 0,
             },
-            replacement_enabled,
+            supersession_enabled,
             cancellation.as_ref(),
         )
         .await
@@ -463,7 +447,7 @@ impl ModelSession for OpenAIResponsesSession {
 pub struct OpenAIResponsesTurn {
     context: ResponsesRequestContext,
     attempt: Option<LiveAttempt>,
-    replacement_enabled: bool,
+    supersession_enabled: bool,
     attempt_output_emitted: bool,
     pending_reopen: bool,
     pending_delay: Duration,
@@ -483,13 +467,13 @@ impl ModelTurn for OpenAIResponsesTurn {
 impl OpenAIResponsesTurn {
     async fn open(
         context: ResponsesRequestContext,
-        replacement_enabled: bool,
+        supersession_enabled: bool,
         cancellation: Option<&TurnCancellation>,
     ) -> Result<Self, LoopError> {
         let mut turn = Self {
             context,
             attempt: None,
-            replacement_enabled,
+            supersession_enabled,
             attempt_output_emitted: false,
             pending_reopen: true,
             pending_delay: Duration::ZERO,
@@ -668,7 +652,7 @@ impl OpenAIResponsesTurn {
                 {
                     return Err(*failure.error);
                 }
-                if self.attempt_output_emitted && !self.replacement_enabled {
+                if self.attempt_output_emitted && !self.supersession_enabled {
                     return Err(*failure.error);
                 }
                 let delay = self
@@ -684,7 +668,7 @@ impl OpenAIResponsesTurn {
                 self.pending_delay = delay;
                 if self.attempt_output_emitted {
                     self.attempt_output_emitted = false;
-                    return Ok(Some(agentkit_loop::response_attempt::marker_event()));
+                    return Ok(Some(ModelTurnEvent::ResponseAttemptSuperseded));
                 }
             }
         }
@@ -695,7 +679,30 @@ fn encode_request(
     config: &OpenAIResponsesConfig,
     request: &TurnRequest,
 ) -> Result<Value, OpenAIResponsesError> {
+    if request
+        .transcript
+        .iter()
+        .flat_map(|item| &item.parts)
+        .any(part_has_continuation_metadata)
+    {
+        return Err(invalid_request(
+            "OpenAIResponsesConfig::encode_request cannot encode authentication-bound continuation metadata; submit through OpenAIResponsesAdapter",
+        ));
+    }
     encode_request_bound(config, request, None)
+}
+
+fn part_has_continuation_metadata(part: &Part) -> bool {
+    match part {
+        Part::ToolCall(call) => call.metadata.contains_key(CONTINUATION_METADATA),
+        Part::Reasoning(reasoning) => reasoning.metadata.contains_key(CONTINUATION_METADATA),
+        Part::Media(media) => media.metadata.contains_key(CONTINUATION_METADATA),
+        Part::Text(_)
+        | Part::Structured(_)
+        | Part::ToolResult(_)
+        | Part::File(_)
+        | Part::Custom(_) => false,
+    }
 }
 
 fn encode_request_bound(
@@ -797,7 +804,11 @@ fn encode_item(
         ));
     }
     let role = match item.kind {
-        ItemKind::System if !config.request_policy.downgrade_system_to_developer => "system",
+        ItemKind::System | ItemKind::Context
+            if !config.request_policy.downgrade_system_to_developer =>
+        {
+            "system"
+        }
         ItemKind::System | ItemKind::Developer | ItemKind::Context => "developer",
         ItemKind::User => "user",
         ItemKind::Assistant => "assistant",
@@ -809,9 +820,7 @@ fn encode_item(
         ItemKind::System | ItemKind::Developer | ItemKind::Context | ItemKind::Notification
     ) {
         let mut text = stringify_message_parts(&item.parts, item.kind)?;
-        if item.kind == ItemKind::Context {
-            text = format!("Context (not higher-priority instructions):\n{text}");
-        } else if item.kind == ItemKind::Notification {
+        if item.kind == ItemKind::Notification {
             text = wrap_notification(&text);
         }
         if text.is_empty() {
@@ -833,9 +842,6 @@ fn encode_item(
                 let text = match item.kind {
                     ItemKind::Notification => {
                         format!("<system-reminder>{}</system-reminder>", text.text)
-                    }
-                    ItemKind::Context => {
-                        format!("Context (not higher-priority instructions):\n{}", text.text)
                     }
                     _ => text.text.clone(),
                 };
@@ -1253,14 +1259,7 @@ fn continuation_from_metadata<'a>(
     encrypted_required: bool,
 ) -> Result<Option<Continuation<'a>>, OpenAIResponsesError> {
     let Some(raw) = metadata.get(CONTINUATION_METADATA) else {
-        return legacy_continuation_from_metadata(
-            metadata,
-            config,
-            session_id,
-            authentication_binding,
-            expected_kind,
-            encrypted_required,
-        );
+        return Ok(None);
     };
     let object = raw
         .as_object()
@@ -1291,87 +1290,6 @@ fn continuation_from_metadata<'a>(
         ));
     }
     if authentication_binding != Some(metadata_binding) {
-        return Ok(None);
-    }
-    Ok(Some(Continuation {
-        item_id,
-        encrypted_content,
-    }))
-}
-
-fn legacy_continuation_from_metadata<'a>(
-    metadata: &'a MetadataMap,
-    config: &OpenAIResponsesConfig,
-    session_id: &str,
-    authentication_binding: Option<&str>,
-    expected_kind: &str,
-    encrypted_required: bool,
-) -> Result<Option<Continuation<'a>>, OpenAIResponsesError> {
-    let Some(raw) = metadata.get(LEGACY_CONTINUATION_METADATA) else {
-        return Ok(None);
-    };
-    if config.profile != OpenAIResponsesProfile::ChatGptPrivate {
-        return Ok(None);
-    }
-    let Some(authentication_binding) = authentication_binding else {
-        return Ok(None);
-    };
-    let Some(authenticator) = &config.legacy_continuation_authenticator else {
-        return Ok(None);
-    };
-    let object = raw
-        .as_object()
-        .ok_or_else(|| protocol_error("legacy Responses continuation metadata is not an object"))?;
-    let expected_len = if encrypted_required { 9 } else { 8 };
-    if object.len() != expected_len
-        || object.get("schema_version").and_then(Value::as_u64)
-            != Some(LEGACY_CONTINUATION_SCHEMA_VERSION)
-        || object.get("kind").and_then(Value::as_str) != Some(expected_kind)
-        || object.get("model").and_then(Value::as_str) != Some(&*config.model)
-        || object.get("session_id").and_then(Value::as_str) != Some(session_id)
-        || object.get("output_index").and_then(Value::as_u64).is_none()
-    {
-        return Err(protocol_error(
-            "legacy Responses continuation metadata binding is invalid",
-        ));
-    }
-    let account_binding = object
-        .get("account_binding")
-        .and_then(Value::as_object)
-        .filter(|binding| binding.len() == 2)
-        .ok_or_else(|| protocol_error("legacy Responses account binding is invalid"))?;
-    let digest = bounded_metadata_string(
-        account_binding.get("account_id_digest"),
-        "legacy account digest",
-    )?;
-    if digest.len() != 64
-        || !digest
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return Err(protocol_error("legacy Responses account digest is invalid"));
-    }
-    bounded_metadata_string(
-        account_binding.get("login_generation"),
-        "legacy login generation",
-    )?;
-    bounded_metadata_string(object.get("response_id"), "legacy response_id")?;
-    let item_id = bounded_metadata_string(object.get("item_id"), "legacy item_id")?;
-    let encrypted_content = object.get("encrypted_content").and_then(Value::as_str);
-    if encrypted_required
-        && encrypted_content
-            .is_none_or(|value| value.is_empty() || value.len() > config.limits.max_text_bytes)
-    {
-        return Err(protocol_error(
-            "legacy Responses encrypted continuation is invalid",
-        ));
-    }
-    if !authenticator(
-        object
-            .get("account_binding")
-            .expect("validated legacy account binding"),
-        authentication_binding,
-    ) {
         return Ok(None);
     }
     Ok(Some(Continuation {
@@ -2812,6 +2730,7 @@ impl ResponsesState {
                     MediaPart::new(Modality::Image, "image/png", DataRef::InlineBytes(bytes))
                         .with_metadata(metadata);
                 self.next_media += 1;
+                let placeholder = format!("[Image #{}]", self.next_media);
                 let placeholder_id = PartId::new(format!("generated-image-{output_index}"));
                 push_event(
                     &mut self.events,
@@ -2827,7 +2746,15 @@ impl ResponsesState {
                     &mut self.event_count,
                     ModelTurnEvent::Delta(Delta::AppendText {
                         part_id: placeholder_id,
-                        chunk: format!("[Image #{}]", self.next_media),
+                        chunk: placeholder.clone(),
+                    }),
+                    self.limits.max_items,
+                )?;
+                push_event(
+                    &mut self.events,
+                    &mut self.event_count,
+                    ModelTurnEvent::Delta(Delta::CommitPart {
+                        part: Part::Text(TextPart::new(placeholder)),
                     }),
                     self.limits.max_items,
                 )?;
@@ -3708,6 +3635,31 @@ data: {"type":"response.completed","sequence_number":18,"response":{"id":"resp-1
         assert_eq!(private["parallel_tool_calls"], true);
     }
 
+    #[test]
+    fn context_content_is_unchanged_and_honors_role_downgrade_policy() {
+        let mut request = request();
+        request.transcript[0] = Item::text(ItemKind::Context, "project facts");
+
+        let public = OpenAIResponsesConfig::new("secret", "gpt-test")
+            .encode_request(&request)
+            .unwrap();
+        let private =
+            OpenAIResponsesConfig::chatgpt_private("gpt-test", Authentication::bearer("secret"))
+                .encode_request(&request)
+                .unwrap();
+
+        assert_eq!(public.pointer("/input/0/role"), Some(&json!("system")));
+        assert_eq!(private.pointer("/input/0/role"), Some(&json!("developer")));
+        assert_eq!(
+            public.pointer("/input/0/content/0/text"),
+            Some(&json!("project facts"))
+        );
+        assert_eq!(
+            private.pointer("/input/0/content/0/text"),
+            Some(&json!("project facts"))
+        );
+    }
+
     #[tokio::test]
     async fn refreshes_once_and_replays_stable_body_and_idempotency_key_before_output() {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -3952,6 +3904,10 @@ data: {"type":"response.completed","sequence_number":18,"response":{"id":"resp-1
         replay.transcript = result.output_items.clone();
         let config =
             OpenAIResponsesConfig::chatgpt_private("gpt-test", Authentication::bearer("secret"));
+        assert!(matches!(
+            config.encode_request(&replay),
+            Err(OpenAIResponsesError::InvalidRequest(_))
+        ));
         let encoded =
             encode_request_bound(&config, &replay, Some("test-authentication-binding")).unwrap();
         let input = encoded["input"].as_array().unwrap();
@@ -4494,7 +4450,7 @@ data: {"type":"response.completed","sequence_number":18,"response":{"id":"resp-1
     }
 
     #[tokio::test]
-    async fn opted_in_visible_stream_failure_emits_marker_then_replays() {
+    async fn opted_in_visible_stream_failure_emits_supersession_then_replays() {
         const PARTIAL: &str = concat!(
             "event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":1,\"response\":{\"id\":\"failed\",\"model\":\"gpt-test\"}}\n\n",
             "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"sequence_number\":2,\"output_index\":0,\"item\":{\"id\":\"failed-item\",\"type\":\"message\"}}\n\n",
@@ -4526,26 +4482,25 @@ data: {"type":"response.completed","sequence_number":18,"response":{"id":"resp-1
                 max_backoff: Duration::ZERO,
             });
         let adapter = OpenAIResponsesAdapter::with_client(config, Http::from_arc(client.clone()));
-        let mut session_config = SessionConfig::new("session");
-        agentkit_loop::response_attempt::enable(&mut session_config);
+        let session_config = SessionConfig::new("session").with_response_attempt_supersession();
         let mut session = adapter.start_session(session_config).await.unwrap();
         let mut turn = session.begin_turn(request(), None).await.unwrap();
-        let mut saw_marker = false;
+        let mut saw_supersession = false;
         let mut saw_replacement = false;
         while let Some(event) = turn.next_event(None).await.unwrap() {
             match event {
-                ModelTurnEvent::Delta(ref delta)
-                    if agentkit_loop::response_attempt::is_marker(delta) =>
-                {
-                    saw_marker = true;
+                ModelTurnEvent::ResponseAttemptSuperseded => {
+                    assert!(!saw_supersession);
+                    saw_supersession = true;
                 }
                 ModelTurnEvent::Delta(Delta::AppendText { chunk, .. }) if chunk == "hello" => {
+                    assert!(saw_supersession);
                     saw_replacement = true;
                 }
                 _ => {}
             }
         }
-        assert!(saw_marker);
+        assert!(saw_supersession);
         assert!(saw_replacement);
         assert_eq!(client.requests.lock().unwrap().len(), 2);
     }
@@ -4672,6 +4627,32 @@ data: {"type":"response.completed","sequence_number":18,"response":{"id":"resp-1
         );
         decoder.push(wire.as_bytes()).unwrap();
         let events = decoder.finish().unwrap();
+        let deltas = events
+            .iter()
+            .filter_map(|event| match event {
+                ModelTurnEvent::Delta(delta) => Some(delta),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            deltas.as_slice(),
+            [
+                Delta::BeginPart {
+                    part_id: begin,
+                    kind: PartKind::Text,
+                },
+                Delta::AppendText {
+                    part_id: append,
+                    chunk,
+                },
+                Delta::CommitPart {
+                    part: Part::Text(committed),
+                },
+            ] if begin.0 == "generated-image-0"
+                && append == begin
+                && chunk == "[Image #1]"
+                && committed.text == "[Image #1]"
+        ));
         let result = events
             .iter()
             .find_map(|event| match event {
@@ -4684,7 +4665,7 @@ data: {"type":"response.completed","sequence_number":18,"response":{"id":"resp-1
         };
         assert_eq!(media.data, DataRef::InlineBytes(vec![1, 2, 3]));
         assert!(media.metadata.contains_key(CONTINUATION_METADATA));
-        assert!(!media.metadata.contains_key(LEGACY_CONTINUATION_METADATA));
+        assert!(media.metadata.contains_key(GENERATED_IMAGE_METADATA));
 
         let replay = TurnRequest {
             transcript: result.output_items.clone(),
@@ -4732,44 +4713,6 @@ data: {"type":"response.completed","sequence_number":18,"response":{"id":"resp-1
             &json!({"type": "error", "error": {"type": "invalid_request_error", "code": "invalid_prompt"}}),
             "error",
         ));
-    }
-
-    #[test]
-    fn legacy_subscription_continuation_requires_all_bindings() {
-        let legacy = json!({
-            "schema_version": 1,
-            "account_binding": {
-                "account_id_digest": "a".repeat(64),
-                "login_generation": "generation-1",
-            },
-            "model": "gpt-test",
-            "session_id": "session",
-            "response_id": "resp-1",
-            "item_id": "call-item-1",
-            "output_index": 0,
-            "kind": "function_call",
-        });
-        let call = ToolCallPart::new("call-1", "tool", json!({})).with_metadata(MetadataMap::from(
-            [(LEGACY_CONTINUATION_METADATA.into(), legacy)],
-        ));
-        let replay = TurnRequest {
-            transcript: vec![Item::new(ItemKind::Assistant, vec![Part::ToolCall(call)])],
-            ..request()
-        };
-        let config =
-            OpenAIResponsesConfig::chatgpt_private("gpt-test", Authentication::bearer("secret"))
-                .with_legacy_subscription_continuation_authenticator(|account, current| {
-                    current == "current-binding" && account["login_generation"] == "generation-1"
-                });
-        let encoded = encode_request_bound(&config, &replay, Some("current-binding")).unwrap();
-        assert_eq!(encoded["input"][0]["id"], "call-item-1");
-        let not_bound = encode_request_bound(&config, &replay, Some("other-binding")).unwrap();
-        assert!(not_bound["input"][0].get("id").is_none());
-
-        let public = OpenAIResponsesConfig::new("secret", "gpt-test")
-            .with_legacy_subscription_continuation_authenticator(|_, _| true);
-        let public = encode_request_bound(&public, &replay, Some("current-binding")).unwrap();
-        assert!(public["input"][0].get("id").is_none());
     }
 
     #[test]
@@ -4889,8 +4832,8 @@ data: {"type":"response.completed","sequence_number":18,"response":{"id":"resp-1
         });
         let config =
             OpenAIResponsesConfig::chatgpt_private("gpt-test", Authentication::bearer("secret"))
-                .with_user_agent("kit/test")
-                .with_originator("kit")
+                .with_user_agent("example-client/test")
+                .with_originator("example-client")
                 .with_resilience(ResilienceConfig {
                     max_retries: 1,
                     retry_budget: Duration::from_secs(1),
@@ -4907,8 +4850,8 @@ data: {"type":"response.completed","sequence_number":18,"response":{"id":"resp-1
         session.begin_turn(request(), None).await.unwrap();
         let requests = client.requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0].headers["user-agent"], "kit/test");
-        assert_eq!(requests[0].headers["originator"], "kit");
+        assert_eq!(requests[0].headers["user-agent"], "example-client/test");
+        assert_eq!(requests[0].headers["originator"], "example-client");
     }
 
     #[tokio::test]

@@ -400,6 +400,7 @@ pub enum ModelTurnEvent {
     Delta(ContentDelta),
     ToolCall(ToolCallPart),
     Usage(Usage),
+    ResponseAttemptSuperseded,
     Finished(ModelTurnResult),
 }
 ```
@@ -409,7 +410,15 @@ Where:
 - `Delta` carries streamed content fragments
 - `ToolCall` surfaces a complete tool invocation request
 - `Usage` provides incremental or final usage updates
+- `ResponseAttemptSuperseded` invalidates the preceding visible response attempt
 - `Finished` includes normalized finish reason and optional final assistant items
+
+Supersession is opt-in through
+`SessionConfig::with_response_attempt_supersession()`. The model event is ordered
+after the failed attempt's events and before replacement output. The loop resets
+its attempt-local tool-call and usage state, then emits
+`AgentEvent::ResponseAttemptSuperseded`. Consumers must discard all deltas, tool
+calls, usage updates, and reconstruction state from the preceding attempt.
 
 The loop consumes these events, updates its transcript, calls observers, and decides what to do next.
 

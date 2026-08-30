@@ -105,6 +105,7 @@ pub enum ModelTurnEvent {
     Delta(Delta),
     ToolCall(ToolCallPart),
     Usage(Usage),
+    ResponseAttemptSuperseded,
     Finished(ModelTurnResult),
 }
 ```
@@ -129,10 +130,20 @@ Turn event timeline:
 
   Usage(Usage)              ← token counts
 
+  ResponseAttemptSuperseded ← optional; invalidates every event above
+  Delta(...)                 ← replacement attempt starts after the marker
+
   Finished(ModelTurnResult) ← always last
 ```
 
 `Finished` always comes last. `Usage` typically comes just before `Finished` but some providers interleave it with deltas. `ToolCall` events represent fully assembled tool calls — the adapter has already accumulated the streaming chunks internally.
+
+`ResponseAttemptSuperseded` is emitted only when the consumer enabled
+`SessionConfig::with_response_attempt_supersession()`. It appears after the failed
+visible attempt and before replacement output. The loop resets its attempt-local
+tool-call and usage state and forwards `AgentEvent::ResponseAttemptSuperseded`;
+consumers must discard every delta, tool call, usage update, and reconstruction
+state from the preceding attempt.
 
 ### ModelTurnResult
 

@@ -58,8 +58,12 @@ Responses retries reuse one clone-cheap serialized request body and a
 body-bound idempotency key. Events stream as soon as they are decoded. A failed
 attempt is replayed automatically only before its first event becomes visible.
 After visible output, replay is disabled unless the upstream consumer explicitly
-enables `agentkit_loop::response_attempt` replacement on `SessionConfig` and
-handles its reserved marker by discarding the preceding attempt. Cancellation, the logical retry deadline, stream-idle timeout, absolute
+calls `SessionConfig::with_response_attempt_supersession()`. On a visible-attempt
+retry, the adapter emits `ModelTurnEvent::ResponseAttemptSuperseded` after the
+failed attempt's events and before replacement output; the loop forwards it as
+`AgentEvent::ResponseAttemptSuperseded`. Consumers must discard every delta, tool
+call, usage update, and reconstruction state from that preceding attempt.
+Cancellation, the logical retry deadline, stream-idle timeout, absolute
 per-attempt deadline (including stream reads), auth/refresh, and backoff remain
 bounded. Responses default to a 32 MiB serialized request limit, 16 MiB per
 attempt, and 64 MiB aggregate wire limit across retries. Requests and responses
@@ -71,6 +75,12 @@ Limits must be non-zero; the per-field bound must fit both request and attempt
 bounds, and the per-attempt bound must fit the aggregate wire bound.
 
 ## Responses API
+
+`OpenAIResponsesConfig::new(authentication, model)` deliberately matches
+`OpenAIConfig::new(authentication, model)`. The profile-specific constructors use
+`public(model, authentication)` and `chatgpt_private(model, authentication)`; use
+those named forms when selecting a profile so the different argument order is
+explicit.
 
 ```rust,no_run
 use agentkit_provider_openai::{OpenAIResponsesAdapter, OpenAIResponsesConfig};
@@ -101,9 +111,14 @@ let adapter = OpenAIResponsesAdapter::new(config)?;
 
 `with_headers` supplies ordinary non-authentication headers.
 `with_user_agent` and `with_originator` provide explicit request attribution,
-and `with_request_policy` can override public/private request-field differences. The
-public and private profiles request encrypted reasoning continuation data by
-default. The private profile downgrades system messages to developer messages,
+and `with_request_policy` can override public/private request-field differences.
+The synchronous `encode_request` helper cannot resolve an authentication binding
+and rejects bound continuation metadata; submit through `OpenAIResponsesAdapter`
+to replay adapter-emitted function-call, reasoning, or generated-image state.
+The public and private profiles request encrypted reasoning continuation data by
+default. Context content is sent unchanged: the public profile keeps system and
+Context items as system messages, while the private profile downgrades both to
+developer messages,
 defaults `parallel_tool_calls` to `true`,
 omits unsupported `max_output_tokens`, sends `originator`/`session-id`, and
 replays validated `x-codex-turn-state` only within one logical turn and its
@@ -116,12 +131,7 @@ Continuation metadata is versioned and bound to the authentication binding,
 model, session, provider item ID, and item kind. Durable encrypted reasoning,
 function-call, and generated-image continuation metadata is emitted and replayed
 only when authentication supplies a binding. Valid metadata for another binding
-is omitted safely; malformed metadata is a protocol error. Private deployments
-that need to resume Kit's legacy `openai.subscription.v1` schema can install a
-credential-binding validator with
-`with_legacy_subscription_continuation_authenticator`; AgentKit validates the
-remaining schema/model/session fields and emits only current continuation
-metadata. The private profile accepts image/audio transcript inputs and
+is omitted safely; malformed metadata is a protocol error. The private profile accepts image/audio transcript inputs and
 media-bearing tool outputs. The public profile continues to reject the private
 audio shape.
 

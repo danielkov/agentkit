@@ -625,7 +625,7 @@ Interactive REPL. Primary demo of the turn-loop path. Deps: `agentkit-core`, `ag
 
 **Banner on startup**: prints every effective knob (redacted key) so a screenshot proves the run exercised the intended config. Mirrors `anthropic-chat`'s `print_banner` shape.
 
-**Stream decoding**: the REPL prints `delta.content` incrementally, annotates `delta.reasoning` chunks in a distinct colour, shows tool-call assembly live, and prints the terminal `Usage`/`time_info`. Covers every `ModelTurnEvent` variant.
+**Stream decoding**: the REPL prints `delta.content` incrementally, annotates `delta.reasoning` chunks in a distinct colour, shows tool-call assembly live, and prints the terminal `Usage`/`time_info`. Its exhaustive `ModelTurnEvent` handling also covers `ResponseAttemptSuperseded`; if a future adapter emits that capability-gated marker, the REPL discards all deltas, tool calls, usage, and reconstruction state from the preceding attempt before rendering replacement output.
 
 #### 11.1.2 `examples/cerebras-batch/`
 

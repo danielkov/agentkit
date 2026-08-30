@@ -61,8 +61,6 @@
 //! # }
 //! ```
 
-pub mod response_attempt;
-
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
@@ -245,6 +243,22 @@ impl TelemetryConfig {
     }
 }
 
+/// Capabilities supported by the consumer of model-turn events.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionConsumerCapabilities {
+    /// The consumer can discard all events from a superseded response attempt.
+    #[serde(default)]
+    pub response_attempt_supersession: bool,
+}
+
+impl SessionConsumerCapabilities {
+    /// Enables response-attempt supersession support.
+    pub fn with_response_attempt_supersession(mut self) -> Self {
+        self.response_attempt_supersession = true;
+        self
+    }
+}
+
 /// Configuration required to start a new model session.
 ///
 /// Pass this to [`Agent::start`] to initialise the underlying [`ModelSession`]
@@ -267,6 +281,9 @@ pub struct SessionConfig {
     pub metadata: MetadataMap,
     /// Default provider-side prompt caching policy for turns in this session.
     pub cache: Option<PromptCacheRequest>,
+    /// Features that the consumer of model-turn events can safely handle.
+    #[serde(default)]
+    pub consumer_capabilities: SessionConsumerCapabilities,
 }
 
 impl SessionConfig {
@@ -276,6 +293,7 @@ impl SessionConfig {
             session_id: session_id.into(),
             metadata: MetadataMap::new(),
             cache: None,
+            consumer_capabilities: SessionConsumerCapabilities::default(),
         }
     }
 
@@ -294,6 +312,14 @@ impl SessionConfig {
     /// Clears any default prompt cache request for the session.
     pub fn without_cache(mut self) -> Self {
         self.cache = None;
+        self
+    }
+
+    /// Declares that the event consumer can discard superseded response attempts.
+    pub fn with_response_attempt_supersession(mut self) -> Self {
+        self.consumer_capabilities = self
+            .consumer_capabilities
+            .with_response_attempt_supersession();
         self
     }
 }
@@ -561,6 +587,11 @@ pub enum ModelTurnEvent {
     ToolCall(ToolCallPart),
     /// Updated token usage statistics.
     Usage(Usage),
+    /// Supersedes every previously emitted event from the current response attempt.
+    ///
+    /// This marker is ordered after the failed attempt's deltas, tool calls, and usage and
+    /// before replacement-attempt output. It is emitted only when the session consumer opted in.
+    ResponseAttemptSuperseded,
     /// The model has finished generating for this turn.
     Finished(ModelTurnResult),
 }
@@ -936,6 +967,11 @@ pub enum AgentEvent {
     },
     /// Updated token usage statistics.
     UsageUpdated(Usage),
+    /// All events from the preceding model response attempt are superseded.
+    ///
+    /// Consumers that opted in must discard that attempt's deltas, tool calls, usage updates,
+    /// and reconstruction state before handling replacement output.
+    ResponseAttemptSuperseded,
     /// Non-fatal warning (e.g. a tool failure that was recovered from).
     Warning { message: String },
     /// The agent run has failed with an unrecoverable error.
@@ -2369,6 +2405,11 @@ where
                 ModelTurnEvent::ToolCall(call) => {
                     saw_tool_call = true;
                     self.emit(AgentEvent::ToolCallRequested(call.clone()));
+                }
+                ModelTurnEvent::ResponseAttemptSuperseded => {
+                    saw_tool_call = false;
+                    latest_usage = None;
+                    self.emit(AgentEvent::ResponseAttemptSuperseded);
                 }
                 ModelTurnEvent::Finished(result) => {
                     finished_result = Some(result);
@@ -4313,6 +4354,7 @@ mod tests {
     use super::*;
 
     struct FakeAdapter;
+    struct SupersedingAdapter;
     struct SlowAdapter;
     struct RecordingAdapter {
         seen_descriptions: StdArc<StdMutex<Vec<Vec<String>>>>,
@@ -4322,6 +4364,9 @@ mod tests {
     struct DualApprovalAdapter;
 
     struct FakeSession;
+    struct SupersedingSession {
+        supersession_enabled: bool,
+    }
     struct SlowSession;
     struct RecordingSession {
         seen_descriptions: StdArc<StdMutex<Vec<Vec<String>>>>,
@@ -4331,6 +4376,10 @@ mod tests {
     struct DualApprovalSession;
 
     struct FakeTurn {
+        events: VecDeque<ModelTurnEvent>,
+    }
+
+    struct SupersedingTurn {
         events: VecDeque<ModelTurnEvent>,
     }
 
@@ -4568,6 +4617,17 @@ mod tests {
     }
 
     #[async_trait]
+    impl ModelAdapter for SupersedingAdapter {
+        type Session = SupersedingSession;
+
+        async fn start_session(&self, config: SessionConfig) -> Result<Self::Session, LoopError> {
+            Ok(SupersedingSession {
+                supersession_enabled: config.consumer_capabilities.response_attempt_supersession,
+            })
+        }
+    }
+
+    #[async_trait]
     impl ModelAdapter for SlowAdapter {
         type Session = SlowSession;
 
@@ -4603,6 +4663,38 @@ mod tests {
 
         async fn start_session(&self, _config: SessionConfig) -> Result<Self::Session, LoopError> {
             Ok(DualApprovalSession)
+        }
+    }
+
+    #[async_trait]
+    impl ModelSession for SupersedingSession {
+        type Turn = SupersedingTurn;
+
+        async fn begin_turn(
+            &mut self,
+            _request: TurnRequest,
+            _cancellation: Option<TurnCancellation>,
+        ) -> Result<Self::Turn, LoopError> {
+            assert!(self.supersession_enabled);
+            Ok(SupersedingTurn {
+                events: VecDeque::from([
+                    ModelTurnEvent::Usage(Usage::default()),
+                    ModelTurnEvent::ToolCall(ToolCallPart::new(
+                        "discarded-call",
+                        "discarded-tool",
+                        json!({}),
+                    )),
+                    ModelTurnEvent::ResponseAttemptSuperseded,
+                    ModelTurnEvent::Finished(ModelTurnResult {
+                        finish_reason: FinishReason::Completed,
+                        output_items: vec![Item::text(ItemKind::Assistant, "replacement")],
+                        usage: None,
+                        metadata: MetadataMap::new(),
+                        model: None,
+                        response_id: None,
+                    }),
+                ]),
+            })
         }
     }
 
@@ -4907,6 +4999,16 @@ mod tests {
 
     #[async_trait]
     impl ModelTurn for FakeTurn {
+        async fn next_event(
+            &mut self,
+            _cancellation: Option<TurnCancellation>,
+        ) -> Result<Option<ModelTurnEvent>, LoopError> {
+            Ok(self.events.pop_front())
+        }
+    }
+
+    #[async_trait]
+    impl ModelTurn for SupersedingTurn {
         async fn next_event(
             &mut self,
             _cancellation: Option<TurnCancellation>,
@@ -5329,6 +5431,58 @@ mod tests {
         }
     }
 
+    #[test]
+    fn session_consumer_capabilities_are_typed_and_serde_defaulted() {
+        let config = SessionConfig::new("session").with_response_attempt_supersession();
+        assert!(config.consumer_capabilities.response_attempt_supersession);
+
+        let decoded: SessionConfig = serde_json::from_value(json!({
+            "session_id": "session",
+            "metadata": {},
+            "cache": null
+        }))
+        .unwrap();
+        assert_eq!(
+            decoded.consumer_capabilities,
+            SessionConsumerCapabilities::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn response_attempt_supersession_is_forwarded_and_resets_attempt_state() {
+        let events = StdArc::new(StdMutex::new(Vec::new()));
+        let agent = Agent::builder()
+            .model(SupersedingAdapter)
+            .observer(RecordingObserver {
+                events: events.clone(),
+            })
+            .build()
+            .unwrap();
+        let mut driver = agent
+            .start(SessionConfig::new("supersession-session").with_response_attempt_supersession())
+            .await
+            .unwrap();
+        driver
+            .submit_input(vec![Item::text(ItemKind::User, "hello")])
+            .unwrap();
+
+        let LoopStep::Finished(result) = run_until_finished(&mut driver).await else {
+            panic!("turn did not finish");
+        };
+        assert!(result.usage.is_none());
+
+        let events = events.lock().unwrap();
+        let tool_call = events
+            .iter()
+            .position(|event| matches!(event, AgentEvent::ToolCallRequested(_)))
+            .unwrap();
+        let superseded = events
+            .iter()
+            .position(|event| matches!(event, AgentEvent::ResponseAttemptSuperseded))
+            .unwrap();
+        assert!(tool_call < superseded);
+    }
+
     fn turn_lifecycle_events(
         events: &[AgentEvent],
     ) -> Vec<(agentkit_core::TurnId, Option<FinishReason>)> {
@@ -5534,6 +5688,7 @@ mod tests {
                 session_id: SessionId::new("session-1"),
                 metadata: MetadataMap::new(),
                 cache: None,
+                consumer_capabilities: SessionConsumerCapabilities::default(),
             })
             .await
             .unwrap();
@@ -5611,6 +5766,7 @@ mod tests {
                 session_id: SessionId::new("session-mutation-point"),
                 metadata: MetadataMap::new(),
                 cache: None,
+                consumer_capabilities: SessionConsumerCapabilities::default(),
             })
             .await
             .unwrap();
@@ -6002,6 +6158,7 @@ mod tests {
                 session_id: SessionId::new("session-no-valid-input"),
                 metadata: MetadataMap::new(),
                 cache: None,
+                consumer_capabilities: SessionConsumerCapabilities::default(),
             })
             .await
             .unwrap();
@@ -6045,6 +6202,7 @@ mod tests {
                 session_id: SessionId::new("session-2"),
                 metadata: MetadataMap::new(),
                 cache: None,
+                consumer_capabilities: SessionConsumerCapabilities::default(),
             })
             .await
             .unwrap();
@@ -6103,6 +6261,7 @@ mod tests {
                 session_id: SessionId::new("session-failing-start-event"),
                 metadata: MetadataMap::new(),
                 cache: None,
+                consumer_capabilities: SessionConsumerCapabilities::default(),
             })
             .await
             .unwrap();
@@ -6146,6 +6305,7 @@ mod tests {
                 session_id: SessionId::new("session-run-then-deny-start-event"),
                 metadata: MetadataMap::new(),
                 cache: None,
+                consumer_capabilities: SessionConsumerCapabilities::default(),
             })
             .await
             .unwrap();
@@ -6175,10 +6335,9 @@ mod tests {
                         .get(TOOL_RESULT_FAILURE_KIND_METADATA_KEY)
                         .and_then(Value::as_str)
                         == Some(TOOL_RESULT_FAILURE_KIND_PERMISSION_DENIED)
-                    && result
+                    && !result
                         .metadata
-                        .get(TOOL_RESULT_NOT_STARTED_METADATA_KEY)
-                        .is_none()
+                        .contains_key(TOOL_RESULT_NOT_STARTED_METADATA_KEY)
         )));
     }
 
@@ -6214,6 +6373,7 @@ mod tests {
                 session_id: SessionId::new("session-background"),
                 metadata: MetadataMap::new(),
                 cache: None,
+                consumer_capabilities: SessionConsumerCapabilities::default(),
             })
             .await
             .unwrap();
@@ -6445,6 +6605,7 @@ mod tests {
                 session_id: SessionId::new("session-detached-progress"),
                 metadata: MetadataMap::new(),
                 cache: None,
+                consumer_capabilities: SessionConsumerCapabilities::default(),
             })
             .await
             .unwrap();
@@ -6535,6 +6696,7 @@ mod tests {
                 session_id: SessionId::new("session-cancel-delayed-background-approval"),
                 metadata: MetadataMap::new(),
                 cache: None,
+                consumer_capabilities: SessionConsumerCapabilities::default(),
             })
             .await
             .unwrap();
@@ -7135,6 +7297,7 @@ mod tests {
                 session_id: SessionId::new("session-cancel"),
                 metadata: MetadataMap::new(),
                 cache: None,
+                consumer_capabilities: SessionConsumerCapabilities::default(),
             })
             .await
             .unwrap();
@@ -7237,6 +7400,7 @@ mod tests {
                 session_id: SessionId::new("session-mixed-cancel"),
                 metadata: MetadataMap::new(),
                 cache: None,
+                consumer_capabilities: SessionConsumerCapabilities::default(),
             })
             .await
             .unwrap();
@@ -7326,6 +7490,7 @@ mod tests {
                 session_id: SessionId::new("session-cancel-mid-call"),
                 metadata: MetadataMap::new(),
                 cache: None,
+                consumer_capabilities: SessionConsumerCapabilities::default(),
             })
             .await
             .unwrap();
@@ -7545,6 +7710,7 @@ mod tests {
                 session_id: SessionId::new("session-approval"),
                 metadata: MetadataMap::new(),
                 cache: None,
+                consumer_capabilities: SessionConsumerCapabilities::default(),
             })
             .await
             .unwrap();
@@ -7602,6 +7768,7 @@ mod tests {
                 session_id: SessionId::new("session-approval-start-event"),
                 metadata: MetadataMap::new(),
                 cache: None,
+                consumer_capabilities: SessionConsumerCapabilities::default(),
             })
             .await
             .unwrap();
@@ -7664,6 +7831,7 @@ mod tests {
                 session_id: SessionId::new("session-cancel-pending-approval"),
                 metadata: MetadataMap::new(),
                 cache: None,
+                consumer_capabilities: SessionConsumerCapabilities::default(),
             })
             .await
             .unwrap();
@@ -7760,6 +7928,7 @@ mod tests {
                 session_id: SessionId::new("session-resolved-approval-cancel-race"),
                 metadata: MetadataMap::new(),
                 cache: None,
+                consumer_capabilities: SessionConsumerCapabilities::default(),
             })
             .await
             .unwrap();
@@ -7803,6 +7972,7 @@ mod tests {
                 session_id: SessionId::new("session-approval-patched"),
                 metadata: MetadataMap::new(),
                 cache: None,
+                consumer_capabilities: SessionConsumerCapabilities::default(),
             })
             .await
             .unwrap();
@@ -7854,6 +8024,7 @@ mod tests {
                 session_id: SessionId::new("session-dual-approval"),
                 metadata: MetadataMap::new(),
                 cache: None,
+                consumer_capabilities: SessionConsumerCapabilities::default(),
             })
             .await
             .unwrap();
@@ -7988,6 +8159,7 @@ mod tests {
                 session_id: SessionId::new("session-dual-approval-cancel"),
                 metadata: MetadataMap::new(),
                 cache: None,
+                consumer_capabilities: SessionConsumerCapabilities::default(),
             })
             .await
             .unwrap();
@@ -8085,6 +8257,7 @@ mod tests {
                 session_id: SessionId::new("session-4"),
                 metadata: MetadataMap::new(),
                 cache: None,
+                consumer_capabilities: SessionConsumerCapabilities::default(),
             })
             .await
             .unwrap();
@@ -8207,6 +8380,7 @@ mod tests {
                 session_id: SessionId::new("session-dynamic-tools"),
                 metadata: MetadataMap::new(),
                 cache: None,
+                consumer_capabilities: SessionConsumerCapabilities::default(),
             })
             .await
             .unwrap();
@@ -8263,6 +8437,7 @@ mod tests {
                 session_id: SessionId::new("session-catalog-events"),
                 metadata: MetadataMap::new(),
                 cache: None,
+                consumer_capabilities: SessionConsumerCapabilities::default(),
             })
             .await
             .unwrap();
@@ -8330,6 +8505,7 @@ mod tests {
                 session_id: SessionId::new("session-cache"),
                 metadata: MetadataMap::new(),
                 cache: Some(default_cache.clone()),
+                consumer_capabilities: SessionConsumerCapabilities::default(),
             })
             .await
             .unwrap();
@@ -8390,6 +8566,7 @@ mod tests {
                 session_id: SessionId::new("yield-session"),
                 metadata: MetadataMap::new(),
                 cache: None,
+                consumer_capabilities: SessionConsumerCapabilities::default(),
             })
             .await
             .unwrap();
@@ -8481,6 +8658,7 @@ mod tests {
                 session_id: SessionId::new("observer-session"),
                 metadata: MetadataMap::new(),
                 cache: None,
+                consumer_capabilities: SessionConsumerCapabilities::default(),
             })
             .await
             .unwrap();

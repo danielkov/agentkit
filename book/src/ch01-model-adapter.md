@@ -254,9 +254,16 @@ pub enum ModelTurnEvent {
     Delta(Delta),
     ToolCall(ToolCallPart),
     Usage(Usage),
+    ResponseAttemptSuperseded,
     Finished(ModelTurnResult),
 }
 ```
+
+`ResponseAttemptSuperseded` is capability-gated. An adapter emits it after events
+from a failed visible attempt and before any replacement-attempt events. The loop
+forwards it as `AgentEvent::ResponseAttemptSuperseded`. A consumer that enables
+`SessionConfig::with_response_attempt_supersession()` must discard all deltas,
+tool calls, usage updates, and reconstruction state from the preceding attempt.
 
 ## Building an adapter from scratch
 

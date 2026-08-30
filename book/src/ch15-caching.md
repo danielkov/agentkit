@@ -13,6 +13,7 @@ pub struct SessionConfig {
     pub session_id: SessionId,
     pub metadata: MetadataMap,
     pub cache: Option<PromptCacheRequest>,
+    pub consumer_capabilities: SessionConsumerCapabilities,
 }
 
 pub struct TurnRequest {
@@ -83,16 +84,12 @@ The simplest place to configure caching is the session:
 
 ```rust
 let mut driver = agent
-    .start(SessionConfig {
-        session_id: SessionId::new("coding-agent"),
-        metadata: MetadataMap::new(),
-        cache: Some(PromptCacheRequest {
-            mode: PromptCacheMode::BestEffort,
-            strategy: PromptCacheStrategy::Automatic,
-            retention: Some(PromptCacheRetention::Short),
-            key: None,
-        }),
-    })
+    .start(SessionConfig::new("coding-agent").with_cache(PromptCacheRequest {
+        mode: PromptCacheMode::BestEffort,
+        strategy: PromptCacheStrategy::Automatic,
+        retention: Some(PromptCacheRetention::Short),
+        key: None,
+    }))
     .await?;
 ```
 
@@ -225,16 +222,12 @@ This makes caching visible to reporters and host-side cost accounting without ex
 For most hosts, start here:
 
 ```rust
-SessionConfig {
-    session_id: SessionId::new("demo"),
-    metadata: MetadataMap::new(),
-    cache: Some(PromptCacheRequest {
-        mode: PromptCacheMode::BestEffort,
-        strategy: PromptCacheStrategy::Automatic,
-        retention: Some(PromptCacheRetention::Short),
-        key: None,
-    }),
-}
+SessionConfig::new("demo").with_cache(PromptCacheRequest {
+    mode: PromptCacheMode::BestEffort,
+    strategy: PromptCacheStrategy::Automatic,
+    retention: Some(PromptCacheRetention::Short),
+    key: None,
+})
 ```
 
 Then reach for explicit breakpoints only when you need to control exact cache boundaries.
