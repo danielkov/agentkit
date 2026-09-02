@@ -246,6 +246,32 @@ async fn loop_fans_out_and_preserves_order() {
 }
 
 #[tokio::test]
+async fn fold_break_stops_with_the_final_accumulator() {
+    let outcome = execute_compose(
+        ComposeConfig::default(),
+        EchoTool::new(),
+        request(
+            "result = fold state = { total: 0, count: 0 } for item in input.items {\n\
+                 next = { total: state.total + item, count: state.count + 1 }\n\
+                 break next if next.total >= input.limit\n\
+                 return next\n\
+             }\n\
+             return result",
+            json!({ "items": [2, 3, 5, 8], "limit": 5 }),
+        ),
+    )
+    .await;
+
+    match outcome {
+        ToolExecutionOutcome::Completed(result) => assert_eq!(
+            result.result.output,
+            ToolOutput::structured(json!({ "total": 5, "count": 2 }))
+        ),
+        other => panic!("unexpected outcome: {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn compile_diagnostics_surface_as_invalid_input() {
     let outcome = execute_compose(
         ComposeConfig::default(),

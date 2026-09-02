@@ -9,7 +9,7 @@ optional JSON input; the script can call the current tool catalog with
 Sandboxed Lua is enabled by default. To use only the Runlet backend:
 
 ```toml
-agentkit-tool-compose = { version = "0.10.9", default-features = false, features = ["runlet"] }
+agentkit-tool-compose = { version = "0.10.10", default-features = false, features = ["runlet"] }
 ```
 
 ```rust

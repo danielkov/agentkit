@@ -80,7 +80,9 @@ const RULES_PRIMER: &str = "Run a Runlet program that composes available tools. 
              - Aggregation: `fold acc = init for x in xs { ... return next_acc }` is a \
              sequential reduce — the body's return becomes the next accumulator: \
              `total = fold acc = 0 for o in orders { return acc + o.amount }`. `skip if cond` \
-             keeps the accumulator unchanged. Count: `fold n = 0 for x in xs { return n + 1 }`. \
+             keeps the accumulator unchanged. `break next_acc if cond` stops the fold early with \
+             the required final accumulator; it is valid only directly in a fold body, which must \
+             still end with `return`. Count: `fold n = 0 for x in xs { return n + 1 }`. \
              Group or index by key with computed keys: \
              `by_id = fold acc = {} for u in users { return acc + { [u.id]: u } }`; for \
              grouping, guard the first hit: `acc + { [c.team]: (acc[c.team] if c.team in acc \
@@ -207,7 +209,12 @@ label = if total >= config.threshold {                # block-bodied if is an ex
     return "empty"
 }
 
-first_row = shaped[0] if shaped != [] and total > 0 else fail("EMPTY", "no rows")
+first_rows = fold rows = [] for row in shaped {         # fold-local `break value if condition` stops early;
+    next = rows + [row]
+    break next if list.length(next) == 1                # the value is the final accumulator; it is required.
+    return next                                         # a structural final return is still required.
+}
+first_row = first_rows[0] if first_rows != [] and total > 0 else fail("EMPTY", "no rows")
                                                       # comparisons, `and`/`or`/`not` — operands must be boolean
 summary = text.upper(by_id[first_row.id].id)          # fail(code, message) raises a catchable error
 return { total, label, summary }                      # return only requested summaries, not source rows;
@@ -233,6 +240,7 @@ mod primer_tests {
             assert!(primer.contains("after "));
             assert!(primer.contains("lexically created"));
             assert!(primer.contains("_ = expression"));
+            assert!(primer.contains("break next"));
         }
     }
 }
