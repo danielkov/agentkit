@@ -67,8 +67,10 @@ Cancellation, the logical retry deadline, stream-idle timeout, absolute
 per-attempt deadline (including stream reads), auth/refresh, and backoff remain
 bounded. Responses default to a 32 MiB serialized request limit, 16 MiB per
 attempt, and 64 MiB aggregate wire limit across retries. Requests and responses
-also default to at most 100,000 items/events and 8 MiB per text, reasoning,
-ciphertext, or media field. Override these with `OpenAIResponsesLimits` and
+also default to at most 100,000 collection items/indexes and 8 MiB per text,
+reasoning, ciphertext, or media field. SSE and normalized event traffic is bounded
+by the response byte limits rather than this collection-cardinality limit. Override
+these with `OpenAIResponsesLimits` and
 `.with_limits(...)`; for example, a host can set `max_items` to `10_000` and
 `max_text_bytes` to `1024 * 1024` while retaining the default aggregate bounds.
 Limits must be non-zero; the per-field bound must fit both request and attempt
