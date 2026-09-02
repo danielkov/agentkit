@@ -97,6 +97,8 @@ const USER_CANCELLED_REASON: &str = "user_cancelled";
 const DETACHED_NOTIFICATION_TEXT_MAX_CHARS: usize = 512;
 const DETACHED_TEXT_PREVIEW_MAX_CHARS: usize = 160;
 const DETACHED_CALL_ID_MAX_CHARS: usize = 80;
+const MAX_STREAMED_ASSISTANT_CONTENT_BYTES: usize = 1024 * 1024;
+const MAX_STREAMED_ASSISTANT_CONTENT_PARTS: usize = 256;
 
 /// Metadata key used by adapters to retain provider-native finish reasons.
 pub const PROVIDER_FINISH_REASONS_METADATA_KEY: &str = "agentkit.provider_finish_reasons";
@@ -2397,7 +2399,7 @@ where
                 saw_tool_call = false;
                 latest_usage = None;
                 if let Some(content) = &mut streamed_content {
-                    content.clear();
+                    content.reset();
                 }
                 self.emit(AgentEvent::ResponseAttemptSuperseded);
             }
@@ -2431,7 +2433,7 @@ where
                 ModelTurnEvent::ToolCall(call) => {
                     saw_tool_call = true;
                     if let Some(content) = &mut streamed_content {
-                        content.commit_tool_call(call.clone());
+                        content.commit_tool_call(&call);
                     }
                     self.emit(AgentEvent::ToolCallRequested(call));
                 }
@@ -4142,6 +4144,8 @@ fn main() {
 #[derive(Default)]
 struct StreamedAssistantContent {
     parts: Vec<StreamedPart>,
+    retained_bytes: usize,
+    overflowed: bool,
 }
 
 enum StreamedPart {
@@ -4151,83 +4155,160 @@ enum StreamedPart {
         text: String,
         bytes: Vec<u8>,
         structured: Option<Value>,
+        structured_bytes: usize,
         metadata: MetadataMap,
+        metadata_bytes: usize,
+        retained_bytes: usize,
     },
-    Committed(Part),
+    Committed {
+        part: Part,
+        retained_bytes: usize,
+    },
 }
 
 impl StreamedAssistantContent {
     fn apply_delta(&mut self, delta: &Delta) {
+        if self.overflowed {
+            return;
+        }
+
         match delta {
             Delta::BeginPart { part_id, kind } => {
+                let index = self.open_part_index(part_id);
+                let retained_bytes = part_id.0.len();
+                if !self.reserve_slot(index, retained_bytes) {
+                    return;
+                }
                 let open = StreamedPart::Open {
                     id: part_id.clone(),
                     kind: *kind,
                     text: String::new(),
                     bytes: Vec::new(),
                     structured: None,
+                    structured_bytes: 0,
                     metadata: MetadataMap::new(),
+                    metadata_bytes: 0,
+                    retained_bytes,
                 };
-                if let Some(slot) = self
-                    .parts
-                    .iter_mut()
-                    .find(|slot| matches!(slot, StreamedPart::Open { id, .. } if id == part_id))
-                {
-                    *slot = open;
+                if let Some(index) = index {
+                    self.parts[index] = open;
                 } else {
                     self.parts.push(open);
                 }
             }
             Delta::AppendText { part_id, chunk } => {
-                if let Some(StreamedPart::Open { text, .. }) = self.open_part_mut(part_id) {
+                let Some(index) = self.open_part_index(part_id) else {
+                    return;
+                };
+                if self.grow_slot(index, chunk.len())
+                    && let StreamedPart::Open { text, .. } = &mut self.parts[index]
+                {
                     text.push_str(chunk);
                 }
             }
             Delta::AppendBytes { part_id, chunk } => {
-                if let Some(StreamedPart::Open { kind, bytes, .. }) = self.open_part_mut(part_id)
-                    && !matches!(kind, PartKind::Media)
+                let Some(index) = self.open_part_index(part_id) else {
+                    return;
+                };
+                if matches!(
+                    self.parts[index],
+                    StreamedPart::Open {
+                        kind: PartKind::Media,
+                        ..
+                    }
+                ) {
+                    return;
+                }
+                if self.grow_slot(index, chunk.len())
+                    && let StreamedPart::Open { bytes, .. } = &mut self.parts[index]
                 {
                     bytes.extend_from_slice(chunk);
                 }
             }
             Delta::ReplaceStructured { part_id, value } => {
-                if let Some(StreamedPart::Open { structured, .. }) = self.open_part_mut(part_id) {
+                let Some(index) = self.open_part_index(part_id) else {
+                    return;
+                };
+                let old_bytes = match &self.parts[index] {
+                    StreamedPart::Open {
+                        structured_bytes, ..
+                    } => *structured_bytes,
+                    StreamedPart::Committed { .. } => unreachable!(),
+                };
+                let limit = self.available_after_replacing(old_bytes);
+                let Some(new_bytes) = serialized_size_with_limit(value, limit) else {
+                    self.overflow();
+                    return;
+                };
+                self.replace_slot_bytes(index, old_bytes, new_bytes);
+                if let StreamedPart::Open {
+                    structured,
+                    structured_bytes,
+                    ..
+                } = &mut self.parts[index]
+                {
                     *structured = Some(value.clone());
+                    *structured_bytes = new_bytes;
                 }
             }
             Delta::SetMetadata { part_id, metadata } => {
-                if let Some(StreamedPart::Open {
-                    metadata: target, ..
-                }) = self.open_part_mut(part_id)
+                let Some(index) = self.open_part_index(part_id) else {
+                    return;
+                };
+                let old_bytes = match &self.parts[index] {
+                    StreamedPart::Open { metadata_bytes, .. } => *metadata_bytes,
+                    StreamedPart::Committed { .. } => unreachable!(),
+                };
+                let limit = self.available_after_replacing(old_bytes);
+                let Some(new_bytes) = serialized_size_with_limit(metadata, limit) else {
+                    self.overflow();
+                    return;
+                };
+                self.replace_slot_bytes(index, old_bytes, new_bytes);
+                if let StreamedPart::Open {
+                    metadata: target,
+                    metadata_bytes,
+                    ..
+                } = &mut self.parts[index]
                 {
                     *target = metadata.clone();
+                    *metadata_bytes = new_bytes;
                 }
             }
-            Delta::CommitPart { part } => self.commit_part(part.clone()),
+            Delta::CommitPart { part } => self.commit_part(part),
         }
     }
 
-    fn open_part_mut(&mut self, id: &PartId) -> Option<&mut StreamedPart> {
-        self.parts
-            .iter_mut()
-            .find(|part| matches!(part, StreamedPart::Open { id: open_id, .. } if open_id == id))
+    fn open_part_index(&self, id: &PartId) -> Option<usize> {
+        self.parts.iter().position(
+            |part| matches!(part, StreamedPart::Open { id: open_id, .. } if open_id == id),
+        )
     }
 
-    fn commit_part(&mut self, part: Part) {
-        if let Part::ToolCall(call) = &part
-            && let Some(slot) = self.parts.iter_mut().find(|slot| {
-                matches!(slot, StreamedPart::Committed(Part::ToolCall(existing)) if existing.id == call.id)
-            })
-        {
-            *slot = StreamedPart::Committed(part);
+    fn commit_part(&mut self, part: &Part) {
+        if self.overflowed {
             return;
         }
 
-        let kind = part_kind(&part);
+        let duplicate_tool_call = if let Part::ToolCall(call) = part {
+            self.parts.iter().position(|slot| {
+                matches!(
+                    slot,
+                    StreamedPart::Committed {
+                        part: Part::ToolCall(existing),
+                        ..
+                    } if existing.id == call.id
+                )
+            })
+        } else {
+            None
+        };
+
+        let kind = part_kind(part);
         let matching_open = self
             .parts
             .iter()
-            .position(|slot| slot.open_matches_part(&part));
+            .position(|slot| slot.open_matches_part(part));
         let mut open_with_kind = self.parts.iter().enumerate().filter_map(|(index, slot)| {
             matches!(slot, StreamedPart::Open { kind: open_kind, .. } if *open_kind == kind)
                 .then_some(index)
@@ -4236,22 +4317,139 @@ impl StreamedAssistantContent {
             (Some(index), None) => Some(index),
             _ => None,
         };
-        if let Some(index) = matching_open.or(only_open_with_kind) {
-            self.parts[index] = StreamedPart::Committed(part);
+        let index = duplicate_tool_call
+            .or(matching_open)
+            .or(only_open_with_kind);
+        let limit = self.available_for_slot(index);
+        let Some(retained_bytes) = serialized_size_with_limit(part, limit) else {
+            self.overflow();
+            return;
+        };
+        if !self.reserve_slot(index, retained_bytes) {
+            return;
+        }
+        let committed = StreamedPart::Committed {
+            part: part.clone(),
+            retained_bytes,
+        };
+        if let Some(index) = index {
+            self.parts[index] = committed;
         } else {
-            self.parts.push(StreamedPart::Committed(part));
+            self.parts.push(committed);
         }
     }
 
-    fn commit_tool_call(&mut self, call: ToolCallPart) {
-        self.commit_part(Part::ToolCall(call));
+    fn commit_tool_call(&mut self, call: &ToolCallPart) {
+        if self.overflowed {
+            return;
+        }
+        let duplicate_tool_call = self.parts.iter().position(|slot| {
+            matches!(
+                slot,
+                StreamedPart::Committed {
+                    part: Part::ToolCall(existing),
+                    ..
+                } if existing.id == call.id
+            )
+        });
+        let mut open_tool_calls = self.parts.iter().enumerate().filter_map(|(index, slot)| {
+            matches!(
+                slot,
+                StreamedPart::Open {
+                    kind: PartKind::ToolCall,
+                    ..
+                }
+            )
+            .then_some(index)
+        });
+        let only_open_tool_call = match (open_tool_calls.next(), open_tool_calls.next()) {
+            (Some(index), None) => Some(index),
+            _ => None,
+        };
+        let index = duplicate_tool_call.or(only_open_tool_call);
+        let limit = self.available_for_slot(index);
+        let borrowed_part = BorrowedPart::ToolCall(call);
+        let Some(retained_bytes) = serialized_size_with_limit(&borrowed_part, limit) else {
+            self.overflow();
+            return;
+        };
+        if !self.reserve_slot(index, retained_bytes) {
+            return;
+        }
+        let committed = StreamedPart::Committed {
+            part: Part::ToolCall(call.clone()),
+            retained_bytes,
+        };
+        if let Some(index) = index {
+            self.parts[index] = committed;
+        } else {
+            self.parts.push(committed);
+        }
     }
 
-    fn clear(&mut self) {
+    fn reserve_slot(&mut self, index: Option<usize>, retained_bytes: usize) -> bool {
+        if index.is_none() && self.parts.len() >= MAX_STREAMED_ASSISTANT_CONTENT_PARTS {
+            self.overflow();
+            return false;
+        }
+        let replaced_bytes = index.map_or(0, |index| self.parts[index].retained_bytes());
+        let Some(total) = self
+            .retained_bytes
+            .checked_sub(replaced_bytes)
+            .and_then(|bytes| bytes.checked_add(retained_bytes))
+            .filter(|bytes| *bytes <= MAX_STREAMED_ASSISTANT_CONTENT_BYTES)
+        else {
+            self.overflow();
+            return false;
+        };
+        self.retained_bytes = total;
+        true
+    }
+
+    fn grow_slot(&mut self, index: usize, additional_bytes: usize) -> bool {
+        let Some(total) = self
+            .retained_bytes
+            .checked_add(additional_bytes)
+            .filter(|bytes| *bytes <= MAX_STREAMED_ASSISTANT_CONTENT_BYTES)
+        else {
+            self.overflow();
+            return false;
+        };
+        self.retained_bytes = total;
+        *self.parts[index].retained_bytes_mut() += additional_bytes;
+        true
+    }
+
+    fn available_after_replacing(&self, replaced_bytes: usize) -> usize {
+        MAX_STREAMED_ASSISTANT_CONTENT_BYTES - (self.retained_bytes - replaced_bytes)
+    }
+
+    fn available_for_slot(&self, index: Option<usize>) -> usize {
+        self.available_after_replacing(index.map_or(0, |index| self.parts[index].retained_bytes()))
+    }
+
+    fn replace_slot_bytes(&mut self, index: usize, old_bytes: usize, new_bytes: usize) {
+        self.retained_bytes = self.retained_bytes - old_bytes + new_bytes;
+        let retained_bytes = self.parts[index].retained_bytes_mut();
+        *retained_bytes = *retained_bytes - old_bytes + new_bytes;
+    }
+
+    fn overflow(&mut self) {
         self.parts.clear();
+        self.retained_bytes = 0;
+        self.overflowed = true;
+    }
+
+    fn reset(&mut self) {
+        self.parts.clear();
+        self.retained_bytes = 0;
+        self.overflowed = false;
     }
 
     fn interrupted_items(&self) -> Vec<Item> {
+        if self.overflowed {
+            return interrupted_assistant_items();
+        }
         let parts = self
             .parts
             .iter()
@@ -4265,6 +4463,22 @@ impl StreamedAssistantContent {
 }
 
 impl StreamedPart {
+    fn retained_bytes(&self) -> usize {
+        match self {
+            Self::Open { retained_bytes, .. } | Self::Committed { retained_bytes, .. } => {
+                *retained_bytes
+            }
+        }
+    }
+
+    fn retained_bytes_mut(&mut self) -> &mut usize {
+        match self {
+            Self::Open { retained_bytes, .. } | Self::Committed { retained_bytes, .. } => {
+                retained_bytes
+            }
+        }
+    }
+
     fn open_matches_part(&self, committed: &Part) -> bool {
         match (self, committed) {
             (
@@ -4305,8 +4519,8 @@ impl StreamedPart {
 
     fn preserved_part(&self) -> Option<Part> {
         match self {
-            Self::Committed(part) if useful_streamed_part(part) => Some(part.clone()),
-            Self::Committed(_) => None,
+            Self::Committed { part, .. } if useful_streamed_part(part) => Some(part.clone()),
+            Self::Committed { .. } => None,
             Self::Open {
                 kind,
                 text,
@@ -4336,6 +4550,42 @@ impl StreamedPart {
             },
         }
     }
+}
+
+#[derive(Serialize)]
+enum BorrowedPart<'a> {
+    ToolCall(&'a ToolCallPart),
+}
+
+struct PayloadSizeWriter {
+    remaining: usize,
+    written: usize,
+}
+
+impl std::io::Write for PayloadSizeWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > self.remaining {
+            return Err(std::io::Error::other(
+                "streamed assistant payload limit exceeded",
+            ));
+        }
+        self.remaining -= bytes.len();
+        self.written += bytes.len();
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialized_size_with_limit<T: Serialize + ?Sized>(value: &T, limit: usize) -> Option<usize> {
+    let mut writer = PayloadSizeWriter {
+        remaining: limit,
+        written: 0,
+    };
+    serde_json::to_writer(&mut writer, value).ok()?;
+    Some(writer.written)
 }
 
 fn part_kind(part: &Part) -> PartKind {
@@ -4655,6 +4905,7 @@ mod tests {
     enum InterruptedStreamScenario {
         PreserveContent,
         CancelOnSupersession,
+        OverflowThenSupersession,
     }
 
     struct InterruptedStreamTurn {
@@ -5060,6 +5311,25 @@ mod tests {
                         chunk: "discard me".into(),
                     }),
                     ModelTurnEvent::ResponseAttemptSuperseded,
+                ]),
+                InterruptedStreamScenario::OverflowThenSupersession => VecDeque::from([
+                    ModelTurnEvent::Delta(Delta::BeginPart {
+                        part_id: PartId::new("oversized"),
+                        kind: PartKind::Text,
+                    }),
+                    ModelTurnEvent::Delta(Delta::AppendText {
+                        part_id: PartId::new("oversized"),
+                        chunk: "x".repeat(MAX_STREAMED_ASSISTANT_CONTENT_BYTES),
+                    }),
+                    ModelTurnEvent::ResponseAttemptSuperseded,
+                    ModelTurnEvent::Delta(Delta::BeginPart {
+                        part_id: PartId::new("fresh"),
+                        kind: PartKind::Text,
+                    }),
+                    ModelTurnEvent::Delta(Delta::AppendText {
+                        part_id: PartId::new("fresh"),
+                        chunk: "preserve me".into(),
+                    }),
                 ]),
             };
             Ok(InterruptedStreamTurn {
@@ -6033,6 +6303,117 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn streamed_content_byte_budget_covers_every_retained_payload() {
+        fn open_content(kind: PartKind) -> StreamedAssistantContent {
+            let mut content = StreamedAssistantContent::default();
+            content.apply_delta(&Delta::BeginPart {
+                part_id: PartId::new("part"),
+                kind,
+            });
+            content
+        }
+
+        let mut content = open_content(PartKind::Text);
+        content.apply_delta(&Delta::AppendText {
+            part_id: PartId::new("part"),
+            chunk: "x".repeat(MAX_STREAMED_ASSISTANT_CONTENT_BYTES),
+        });
+        assert!(content.overflowed);
+
+        let mut content = open_content(PartKind::Reasoning);
+        content.apply_delta(&Delta::AppendBytes {
+            part_id: PartId::new("part"),
+            chunk: vec![0; MAX_STREAMED_ASSISTANT_CONTENT_BYTES],
+        });
+        assert!(content.overflowed);
+
+        let mut content = open_content(PartKind::Structured);
+        content.apply_delta(&Delta::ReplaceStructured {
+            part_id: PartId::new("part"),
+            value: Value::String("x".repeat(MAX_STREAMED_ASSISTANT_CONTENT_BYTES)),
+        });
+        assert!(content.overflowed);
+
+        let mut metadata = MetadataMap::new();
+        metadata.insert(
+            "large".into(),
+            Value::String("x".repeat(MAX_STREAMED_ASSISTANT_CONTENT_BYTES)),
+        );
+        let mut content = open_content(PartKind::Text);
+        content.apply_delta(&Delta::SetMetadata {
+            part_id: PartId::new("part"),
+            metadata,
+        });
+        assert!(content.overflowed);
+
+        let mut content = StreamedAssistantContent::default();
+        content.apply_delta(&Delta::CommitPart {
+            part: Part::text("x".repeat(MAX_STREAMED_ASSISTANT_CONTENT_BYTES)),
+        });
+        assert!(content.overflowed);
+
+        let mut content = StreamedAssistantContent::default();
+        content.commit_tool_call(&ToolCallPart::new(
+            "call",
+            "tool",
+            Value::String("x".repeat(MAX_STREAMED_ASSISTANT_CONTENT_BYTES)),
+        ));
+        assert!(content.overflowed);
+    }
+
+    #[test]
+    fn streamed_content_part_budget_releases_all_parts() {
+        let mut content = StreamedAssistantContent::default();
+        for index in 0..MAX_STREAMED_ASSISTANT_CONTENT_PARTS {
+            content.apply_delta(&Delta::BeginPart {
+                part_id: PartId::new(format!("part-{index}")),
+                kind: PartKind::Text,
+            });
+        }
+        assert_eq!(content.parts.len(), MAX_STREAMED_ASSISTANT_CONTENT_PARTS);
+
+        content.apply_delta(&Delta::BeginPart {
+            part_id: PartId::new("overflow"),
+            kind: PartKind::Text,
+        });
+
+        assert!(content.overflowed);
+        assert!(content.parts.is_empty());
+        assert_eq!(content.retained_bytes, 0);
+    }
+
+    #[test]
+    fn streamed_content_overflow_uses_generic_interruption_fallback() {
+        let mut content = StreamedAssistantContent::default();
+        content.apply_delta(&Delta::BeginPart {
+            part_id: PartId::new("text"),
+            kind: PartKind::Text,
+        });
+        content.apply_delta(&Delta::AppendText {
+            part_id: PartId::new("text"),
+            chunk: "release me".into(),
+        });
+        content.apply_delta(&Delta::AppendText {
+            part_id: PartId::new("text"),
+            chunk: "x".repeat(MAX_STREAMED_ASSISTANT_CONTENT_BYTES),
+        });
+        content.apply_delta(&Delta::BeginPart {
+            part_id: PartId::new("ignored after overflow"),
+            kind: PartKind::Text,
+        });
+
+        assert!(content.parts.is_empty());
+        assert_eq!(content.retained_bytes, 0);
+        let items = content.interrupted_items();
+        assert!(matches!(
+            items[0].parts.as_slice(),
+            [Part::Text(text)]
+                if text.text.contains("response was interrupted")
+                    && !text.text.contains("release me")
+        ));
+    }
+
     #[tokio::test]
     async fn supersession_is_processed_before_concurrent_cancellation() {
         let controller = CancellationController::new();
@@ -6083,6 +6464,37 @@ mod tests {
             .position(|event| matches!(event, AgentEvent::TurnFinished(_)))
             .expect("turn-finished event");
         assert!(superseded < finished);
+    }
+
+    #[tokio::test]
+    async fn supersession_resets_streamed_content_budget() {
+        let controller = CancellationController::new();
+        let agent = Agent::builder()
+            .model(InterruptedStreamAdapter {
+                controller: controller.clone(),
+                scenario: InterruptedStreamScenario::OverflowThenSupersession,
+            })
+            .cancellation(controller.handle())
+            .build()
+            .unwrap();
+        let mut driver = agent
+            .start(
+                SessionConfig::new("overflow-then-supersede").with_response_attempt_supersession(),
+            )
+            .await
+            .unwrap();
+        driver
+            .submit_input(vec![Item::text(ItemKind::User, "start")])
+            .unwrap();
+
+        let LoopStep::Finished(result) = run_until_finished(&mut driver).await else {
+            panic!("turn did not finish");
+        };
+        assert_eq!(result.finish_reason, FinishReason::Cancelled);
+        assert!(matches!(
+            result.items[0].parts.as_slice(),
+            [Part::Text(text)] if text.text == "preserve me"
+        ));
     }
 
     fn turn_lifecycle_events(
