@@ -60,7 +60,7 @@ pub struct OpenAIResponsesLimits {
     pub max_attempt_bytes: usize,
     /// Maximum aggregate wire bytes accepted across all attempts for one logical turn.
     pub max_wire_bytes: usize,
-    /// Maximum number of request items/tools, response indexes, or SSE events.
+    /// Maximum request/response collection cardinality and exclusive index bound.
     pub max_items: usize,
     /// Maximum bytes accepted in any text, reasoning, ciphertext, or media field.
     pub max_text_bytes: usize,
@@ -2050,8 +2050,6 @@ struct ResponsesState {
     response_id: Option<String>,
     response_model: Option<String>,
     events: VecDeque<ModelTurnEvent>,
-    event_count: usize,
-    sse_event_count: usize,
     output: BTreeMap<u64, Item>,
     item_indices: BTreeMap<String, u64>,
     item_types: BTreeMap<String, String>,
@@ -2098,8 +2096,6 @@ impl ResponsesState {
             response_id: None,
             response_model: None,
             events: VecDeque::new(),
-            event_count: 0,
-            sse_event_count: 0,
             output: BTreeMap::new(),
             item_indices: BTreeMap::new(),
             item_types: BTreeMap::new(),
@@ -2124,12 +2120,6 @@ impl ResponsesState {
     }
 
     fn consume(&mut self, kind: &str, value: &Value) -> Result<(), AttemptFailure> {
-        if self.sse_event_count >= self.limits.max_items {
-            return Err(protocol_failure(
-                "Responses attempt produced too many SSE events",
-            ));
-        }
-        self.sse_event_count += 1;
         if self.terminal {
             return Err(protocol_failure(
                 "Responses event followed a terminal event",
@@ -2459,7 +2449,6 @@ impl ResponsesState {
                 PartKind::Text
             },
             &mut self.events,
-            &mut self.event_count,
             self.limits,
         )
     }
@@ -2623,9 +2612,7 @@ impl ResponsesState {
                     if streamed.is_some() {
                         push_event(
                             &mut self.events,
-                            &mut self.event_count,
                             ModelTurnEvent::Delta(Delta::CommitPart { part: part.clone() }),
-                            self.limits.max_items,
                         )?;
                     }
                     parts.push(part);
@@ -2734,29 +2721,23 @@ impl ResponsesState {
                 let placeholder_id = PartId::new(format!("generated-image-{output_index}"));
                 push_event(
                     &mut self.events,
-                    &mut self.event_count,
                     ModelTurnEvent::Delta(Delta::BeginPart {
                         part_id: placeholder_id.clone(),
                         kind: PartKind::Text,
                     }),
-                    self.limits.max_items,
                 )?;
                 push_event(
                     &mut self.events,
-                    &mut self.event_count,
                     ModelTurnEvent::Delta(Delta::AppendText {
                         part_id: placeholder_id,
                         chunk: placeholder.clone(),
                     }),
-                    self.limits.max_items,
                 )?;
                 push_event(
                     &mut self.events,
-                    &mut self.event_count,
                     ModelTurnEvent::Delta(Delta::CommitPart {
                         part: Part::Text(TextPart::new(placeholder)),
                     }),
-                    self.limits.max_items,
                 )?;
                 self.output.insert(
                     output_index,
@@ -2806,11 +2787,9 @@ impl ResponsesState {
                     if streamed.is_some() {
                         push_event(
                             &mut self.events,
-                            &mut self.event_count,
                             ModelTurnEvent::Delta(Delta::CommitPart {
                                 part: Part::Reasoning(ReasoningPart::summary(text)),
                             }),
-                            self.limits.max_items,
                         )?;
                     }
                     summary_texts.push(text);
@@ -2918,9 +2897,7 @@ impl ResponsesState {
             let part = Part::Text(TextPart::new(accumulator.text));
             push_event(
                 &mut self.events,
-                &mut self.event_count,
                 ModelTurnEvent::Delta(Delta::CommitPart { part: part.clone() }),
-                self.limits.max_items,
             )?;
             self.output
                 .insert(index, provider_item(&item_id, vec![part]));
@@ -2940,26 +2917,14 @@ impl ResponsesState {
         {
             push_event(
                 &mut self.events,
-                &mut self.event_count,
                 ModelTurnEvent::Delta(Delta::CommitPart {
                     part: Part::ToolCall(call.clone()),
                 }),
-                self.limits.max_items,
             )?;
-            push_event(
-                &mut self.events,
-                &mut self.event_count,
-                ModelTurnEvent::ToolCall(call),
-                self.limits.max_items,
-            )?;
+            push_event(&mut self.events, ModelTurnEvent::ToolCall(call))?;
         }
         if let Some(usage) = self.usage.clone() {
-            push_event(
-                &mut self.events,
-                &mut self.event_count,
-                ModelTurnEvent::Usage(usage),
-                self.limits.max_items,
-            )?;
+            push_event(&mut self.events, ModelTurnEvent::Usage(usage))?;
         }
         let mut metadata = MetadataMap::from([(
             "openai.responses.profile".into(),
@@ -2968,7 +2933,6 @@ impl ResponsesState {
         set_provider_finish_reasons(&mut metadata, self.provider_finish_reason.iter().cloned());
         push_event(
             &mut self.events,
-            &mut self.event_count,
             ModelTurnEvent::Finished(ModelTurnResult {
                 finish_reason: self.finish_reason.clone().expect("terminal reason"),
                 output_items: std::mem::take(&mut self.output).into_values().collect(),
@@ -2977,7 +2941,6 @@ impl ResponsesState {
                 model: self.response_model.clone(),
                 response_id: self.response_id.clone(),
             }),
-            self.limits.max_items,
         )?;
         Ok(())
     }
@@ -2997,11 +2960,6 @@ impl ResponsesState {
                 headers: None,
             });
         }
-        if self.events.len() > self.limits.max_items {
-            return Err(protocol_failure(
-                "Responses attempt produced too many events",
-            ));
-        }
         Ok(())
     }
 
@@ -3020,16 +2978,8 @@ fn provider_item(item_id: &str, parts: Vec<Part>) -> Item {
 
 fn push_event(
     events: &mut VecDeque<ModelTurnEvent>,
-    event_count: &mut usize,
     event: ModelTurnEvent,
-    max_items: usize,
 ) -> Result<(), AttemptFailure> {
-    if *event_count >= max_items {
-        return Err(protocol_failure(
-            "Responses attempt produced too many events",
-        ));
-    }
-    *event_count += 1;
     events.push_back(event);
     Ok(())
 }
@@ -3040,7 +2990,6 @@ fn append_part(
     delta: &str,
     kind: PartKind,
     events: &mut VecDeque<ModelTurnEvent>,
-    event_count: &mut usize,
     limits: OpenAIResponsesLimits,
 ) -> Result<(), AttemptFailure> {
     if !parts.contains_key(&key) {
@@ -3053,12 +3002,10 @@ fn append_part(
         ));
         push_event(
             events,
-            event_count,
             ModelTurnEvent::Delta(Delta::BeginPart {
                 part_id: id.clone(),
                 kind,
             }),
-            limits.max_items,
         )?;
         parts.insert(
             key.clone(),
@@ -3077,12 +3024,10 @@ fn append_part(
     part.text.push_str(delta);
     push_event(
         events,
-        event_count,
         ModelTurnEvent::Delta(Delta::AppendText {
             part_id: part.id.clone(),
             chunk: delta.to_owned(),
         }),
-        limits.max_items,
     )
 }
 
@@ -4776,7 +4721,7 @@ data: {"type":"response.completed","sequence_number":18,"response":{"id":"resp-1
     }
 
     #[test]
-    fn sse_event_index_and_text_limits_are_configurable() {
+    fn event_traffic_and_response_limits_are_independent() {
         let decoder = |limits| {
             ResponsesSseDecoder::with_policy(
                 "gpt-test",
@@ -4789,11 +4734,12 @@ data: {"type":"response.completed","sequence_number":18,"response":{"id":"resp-1
             )
         };
 
-        let mut event_bounded = decoder(OpenAIResponsesLimits {
+        let mut traffic_unbounded = decoder(OpenAIResponsesLimits {
             max_items: 3,
             ..OpenAIResponsesLimits::default()
         });
-        assert!(event_bounded.push(SUCCESS.as_bytes()).is_err());
+        traffic_unbounded.push(SUCCESS.as_bytes()).unwrap();
+        assert!(traffic_unbounded.finish().is_ok());
 
         let outside_index = concat!(
             "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\",\"model\":\"gpt-test\"}}\n\n",
