@@ -1742,9 +1742,7 @@ async fn send_live_attempt(
             error: Box::new(LoopError::Provider(format!(
                 "OpenAI Responses returned HTTP {status}"
             ))),
-            retryable: is_retryable_status(status)
-                || (context.config.profile == OpenAIResponsesProfile::ChatGptPrivate
-                    && status.as_u16() == 529),
+            retryable: retryable_response_status(status, context.config.profile),
             headers: retry_headers(response.headers()),
         });
     }
@@ -1789,6 +1787,12 @@ async fn send_live_attempt(
         eof: false,
         closed: false,
     })
+}
+
+fn retryable_response_status(status: StatusCode, profile: OpenAIResponsesProfile) -> bool {
+    is_retryable_status(status)
+        || (profile == OpenAIResponsesProfile::ChatGptPrivate
+            && matches!(status.as_u16(), 404 | 529))
 }
 
 fn attempt_timeout_failure(timeout: Duration) -> AttemptFailure {
@@ -4756,6 +4760,22 @@ data: {"type":"response.completed","sequence_number":18,"response":{"id":"resp-1
             ..OpenAIResponsesLimits::default()
         });
         assert!(text_bounded.push(SUCCESS.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn private_response_status_retry_policy_is_scoped() {
+        assert!(retryable_response_status(
+            StatusCode::NOT_FOUND,
+            OpenAIResponsesProfile::ChatGptPrivate,
+        ));
+        assert!(retryable_response_status(
+            StatusCode::from_u16(529).unwrap(),
+            OpenAIResponsesProfile::ChatGptPrivate,
+        ));
+        assert!(!retryable_response_status(
+            StatusCode::NOT_FOUND,
+            OpenAIResponsesProfile::Public,
+        ));
     }
 
     #[tokio::test]
