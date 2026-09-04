@@ -1268,13 +1268,15 @@ fn continuation_from_metadata<'a>(
     if object.len() != expected_len
         || object.get("schema_version").and_then(Value::as_u64) != Some(CONTINUATION_SCHEMA_VERSION)
         || object.get("kind").and_then(Value::as_str) != Some(expected_kind)
-        || object.get("model").and_then(Value::as_str) != Some(&*config.model)
         || object.get("session_id").and_then(Value::as_str) != Some(session_id)
     {
         return Err(protocol_error(
             "Responses continuation metadata binding is invalid",
         ));
     }
+    // The originating model is provenance, not a replay boundary. Responses continuation
+    // state can be consumed by another model when the remaining bindings still match.
+    let _originating_model = bounded_metadata_string(object.get("model"), "model")?;
     let metadata_binding = bounded_metadata_string(
         object.get("authentication_binding"),
         "authentication binding",
@@ -3837,7 +3839,7 @@ data: {"type":"response.completed","sequence_number":18,"response":{"id":"resp-1
     }
 
     #[test]
-    fn continuation_is_versioned_bound_and_preserves_function_item_id() {
+    fn continuation_is_versioned_and_replays_reasoning_and_calls_across_models() {
         let mut decoder = ResponsesSseDecoder::new("gpt-test", "session");
         decoder.push(SUCCESS.as_bytes()).unwrap();
         let events = decoder.finish().unwrap();
@@ -3851,14 +3853,23 @@ data: {"type":"response.completed","sequence_number":18,"response":{"id":"resp-1
         assert!(result.output_items.iter().all(|item| item.id.is_some()));
         let mut replay = request();
         replay.transcript = result.output_items.clone();
-        let config =
-            OpenAIResponsesConfig::chatgpt_private("gpt-test", Authentication::bearer("secret"));
+        let config = OpenAIResponsesConfig::chatgpt_private(
+            "gpt-cross-model",
+            Authentication::bearer("secret"),
+        );
         assert!(matches!(
             config.encode_request(&replay),
             Err(OpenAIResponsesError::InvalidRequest(_))
         ));
         let encoded =
             encode_request_bound(&config, &replay, Some("test-authentication-binding")).unwrap();
+        assert_eq!(encoded["model"], "gpt-cross-model");
+        let same_model =
+            OpenAIResponsesConfig::chatgpt_private("gpt-test", Authentication::bearer("secret"));
+        let control =
+            encode_request_bound(&same_model, &replay, Some("test-authentication-binding"))
+                .unwrap();
+        assert_eq!(encoded["input"], control["input"]);
         let input = encoded["input"].as_array().unwrap();
         assert!(
             input
@@ -3899,23 +3910,36 @@ data: {"type":"response.completed","sequence_number":18,"response":{"id":"resp-1
                 && item.get("id") != Some(&json!("call-item"))
         }));
 
-        let mut malformed = replay.clone();
-        let reasoning = malformed
-            .transcript
-            .iter_mut()
-            .flat_map(|item| &mut item.parts)
-            .find_map(|part| match part {
-                Part::Reasoning(reasoning) => Some(reasoning),
-                _ => None,
-            })
-            .unwrap();
-        reasoning
-            .metadata
-            .insert(CONTINUATION_METADATA.into(), json!("malformed"));
-        assert!(matches!(
-            encode_request_bound(&config, &malformed, Some("test-authentication-binding")),
-            Err(OpenAIResponsesError::Protocol(_))
-        ));
+        for (field, value) in [
+            ("", json!("malformed")),
+            ("model", json!(null)),
+            ("model", json!("")),
+            ("model", json!("x".repeat(513))),
+            ("session_id", json!("other-session")),
+            ("kind", json!("function_call")),
+            ("authentication_binding", json!(null)),
+        ] {
+            let mut malformed = replay.clone();
+            let reasoning = malformed
+                .transcript
+                .iter_mut()
+                .flat_map(|item| &mut item.parts)
+                .find_map(|part| match part {
+                    Part::Reasoning(reasoning) => Some(reasoning),
+                    _ => None,
+                })
+                .unwrap();
+            let metadata = reasoning.metadata.get_mut(CONTINUATION_METADATA).unwrap();
+            if field.is_empty() {
+                *metadata = value;
+            } else {
+                metadata[field] = value;
+            }
+            assert!(matches!(
+                encode_request_bound(&config, &malformed, Some("test-authentication-binding")),
+                Err(OpenAIResponsesError::Protocol(_))
+            ));
+        }
     }
 
     #[test]
@@ -4558,7 +4582,7 @@ data: {"type":"response.completed","sequence_number":18,"response":{"id":"resp-1
     }
 
     #[test]
-    fn generated_image_output_is_persisted_and_replayed() {
+    fn generated_image_output_is_persisted_and_replayed_across_models() {
         let wire = concat!(
             "event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":1,\"response\":{\"id\":\"resp-image\",\"model\":\"gpt-test\"}}\n\n",
             "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"sequence_number\":2,\"output_index\":0,\"item\":{\"id\":\"image-1\",\"type\":\"image_generation_call\"}}\n\n",
@@ -4620,8 +4644,10 @@ data: {"type":"response.completed","sequence_number":18,"response":{"id":"resp-1
             transcript: result.output_items.clone(),
             ..request()
         };
-        let config =
-            OpenAIResponsesConfig::chatgpt_private("gpt-test", Authentication::bearer("secret"));
+        let config = OpenAIResponsesConfig::chatgpt_private(
+            "gpt-cross-model",
+            Authentication::bearer("secret"),
+        );
         let encoded =
             encode_request_bound(&config, &replay, Some("test-authentication-binding")).unwrap();
         assert_eq!(encoded["input"][0]["type"], "image_generation_call");
