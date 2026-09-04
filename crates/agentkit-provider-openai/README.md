@@ -130,7 +130,8 @@ metadata, and retry values must agree. It does not perform credential discovery
 or model catalog lookups.
 
 Continuation metadata is versioned and bound to the authentication binding,
-model, session, provider item ID, and item kind. Durable encrypted reasoning,
+session, provider item ID, and item kind. It records the originating model as
+provenance without restricting replay to that model. Durable encrypted reasoning,
 function-call, and generated-image continuation metadata is emitted and replayed
 only when authentication supplies a binding. Valid metadata for another binding
 is omitted safely; malformed metadata is a protocol error. The private profile accepts image/audio transcript inputs and
