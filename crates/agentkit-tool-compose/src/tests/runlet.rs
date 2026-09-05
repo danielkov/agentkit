@@ -465,3 +465,167 @@ async fn prelude_intrinsics_and_folds_run_locally_without_consuming_call_budget(
         other => panic!("unexpected outcome: {other:?}"),
     }
 }
+
+struct TypedFailureTool {
+    spec: ToolSpec,
+    error: ToolError,
+    error_result: bool,
+}
+impl TypedFailureTool {
+    fn new(cancelled: bool) -> Self {
+        let receipt = agentkit_core::failure::HostFatalReceipt {
+            session_id: agentkit_core::failure::HostReceiptId::new("session-1").unwrap(),
+            event_id: agentkit_core::failure::HostReceiptId::new("event-1").unwrap(),
+            storage: agentkit_core::failure::FatalStorage::Unavailable,
+        };
+        Self {
+            spec: ToolSpec::new("typed_failure", "fail natively", json!({"type":"object"})),
+            error: ToolError::diagnostic(agentkit_tools_core::DiagnosticToolFailure {
+                kind: if cancelled {
+                    agentkit_tools_core::DiagnosticFailureKind::Cancelled
+                } else {
+                    agentkit_tools_core::DiagnosticFailureKind::ExecutionFailed
+                },
+                metadata: agentkit_core::failure::FailureMetadataV1::default()
+                    .with_receipt(receipt),
+            }),
+            error_result: false,
+        }
+    }
+}
+#[async_trait::async_trait]
+impl Tool for TypedFailureTool {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+    async fn invoke(
+        &self,
+        request: ToolRequest,
+        _ctx: &mut ToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
+        if self.error_result {
+            let mut result = ToolResultPart::success(
+                request.call_id,
+                ToolOutput::Text("PRIVATE error output".into()),
+            );
+            result.is_error = true;
+            Ok(ToolResult::new(result))
+        } else {
+            Err(self.error.clone())
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn runlet_native_failure_and_explicit_rethrow_retain_exact_metadata() {
+    for cancelled in [false, true] {
+        for script in [
+            "return typed_failure({})",
+            "return boundary { return typed_failure({}) } catch err { return fail(err.code, err.message, {agentkit_failure_token: err.agentkit_failure_token}) }",
+            "return boundary { return typed_failure({}) } catch err { return fail(err.code, err.message, err) }",
+        ] {
+            let tool = TypedFailureTool::new(cancelled);
+            let expected = tool.error.clone();
+            let result =
+                execute_compose(ComposeConfig::default(), tool, request(script, json!(null))).await;
+            assert_eq!(result, ToolExecutionOutcome::Failed(expected), "{script}");
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn runlet_transformation_and_fake_host_codes_do_not_resurrect_native_metadata() {
+    for script in [
+        "return boundary { return typed_failure({}) } catch err { return fail(err.code, err.message) }",
+        "return boundary { return typed_failure({}) } catch err { return fail(\"HOST_FAILURE_0\", err.message) }",
+        "return boundary { return typed_failure({}) } catch err { return fail(\"REPLACED\", err.message, err) }",
+    ] {
+        let result = execute_compose(
+            ComposeConfig::default(),
+            TypedFailureTool::new(true),
+            request(script, json!(null)),
+        )
+        .await;
+        let ToolExecutionOutcome::Failed(error) = result else {
+            panic!("{result:?}")
+        };
+        assert!(
+            matches!(error, ToolError::ExecutionFailed(_)),
+            "{script}: {error:?}"
+        );
+        assert!(!error.is_cancelled());
+        assert!(error.failure_metadata().is_none());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn runlet_catch_sees_closed_facts_and_can_explicitly_recover() {
+    let tool = TypedFailureTool::new(false);
+    let expected = serde_json::to_value(tool.error.failure_info()).unwrap();
+    let result = execute_compose(ComposeConfig::default(), tool, request("return boundary { return typed_failure({}) } catch err { return err.agentkit_failure }", json!(null))).await;
+    let ToolExecutionOutcome::Completed(result) = result else {
+        panic!("{result:?}")
+    };
+    assert_eq!(
+        crate::tool_output_to_json(result.result.output).unwrap(),
+        expected
+    );
+    assert!(!result.result.is_error);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn runlet_does_not_accept_error_shaped_completed_child_as_success() {
+    let mut tool = TypedFailureTool::new(false);
+    tool.error_result = true;
+    let result = execute_compose(
+        ComposeConfig::default(),
+        tool,
+        request("return typed_failure({})", json!(null)),
+    )
+    .await;
+    let ToolExecutionOutcome::Failed(error) = result else {
+        panic!("{result:?}")
+    };
+    assert!(!error.to_string().contains("PRIVATE"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unrepresentable_native_facts_fail_closed_even_when_caught() {
+    for seconds in [false, true] {
+        let mut tool = TypedFailureTool::new(false);
+        let ToolError::Diagnostic(failure) = &mut tool.error else {
+            panic!()
+        };
+        failure.metadata = failure
+            .metadata
+            .clone()
+            .with_retry(agentkit_core::retry::ProviderFailure {
+                route: agentkit_core::retry::ProviderRoute::Unknown,
+                reason: agentkit_core::retry::ProviderFailureReason::Cancelled,
+                last_attempt_reason: None,
+                upstream: agentkit_core::retry::ProviderClassification::default(),
+                accounting: agentkit_core::retry::RetryAccounting {
+                    attempts: if seconds { 1 } else { i64::MAX as u64 + 1 },
+                    elapsed: if seconds {
+                        std::time::Duration::MAX
+                    } else {
+                        std::time::Duration::ZERO
+                    },
+                    completed_backoff: std::time::Duration::ZERO,
+                },
+            })
+            .unwrap();
+        let result = execute_compose(
+            ComposeConfig::default(),
+            tool,
+            request(
+                "return boundary { return typed_failure({}) } catch err { return true }",
+                json!(null),
+            ),
+        )
+        .await;
+        assert!(
+            matches!(result, ToolExecutionOutcome::Failed(ToolError::Internal(message)) if message == "compose failure facts exceed Runlet integer range")
+        );
+    }
+}

@@ -331,6 +331,13 @@ impl ChildDispatcher {
 
         match outcome {
             ToolExecutionOutcome::Completed(result) => {
+                // Error-shaped legacy results are not successful compose values
+                // and must not enter the successful child replay cache.
+                if result.result.is_error {
+                    return Err(DispatchError::Failed(ToolError::ExecutionFailed(
+                        "nested tool returned an error result".into(),
+                    )));
+                }
                 let output =
                     tool_output_to_json(result.result.output).map_err(DispatchError::Failed)?;
                 {

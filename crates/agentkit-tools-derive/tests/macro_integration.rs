@@ -55,6 +55,7 @@ fn build_request(tool_name: &str, input: serde_json::Value) -> ToolRequest {
 
 fn ctx() -> OwnedToolContext {
     OwnedToolContext {
+        failure_observer: None,
         session_id: SessionId::new("s"),
         turn_id: TurnId::new("t"),
         metadata: MetadataMap::new(),

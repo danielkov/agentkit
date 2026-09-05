@@ -385,6 +385,7 @@ async fn tool_adapter_propagates_call_through_running_service() {
 
     let metadata = MetadataMap::new();
     let mut ctx = ToolContext {
+        failure_observer: None,
         capability: CapabilityContext {
             session_id: None,
             turn_id: None,
@@ -431,6 +432,7 @@ async fn tool_adapter_error_responder_receives_typed_invocation_error() {
     let adapter = McpToolAdapter::new(&server_id, connection.clone(), descriptor);
     let metadata = MetadataMap::new();
     let mut ctx = ToolContext {
+        failure_observer: None,
         capability: CapabilityContext {
             session_id: None,
             turn_id: None,

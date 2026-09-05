@@ -154,6 +154,7 @@ pub(crate) fn owned_context(
         cancellation: None,
     };
     agentkit_tools_core::OwnedToolContext {
+        failure_observer: None,
         session_id,
         turn_id,
         metadata,
@@ -660,3 +661,53 @@ fn type_notation_renders_json_schema_compactly() {
 
 #[cfg(feature = "runlet")]
 mod runlet;
+
+#[cfg(feature = "lua")]
+#[tokio::test]
+async fn lua_native_diagnostic_rethrow_preserves_kind_and_metadata() {
+    struct NativeFailure(ToolSpec, ToolError);
+    #[async_trait]
+    impl Tool for NativeFailure {
+        fn spec(&self) -> &ToolSpec {
+            &self.0
+        }
+        async fn invoke(
+            &self,
+            _: ToolRequest,
+            _: &mut ToolContext<'_>,
+        ) -> Result<ToolResult, ToolError> {
+            Err(self.1.clone())
+        }
+    }
+    for (script, preserve) in [
+        ("return tool('typed_failure', {})", true),
+        (
+            "local ok, err = pcall(function() return tool('typed_failure', {}) end); error(err)",
+            true,
+        ),
+        (
+            "local ok, err = pcall(function() return tool('typed_failure', {}) end); error(tostring(err))",
+            false,
+        ),
+    ] {
+        let error = ToolError::diagnostic(agentkit_tools_core::DiagnosticToolFailure {
+            kind: agentkit_tools_core::DiagnosticFailureKind::Cancelled,
+            metadata: agentkit_core::failure::FailureMetadataV1::default(),
+        });
+        let tool = NativeFailure(
+            ToolSpec::new("typed_failure", "fail", json!({"type":"object"})),
+            error.clone(),
+        );
+        let outcome =
+            execute_compose(ComposeConfig::default(), tool, request(script, json!(null))).await;
+        let ToolExecutionOutcome::Failed(actual) = outcome else {
+            panic!("{outcome:?}")
+        };
+        if preserve {
+            assert_eq!(actual, error);
+        } else {
+            assert!(actual.failure_metadata().is_none());
+            assert!(!actual.is_cancelled());
+        }
+    }
+}

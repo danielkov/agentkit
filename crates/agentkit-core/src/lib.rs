@@ -32,6 +32,9 @@
 //! assert_eq!(transcript[0].kind, ItemKind::System);
 //! ```
 
+pub mod failure;
+pub mod retry;
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;

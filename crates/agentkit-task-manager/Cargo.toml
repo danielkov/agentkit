@@ -16,5 +16,4 @@ async-trait.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync", "time"] }
 
-[dev-dependencies]
 serde_json.workspace = true

@@ -126,7 +126,11 @@ SessionRecording(
                             call_id: ToolCallId("call-fail"),
                             output: Text("tool execution failed: kaboom"),
                             is_error: true,
-                            metadata: {},
+                            metadata: {
+                                "agentkit.tool.failure": {
+                                    "kind": "execution_failed",
+                                },
+                            },
                         )),
                     ],
                     metadata: {},
@@ -219,7 +223,11 @@ SessionRecording(
                     call_id: ToolCallId("call-fail"),
                     output: Text("tool execution failed: kaboom"),
                     is_error: true,
-                    metadata: {},
+                    metadata: {
+                        "agentkit.tool.failure": {
+                            "kind": "execution_failed",
+                        },
+                    },
                 )),
             ],
             metadata: {},

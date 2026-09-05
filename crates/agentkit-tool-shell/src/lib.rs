@@ -342,6 +342,7 @@ mod tests {
         let executor = BasicToolExecutor::from_registry(registry());
         let metadata = MetadataMap::new();
         let mut ctx = ToolContext {
+            failure_observer: None,
             capability: CapabilityContext {
                 session_id: Some(&SessionId::new("session-1")),
                 turn_id: Some(&TurnId::new("turn-1")),
@@ -389,6 +390,7 @@ mod tests {
         let executor = BasicToolExecutor::from_registry(registry());
         let metadata = MetadataMap::new();
         let mut ctx = ToolContext {
+            failure_observer: None,
             capability: CapabilityContext {
                 session_id: Some(&SessionId::new("session-1")),
                 turn_id: Some(&TurnId::new("turn-1")),

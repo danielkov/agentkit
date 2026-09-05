@@ -1495,6 +1495,7 @@ mod tests {
         resources: &'a dyn ToolResources,
     ) -> ToolContext<'a> {
         ToolContext {
+            failure_observer: None,
             capability: CapabilityContext {
                 session_id: Some(session_id),
                 turn_id: Some(turn_id),

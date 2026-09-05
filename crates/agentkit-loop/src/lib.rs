@@ -1797,6 +1797,7 @@ where
                                 cancellation: cancellation.clone(),
                             };
                             OwnedToolContext {
+                                failure_observer: None,
                                 session_id,
                                 turn_id,
                                 metadata,
@@ -2600,33 +2601,46 @@ where
                 let outcome = match start {
                     Ok(outcome) => outcome,
                     Err(error) => {
-                        self.append_tool_result_item(Item {
-                            id: None,
-                            kind: ItemKind::Tool,
-                            parts: vec![Part::ToolResult(ToolResultPart {
-                                call_id: pending.call.id.clone(),
-                                output: ToolOutput::Text(format!(
-                                    "approved task failed to start: {error}"
-                                )),
-                                is_error: true,
-                                metadata: pending.call.metadata.clone(),
-                            })],
-                            metadata: MetadataMap::new(),
-                            usage: None,
-                            finish_reason: None,
-                            created_at: None,
-                        });
-                        let turn_id = pending.tool_request.turn_id.clone();
-                        if let Err(cleanup_error) =
-                            self.task_manager.on_turn_interrupted(&turn_id).await
+                        if let Some(resolution) = self
+                            .task_manager
+                            .take_terminal_task_result(&pending.task_id)
+                            .await
+                            .map_err(|error| {
+                                LoopError::Tool(ToolError::Internal(error.to_string()))
+                            })?
                         {
-                            tracing::debug!(
-                                %cleanup_error,
-                                %turn_id,
-                                "failed to clean up turn after approved task start error"
-                            );
+                            TaskStartOutcome::Ready(Box::new(resolution))
+                        } else {
+                            self.append_tool_result_item(Item {
+                                id: None,
+                                kind: ItemKind::Tool,
+                                parts: vec![Part::ToolResult(ToolResultPart {
+                                    call_id: pending.call.id.clone(),
+                                    output: ToolOutput::Text(format!(
+                                        "approved task failed to start: {error}"
+                                    )),
+                                    is_error: true,
+                                    metadata: untrusted_call_metadata(
+                                        pending.call.metadata.clone(),
+                                    ),
+                                })],
+                                metadata: MetadataMap::new(),
+                                usage: None,
+                                finish_reason: None,
+                                created_at: None,
+                            });
+                            let turn_id = pending.tool_request.turn_id.clone();
+                            if let Err(cleanup_error) =
+                                self.task_manager.on_turn_interrupted(&turn_id).await
+                            {
+                                tracing::debug!(
+                                    %cleanup_error,
+                                    %turn_id,
+                                    "failed to clean up turn after approved task start error"
+                                );
+                            }
+                            return Err(error);
                         }
-                        return Err(error);
                     }
                 };
                 match outcome {
@@ -2665,22 +2679,47 @@ where
                 }
             }
             ApprovalDecision::Deny { reason } => {
-                self.append_tool_result_item(Item {
-                    id: None,
-                    kind: ItemKind::Tool,
-                    parts: vec![Part::ToolResult(ToolResultPart {
-                        call_id: pending.call.id.clone(),
-                        output: ToolOutput::Text(
-                            reason.unwrap_or_else(|| "approval denied".into()),
-                        ),
-                        is_error: true,
-                        metadata: pending.call.metadata.clone(),
-                    })],
-                    metadata: MetadataMap::new(),
-                    usage: None,
-                    finish_reason: None,
-                    created_at: None,
-                });
+                let reason = reason.unwrap_or_else(|| "approval denied".into());
+                let selected = self
+                    .task_manager
+                    .close_suspended_task(
+                        &pending.task_id,
+                        &pending.request.id,
+                        ToolError::ExecutionFailed(reason.clone()),
+                    )
+                    .await
+                    .map_err(|error| LoopError::Tool(ToolError::Internal(error.to_string())))?;
+                if let Some(TaskResolution::Item(mut item)) = selected {
+                    // Keep the existing denial text while retaining typed facts.
+                    for part in &mut item.parts {
+                        if let Part::ToolResult(result) = part
+                            && agentkit_task_manager::tool_failure_info(result)
+                                .ok()
+                                .flatten()
+                                .is_some_and(|info| {
+                                    info.kind != agentkit_tools_core::ToolFailureKind::Cancelled
+                                })
+                        {
+                            result.output = ToolOutput::Text(reason.clone());
+                        }
+                    }
+                    self.append_tool_result_item(item);
+                } else {
+                    self.append_tool_result_item(Item {
+                        id: None,
+                        kind: ItemKind::Tool,
+                        parts: vec![Part::ToolResult(ToolResultPart {
+                            call_id: pending.call.id.clone(),
+                            output: ToolOutput::Text(reason),
+                            is_error: true,
+                            metadata: untrusted_call_metadata(pending.call.metadata.clone()),
+                        })],
+                        metadata: MetadataMap::new(),
+                        usage: None,
+                        finish_reason: None,
+                        created_at: None,
+                    });
+                }
             }
         }
 
@@ -2846,14 +2885,34 @@ where
     ///
     /// This clears the blocking approval and appends an error tool result so
     /// the transcript remains provider-valid if the host continues the turn.
-    pub fn cancel_pending_approval_for(&mut self, call_id: ToolCallId) -> Result<(), LoopError> {
-        let Some(pending) = self.drain_pending_approval_for(&call_id) else {
+    pub async fn cancel_pending_approval_for(
+        &mut self,
+        call_id: ToolCallId,
+    ) -> Result<(), LoopError> {
+        let Some(pending) = self.pending_approvals.get(&call_id).cloned() else {
             return Err(LoopError::InvalidState(format!(
                 "no approval request is pending for call {}",
                 call_id.0
             )));
         };
+        let selected = self
+            .task_manager
+            .close_suspended_task(&pending.task_id, &pending.request.id, ToolError::Cancelled)
+            .await
+            .map_err(|error| LoopError::Tool(ToolError::Internal(error.to_string())))?;
+        let pending = self
+            .drain_pending_approval_for(&call_id)
+            .expect("pending approval retained across closure");
         let turn_id = pending.presentation_turn_id.clone();
+        if let Some(TaskResolution::Item(mut item)) = selected {
+            item.metadata.extend(interrupted_metadata("tool"));
+            for part in &mut item.parts {
+                if let Part::ToolResult(result) = part {
+                    result.metadata.extend(interrupted_metadata("tool"));
+                }
+            }
+            self.append_tool_result_item(item);
+        }
         self.reject_drained_approvals(vec![pending]);
         if self.pending_approvals.is_empty() && self.active_tool_round.is_none() {
             let _ = self.finish_cancelled(turn_id, Vec::new())?;
@@ -3205,10 +3264,62 @@ where
         pending
     }
 
+    fn collect_interrupted_task_updates(&mut self, extra_call_ids: &[ToolCallId]) {
+        let mut call_ids: Vec<_> = unanswered_tool_calls(&self.transcript)
+            .into_iter()
+            .map(|call| call.id)
+            .collect();
+        call_ids.extend_from_slice(extra_call_ids);
+        for update in self
+            .task_manager
+            .take_interrupted_task_updates(&self.session_id, &call_ids)
+        {
+            match update {
+                TurnTaskUpdate::Detached(snapshot) => {
+                    self.append_detach_placeholder(snapshot.call_id, &snapshot.tool_name)
+                }
+                TurnTaskUpdate::Resolution(resolution) => {
+                    if let TaskResolution::Item(mut item) = *resolution {
+                        let mut cancelled = false;
+                        for part in &mut item.parts {
+                            if let Part::ToolResult(result) = part
+                                && agentkit_task_manager::tool_failure_info(result)
+                                    .ok()
+                                    .flatten()
+                                    .is_some_and(|failure| {
+                                        failure.kind
+                                            == agentkit_tools_core::ToolFailureKind::Cancelled
+                                    })
+                            {
+                                result.metadata.extend(interrupted_metadata("tool"));
+                                cancelled = true;
+                            }
+                        }
+                        if cancelled {
+                            item.metadata.extend(interrupted_metadata("tool"));
+                        }
+                        self.append_tool_result_item(item);
+                    }
+                }
+            }
+        }
+    }
+
     fn reject_drained_approvals(&mut self, pending: Vec<PendingApprovalToolCall>) {
+        let call_ids: Vec<_> = pending
+            .iter()
+            .map(|pending| pending.call.id.clone())
+            .collect();
+        self.collect_interrupted_task_updates(&call_ids);
         for pending in pending {
             self.emit(AgentEvent::ApprovalResolved { approved: false });
-            self.append_tool_result_item(cancelled_approval_item(pending));
+            if self.background_call_ids.contains(&pending.call.id)
+                || unanswered_tool_calls(&self.transcript)
+                    .iter()
+                    .any(|call| call.id == pending.call.id)
+            {
+                self.append_tool_result_item(cancelled_approval_item(pending));
+            }
         }
     }
 
@@ -3229,6 +3340,7 @@ where
     /// are converted to notifications; calls that never started or were
     /// cancelled in the foreground are not retained as detached work.
     fn close_interrupted_tool_calls(&mut self) {
+        self.collect_interrupted_task_updates(&[]);
         for call in unanswered_tool_calls(&self.transcript) {
             let call_id = call.id.clone();
             let completes_in_background = self.background_call_ids.contains(&call_id);
@@ -4191,6 +4303,19 @@ fn interrupted_tool_result_item(call: ToolCallPart) -> Item {
     }
 }
 
+// Synthesized fallback results have no host-observed diagnostic facts.
+fn untrusted_call_metadata(mut metadata: MetadataMap) -> MetadataMap {
+    for key in [
+        agentkit_task_manager::TOOL_RESULT_FAILURE_METADATA_KEY,
+        agentkit_task_manager::TOOL_RESULT_FAILURE_OBSERVATIONS_METADATA_KEY,
+        agentkit_task_manager::TOOL_RESULT_FAILURE_KIND_METADATA_KEY,
+        agentkit_task_manager::TOOL_RESULT_NOT_STARTED_METADATA_KEY,
+    ] {
+        metadata.remove(key);
+    }
+    metadata
+}
+
 fn cancelled_approval_item(pending: PendingApprovalToolCall) -> Item {
     Item {
         id: None,
@@ -4199,7 +4324,7 @@ fn cancelled_approval_item(pending: PendingApprovalToolCall) -> Item {
             call_id: pending.call.id,
             output: ToolOutput::Text("approval cancelled".into()),
             is_error: true,
-            metadata: pending.call.metadata,
+            metadata: untrusted_call_metadata(pending.call.metadata),
         })],
         metadata: MetadataMap::new(),
         usage: None,
@@ -4372,6 +4497,7 @@ fn validate_transcript_invariants(transcript: &[Item]) -> Result<(), LoopError> 
 
 #[cfg(test)]
 mod tests {
+    mod failure_transport_tests;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc as StdArc, Mutex as StdMutex};
@@ -4536,6 +4662,33 @@ mod tests {
                 return Err(TaskManagerError::Internal(message.into()));
             }
             self.inner.on_turn_interrupted(turn_id).await
+        }
+
+        fn take_interrupted_task_updates(
+            &self,
+            session_id: &SessionId,
+            call_ids: &[ToolCallId],
+        ) -> Vec<TurnTaskUpdate> {
+            self.inner
+                .take_interrupted_task_updates(session_id, call_ids)
+        }
+
+        async fn take_terminal_task_result(
+            &self,
+            task_id: &TaskId,
+        ) -> Result<Option<TaskResolution>, TaskManagerError> {
+            self.inner.take_terminal_task_result(task_id).await
+        }
+
+        async fn close_suspended_task(
+            &self,
+            task_id: &TaskId,
+            approval_id: &agentkit_core::ApprovalId,
+            error: ToolError,
+        ) -> Result<Option<TaskResolution>, TaskManagerError> {
+            self.inner
+                .close_suspended_task(task_id, approval_id, error)
+                .await
         }
 
         fn handle(&self) -> TaskManagerHandle {
@@ -5703,7 +5856,9 @@ mod tests {
 
     async fn wait_until_completed(handle: &TaskManagerHandle) {
         timeout(Duration::from_secs(1), async {
-            while handle.list_completed().await.is_empty() {
+            while handle.list_completed().await.is_empty()
+                && handle.list_suspended().await.is_empty()
+            {
                 tokio::task::yield_now().await;
             }
         })
@@ -7942,7 +8097,7 @@ mod tests {
             }
             other => panic!("unexpected loop step: {other:?}"),
         };
-        driver.cancel_pending_approval_for(call_id).unwrap();
+        driver.cancel_pending_approval_for(call_id).await.unwrap();
 
         assert!(driver.lifecycle.active_turn.is_none());
         assert!(driver.pending_approvals.is_empty());
