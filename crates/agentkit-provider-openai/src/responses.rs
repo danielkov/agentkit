@@ -1774,6 +1774,12 @@ async fn send_live_attempt(
 ) -> Result<LiveAttempt, AttemptFailure> {
     deadline_remaining(context.deadline.as_ref())
         .map_err(|error| nonretryable(http_loop_error(error)))?;
+    // The transport-neutral request builder only stores the URL string. Reject
+    // local endpoint errors before they become counted, retryable transport errors.
+    reqwest::Url::parse(&context.config.endpoint)
+        .ok()
+        .filter(|url| matches!(url.scheme(), "http" | "https") && url.has_host())
+        .ok_or_else(|| nonretryable(local_error(ProviderFailureReason::InvalidRequest)))?;
     let mut headers = context.config.headers.clone();
     headers.insert("accept", HeaderValue::from_static("text/event-stream"));
     headers.insert("content-type", HeaderValue::from_static("application/json"));
@@ -1800,7 +1806,7 @@ async fn send_live_attempt(
         headers.insert(
             "originator",
             HeaderValue::from_str(originator)
-                .map_err(|_| protocol_failure("invalid originator header"))?,
+                .map_err(|_| nonretryable(local_error(ProviderFailureReason::InvalidRequest)))?,
         );
     }
     let sent_turn_state = if context.config.profile == OpenAIResponsesProfile::ChatGptPrivate {
@@ -1810,7 +1816,7 @@ async fn send_live_attempt(
             .or_insert(HeaderValue::from_static("agentkit"));
         headers.entry("session-id").or_insert(
             HeaderValue::from_str(&context.session_id)
-                .map_err(|_| protocol_failure("invalid session ID header"))?,
+                .map_err(|_| nonretryable(local_error(ProviderFailureReason::InvalidRequest)))?,
         );
         let state = context
             .turn_state

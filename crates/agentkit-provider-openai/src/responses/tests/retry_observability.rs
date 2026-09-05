@@ -778,3 +778,99 @@ async fn ready_finished_event_loses_to_an_expired_logical_deadline() {
         [ProviderRetryEvent::Stopped(_)]
     ));
 }
+
+struct CountedReqwest {
+    client: reqwest::Client,
+    executions: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl HttpClient for CountedReqwest {
+    async fn execute(&self, request: HttpRequest) -> Result<HttpResponse, HttpError> {
+        self.executions.fetch_add(1, Ordering::SeqCst);
+        HttpClient::execute(&self.client, request).await
+    }
+}
+
+#[tokio::test]
+async fn invalid_endpoint_preflight_never_executes_or_retries_real_transport() {
+    // Each endpoint is also rejected locally by reqwest if adapter preflight
+    // regresses. The real transport cannot dispatch a network request here.
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    for endpoint in [
+        "SECRET-ENDPOINT not a URL",
+        "https://",
+        "http://127.0.0.1:SECRET-ENDPOINT",
+        "file:///SECRET-ENDPOINT",
+        "ftp://127.0.0.1/SECRET-ENDPOINT",
+    ] {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let adapter = OpenAIResponsesAdapter::with_client(
+            OpenAIResponsesConfig::new("SECRET-CREDENTIAL", "gpt-test")
+                .with_endpoint(endpoint)
+                .with_resilience(policy(2)),
+            Http::new(CountedReqwest {
+                client: client.clone(),
+                executions: executions.clone(),
+            }),
+        );
+        let mut session = adapter
+            .start_session(SessionConfig::new("session"))
+            .await
+            .unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let capture = events.clone();
+        session.set_retry_observer(Some(Arc::new(move |event| {
+            capture.lock().unwrap().push(event)
+        })));
+        let error = match session.begin_turn(request(), None).await {
+            Err(error) => error,
+            Ok(_) => panic!("invalid endpoint accepted"),
+        };
+        let failure = error.provider_failure().unwrap();
+        assert_eq!(failure.reason, ProviderFailureReason::InvalidRequest);
+        assert_eq!(failure.last_attempt_reason, None);
+        assert_eq!(failure.upstream, ProviderClassification::default());
+        assert_eq!(failure.accounting.attempts, 0);
+        assert_eq!(failure.accounting.completed_backoff, Duration::ZERO);
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+        let events = events.lock().unwrap();
+        assert_eq!(*events, vec![ProviderRetryEvent::Stopped(*failure)]);
+        let rendered = format!(
+            "{error:?} {error} {}",
+            serde_json::to_string(&*events).unwrap()
+        );
+        assert!(!rendered.contains("SECRET"));
+    }
+}
+
+#[tokio::test]
+async fn invalid_local_headers_preflight_have_zero_attempts_and_no_retry() {
+    for invalid_session in [false, true] {
+        let invalid = format!("SECRET-HEADER{}", char::from(10));
+        let mut config = OpenAIResponsesConfig::chatgpt_private("gpt-test", "SECRET-CREDENTIAL")
+            .with_resilience(policy(2));
+        let mut request = request();
+        if invalid_session {
+            request.session_id = SessionId::new(invalid);
+        } else {
+            config = config.with_originator(invalid);
+        }
+        let (mut session, events, client) = observed(config, vec![]).await;
+        let error = match session.begin_turn(request, None).await {
+            Err(error) => error,
+            Ok(_) => panic!("invalid local header accepted"),
+        };
+        let failure = error.provider_failure().unwrap();
+        assert_eq!(failure.reason, ProviderFailureReason::InvalidRequest);
+        assert_eq!(failure.accounting.attempts, 0);
+        assert_eq!(failure.accounting.completed_backoff, Duration::ZERO);
+        assert_eq!(failure.last_attempt_reason, None);
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![ProviderRetryEvent::Stopped(*failure)]
+        );
+        assert!(client.requests.lock().unwrap().is_empty());
+        assert!(!format!("{error:?} {error}").contains("SECRET"));
+    }
+}

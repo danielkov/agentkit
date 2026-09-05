@@ -102,7 +102,9 @@ Direct adapter consumers can call `ModelSession::set_retry_observer` before
 
 `RetryAccounting::attempts` counts polled HTTP client executions, including a
 resend after reactive authentication refresh, not policy retries plus one.
-Initial authentication and preflight failures can have zero attempts.
+Initial authentication and preflight failures can have zero attempts. Malformed
+endpoints, non-HTTP(S) endpoints, and invalid local attribution headers are
+rejected as `InvalidRequest` before transport execution, without retrying.
 `completed_backoff` sums the requested durations of fully completed waits;
 interrupted waits contribute zero, while earlier completed waits remain counted.
 `elapsed` measures monotonic time from before authentication and includes
