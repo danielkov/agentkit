@@ -2601,33 +2601,46 @@ where
                 let outcome = match start {
                     Ok(outcome) => outcome,
                     Err(error) => {
-                        self.append_tool_result_item(Item {
-                            id: None,
-                            kind: ItemKind::Tool,
-                            parts: vec![Part::ToolResult(ToolResultPart {
-                                call_id: pending.call.id.clone(),
-                                output: ToolOutput::Text(format!(
-                                    "approved task failed to start: {error}"
-                                )),
-                                is_error: true,
-                                metadata: pending.call.metadata.clone(),
-                            })],
-                            metadata: MetadataMap::new(),
-                            usage: None,
-                            finish_reason: None,
-                            created_at: None,
-                        });
-                        let turn_id = pending.tool_request.turn_id.clone();
-                        if let Err(cleanup_error) =
-                            self.task_manager.on_turn_interrupted(&turn_id).await
+                        if let Some(resolution) = self
+                            .task_manager
+                            .take_terminal_task_result(&pending.task_id)
+                            .await
+                            .map_err(|error| {
+                                LoopError::Tool(ToolError::Internal(error.to_string()))
+                            })?
                         {
-                            tracing::debug!(
-                                %cleanup_error,
-                                %turn_id,
-                                "failed to clean up turn after approved task start error"
-                            );
+                            TaskStartOutcome::Ready(Box::new(resolution))
+                        } else {
+                            self.append_tool_result_item(Item {
+                                id: None,
+                                kind: ItemKind::Tool,
+                                parts: vec![Part::ToolResult(ToolResultPart {
+                                    call_id: pending.call.id.clone(),
+                                    output: ToolOutput::Text(format!(
+                                        "approved task failed to start: {error}"
+                                    )),
+                                    is_error: true,
+                                    metadata: untrusted_call_metadata(
+                                        pending.call.metadata.clone(),
+                                    ),
+                                })],
+                                metadata: MetadataMap::new(),
+                                usage: None,
+                                finish_reason: None,
+                                created_at: None,
+                            });
+                            let turn_id = pending.tool_request.turn_id.clone();
+                            if let Err(cleanup_error) =
+                                self.task_manager.on_turn_interrupted(&turn_id).await
+                            {
+                                tracing::debug!(
+                                    %cleanup_error,
+                                    %turn_id,
+                                    "failed to clean up turn after approved task start error"
+                                );
+                            }
+                            return Err(error);
                         }
-                        return Err(error);
                     }
                 };
                 match outcome {
@@ -4658,6 +4671,13 @@ mod tests {
         ) -> Vec<TurnTaskUpdate> {
             self.inner
                 .take_interrupted_task_updates(session_id, call_ids)
+        }
+
+        async fn take_terminal_task_result(
+            &self,
+            task_id: &TaskId,
+        ) -> Result<Option<TaskResolution>, TaskManagerError> {
+            self.inner.take_terminal_task_result(task_id).await
         }
 
         async fn close_suspended_task(

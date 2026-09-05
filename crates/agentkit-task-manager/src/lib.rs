@@ -303,6 +303,16 @@ pub trait TaskManager: Send + Sync {
         Vec::new()
     }
 
+    /// Transfer an already-selected terminal result for a failed continuation.
+    /// This never closes a live or suspended task. Retained-task wrappers must
+    /// delegate it so approval cannot replace a winning cancellation.
+    async fn take_terminal_task_result(
+        &self,
+        _task_id: &TaskId,
+    ) -> Result<Option<TaskResolution>, TaskManagerError> {
+        Ok(None)
+    }
+
     /// Terminalize an approval already delivered to the caller and transfer its
     /// frozen result directly, without enqueuing a second delivery. Wrappers
     /// must delegate this method alongside interruption and its scoped drain.
@@ -627,6 +637,25 @@ impl TaskManager for SimpleTaskManager {
         call_ids: &[ToolCallId],
     ) -> Vec<TurnTaskUpdate> {
         drain_interrupted_updates(&self.state.interrupted_updates, session_id, call_ids)
+    }
+
+    async fn take_terminal_task_result(
+        &self,
+        task_id: &TaskId,
+    ) -> Result<Option<TaskResolution>, TaskManagerError> {
+        let tasks = self
+            .state
+            .tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if tasks.get(task_id).is_some_and(|record| record.completed) {
+            Ok(take_interrupted_resolution(
+                &self.state.interrupted_updates,
+                task_id,
+            ))
+        } else {
+            Ok(None)
+        }
     }
 
     async fn close_suspended_task(
@@ -1018,6 +1047,44 @@ struct AsyncInner {
 }
 
 impl AsyncInner {
+    fn take_terminal_result(
+        &self,
+        state: &mut AsyncState,
+        task_id: &TaskId,
+    ) -> Result<Option<TaskResolution>, TaskManagerError> {
+        if !state
+            .tasks
+            .get(task_id)
+            .is_some_and(|record| record.completed)
+        {
+            return Ok(None);
+        }
+        let turn_id = state.tasks[task_id].snapshot.turn_id.clone();
+        if let Some(queue) = state.per_turn_updates.get_mut(&turn_id)
+            && let Some(index) = queue.iter().position(|entry| {
+                &entry.task_id == task_id && matches!(&entry.update, TurnTaskUpdate::Resolution(_))
+            })
+            && let Some(entry) = queue.remove(index)
+            && let TurnTaskUpdate::Resolution(resolution) = entry.update
+        {
+            return Ok(Some(*resolution));
+        }
+        if let Some(index) = state
+            .pending_loop_updates
+            .iter()
+            .position(|(id, _)| id == task_id)
+        {
+            return Ok(state
+                .pending_loop_updates
+                .remove(index)
+                .map(|(_, resolution)| resolution));
+        }
+        Ok(take_interrupted_resolution(
+            &self.interrupted_updates,
+            task_id,
+        ))
+    }
+
     async fn next_task_id(&self) -> TaskId {
         let mut state = self.state.lock().await;
         state.next_task_index += 1;
@@ -1524,6 +1591,14 @@ impl TaskManager for AsyncTaskManager {
         drain_interrupted_updates(&self.inner.interrupted_updates, session_id, call_ids)
     }
 
+    async fn take_terminal_task_result(
+        &self,
+        task_id: &TaskId,
+    ) -> Result<Option<TaskResolution>, TaskManagerError> {
+        let mut state = self.inner.state.lock().await;
+        self.inner.take_terminal_result(&mut state, task_id)
+    }
+
     async fn close_suspended_task(
         &self,
         task_id: &TaskId,
@@ -1536,31 +1611,7 @@ impl TaskManager for AsyncTaskManager {
             .get_mut(task_id)
             .ok_or_else(|| TaskManagerError::NotFound(task_id.clone()))?;
         if record.completed {
-            let turn_id = record.snapshot.turn_id.clone();
-            if let Some(queue) = state.per_turn_updates.get_mut(&turn_id)
-                && let Some(index) = queue.iter().position(|entry| {
-                    &entry.task_id == task_id
-                        && matches!(&entry.update, TurnTaskUpdate::Resolution(_))
-                })
-                && let Some(entry) = queue.remove(index)
-                && let TurnTaskUpdate::Resolution(resolution) = entry.update
-            {
-                return Ok(Some(*resolution));
-            }
-            if let Some(index) = state
-                .pending_loop_updates
-                .iter()
-                .position(|(id, _)| id == task_id)
-            {
-                return Ok(state
-                    .pending_loop_updates
-                    .remove(index)
-                    .map(|(_, resolution)| resolution));
-            }
-            return Ok(take_interrupted_resolution(
-                &self.inner.interrupted_updates,
-                task_id,
-            ));
+            return self.inner.take_terminal_result(&mut state, task_id);
         }
         let result = close_suspended_record(record, approval_id, &error)?;
         if result.is_some() {

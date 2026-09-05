@@ -313,7 +313,7 @@ async fn real_loop_pending_approval_cancel_prefers_frozen_facts_over_synthetic_r
 #[tokio::test]
 async fn individual_approval_closure_terminalizes_manager_and_preserves_facts() {
     for inline in [false, true] {
-        for mode in ["cancel", "deny", "cancel_won"] {
+        for mode in ["cancel", "deny", "cancel_won", "approve_after_cancel"] {
             let manager: Arc<dyn TaskManager> = if inline {
                 Arc::new(agentkit_task_manager::SimpleTaskManager::new())
             } else {
@@ -342,7 +342,17 @@ async fn individual_approval_closure_terminalizes_manager_and_preserves_facts() 
             };
             let suspended = handle.list_suspended().await;
             assert_eq!(suspended.len(), 1);
-            if mode == "cancel_won" {
+            assert!(
+                driver
+                    .task_manager
+                    .take_terminal_task_result(&suspended[0].id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(handle.list_suspended().await.len(), 1);
+
+            if mode == "cancel_won" || mode == "approve_after_cancel" {
                 handle.cancel(suspended[0].id.clone()).await.unwrap();
             }
             if mode == "cancel" {
@@ -354,8 +364,12 @@ async fn individual_approval_closure_terminalizes_manager_and_preserves_facts() 
                 driver
                     .resolve_approval_for(
                         "call-1".into(),
-                        ApprovalDecision::Deny {
-                            reason: Some("denied".into()),
+                        if mode == "approve_after_cancel" {
+                            ApprovalDecision::Approve
+                        } else {
+                            ApprovalDecision::Deny {
+                                reason: Some("denied".into()),
+                            }
                         },
                     )
                     .unwrap();
@@ -363,6 +377,15 @@ async fn individual_approval_closure_terminalizes_manager_and_preserves_facts() 
             }
             assert!(handle.list_suspended().await.is_empty());
             assert_eq!(handle.list_completed().await.len(), 1);
+            assert!(
+                driver
+                    .task_manager
+                    .take_terminal_task_result(&suspended[0].id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+
             let transcript = driver.snapshot().transcript;
             validate_transcript_invariants(&transcript).unwrap();
             let results: Vec<_> = transcript
