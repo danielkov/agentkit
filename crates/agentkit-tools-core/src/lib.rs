@@ -3766,6 +3766,13 @@ impl From<PermissionDenial> for ToolError {
     }
 }
 
+impl ToolContext<'_> {
+    /// Clone the invocation-scoped producer for host callbacks that outlive a borrow.
+    pub fn failure_observer(&self) -> Option<FailureObservationPublisher> {
+        self.failure_observer.clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4840,12 +4847,5 @@ mod tests {
         let mut names: Vec<_> = source.specs().into_iter().map(|s| s.name.0).collect();
         names.sort();
         assert_eq!(names, vec!["fs_read_file", "fs_write_file"]);
-    }
-}
-
-impl ToolContext<'_> {
-    /// Clone the invocation-scoped producer for host callbacks that outlive a borrow.
-    pub fn failure_observer(&self) -> Option<FailureObservationPublisher> {
-        self.failure_observer.clone()
     }
 }

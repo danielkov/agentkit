@@ -325,8 +325,8 @@ async fn interruption_exposes_frozen_real_result_once_for_loop_synthesis() {
     wait_until_entered(&entered).await;
     manager.on_turn_interrupted(&request.turn_id).await.unwrap();
     assert!(matches!(next_event(&handle).await, TaskEvent::Cancelled(_)));
-    let mut updates =
-        manager.take_interrupted_task_updates(&request.session_id, &[request.call_id.clone()]);
+    let mut updates = manager
+        .take_interrupted_task_updates(&request.session_id, std::slice::from_ref(&request.call_id));
     let mut items: Vec<_> = updates
         .drain(..)
         .filter_map(|update| match update {
@@ -345,7 +345,10 @@ async fn interruption_exposes_frozen_real_result_once_for_loop_synthesis() {
     );
     assert!(
         manager
-            .take_interrupted_task_updates(&request.session_id, &[request.call_id.clone()])
+            .take_interrupted_task_updates(
+                &request.session_id,
+                std::slice::from_ref(&request.call_id)
+            )
             .is_empty()
     );
     assert!(
@@ -557,13 +560,16 @@ async fn inline_drop_seals_publisher_and_preserves_one_cancellation_projection()
         manager
             .take_interrupted_task_updates(
                 &SessionId::new("different-session"),
-                &[request.call_id.clone()]
+                std::slice::from_ref(&request.call_id)
             )
             .is_empty()
     );
     assert_eq!(
         manager
-            .take_interrupted_task_updates(&request.session_id, &[request.call_id.clone()])
+            .take_interrupted_task_updates(
+                &request.session_id,
+                std::slice::from_ref(&request.call_id)
+            )
             .len(),
         1
     );
