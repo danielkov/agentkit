@@ -303,6 +303,18 @@ pub trait TaskManager: Send + Sync {
         Vec::new()
     }
 
+    /// Terminalize an approval already delivered to the caller and transfer its
+    /// frozen result directly, without enqueuing a second delivery. Wrappers
+    /// must delegate this method alongside interruption and its scoped drain.
+    async fn close_suspended_task(
+        &self,
+        _task_id: &TaskId,
+        _approval_id: &agentkit_core::ApprovalId,
+        _error: ToolError,
+    ) -> Result<Option<TaskResolution>, TaskManagerError> {
+        Ok(None)
+    }
+
     fn handle(&self) -> TaskManagerHandle;
 }
 
@@ -617,6 +629,37 @@ impl TaskManager for SimpleTaskManager {
         drain_interrupted_updates(&self.state.interrupted_updates, session_id, call_ids)
     }
 
+    async fn close_suspended_task(
+        &self,
+        task_id: &TaskId,
+        approval_id: &agentkit_core::ApprovalId,
+        error: ToolError,
+    ) -> Result<Option<TaskResolution>, TaskManagerError> {
+        let mut tasks = self
+            .state
+            .tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let record = tasks
+            .get_mut(task_id)
+            .ok_or_else(|| TaskManagerError::NotFound(task_id.clone()))?;
+        if record.completed {
+            return Ok(take_interrupted_resolution(
+                &self.state.interrupted_updates,
+                task_id,
+            ));
+        }
+        let result = close_suspended_record(record, approval_id, &error)?;
+        if result.is_some() {
+            let _ = self
+                .state
+                .events_tx
+                .send(failure_event(record.snapshot.clone(), error));
+            self.state.notify.notify_waiters();
+        }
+        Ok(result)
+    }
+
     fn handle(&self) -> TaskManagerHandle {
         TaskManagerHandle {
             inner: self.state.clone(),
@@ -688,6 +731,7 @@ impl HandleState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(InterruptedUpdate {
+                task_id: task_id.clone(),
                 session_id: record.session_id.clone(),
                 update: TurnTaskUpdate::Resolution(Box::new(cancellation_resolution(
                     &record.snapshot,
@@ -833,8 +877,8 @@ struct AsyncState {
     next_task_index: u64,
     tasks: BTreeMap<TaskId, TaskRecord>,
     per_turn_running: BTreeMap<TurnId, usize>,
-    per_turn_updates: BTreeMap<TurnId, VecDeque<TurnTaskUpdate>>,
-    pending_loop_updates: VecDeque<TaskResolution>,
+    per_turn_updates: BTreeMap<TurnId, VecDeque<InterruptedUpdate>>,
+    pending_loop_updates: VecDeque<(TaskId, TaskResolution)>,
     manual_ready_items: Vec<Item>,
 }
 
@@ -908,6 +952,7 @@ struct TaskRecord {
 }
 
 struct InterruptedUpdate {
+    task_id: TaskId,
     session_id: agentkit_core::SessionId,
     update: TurnTaskUpdate,
 }
@@ -922,6 +967,22 @@ fn update_call_id(update: &TurnTaskUpdate) -> Option<&ToolCallId> {
                 _ => None,
             }),
         },
+    }
+}
+
+fn take_interrupted_resolution(
+    queue: &std::sync::Mutex<Vec<InterruptedUpdate>>,
+    task_id: &TaskId,
+) -> Option<TaskResolution> {
+    let mut queue = queue
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let index = queue.iter().position(|entry| {
+        &entry.task_id == task_id && matches!(&entry.update, TurnTaskUpdate::Resolution(_))
+    })?;
+    match queue.remove(index).update {
+        TurnTaskUpdate::Resolution(resolution) => Some(*resolution),
+        _ => unreachable!(),
     }
 }
 
@@ -969,7 +1030,7 @@ impl AsyncInner {
         generation: Option<&Arc<()>>,
     ) -> Result<(), TaskManagerError> {
         let mut state = self.state.lock().await;
-        let snapshot = {
+        let (session_id, snapshot) = {
             let record = state
                 .tasks
                 .get_mut(task_id)
@@ -983,7 +1044,7 @@ impl AsyncInner {
                 return Err(TaskManagerError::AlreadyBackground(task_id.clone()));
             }
             record.snapshot.kind = TaskKind::Background;
-            record.snapshot.clone()
+            (record.session_id.clone(), record.snapshot.clone())
         };
 
         if let Some(count) = state.per_turn_running.get_mut(&snapshot.turn_id) {
@@ -996,7 +1057,11 @@ impl AsyncInner {
             .per_turn_updates
             .entry(snapshot.turn_id.clone())
             .or_default()
-            .push_back(TurnTaskUpdate::Detached(Box::new(snapshot.clone())));
+            .push_back(InterruptedUpdate {
+                task_id: task_id.clone(),
+                session_id,
+                update: TurnTaskUpdate::Detached(Box::new(snapshot.clone())),
+            });
         let _ = self.host_event_tx.send(TaskEvent::Detached(snapshot));
         self.notify.notify_waiters();
         Ok(())
@@ -1011,22 +1076,7 @@ impl AsyncInner {
                 .interrupted_updates
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for update in queued {
-                if matches!(&update, TurnTaskUpdate::Resolution(resolution) if matches!(resolution.as_ref(), TaskResolution::Approval(_)))
-                {
-                    continue;
-                }
-                if let Some(call_id) = update_call_id(&update)
-                    && let Some(record) = state.tasks.values().find(|record| {
-                        record.snapshot.turn_id == *turn_id && record.snapshot.call_id == *call_id
-                    })
-                {
-                    closed.push(InterruptedUpdate {
-                        session_id: record.session_id.clone(),
-                        update,
-                    });
-                }
-            }
+            closed.extend(queued.into_iter().filter(|entry| !matches!(&entry.update, TurnTaskUpdate::Resolution(resolution) if matches!(resolution.as_ref(), TaskResolution::Approval(_)))));
         }
         let interrupted: Vec<TaskId> = state
             .tasks
@@ -1038,7 +1088,17 @@ impl AsyncInner {
                 .then_some(id.clone())
             })
             .collect();
-        state.pending_loop_updates.retain(|resolution| !matches!(resolution, TaskResolution::Approval(task) if interrupted.contains(&task.task_id)));
+        // An approval still in this queue has not been handed to LoopDriver.
+        // Its background terminal result must retain its normal destination.
+        let unsurfaced: Vec<_> = state
+            .pending_loop_updates
+            .iter()
+            .filter_map(|(_, resolution)| match resolution {
+                TaskResolution::Approval(task) => Some(task.task_id.clone()),
+                _ => None,
+            })
+            .collect();
+        state.pending_loop_updates.retain(|(_, resolution)| !matches!(resolution, TaskResolution::Approval(task) if interrupted.contains(&task.task_id)));
         let mut aborts = Vec::new();
         for task_id in interrupted {
             if let Some(record) = state.tasks.get_mut(&task_id) {
@@ -1057,15 +1117,31 @@ impl AsyncInner {
                     aborts.push(join);
                 }
                 let snapshot = record.snapshot.clone();
-                self.interrupted_updates
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .push(InterruptedUpdate {
-                        session_id: record.session_id.clone(),
-                        update: TurnTaskUpdate::Resolution(Box::new(cancellation_resolution(
-                            &snapshot,
-                        ))),
-                    });
+                let session_id = record.session_id.clone();
+                let delivery_mode = record.delivery_mode;
+                let continue_policy = record.continue_policy;
+                let resolution = cancellation_resolution(&snapshot);
+                if snapshot.kind == TaskKind::Background && delivery_mode == DeliveryMode::Manual {
+                    if let TaskResolution::Item(item) = resolution {
+                        state.manual_ready_items.push(item);
+                    }
+                } else if snapshot.kind == TaskKind::Background && unsurfaced.contains(&task_id) {
+                    state
+                        .pending_loop_updates
+                        .push_back((task_id.clone(), resolution));
+                    if continue_policy == ContinuePolicy::RequestContinue {
+                        let _ = self.host_event_tx.send(TaskEvent::ContinueRequested);
+                    }
+                } else {
+                    self.interrupted_updates
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(InterruptedUpdate {
+                            task_id: task_id.clone(),
+                            session_id,
+                            update: TurnTaskUpdate::Resolution(Box::new(resolution)),
+                        });
+                }
                 let _ = self.host_event_tx.send(TaskEvent::Cancelled(snapshot));
             }
         }
@@ -1278,6 +1354,7 @@ impl TaskManager for AsyncTaskManager {
                 let continue_policy = record.continue_policy;
                 let delivery_mode = record.delivery_mode;
                 let current_kind = snapshot.kind;
+                let session_id = record.session_id.clone();
 
                 if current_kind == TaskKind::Foreground {
                     if let Some(count) = state.per_turn_running.get_mut(&turn_id) {
@@ -1290,14 +1367,22 @@ impl TaskManager for AsyncTaskManager {
                         .per_turn_updates
                         .entry(turn_id.clone())
                         .or_default()
-                        .push_back(TurnTaskUpdate::Resolution(Box::new(resolution.clone())));
+                        .push_back(InterruptedUpdate {
+                            task_id: task_id_for_future.clone(),
+                            session_id,
+                            update: TurnTaskUpdate::Resolution(Box::new(resolution.clone())),
+                        });
                 } else {
                     match &resolution {
                         TaskResolution::Item(_) if delivery_mode == DeliveryMode::ToLoop => {
-                            state.pending_loop_updates.push_back(resolution.clone());
+                            state
+                                .pending_loop_updates
+                                .push_back((task_id_for_future.clone(), resolution.clone()));
                         }
                         TaskResolution::Approval(_) if delivery_mode == DeliveryMode::ToLoop => {
-                            state.pending_loop_updates.push_back(resolution.clone());
+                            state
+                                .pending_loop_updates
+                                .push_back((task_id_for_future.clone(), resolution.clone()));
                         }
                         TaskResolution::Item(item) => {
                             state.manual_ready_items.push(item.clone());
@@ -1363,7 +1448,7 @@ impl TaskManager for AsyncTaskManager {
                 if let Some(queue) = state.per_turn_updates.get_mut(turn_id)
                     && let Some(update) = queue.pop_front()
                 {
-                    return Ok(Some(update));
+                    return Ok(Some(update.update));
                 }
                 if state
                     .per_turn_running
@@ -1401,7 +1486,11 @@ impl TaskManager for AsyncTaskManager {
     async fn take_pending_loop_updates(&self) -> Result<PendingLoopUpdates, TaskManagerError> {
         let mut state = self.inner.state.lock().await;
         Ok(PendingLoopUpdates {
-            resolutions: std::mem::take(&mut state.pending_loop_updates),
+            resolutions: state
+                .pending_loop_updates
+                .drain(..)
+                .map(|(_, resolution)| resolution)
+                .collect(),
         })
     }
 
@@ -1435,6 +1524,60 @@ impl TaskManager for AsyncTaskManager {
         drain_interrupted_updates(&self.inner.interrupted_updates, session_id, call_ids)
     }
 
+    async fn close_suspended_task(
+        &self,
+        task_id: &TaskId,
+        approval_id: &agentkit_core::ApprovalId,
+        error: ToolError,
+    ) -> Result<Option<TaskResolution>, TaskManagerError> {
+        let mut state = self.inner.state.lock().await;
+        let record = state
+            .tasks
+            .get_mut(task_id)
+            .ok_or_else(|| TaskManagerError::NotFound(task_id.clone()))?;
+        if record.completed {
+            let turn_id = record.snapshot.turn_id.clone();
+            if let Some(queue) = state.per_turn_updates.get_mut(&turn_id)
+                && let Some(index) = queue.iter().position(|entry| {
+                    &entry.task_id == task_id
+                        && matches!(&entry.update, TurnTaskUpdate::Resolution(_))
+                })
+                && let Some(entry) = queue.remove(index)
+                && let TurnTaskUpdate::Resolution(resolution) = entry.update
+            {
+                return Ok(Some(*resolution));
+            }
+            if let Some(index) = state
+                .pending_loop_updates
+                .iter()
+                .position(|(id, _)| id == task_id)
+            {
+                return Ok(state
+                    .pending_loop_updates
+                    .remove(index)
+                    .map(|(_, resolution)| resolution));
+            }
+            return Ok(take_interrupted_resolution(
+                &self.inner.interrupted_updates,
+                task_id,
+            ));
+        }
+        let result = close_suspended_record(record, approval_id, &error)?;
+        if result.is_some() {
+            let snapshot = record.snapshot.clone();
+            if let Some(queue) = state.per_turn_updates.get_mut(&snapshot.turn_id) {
+                queue.retain(|entry| !matches!(&entry.update, TurnTaskUpdate::Resolution(resolution) if matches!(resolution.as_ref(), TaskResolution::Approval(task) if &task.task_id == task_id)));
+            }
+            state.pending_loop_updates.retain(|(_, resolution)| !matches!(resolution, TaskResolution::Approval(task) if &task.task_id == task_id));
+            let _ = self
+                .inner
+                .host_event_tx
+                .send(failure_event(snapshot, error));
+            self.inner.notify.notify_waiters();
+        }
+        Ok(result)
+    }
+
     fn handle(&self) -> TaskManagerHandle {
         TaskManagerHandle {
             inner: self.inner.clone(),
@@ -1457,6 +1600,7 @@ impl TaskManagerControl for AsyncInner {
         if !record.running && record.suspended.is_none() {
             return Ok(());
         }
+        let session_id = record.session_id.clone();
         let was_running = record.running;
         record.suspended = None;
         let join = record.join.take();
@@ -1483,18 +1627,24 @@ impl TaskManagerControl for AsyncInner {
             }
         }
         if let Some(queue) = state.per_turn_updates.get_mut(&snapshot.turn_id) {
-            queue.retain(|update| !matches!(update, TurnTaskUpdate::Resolution(resolution) if matches!(resolution.as_ref(), TaskResolution::Approval(task) if task.task_id == task_id)));
+            queue.retain(|entry| !matches!(&entry.update, TurnTaskUpdate::Resolution(resolution) if matches!(resolution.as_ref(), TaskResolution::Approval(task) if task.task_id == task_id)));
         }
-        state.pending_loop_updates.retain(|resolution| !matches!(resolution, TaskResolution::Approval(task) if task.task_id == task_id));
+        state.pending_loop_updates.retain(|(_, resolution)| !matches!(resolution, TaskResolution::Approval(task) if task.task_id == task_id));
         let resolution = cancellation_resolution(&snapshot);
         if snapshot.kind == TaskKind::Foreground {
             state
                 .per_turn_updates
                 .entry(snapshot.turn_id.clone())
                 .or_default()
-                .push_back(TurnTaskUpdate::Resolution(Box::new(resolution)));
+                .push_back(InterruptedUpdate {
+                    task_id: task_id.clone(),
+                    session_id,
+                    update: TurnTaskUpdate::Resolution(Box::new(resolution)),
+                });
         } else if delivery_mode == DeliveryMode::ToLoop {
-            state.pending_loop_updates.push_back(resolution);
+            state
+                .pending_loop_updates
+                .push_back((task_id.clone(), resolution));
         } else if let TaskResolution::Item(item) = resolution {
             state.manual_ready_items.push(item);
         }
@@ -1594,7 +1744,39 @@ impl TaskManagerControl for AsyncInner {
     }
 }
 
+fn close_suspended_record(
+    record: &mut TaskRecord,
+    approval_id: &agentkit_core::ApprovalId,
+    error: &ToolError,
+) -> Result<Option<TaskResolution>, TaskManagerError> {
+    let Some(saved) = &record.suspended else {
+        return Ok(None);
+    };
+    if &saved.approval_id != approval_id {
+        return Err(TaskManagerError::InvalidContinuation(
+            record.snapshot.id.clone(),
+        ));
+    }
+    record.suspended = None;
+    record.completed = true;
+    record.snapshot.failure = Some(error.failure_info());
+    record.snapshot.failure_observations = record.observations.seal();
+    Ok(Some(failure_resolution(&record.snapshot, error.clone())))
+}
+
+fn failure_event(snapshot: TaskSnapshot, error: ToolError) -> TaskEvent {
+    if error.is_cancelled() {
+        TaskEvent::Cancelled(snapshot)
+    } else {
+        TaskEvent::Failed(snapshot, error)
+    }
+}
+
 fn cancellation_resolution(snapshot: &TaskSnapshot) -> TaskResolution {
+    failure_resolution(snapshot, ToolError::Cancelled)
+}
+
+fn failure_resolution(snapshot: &TaskSnapshot, error: ToolError) -> TaskResolution {
     let request = ToolRequest {
         call_id: snapshot.call_id.clone(),
         tool_name: snapshot.tool_name.as_str().into(),
@@ -1609,9 +1791,9 @@ fn cancellation_resolution(snapshot: &TaskSnapshot) -> TaskResolution {
         .and_then(|v| v.as_bool())
         == Some(true)
     {
-        ToolExecutionOutcome::FailedBeforeInvocation(ToolError::Cancelled)
+        ToolExecutionOutcome::FailedBeforeInvocation(error)
     } else {
-        ToolExecutionOutcome::Failed(ToolError::Cancelled)
+        ToolExecutionOutcome::Failed(error)
     };
     let mut resolution = map_outcome_to_resolution(Some(snapshot.id.clone()), request, outcome);
     attach_observations(&mut resolution, snapshot.failure_observations.as_ref());

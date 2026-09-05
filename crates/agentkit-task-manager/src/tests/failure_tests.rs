@@ -804,3 +804,141 @@ async fn concurrent_tasks_from_one_context_template_keep_distinct_receipts() {
         );
     }
 }
+
+#[tokio::test]
+async fn queued_winners_keep_origin_session_when_turn_and_call_ids_collide() {
+    let manager = AsyncTaskManager::new();
+    let handle = manager.handle();
+    for (session, cancelled) in [("a", false), ("b", true)] {
+        let executor: Arc<dyn ToolExecutor> = Arc::new(TestExecutor::new([(
+            "observed",
+            TestBehavior::ObserveBlock {
+                entered: StdArc::new(AtomicBool::new(false)),
+                release: {
+                    let n = StdArc::new(Notify::new());
+                    n.notify_one();
+                    n
+                },
+                publisher: StdArc::new(std::sync::Mutex::new(None)),
+                outcome: ToolExecutionOutcome::Failed(native(cancelled)),
+            },
+        )]));
+        let mut request = make_request("observed", "same-turn", "same-call");
+        request.session_id = session.into();
+        manager
+            .start_task(
+                TaskLaunchRequest::plain(None, request.clone()),
+                make_context(executor, &request.turn_id, None),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(next_event(&handle).await, TaskEvent::Started(_)));
+        let event = next_event(&handle).await;
+        assert!(matches!(
+            event,
+            TaskEvent::Failed(..) | TaskEvent::Cancelled(_)
+        ));
+    }
+    manager
+        .on_turn_interrupted(&"same-turn".into())
+        .await
+        .unwrap();
+    for (session, cancelled) in [("a", false), ("b", true)] {
+        let updates = manager.take_interrupted_task_updates(&session.into(), &["same-call".into()]);
+        assert_eq!(updates.len(), 1);
+        let TurnTaskUpdate::Resolution(resolution) = updates.into_iter().next().unwrap() else {
+            panic!()
+        };
+        assert_eq!(
+            tool_failure_info(&result(*resolution)).unwrap(),
+            Some(native(cancelled).failure_info())
+        );
+    }
+}
+
+#[tokio::test]
+async fn unsurfaced_background_approval_interruption_preserves_delivery_policy() {
+    for manual in [false, true] {
+        let manager =
+            AsyncTaskManager::new().routing(|_: &ToolRequest| RoutingDecision::Background);
+        let handle = manager.handle();
+        let request = make_request("observed", "turn", "call");
+        let entered = StdArc::new(AtomicBool::new(false));
+        let release = StdArc::new(Notify::new());
+        let approval = ApprovalRequest {
+            task_id: None,
+            call_id: Some(request.call_id.clone()),
+            id: "approval:bg".into(),
+            request_kind: "test".into(),
+            reason: ApprovalReason::SensitivePath,
+            summary: "approve".into(),
+            metadata: MetadataMap::new(),
+        };
+        let executor: Arc<dyn ToolExecutor> = Arc::new(TestExecutor::new([(
+            "observed",
+            TestBehavior::ObserveBlock {
+                entered: entered.clone(),
+                release: release.clone(),
+                publisher: StdArc::new(std::sync::Mutex::new(None)),
+                outcome: ToolExecutionOutcome::Interrupted(ToolInterruption::ApprovalRequired(
+                    approval,
+                )),
+            },
+        )]));
+        let TaskStartOutcome::Pending { task_id, .. } = manager
+            .start_task(
+                TaskLaunchRequest::plain(None, request.clone()),
+                make_context(executor, &request.turn_id, None),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!()
+        };
+        if manual {
+            handle
+                .set_delivery_mode(task_id, DeliveryMode::Manual)
+                .await
+                .unwrap();
+        }
+        wait_until_entered(&entered).await;
+        release.notify_one();
+        timeout(Duration::from_secs(2), async {
+            while handle.list_suspended().await.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        manager.on_turn_interrupted(&request.turn_id).await.unwrap();
+        assert!(handle.list_suspended().await.is_empty());
+        let results = if manual {
+            handle
+                .drain_ready_items()
+                .await
+                .into_iter()
+                .map(item_result)
+                .collect::<Vec<_>>()
+        } else {
+            manager
+                .take_pending_loop_updates()
+                .await
+                .unwrap()
+                .resolutions
+                .into_iter()
+                .map(result)
+                .collect()
+        };
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            tool_failure_info(&results[0]).unwrap().unwrap().kind,
+            ToolFailureKind::Cancelled
+        );
+        assert!(task_failure_observations(&results[0]).unwrap().is_some());
+        assert!(
+            manager
+                .take_interrupted_task_updates(&request.session_id, &[request.call_id])
+                .is_empty()
+        );
+    }
+}

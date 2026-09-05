@@ -127,6 +127,9 @@ SessionRecording(
                             output: Text("tool permission denied: PermissionDenial { code: CustomPolicyDenied, message: \"policy says no\", metadata: {} }"),
                             is_error: true,
                             metadata: {
+                                "agentkit.tool.failure": {
+                                    "kind": "permission_denied",
+                                },
                                 "agentkit.tool.failure_kind": "permission_denied",
                                 "agentkit.tool.not_started": true,
                             },
@@ -223,6 +226,9 @@ SessionRecording(
                     output: Text("tool permission denied: PermissionDenial { code: CustomPolicyDenied, message: \"policy says no\", metadata: {} }"),
                     is_error: true,
                     metadata: {
+                        "agentkit.tool.failure": {
+                            "kind": "permission_denied",
+                        },
                         "agentkit.tool.failure_kind": "permission_denied",
                         "agentkit.tool.not_started": true,
                     },

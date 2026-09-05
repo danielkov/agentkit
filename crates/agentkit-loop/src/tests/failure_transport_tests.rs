@@ -309,3 +309,125 @@ async fn real_loop_pending_approval_cancel_prefers_frozen_facts_over_synthetic_r
         1
     );
 }
+
+#[tokio::test]
+async fn individual_approval_closure_terminalizes_manager_and_preserves_facts() {
+    for inline in [false, true] {
+        for mode in ["cancel", "deny", "cancel_won"] {
+            let manager: Arc<dyn TaskManager> = if inline {
+                Arc::new(agentkit_task_manager::SimpleTaskManager::new())
+            } else {
+                Arc::new(AsyncTaskManager::new())
+            };
+            let handle = manager.handle();
+            let mut builder = Agent::builder()
+                .model(FakeAdapter)
+                .tool_executor(WinnerExecutor {
+                    mode: "approval",
+                    entered: StdArc::new(AtomicBool::new(false)),
+                });
+            builder.task_manager = Some(manager);
+            let agent = builder.build().unwrap();
+            let mut driver = agent
+                .start(SessionConfig::new("closure-session"))
+                .await
+                .unwrap();
+            driver
+                .submit_input(vec![Item::text(ItemKind::User, "ping")])
+                .unwrap();
+            let LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(_)) =
+                driver.next().await.unwrap()
+            else {
+                panic!()
+            };
+            let suspended = handle.list_suspended().await;
+            assert_eq!(suspended.len(), 1);
+            if mode == "cancel_won" {
+                handle.cancel(suspended[0].id.clone()).await.unwrap();
+            }
+            if mode == "cancel" {
+                driver
+                    .cancel_pending_approval_for("call-1".into())
+                    .await
+                    .unwrap();
+            } else {
+                driver
+                    .resolve_approval_for(
+                        "call-1".into(),
+                        ApprovalDecision::Deny {
+                            reason: Some("denied".into()),
+                        },
+                    )
+                    .unwrap();
+                driver.next().await.unwrap();
+            }
+            assert!(handle.list_suspended().await.is_empty());
+            assert_eq!(handle.list_completed().await.len(), 1);
+            let transcript = driver.snapshot().transcript;
+            validate_transcript_invariants(&transcript).unwrap();
+            let results: Vec<_> = transcript
+                .iter()
+                .flat_map(|item| &item.parts)
+                .filter_map(|part| match part {
+                    Part::ToolResult(result) => Some(result),
+                    _ => None,
+                })
+                .collect();
+            assert!(matches!(
+                wait_for_task_event(&handle).await,
+                TaskEvent::Started(_)
+            ));
+            let terminal = wait_for_task_event(&handle).await;
+            let task = match &terminal {
+                TaskEvent::Cancelled(task) | TaskEvent::Failed(task, _) => task,
+                _ => panic!("expected terminal"),
+            };
+            assert_eq!(
+                task.failure_observations,
+                agentkit_task_manager::task_failure_observations(results[0]).unwrap()
+            );
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(10), handle.next_event())
+                    .await
+                    .is_err()
+            );
+            assert_eq!(results.len(), 1);
+            assert!(
+                agentkit_task_manager::task_failure_observations(results[0])
+                    .unwrap()
+                    .is_some()
+            );
+            assert_eq!(
+                agentkit_task_manager::tool_failure_info(results[0])
+                    .unwrap()
+                    .unwrap()
+                    .kind,
+                if mode == "deny" {
+                    agentkit_tools_core::ToolFailureKind::ExecutionFailed
+                } else {
+                    agentkit_tools_core::ToolFailureKind::Cancelled
+                }
+            );
+        }
+    }
+}
+
+#[test]
+fn synthetic_approval_metadata_rejects_reserved_request_facts() {
+    let input = [
+        (
+            agentkit_task_manager::TOOL_RESULT_FAILURE_METADATA_KEY.into(),
+            json!({"kind":"cancelled"}),
+        ),
+        (
+            agentkit_task_manager::TOOL_RESULT_FAILURE_OBSERVATIONS_METADATA_KEY.into(),
+            json!({"receipt":"forged"}),
+        ),
+        ("application".into(), json!(1)),
+    ]
+    .into();
+    assert_eq!(
+        untrusted_call_metadata(input),
+        [("application".into(), json!(1))].into()
+    );
+}
