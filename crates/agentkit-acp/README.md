@@ -51,9 +51,14 @@ same receipt-backed acceptance path. Once response commitment succeeds, request
 or session cancellation cannot remove the reservation; a committed steer that
 misses the cancelled turn carries into the next prompt. Closing the session may
 discard it. `session/revoke_inject` is mandatory and is serialized with
-acknowledged `UserMessage` forwarding. Queueing, stream interruption, and
-replacement are not supported. Delivered IDs retain their `already_delivered`
-classification for the session lifetime. To bound that history safely, each
+acknowledged `UserMessage` forwarding. The runtime advertises `pending.replace`:
+`session/replace_inject` atomically replaces the full content of a pending steer,
+preserving its ID, mode, and queue position. Replacement uses injection content
+validation and the same pending-byte budget; rejected replacements leave the
+original content intact. Replacement waits for in-flight delivery to settle:
+delivered IDs return `already_delivered` (`-32010`), while revoked or unknown IDs
+return `unknown_message_id` (`-32002`). Queueing and stream interruption are not
+supported. Delivered IDs retain their classification for the session lifetime. To bound that history safely, each
 session accepts at most 4,096 injections and rejects later accepts with a
 lifetime-limit error.
 

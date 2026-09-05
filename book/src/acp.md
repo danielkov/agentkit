@@ -54,9 +54,14 @@ JSON-RPC batches; the full `ContentBlock` list is emitted unchanged at the next
 safe model/tool boundary. Request or session cancellation cannot remove a
 response-committed steer, so it carries to the next valid boundary when the
 current turn is cancelled. Close may discard it. Revoke is serialized with
-acknowledged user-message forwarding. Queueing and replacement are not
-supported. Delivered IDs retain `already_delivered` classification for the
-session lifetime; a 4,096-accept lifetime cap bounds that history.
+acknowledged user-message forwarding. With `pending.replace` advertised,
+`session/replace_inject` atomically replaces a pending steer's full content while
+preserving its ID, mode, and queue position. It applies the same validation and
+pending-byte budget as injection. Replacement waits for in-flight delivery;
+delivered IDs return `already_delivered` (`-32010`), and revoked or unknown IDs
+return `unknown_message_id` (`-32002`). Queueing is not supported. Delivered IDs
+retain their classification for the session lifetime; a 4,096-accept lifetime
+cap bounds that history.
 
 The initial v2 foundation routes text, reasoning, and tool lifecycle updates.
 ACP v2 permission callbacks are intentionally deferred; unsupported approval

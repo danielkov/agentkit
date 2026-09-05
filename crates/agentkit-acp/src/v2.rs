@@ -1040,6 +1040,19 @@ where
                     }
                 },
                 agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                {
+                    let integration = Arc::clone(&state.integration);
+                    async move |request: wire::ReplaceInjectSessionRequest, responder, cx| {
+                        let integration = Arc::clone(&integration);
+                        cx.spawn(async move {
+                            responder.respond_with_result(integration.replace_inject(request).await)
+                        })?;
+                        Ok(())
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
             );
         let connection = agent
             .on_receive_notification(
@@ -1102,6 +1115,17 @@ pub const MAX_PENDING_INJECTION_BYTES: usize = 256 * 1024;
 pub const MAX_ACCEPTED_INJECTIONS: usize = 4_096;
 
 #[cfg(feature = "unstable-inject")]
+fn validate_inject_content(
+    content: &[wire::ContentBlock],
+) -> Result<(Vec<Item>, usize), agent_client_protocol::Error> {
+    let items = content_blocks_to_items(content).map_err(crate::sdk_error)?;
+    let bytes = serde_json::to_vec(content)
+        .map_err(|error| agent_client_protocol::Error::new(-32603, error.to_string()))?
+        .len();
+    Ok((items, bytes))
+}
+
+#[cfg(feature = "unstable-inject")]
 struct PendingInject {
     message_id: wire::MessageId,
     content: Vec<wire::ContentBlock>,
@@ -1146,8 +1170,8 @@ enum BoundaryAction {
 }
 
 #[cfg(feature = "unstable-inject")]
-enum RevokeTransition {
-    Revoked,
+enum PendingTransition {
+    Applied,
     WaitForDelivery,
     AlreadyDelivered,
     Unknown,
@@ -1289,7 +1313,49 @@ impl InjectionController {
         self.changed.notify_waiters();
     }
 
-    fn revoke_transition(&self, message_id: &wire::MessageId) -> RevokeTransition {
+    fn replace_transition(
+        &self,
+        message_id: &wire::MessageId,
+        content: &[wire::ContentBlock],
+        items: &[Item],
+        bytes: usize,
+    ) -> Result<PendingTransition, agent_client_protocol::Error> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(index) = state
+            .pending
+            .iter()
+            .position(|pending| &pending.message_id == message_id)
+        {
+            if state.pending[index].commitment != InjectCommitment::Ready {
+                return Ok(PendingTransition::WaitForDelivery);
+            }
+            // Include other pending entries and any in-flight delivery in the
+            // budget. Check before mutation so failure preserves the old content.
+            let pending_bytes = state.pending_bytes - state.pending[index].bytes;
+            if pending_bytes.saturating_add(bytes) > MAX_PENDING_INJECTION_BYTES {
+                return Err(agent_client_protocol::Error::new(
+                    -32602,
+                    "pending session injection budget exceeded",
+                ));
+            }
+            let pending = &mut state.pending[index];
+            pending.content = content.to_vec();
+            pending.items = items.to_vec();
+            pending.bytes = bytes;
+            state.pending_bytes = pending_bytes + bytes;
+            // Do not remove/re-enqueue: identity, commitment, and FIFO position
+            // must survive replacement. The state lock also serializes delivery.
+            Ok(PendingTransition::Applied)
+        } else if state.delivering.as_ref() == Some(message_id) {
+            Ok(PendingTransition::WaitForDelivery)
+        } else if state.delivered.contains(message_id) {
+            Ok(PendingTransition::AlreadyDelivered)
+        } else {
+            Ok(PendingTransition::Unknown)
+        }
+    }
+
+    fn revoke_transition(&self, message_id: &wire::MessageId) -> PendingTransition {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         let ready = state.pending.iter().any(|pending| {
             &pending.message_id == message_id && pending.commitment == InjectCommitment::Ready
@@ -1297,18 +1363,18 @@ impl InjectionController {
         if ready && Self::remove_pending(&mut state, message_id) {
             drop(state);
             self.changed.notify_waiters();
-            RevokeTransition::Revoked
+            PendingTransition::Applied
         } else if state.delivering.as_ref() == Some(message_id)
             || state
                 .pending
                 .iter()
                 .any(|pending| &pending.message_id == message_id)
         {
-            RevokeTransition::WaitForDelivery
+            PendingTransition::WaitForDelivery
         } else if state.delivered.contains(message_id) {
-            RevokeTransition::AlreadyDelivered
+            PendingTransition::AlreadyDelivered
         } else {
-            RevokeTransition::Unknown
+            PendingTransition::Unknown
         }
     }
 
@@ -1591,10 +1657,7 @@ impl AcpIntegration {
                 "unsupported session injection mode",
             ));
         }
-        let items = content_blocks_to_items(&request.content).map_err(crate::sdk_error)?;
-        let bytes = serde_json::to_vec(&request.content)
-            .map_err(|error| agent_client_protocol::Error::new(-32603, error.to_string()))?
-            .len();
+        let (items, bytes) = validate_inject_content(&request.content)?;
         let session = self
             .session(&request.session_id)
             .map_err(|_| session_not_found_error(&request.session_id))?;
@@ -1690,6 +1753,57 @@ impl AcpIntegration {
         Ok(())
     }
 
+    /// Atomically replaces the complete content of a pending injection without
+    /// changing its message ID, steer mode, or queue position.
+    ///
+    /// Like revoke, this waits for acceptance or in-flight delivery to settle.
+    /// A delivered ID returns `already_delivered`; revoked or unknown IDs return
+    /// `unknown_message_id`. Cancellation does not prevent replacing a retained
+    /// pending steer, but closing the session does.
+    pub async fn replace_inject(
+        &self,
+        request: wire::ReplaceInjectSessionRequest,
+    ) -> Result<wire::ReplaceInjectSessionResponse, agent_client_protocol::Error> {
+        let (items, bytes) = validate_inject_content(&request.content)?;
+        let session = self
+            .session(&request.session_id)
+            .map_err(|_| session_not_found_error(&request.session_id))?;
+        loop {
+            let changed = session.injection.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let lifecycle = session
+                .lifecycle
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if session.closed.load(Ordering::Acquire) {
+                return Err(session_not_found_error(&request.session_id));
+            }
+            match session.injection.replace_transition(
+                &request.message_id,
+                &request.content,
+                &items,
+                bytes,
+            )? {
+                PendingTransition::Applied => {
+                    return Ok(wire::ReplaceInjectSessionResponse::new(request.message_id));
+                }
+                PendingTransition::WaitForDelivery => drop(lifecycle),
+                PendingTransition::AlreadyDelivered => {
+                    return Err(sdk_v2_error(wire::Error::inject_already_delivered(
+                        request.message_id,
+                    )));
+                }
+                PendingTransition::Unknown => {
+                    return Err(sdk_v2_error(wire::Error::inject_unknown_message_id(
+                        request.message_id,
+                    )));
+                }
+            }
+            changed.await;
+        }
+    }
+
     /// Handles the state transition for unstable ACP v2 `session/revoke_inject`.
     pub async fn revoke_inject(
         &self,
@@ -1710,16 +1824,16 @@ impl AcpIntegration {
                 return Err(session_not_found_error(&request.session_id));
             }
             match session.injection.revoke_transition(&request.message_id) {
-                RevokeTransition::Revoked => {
+                PendingTransition::Applied => {
                     return Ok(wire::RevokeInjectSessionResponse::new());
                 }
-                RevokeTransition::WaitForDelivery => drop(_lifecycle),
-                RevokeTransition::AlreadyDelivered => {
+                PendingTransition::WaitForDelivery => drop(_lifecycle),
+                PendingTransition::AlreadyDelivered => {
                     return Err(sdk_v2_error(wire::Error::inject_already_delivered(
                         request.message_id,
                     )));
                 }
-                RevokeTransition::Unknown => {
+                PendingTransition::Unknown => {
                     return Err(sdk_v2_error(wire::Error::inject_unknown_message_id(
                         request.message_id,
                     )));
@@ -2911,6 +3025,7 @@ fn finish_reason_to_stop_reason(reason: &FinishReason) -> wire::StopReason {
 pub fn session_inject_capabilities() -> wire::SessionInjectCapabilities {
     wire::SessionInjectCapabilities::new(vec![wire::SessionInjectMode::Steer])
         .steer_in_stream(vec![wire::SessionInjectSteerInStream::Finish])
+        .pending(wire::SessionInjectPendingCapabilities::new().replace(true))
 }
 
 /// Constructs the honest ACP v2 capabilities supported by this build.
@@ -6012,7 +6127,7 @@ mod tests {
             injection.activate(&message_id);
             assert!(matches!(
                 injection.revoke_transition(&message_id),
-                RevokeTransition::Revoked
+                PendingTransition::Applied
             ));
         }
 
@@ -6368,7 +6483,10 @@ mod tests {
                         inject.steer_in_stream,
                         Some(vec![wire::SessionInjectSteerInStream::Finish])
                     );
-                    assert!(inject.pending.is_none());
+                    assert_eq!(
+                        inject.pending.and_then(|pending| pending.replace),
+                        Some(true)
+                    );
 
                     let cwd = std::env::current_dir()
                         .map_err(agent_client_protocol::Error::into_internal_error)?;
@@ -6399,8 +6517,15 @@ mod tests {
                         ))
                         .block_task()
                         .await
-                        .expect_err("replace handler must not be registered");
-                    assert_eq!(i32::from(replace_error.code), -32601);
+                        .expect_err("unknown pending message must fail");
+                    assert_eq!(i32::from(replace_error.code), -32002);
+                    assert_eq!(
+                        replace_error.data,
+                        Some(json!({
+                            "reason": "unknown_message_id",
+                            "messageId": "not-pending",
+                        }))
+                    );
 
                     cx.send_request(wire::PromptRequest::new(
                         session_id.clone(),
@@ -6434,6 +6559,19 @@ mod tests {
                         }),
                         "UserMessage was emitted before the inject response"
                     );
+                    let content = vec![
+                        wire::ContentBlock::Text(wire::TextContent::new("replacement")),
+                        content[1].clone(),
+                    ];
+                    let replaced = cx
+                        .send_request(wire::ReplaceInjectSessionRequest::new(
+                            session_id.clone(),
+                            accepted.message_id.clone(),
+                            content.clone(),
+                        ))
+                        .block_task()
+                        .await?;
+                    assert_eq!(replaced.message_id, accepted.message_id);
                     adapter.release(2);
                     wait_for_idle_count(&updates, &session_id, 1).await;
                     let delivered =
@@ -6941,3 +7079,7 @@ mod tests {
             .expect("unbind first");
     }
 }
+
+#[cfg(all(test, feature = "unstable-inject"))]
+#[path = "v2/replace_tests.rs"]
+mod replace_tests;
