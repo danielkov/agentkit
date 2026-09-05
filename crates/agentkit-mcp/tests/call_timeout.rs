@@ -350,6 +350,19 @@ async fn expiry_cleans_pending_state_before_late_success_or_error() {
                 .unwrap(),
             pending.id
         );
+        // The write acknowledgement alone does not prove the client read the
+        // late frame. A server-initiated ping follows it on the same stream,
+        // without adding a client-side outbound pending request.
+        tokio::time::timeout(
+            WATCHDOG,
+            fixture
+                .server
+                .peer()
+                .send_request(rmcp::model::ServerRequest::PingRequest(Default::default())),
+        )
+        .await
+        .unwrap()
+        .unwrap();
     }
     assert!(fixture.cancellations.try_recv().is_err());
     fixture.connection.close().await.unwrap();
