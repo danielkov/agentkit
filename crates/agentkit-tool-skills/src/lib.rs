@@ -954,6 +954,7 @@ mod tests {
 
         let noop_perms = NoopPermissions;
         let mut ctx = ToolContext {
+            failure_observer: None,
             capability: agentkit_capabilities::CapabilityContext {
                 session_id: None,
                 turn_id: None,
@@ -1017,6 +1018,7 @@ mod tests {
 
         let noop_perms = NoopPermissions;
         let mut ctx = ToolContext {
+            failure_observer: None,
             capability: agentkit_capabilities::CapabilityContext {
                 session_id: None,
                 turn_id: None,
@@ -1178,6 +1180,7 @@ mod tests {
         let tool = reg.build_tool();
         let noop_perms = NoopPermissions;
         let mut ctx = ToolContext {
+            failure_observer: None,
             capability: agentkit_capabilities::CapabilityContext {
                 session_id: None,
                 turn_id: None,

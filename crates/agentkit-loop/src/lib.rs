@@ -1797,6 +1797,7 @@ where
                                 cancellation: cancellation.clone(),
                             };
                             OwnedToolContext {
+                                failure_observer: None,
                                 session_id,
                                 turn_id,
                                 metadata,
@@ -3205,10 +3206,62 @@ where
         pending
     }
 
+    fn collect_interrupted_task_updates(&mut self, extra_call_ids: &[ToolCallId]) {
+        let mut call_ids: Vec<_> = unanswered_tool_calls(&self.transcript)
+            .into_iter()
+            .map(|call| call.id)
+            .collect();
+        call_ids.extend_from_slice(extra_call_ids);
+        for update in self
+            .task_manager
+            .take_interrupted_task_updates(&self.session_id, &call_ids)
+        {
+            match update {
+                TurnTaskUpdate::Detached(snapshot) => {
+                    self.append_detach_placeholder(snapshot.call_id, &snapshot.tool_name)
+                }
+                TurnTaskUpdate::Resolution(resolution) => {
+                    if let TaskResolution::Item(mut item) = *resolution {
+                        let mut cancelled = false;
+                        for part in &mut item.parts {
+                            if let Part::ToolResult(result) = part
+                                && agentkit_task_manager::tool_failure_info(result)
+                                    .ok()
+                                    .flatten()
+                                    .is_some_and(|failure| {
+                                        failure.kind
+                                            == agentkit_tools_core::ToolFailureKind::Cancelled
+                                    })
+                            {
+                                result.metadata.extend(interrupted_metadata("tool"));
+                                cancelled = true;
+                            }
+                        }
+                        if cancelled {
+                            item.metadata.extend(interrupted_metadata("tool"));
+                        }
+                        self.append_tool_result_item(item);
+                    }
+                }
+            }
+        }
+    }
+
     fn reject_drained_approvals(&mut self, pending: Vec<PendingApprovalToolCall>) {
+        let call_ids: Vec<_> = pending
+            .iter()
+            .map(|pending| pending.call.id.clone())
+            .collect();
+        self.collect_interrupted_task_updates(&call_ids);
         for pending in pending {
             self.emit(AgentEvent::ApprovalResolved { approved: false });
-            self.append_tool_result_item(cancelled_approval_item(pending));
+            if self.background_call_ids.contains(&pending.call.id)
+                || unanswered_tool_calls(&self.transcript)
+                    .iter()
+                    .any(|call| call.id == pending.call.id)
+            {
+                self.append_tool_result_item(cancelled_approval_item(pending));
+            }
         }
     }
 
@@ -3229,6 +3282,7 @@ where
     /// are converted to notifications; calls that never started or were
     /// cancelled in the foreground are not retained as detached work.
     fn close_interrupted_tool_calls(&mut self) {
+        self.collect_interrupted_task_updates(&[]);
         for call in unanswered_tool_calls(&self.transcript) {
             let call_id = call.id.clone();
             let completes_in_background = self.background_call_ids.contains(&call_id);
@@ -4372,6 +4426,7 @@ fn validate_transcript_invariants(transcript: &[Item]) -> Result<(), LoopError> 
 
 #[cfg(test)]
 mod tests {
+    mod failure_transport_tests;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc as StdArc, Mutex as StdMutex};
@@ -4536,6 +4591,15 @@ mod tests {
                 return Err(TaskManagerError::Internal(message.into()));
             }
             self.inner.on_turn_interrupted(turn_id).await
+        }
+
+        fn take_interrupted_task_updates(
+            &self,
+            session_id: &SessionId,
+            call_ids: &[ToolCallId],
+        ) -> Vec<TurnTaskUpdate> {
+            self.inner
+                .take_interrupted_task_updates(session_id, call_ids)
         }
 
         fn handle(&self) -> TaskManagerHandle {
@@ -5703,7 +5767,9 @@ mod tests {
 
     async fn wait_until_completed(handle: &TaskManagerHandle) {
         timeout(Duration::from_secs(1), async {
-            while handle.list_completed().await.is_empty() {
+            while handle.list_completed().await.is_empty()
+                && handle.list_suspended().await.is_empty()
+            {
                 tokio::task::yield_now().await;
             }
         })

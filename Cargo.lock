@@ -428,6 +428,7 @@ dependencies = [
  "agentkit-tools-core",
  "agentkit-tools-derive",
  "async-trait",
+ "getrandom 0.4.3",
  "mlua",
  "runlet",
  "schemars 1.2.2",

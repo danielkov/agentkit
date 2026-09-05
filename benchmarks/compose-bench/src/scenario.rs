@@ -339,6 +339,7 @@ mod tests {
 
     fn test_context() -> OwnedToolContext {
         OwnedToolContext {
+            failure_observer: None,
             session_id: SessionId::new("s"),
             turn_id: TurnId::new("t"),
             metadata: MetadataMap::new(),

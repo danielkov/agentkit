@@ -185,6 +185,34 @@ Correlate the two events by `call_id`. Hosts that need a fully reconstructable t
        └────────────────────────────────┘
 ```
 
+## Typed failures and cancellation observations
+
+Native failed outcomes emit `TaskEvent::Failed`, not `Completed`. Cancellation
+emits `TaskEvent::Cancelled`; its snapshot retains the terminal classification
+and any validated diagnostic metadata in `failure`. `ToolError::is_cancelled()`
+recognizes both the legacy unit variant and typed diagnostic cancellation.
+
+Each task also owns an isolated observation slot. Host producers can clone
+`context.failure_observer()` and publish positive effects observations, a final
+retry summary, or a host fatal receipt. The manager seals the slot before aborting
+cancelled work. Already-published facts survive cleanup; missing facts remain
+unknown. `failure_observations` on the task snapshot is deliberately separate from
+the native child's diagnostic metadata: these may describe different scopes.
+
+Foreground results, background loop updates, manual results, and detached
+notifications retain these facts in reserved result metadata. Use
+`agentkit_task_manager::tool_failure_info` and `task_failure_observations` to read
+the typed projections. Request metadata cannot forge these host-owned fields;
+successful results have failure-only fields removed. Retry observations never
+make a child invocation safe to replay.
+
+When interrupting a turn, the loop drains the manager's real frozen cancellation
+results before synthesizing missing results. A custom manager that delegates
+interruption must also delegate `take_interrupted_task_updates`.
+
+The complete wire, Runlet catch/rethrow, and downstream compatibility contract is
+in [Typed failure transport](https://github.com/danielkov/agentkit/blob/main/docs/typed-failure-transport.md).
+
 ## Choosing a routing strategy
 
 | Scenario                                | Recommended routing                  | Why                                                 |

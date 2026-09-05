@@ -95,6 +95,11 @@ const RULES_PRIMER: &str = "Run a Runlet program that composes available tools. 
              `fail(\"NO_MATCH\", \"explanation\")` — e.g. `x = items[0] if items != [] else \
              fail(\"EMPTY\", \"expected results\")` or a guard `g = fail(\"BAD\", \"...\") if \
              invalid`.\n\
+             - Native host failures expose sanitized `err.agentkit_failure` facts. Explicitly rethrow \
+             with `fail(err.code, err.message, {agentkit_failure_token: err.agentkit_failure_token})`. \
+             This preserves only that exact same-run failure; two-argument fail or changed code/message \
+             creates a new failure without native facts. Never persist the ephemeral token. Catch-visible \
+             facts must fit signed 64-bit integers; unrepresentable facts fail the bridge closed.\n\
              - Validate an invariant eagerly with `assert(condition, \"message\")`; a false \
              assertion fails the program. Assert inside Runlet instead of returning raw \
              intermediate values for model-side checking.\n\
@@ -297,11 +302,7 @@ impl ComposeBackend for RunletBackend {
             eprintln!("[compose-runlet] executing program:\n{}\n---", run.script);
         }
         let handle = tokio::runtime::Handle::current();
-        let bridge = Arc::new(HostBridge {
-            interrupt: StdMutex::new(None),
-            failures: StdMutex::new(HashMap::new()),
-            failure_counter: AtomicU64::new(0),
-        });
+        let bridge = Arc::new(HostBridge::default());
 
         let mut registry = RunletRegistry::new();
         let mut names: Vec<(String, ToolName)> = Vec::new();
@@ -348,6 +349,12 @@ impl ComposeBackend for RunletBackend {
             let handle = handle.clone();
             let tool_name = tool_name.clone();
             builder = builder.tool(runlet_name.clone(), move |args, ctx| {
+                if bridge.transport_failed() {
+                    return Err(RunletToolError::new(
+                        "HOST_BRIDGE_FAILED",
+                        "compose failure transport unavailable",
+                    ));
+                }
                 if bridge.interrupted() {
                     return Err(RunletToolError::new(
                         "HOST_INTERRUPTED",
@@ -426,6 +433,15 @@ impl ComposeBackend for RunletBackend {
             return Err(ComposeOutcome::Interrupted(interruption));
         }
 
+        if let Some(error) = bridge
+            .transport_failure
+            .lock()
+            .expect("transport failure lock")
+            .take()
+        {
+            return Err(ComposeOutcome::Failed(error));
+        }
+
         match result {
             Ok((execution, heal_notes)) => {
                 let value =
@@ -458,7 +474,7 @@ impl ComposeBackend for RunletBackend {
             }
             Err(RunletRunError::Run(error)) => Err(ComposeOutcome::Failed(
                 bridge.recall_failure(&error).unwrap_or_else(|| {
-                    ToolError::ExecutionFailed(render_runtime_error(&error, &run.script))
+                    ToolError::ExecutionFailed(bridge.redact_runtime_error(&error, &run.script))
                 }),
             )),
         }
@@ -502,12 +518,23 @@ enum RunletRunError {
 /// Carries typed host state across the sync/async boundary: the pending
 /// approval interruption and the original [`ToolError`] behind each dispatch
 /// failure (runlet only transports its own string-based error type).
+#[derive(Default)]
 struct HostBridge {
     interrupt: StdMutex<Option<ToolInterruption>>,
-    failures: StdMutex<HashMap<u64, ToolError>>,
+    failures: StdMutex<HashMap<String, SavedFailure>>,
+    transport_failure: StdMutex<Option<ToolError>>,
     failure_counter: AtomicU64,
 }
 
+struct SavedFailure {
+    error: ToolError,
+    code: String,
+    message: String,
+}
+
+const MAX_SAVED_FAILURES: usize = 4096;
+const FAILURE_TOKEN_KEY: &str = "agentkit_failure_token";
+const FAILURE_FACTS_KEY: &str = "agentkit_failure";
 const FAILURE_CODE_PREFIX: &str = "HOST_FAILURE_";
 
 impl HostBridge {
@@ -526,20 +553,119 @@ impl HostBridge {
         self.interrupt.lock().expect("interrupt lock").take()
     }
 
+    fn redact_runtime_error(&self, error: &RunletToolError, source: &str) -> String {
+        let mut rendered = render_runtime_error(error, source);
+        for token in self.failures.lock().expect("failures lock").keys() {
+            rendered = rendered.replace(token, "<failure capability>");
+        }
+        if let Some(CanonicalValue::String(token)) = error.details.get(FAILURE_TOKEN_KEY)
+            && !token.is_empty()
+        {
+            rendered = rendered.replace(token, "<failure capability>");
+        }
+        rendered
+    }
+
+    fn transport_failed(&self) -> bool {
+        self.transport_failure
+            .lock()
+            .expect("transport failure lock")
+            .is_some()
+    }
+
+    fn fail_transport(&self) -> RunletToolError {
+        self.fail_transport_with_message("compose failure transport unavailable")
+    }
+
+    fn fail_transport_with_message(&self, message: &'static str) -> RunletToolError {
+        let mut failure = self
+            .transport_failure
+            .lock()
+            .expect("transport failure lock");
+        if failure.is_none() {
+            *failure = Some(ToolError::Internal(message.into()));
+        }
+        RunletToolError::new("HOST_BRIDGE_FAILED", message)
+    }
+
     fn record_failure(&self, error: ToolError) -> RunletToolError {
+        let mut bytes = [0u8; 16];
+        if getrandom::fill(&mut bytes).is_err() {
+            return self.fail_transport();
+        }
+        let token: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        self.record_failure_with_token(error, token)
+    }
+
+    fn record_failure_with_token(&self, error: ToolError, token: String) -> RunletToolError {
+        let facts = match canonical_failure_facts(
+            &serde_json::to_value(error.failure_info()).expect("finite failure facts"),
+        ) {
+            Ok(facts) => facts,
+            Err(()) => {
+                return self.fail_transport_with_message(
+                    "compose failure facts exceed Runlet integer range",
+                );
+            }
+        };
+        let mut failures = self.failures.lock().expect("failures lock");
+        if failures.len() >= MAX_SAVED_FAILURES || failures.contains_key(&token) {
+            return self.fail_transport();
+        }
         let id = self.failure_counter.fetch_add(1, Ordering::Relaxed);
+        let code = format!("{FAILURE_CODE_PREFIX}{id}");
+        // Observational retry metadata never makes a child invocation retryable.
         let retryable = matches!(error, ToolError::Unavailable(_));
         let message = error.to_string();
-        self.failures
-            .lock()
-            .expect("failures lock")
-            .insert(id, error);
-        RunletToolError::new(format!("{FAILURE_CODE_PREFIX}{id}"), message).retryable(retryable)
+        let mut result = RunletToolError::new(code.clone(), message.clone()).retryable(retryable);
+        result.details.insert(
+            FAILURE_TOKEN_KEY.into(),
+            CanonicalValue::String(token.clone()),
+        );
+        // Only an exact, representable view is issued. It is advisory and is
+        // never used as input to native restoration.
+        result.details.insert(FAILURE_FACTS_KEY.into(), facts);
+        failures.insert(
+            token,
+            SavedFailure {
+                error,
+                code,
+                message,
+            },
+        );
+        result
     }
 
     fn recall_failure(&self, error: &RunletToolError) -> Option<ToolError> {
-        let id: u64 = error.code.strip_prefix(FAILURE_CODE_PREFIX)?.parse().ok()?;
-        self.failures.lock().expect("failures lock").remove(&id)
+        let CanonicalValue::String(token) = error.details.get(FAILURE_TOKEN_KEY)? else {
+            return None;
+        };
+        if token.len() != 32 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let mut failures = self.failures.lock().expect("failures lock");
+        let saved = failures.get(token)?;
+        if saved.code != error.code || saved.message != error.message {
+            return None;
+        }
+        failures.remove(token).map(|saved| saved.error)
+    }
+}
+
+fn canonical_failure_facts(value: &Value) -> Result<CanonicalValue, ()> {
+    match value {
+        Value::Number(n) => n
+            .as_i64()
+            .filter(|n| *n >= 0)
+            .map(CanonicalValue::Integer)
+            .ok_or(()),
+        Value::Object(fields) => fields
+            .iter()
+            .map(|(key, value)| Ok((key.clone(), canonical_failure_facts(value)?)))
+            .collect::<Result<BTreeMap<_, _>, ()>>()
+            .map(CanonicalValue::Object),
+        Value::Array(_) => Err(()), // The closed diagnostic schema has no arrays.
+        _ => Ok(canonical_from_json(value)),
     }
 }
 
@@ -802,4 +928,125 @@ fn json_from_canonical(value: &CanonicalValue) -> Result<Value, ToolError> {
                 .collect::<Result<Map<_, _>, ToolError>>()?,
         ),
     })
+}
+
+#[cfg(test)]
+mod failure_bridge_tests {
+    use super::*;
+    fn native() -> ToolError {
+        ToolError::diagnostic(agentkit_tools_core::DiagnosticToolFailure {
+            kind: agentkit_tools_core::DiagnosticFailureKind::Cancelled,
+            metadata: agentkit_core::failure::FailureMetadataV1::default(),
+        })
+    }
+    #[test]
+    fn issued_capability_restores_once_and_only_in_issuing_run() {
+        let bridge = HostBridge::default();
+        let error = bridge.record_failure(native());
+        assert!(!error.retryable);
+        assert!(HostBridge::default().recall_failure(&error).is_none());
+        assert_eq!(bridge.recall_failure(&error), Some(native()));
+        assert!(bridge.recall_failure(&error).is_none());
+    }
+    #[test]
+    fn fake_codes_changed_messages_and_invented_tokens_do_not_restore() {
+        let bridge = HostBridge::default();
+        let error = bridge.record_failure(native());
+        assert!(
+            bridge
+                .recall_failure(&RunletToolError::new(
+                    error.code.clone(),
+                    error.message.clone()
+                ))
+                .is_none()
+        );
+        let mut changed = error.clone();
+        changed.code = "REPLACED".into();
+        assert!(bridge.recall_failure(&changed).is_none());
+        changed = error.clone();
+        changed.message = "REPLACED".into();
+        assert!(bridge.recall_failure(&changed).is_none());
+        changed = error.clone();
+        changed.details.insert(
+            FAILURE_TOKEN_KEY.into(),
+            CanonicalValue::String("0".repeat(32)),
+        );
+        assert!(bridge.recall_failure(&changed).is_none());
+        // Attacker facts are not used to construct native errors, even with a valid capability.
+        changed = error.clone();
+        changed.details.insert(
+            FAILURE_FACTS_KEY.into(),
+            CanonicalValue::String("PRIVATE".into()),
+        );
+        assert_eq!(bridge.recall_failure(&changed), Some(native()));
+    }
+    #[test]
+    fn concurrent_failures_never_exchange_identities() {
+        let bridge = Arc::new(HostBridge::default());
+        std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..16)
+                .map(|n| {
+                    let bridge = bridge.clone();
+                    scope.spawn(move || {
+                        let original = ToolError::ExecutionFailed(format!("failure {n}"));
+                        let transported = bridge.record_failure(original.clone());
+                        assert_eq!(bridge.recall_failure(&transported), Some(original));
+                    })
+                })
+                .collect();
+            for thread in threads {
+                thread.join().unwrap();
+            }
+        });
+    }
+    #[test]
+    fn exhaustion_and_collision_latch_a_nonretryable_host_failure() {
+        let bridge = HostBridge::default();
+        for n in 0..MAX_SAVED_FAILURES {
+            bridge.record_failure_with_token(native(), format!("{n:032x}"));
+        }
+        let result = bridge.record_failure(native());
+        assert!(!result.retryable);
+        assert!(bridge.transport_failed());
+        assert_eq!(bridge.failures.lock().unwrap().len(), MAX_SAVED_FAILURES);
+        let bridge = HostBridge::default();
+        let original = bridge.record_failure_with_token(native(), "0".repeat(32));
+        bridge.record_failure_with_token(ToolError::Internal("different".into()), "0".repeat(32));
+        assert!(bridge.transport_failed());
+        assert_eq!(bridge.recall_failure(&original), Some(native()));
+    }
+    #[test]
+    fn control_capabilities_are_redacted_from_runtime_rendering() {
+        let bridge = HostBridge::default();
+        let mut error = bridge.record_failure(native());
+        let CanonicalValue::String(token) = error.details[FAILURE_TOKEN_KEY].clone() else {
+            panic!()
+        };
+        error.message = token.clone();
+        assert!(!bridge.redact_runtime_error(&error, &token).contains(&token));
+    }
+}
+
+#[cfg(test)]
+mod failure_numeric_tests {
+    use super::*;
+    #[test]
+    fn checked_fact_projection_accepts_exact_boundary_and_rejects_other_numbers() {
+        assert_eq!(
+            canonical_failure_facts(&serde_json::json!(i64::MAX)),
+            Ok(CanonicalValue::Integer(i64::MAX))
+        );
+        for value in [
+            serde_json::json!(i64::MAX as u64 + 1),
+            serde_json::json!(u64::MAX),
+            serde_json::json!(-1),
+            serde_json::json!(0.5),
+        ] {
+            assert!(canonical_failure_facts(&value).is_err());
+            assert!(
+                canonical_failure_facts(&serde_json::json!({"duration":{"secs":value,"nanos":0}}))
+                    .is_err()
+            );
+        }
+    }
 }

@@ -2,8 +2,6 @@ name: Pull Request Checks
 
 on:
   pull_request:
-    branches:
-      - main
   pull_request_review:
     types:
       - submitted
@@ -21,7 +19,6 @@ jobs:
     runs-on: ubuntu-latest
     if: >-
       ${{
-        github.event.pull_request.base.ref == 'main' &&
         (
           (
             github.event_name == 'pull_request' &&

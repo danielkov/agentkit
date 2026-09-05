@@ -18,6 +18,11 @@
 //! - **Bridge to the capability layer** with [`ToolCapabilityProvider`],
 //!   which wraps every registered tool as an [`Invocable`].
 
+mod failure_observation;
+pub use failure_observation::{
+    FailureObservationPublisher, FailureObservationSlot, ObservationPublishError, ObservationUpdate,
+};
+
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -501,6 +506,8 @@ impl ToolResources for () {
 /// permission checker, shared resources, and a cancellation signal so the
 /// tool can abort long-running work when a turn is cancelled.
 pub struct ToolContext<'a> {
+    /// Per-invocation host publisher; never inherited by nested execution scopes.
+    pub failure_observer: Option<FailureObservationPublisher>,
     /// Capability-layer context carrying session and turn identifiers.
     pub capability: CapabilityContext<'a>,
     /// The active permission checker for sub-operations the tool may perform.
@@ -536,6 +543,7 @@ impl ToolExecutionScope {
     /// Creates an owned tool context for a nested tool call.
     pub fn nested_context(&self, metadata: MetadataMap) -> OwnedToolContext {
         OwnedToolContext {
+            failure_observer: None,
             session_id: self.session_id.clone(),
             turn_id: self.turn_id.clone(),
             metadata,
@@ -574,6 +582,8 @@ impl ToolExecutionScope {
 /// [`ToolContext`] expected by existing tool implementations.
 #[derive(Clone)]
 pub struct OwnedToolContext {
+    /// Installed fresh by task managers; clones within this invocation share it.
+    pub failure_observer: Option<FailureObservationPublisher>,
     /// Session identifier for the invocation.
     pub session_id: SessionId,
     /// Turn identifier for the invocation.
@@ -596,6 +606,7 @@ impl OwnedToolContext {
     /// Creates a borrowed [`ToolContext`] view over this owned context.
     pub fn borrowed(&self) -> ToolContext<'_> {
         ToolContext {
+            failure_observer: self.failure_observer.clone(),
             capability: CapabilityContext {
                 session_id: Some(&self.session_id),
                 turn_id: Some(&self.turn_id),
@@ -3185,6 +3196,7 @@ impl Invocable for ToolInvocableAdapter {
         }
 
         let mut tool_ctx = ToolContext {
+            failure_observer: None,
             capability: CapabilityContext {
                 session_id: ctx.session_id,
                 turn_id: ctx.turn_id,
@@ -3590,12 +3602,97 @@ impl ToolExecutor for BasicToolExecutor {
     }
 }
 
+/// Finite failure classification, independent of provider retry policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolFailureKind {
+    NotFound,
+    InvalidInput,
+    PermissionDenied,
+    ExecutionFailed,
+    Unavailable,
+    Cancelled,
+    Internal,
+}
+
+/// Sanitized diagnostics intentionally cannot represent a retryable Unavailable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticFailureKind {
+    ExecutionFailed,
+    Internal,
+    Cancelled,
+}
+
+/// A nonrecursive failure carrying only validated facts, never a raw message.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Error)]
+#[error("tool diagnostic failure ({kind:?})")]
+pub struct DiagnosticToolFailure {
+    pub kind: DiagnosticFailureKind,
+    pub metadata: agentkit_core::failure::FailureMetadataV1,
+}
+
+/// Host-owned terminal projection, including cancellation without diagnostics.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ToolFailureInfo {
+    pub kind: ToolFailureKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<agentkit_core::failure::FailureMetadataV1>,
+}
+
+impl<'de> Deserialize<'de> for DiagnosticToolFailure {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            kind: DiagnosticFailureKind,
+            metadata: agentkit_core::failure::FailureMetadataV1,
+        }
+        let wire = Wire::deserialize(deserializer).map_err(|_| {
+            serde::de::Error::custom(agentkit_core::failure::FailureMetadataDecodeError)
+        })?;
+        Ok(Self {
+            kind: wire.kind,
+            metadata: wire.metadata,
+        })
+    }
+}
+impl<'de> Deserialize<'de> for ToolFailureInfo {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            kind: ToolFailureKind,
+            metadata: Option<agentkit_core::failure::FailureMetadataV1>,
+        }
+        let wire = Wire::deserialize(deserializer).map_err(|_| {
+            serde::de::Error::custom(agentkit_core::failure::FailureMetadataDecodeError)
+        })?;
+        Ok(Self {
+            kind: wire.kind,
+            metadata: wire.metadata,
+        })
+    }
+}
+
+impl ToolFailureInfo {
+    /// Validate a parsed terminal projection without retaining unknown input.
+    pub fn from_value(
+        value: &Value,
+    ) -> Result<Self, agentkit_core::failure::FailureMetadataDecodeError> {
+        Self::deserialize(value).map_err(|_| agentkit_core::failure::FailureMetadataDecodeError)
+    }
+}
+
 /// Errors that can occur during tool lookup, permission checking, or execution.
 ///
 /// Returned from [`Tool::invoke`] and also used internally by
 /// [`BasicToolExecutor`] to represent lookup and permission failures.
 #[derive(Debug, Error, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ToolError {
+    /// Payload-free diagnostic failure; retry observations never authorize replay.
+    #[error("{0}")]
+    Diagnostic(Box<DiagnosticToolFailure>),
     /// No tool with the given name exists in the registry.
     #[error("tool not found: {0}")]
     NotFound(ToolName),
@@ -3620,6 +3717,43 @@ pub enum ToolError {
 }
 
 impl ToolError {
+    pub fn diagnostic(failure: DiagnosticToolFailure) -> Self {
+        Self::Diagnostic(Box::new(failure))
+    }
+    pub fn is_cancelled(&self) -> bool {
+        self.failure_kind() == ToolFailureKind::Cancelled
+    }
+    pub fn is_permission_denied(&self) -> bool {
+        self.failure_kind() == ToolFailureKind::PermissionDenied
+    }
+    pub fn failure_kind(&self) -> ToolFailureKind {
+        match self {
+            Self::NotFound(_) => ToolFailureKind::NotFound,
+            Self::InvalidInput(_) => ToolFailureKind::InvalidInput,
+            Self::PermissionDenied(_) => ToolFailureKind::PermissionDenied,
+            Self::ExecutionFailed(_) => ToolFailureKind::ExecutionFailed,
+            Self::Unavailable(_) => ToolFailureKind::Unavailable,
+            Self::Cancelled => ToolFailureKind::Cancelled,
+            Self::Internal(_) => ToolFailureKind::Internal,
+            Self::Diagnostic(failure) => match failure.kind {
+                DiagnosticFailureKind::ExecutionFailed => ToolFailureKind::ExecutionFailed,
+                DiagnosticFailureKind::Internal => ToolFailureKind::Internal,
+                DiagnosticFailureKind::Cancelled => ToolFailureKind::Cancelled,
+            },
+        }
+    }
+    pub fn failure_metadata(&self) -> Option<&agentkit_core::failure::FailureMetadataV1> {
+        match self {
+            Self::Diagnostic(failure) => Some(&failure.metadata),
+            _ => None,
+        }
+    }
+    pub fn failure_info(&self) -> ToolFailureInfo {
+        ToolFailureInfo {
+            kind: self.failure_kind(),
+            metadata: self.failure_metadata().cloned(),
+        }
+    }
     /// Convenience constructor for the [`PermissionDenied`](ToolError::PermissionDenied) variant.
     pub fn permission_denied(denial: PermissionDenial) -> Self {
         Self::PermissionDenied(denial)
@@ -4100,6 +4234,7 @@ mod tests {
 
         // ...but the inner tool must see its own name in the request.
         let owned = OwnedToolContext {
+            failure_observer: None,
             session_id: SessionId::new("s"),
             turn_id: TurnId::new("t"),
             metadata: MetadataMap::new(),
@@ -4289,6 +4424,7 @@ mod tests {
 
     fn test_context() -> OwnedToolContext {
         OwnedToolContext {
+            failure_observer: None,
             session_id: SessionId::new("s"),
             turn_id: TurnId::new("t"),
             metadata: MetadataMap::new(),
@@ -4315,6 +4451,7 @@ mod tests {
             cancellation: None,
         };
         OwnedToolContext {
+            failure_observer: None,
             session_id,
             turn_id,
             metadata,
@@ -4703,5 +4840,12 @@ mod tests {
         let mut names: Vec<_> = source.specs().into_iter().map(|s| s.name.0).collect();
         names.sort();
         assert_eq!(names, vec!["fs_read_file", "fs_write_file"]);
+    }
+}
+
+impl ToolContext<'_> {
+    /// Clone the invocation-scoped producer for host callbacks that outlive a borrow.
+    pub fn failure_observer(&self) -> Option<FailureObservationPublisher> {
+        self.failure_observer.clone()
     }
 }
