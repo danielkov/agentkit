@@ -76,6 +76,72 @@ these with `OpenAIResponsesLimits` and
 Limits must be non-zero; the per-field bound must fit both request and attempt
 bounds, and the per-attempt bound must fit the aggregate wire bound.
 
+## Retry observations and typed failures
+
+Responses emits `agentkit_loop::ProviderRetryEvent` through
+`AgentEvent::ProviderRetry` to registered loop observers. Initial HTTP retries
+are visible while `begin_turn` is still pending; stream retries are visible
+before their deferred backoff, including before an attempt-supersession marker.
+Direct adapter consumers can call `ModelSession::set_retry_observer` before
+`begin_turn`. Other adapters retain the default no-op implementation.
+
+- `Scheduled(RetryProgress)` carries a canonical route, attempt reason,
+  allowlisted upstream type/code, HTTP status when available, next delay, and
+  cumulative accounting. The first snapshot is immediate; subsequent snapshots
+  are limited to one per 250 ms per model request (`begin_turn` invocation). Suppressed updates do not
+  discard accounting. There is no queue, heartbeat, or trailing-update timer.
+- `Stopped(ProviderFailure)` reports explicit failure or cancellation once.
+  `Succeeded { route, accounting }` clears activity once on successful model
+  completion. These observations are not additional model results or tool-effects
+  records. Polling a completed/failed turn again produces no duplicate terminal
+  observation. Dropping a future/turn does not promise terminal delivery.
+- Callbacks are synchronous, infallible at the interface, and run without
+  holding decoder/session locks. They must not block or re-enter the session.
+  As with loop observers, panics propagate; blocking/panicking observers prevent
+  delivery guarantees.
+
+`RetryAccounting::attempts` counts polled HTTP client executions, including a
+resend after reactive authentication refresh, not policy retries plus one.
+Initial authentication and preflight failures can have zero attempts. Malformed
+endpoints, non-HTTP(S) endpoints, and invalid local attribution headers are
+rejected as `InvalidRequest` before transport execution, without retrying.
+`completed_backoff` sums the requested durations of fully completed waits;
+interrupted waits contribute zero, while earlier completed waits remain counted.
+`elapsed` measures monotonic time from before authentication and includes
+preflight, callbacks, requests, and interrupted waits. Cancellation and logical
+deadlines are checked before accepting a ready completion, so a cancelled or
+budget-expired wait is not counted as completed.
+
+Responses model-session failures use `LoopError::ProviderFailure`;
+`LoopError::provider_failure()` exposes the typed payload without string parsing.
+`reason` distinguishes retry-count exhaustion, logical budget expiry, disabled
+retry, unsafe replay after output, authentication, and protocol/transport failure.
+`last_attempt_reason` retains the failed attempt category, such as attempt/idle
+timeout, across a local exhaustion/budget stop. The last source response's
+`upstream` classification survives local stops and authentication refresh failures.
+A later HTTP/SSE failure replaces it, even when its type/code are unknown.
+Unknown, missing, or malformed provider type/code values become `Unknown`;
+provider messages, bodies, headers, credentials, prompts, endpoint URLs, and
+customer identifiers never enter these payloads, their Debug, or their Display.
+Non-success HTTP bodies are not read to obtain classifications.
+
+`LoopError::Cancelled` remains unchanged for cancellation-aware callers; its
+accounting is available in the `Stopped` observation. The driver's explicit
+post-event cancellation boundary calls `ModelTurn::on_cancelled` before dropping
+the turn, so terminal accounting does not require another event poll. Direct
+consumers that explicitly abandon a turn can use the same synchronous hook.
+Correlate observations
+through `ObservedEvent.session_id` and the current `TurnStarted` event. Direct
+session consumers own that association. A host must add its own stable fatal
+event reference when projecting this contract into parent-visible failures.
+
+**Compatibility:** the new `LoopError` variant requires updating exhaustive
+error matches. Existing serialized `AgentEvent` variants are unchanged, but old
+readers can reject the new variant; coordinate reader updates and compatible
+crate releases before sending these events across a versioned boundary. This
+upstream API does not implement ACP parent delivery, fatal-record persistence,
+or stable fatal-record correlation.
+
 ## Responses API
 
 `OpenAIResponsesConfig::new(authentication, model)` deliberately matches
