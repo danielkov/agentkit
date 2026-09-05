@@ -2915,6 +2915,42 @@ where
         self.finish_cancelled(turn_id, Vec::new()).map(Some)
     }
 
+    /// Retire the active logical turn without resuming model or tool execution.
+    ///
+    /// Use this after an interrupt (including [`LoopInterrupt::AfterToolResult`])
+    /// when the host wants to abandon the continuation. Pending approvals are
+    /// denied, foreground task cleanup is requested, and unanswered tool calls
+    /// receive cancellation results. Background work and queued input are kept;
+    /// the next call to [`Self::next`] can start a fresh logical turn.
+    ///
+    /// Returns `None` when no logical turn is active, including on repeated calls.
+    /// Otherwise emits exactly one cancelled [`AgentEvent::TurnFinished`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the first task cleanup error, after completing local cleanup and
+    /// emitting the cancelled terminal event. The turn is retired even on error;
+    /// a failing task manager may leave external tasks running.
+    pub async fn retire_interrupted_turn(&mut self) -> Result<Option<TurnResult>, LoopError> {
+        let Some(turn_id) = self.lifecycle.active_turn.clone() else {
+            return Ok(None);
+        };
+        // This is a logical presentation id, not a task-manager turn id.
+        // At AfterToolResult the foreground task round has already completed.
+        self.pending_round_resume = None;
+        let cleanup = self.cleanup_interrupted_turn().await;
+        let result = TurnResult {
+            turn_id,
+            finish_reason: FinishReason::Cancelled,
+            items: Vec::new(),
+            usage: None,
+            metadata: interrupted_metadata("turn"),
+        };
+        self.finish_logical_turn(&result);
+        cleanup?;
+        Ok(Some(result))
+    }
+
     /// Take a read-only snapshot of the driver's current transcript and input queue.
     pub fn snapshot(&self) -> LoopSnapshot {
         LoopSnapshot {
@@ -2990,7 +3026,9 @@ where
             Ok(LoopStep::Finished(turn)) => self.finish_logical_turn(turn),
             Err(_) => {
                 if let Some(turn_id) = self.lifecycle.active_turn.clone() {
-                    self.recover_from_next_error().await;
+                    if let Err(error) = self.cleanup_interrupted_turn().await {
+                        tracing::debug!(%error, "failed to clean up turn after loop error");
+                    }
                     self.finish_logical_turn(&TurnResult {
                         turn_id,
                         finish_reason: FinishReason::Error,
@@ -3005,7 +3043,7 @@ where
         result
     }
 
-    async fn recover_from_next_error(&mut self) {
+    async fn cleanup_interrupted_turn(&mut self) -> Result<(), LoopError> {
         let mut seen_turns = HashSet::new();
         let mut interrupted_turns = Vec::new();
         if let Some(active) = self.active_tool_round.take()
@@ -3026,13 +3064,20 @@ where
         }
 
         let pending = self.drain_pending_approval_items();
+        let mut cleanup_error = None;
         for turn_id in interrupted_turns {
-            if let Err(error) = self.task_manager.on_turn_interrupted(&turn_id).await {
-                tracing::debug!(%error, %turn_id, "failed to clean up turn after loop error");
+            if let Err(error) = self.task_manager.on_turn_interrupted(&turn_id).await
+                && cleanup_error.is_none()
+            {
+                cleanup_error = Some(LoopError::Tool(ToolError::Internal(error.to_string())));
             }
         }
         self.reject_drained_approvals(pending);
         self.close_interrupted_tool_calls();
+        match cleanup_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     async fn next_inner(&mut self) -> Result<LoopStep, LoopError> {
@@ -9563,6 +9608,242 @@ mod tests {
         assert_eq!(seen.len(), 2);
         assert_eq!(seen[0], Some(default_cache));
         assert_eq!(seen[1], Some(override_cache));
+    }
+
+    // Count actual model requests, including continuations that emit no deltas.
+    struct RetirementCountingAdapter(StdArc<AtomicUsize>);
+    struct RetirementCountingSession(StdArc<AtomicUsize>);
+
+    #[async_trait]
+    impl ModelAdapter for RetirementCountingAdapter {
+        type Session = RetirementCountingSession;
+
+        async fn start_session(&self, _config: SessionConfig) -> Result<Self::Session, LoopError> {
+            Ok(RetirementCountingSession(self.0.clone()))
+        }
+    }
+
+    #[async_trait]
+    impl ModelSession for RetirementCountingSession {
+        type Turn = FakeTurn;
+
+        async fn begin_turn(
+            &mut self,
+            request: TurnRequest,
+            cancellation: Option<TurnCancellation>,
+        ) -> Result<Self::Turn, LoopError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            FakeSession.begin_turn(request, cancellation).await
+        }
+    }
+
+    #[tokio::test]
+    async fn retire_interrupted_turn_after_tool_result_starts_fresh_without_continuing() {
+        let calls = StdArc::new(AtomicUsize::new(0));
+        let events = StdArc::new(StdMutex::new(Vec::new()));
+        let agent = Agent::builder()
+            .model(RetirementCountingAdapter(calls.clone()))
+            .add_tool_source(ToolRegistry::new().with(EchoTool::default()))
+            .permissions(AllowAllPermissions)
+            .observer(RecordingObserver {
+                events: events.clone(),
+            })
+            .build()
+            .unwrap();
+        let mut driver = agent
+            .start(SessionConfig::new("retire-after-tool"))
+            .await
+            .unwrap();
+        assert!(driver.retire_interrupted_turn().await.unwrap().is_none());
+        driver
+            .submit_input(vec![Item::text(ItemKind::User, "ping")])
+            .unwrap();
+        let turn_id = match driver.next().await.unwrap() {
+            LoopStep::Interrupt(LoopInterrupt::AfterToolResult(info)) => info.turn_id,
+            other => panic!("expected AfterToolResult, got {other:?}"),
+        };
+        let transcript = driver.snapshot().transcript;
+        let queued = vec![Item::text(ItemKind::User, "fresh request")];
+        driver.submit_input(queued.clone()).unwrap();
+        let retired = driver.retire_interrupted_turn().await.unwrap().unwrap();
+        assert_eq!(retired.turn_id, turn_id);
+        assert_eq!(retired.finish_reason, FinishReason::Cancelled);
+        assert!(retired.items.is_empty());
+        assert!(driver.retire_interrupted_turn().await.unwrap().is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(driver.snapshot().transcript, transcript);
+        assert_eq!(driver.snapshot().pending_input, queued);
+        assert!(driver.pending_round_resume.is_none());
+        assert!(driver.lifecycle.active_turn.is_none());
+        let fresh = match driver.next().await.unwrap() {
+            LoopStep::Finished(turn) => turn,
+            other => panic!("expected fresh turn to finish, got {other:?}"),
+        };
+        assert_ne!(fresh.turn_id, turn_id);
+        assert_eq!(fresh.finish_reason, FinishReason::Completed);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(driver.snapshot().pending_input.is_empty());
+        assert!(
+            driver
+                .snapshot()
+                .transcript
+                .iter()
+                .any(|item| { item.kind == ItemKind::User && item.parts == queued[0].parts })
+        );
+        assert!(matches!(
+            driver.next().await.unwrap(),
+            LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_))
+        ));
+        assert!(driver.retire_interrupted_turn().await.unwrap().is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let lifecycle = turn_lifecycle_events(&events.lock().unwrap());
+        assert_eq!(
+            lifecycle,
+            vec![
+                (turn_id.clone(), None),
+                (turn_id, Some(FinishReason::Cancelled)),
+                (fresh.turn_id.clone(), None),
+                (fresh.turn_id, Some(FinishReason::Completed)),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn retire_interrupted_turn_denies_pending_approval_even_on_cleanup_error() {
+        for fail_cleanup in [false, true] {
+            let calls = StdArc::new(AtomicUsize::new(0));
+            let events = StdArc::new(StdMutex::new(Vec::new()));
+            let manager = TestTaskManager::new(SimpleTaskManager::new());
+            let manager = if fail_cleanup {
+                manager.fail_interrupt("retirement cleanup failed")
+            } else {
+                manager
+            };
+            let agent = Agent::builder()
+                .model(RetirementCountingAdapter(calls.clone()))
+                .add_tool_source(ToolRegistry::new().with(EchoTool::default()))
+                .permissions(ApproveFsReads)
+                .task_manager(manager)
+                .observer(RecordingObserver {
+                    events: events.clone(),
+                })
+                .build()
+                .unwrap();
+            let mut driver = agent
+                .start(SessionConfig::new("retire-approval"))
+                .await
+                .unwrap();
+            driver
+                .submit_input(vec![Item::text(ItemKind::User, "ping")])
+                .unwrap();
+            assert!(matches!(
+                driver.next().await.unwrap(),
+                LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(_))
+            ));
+            let turn_id = driver.lifecycle.active_turn.clone().unwrap();
+            let result = driver.retire_interrupted_turn().await;
+            if fail_cleanup {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("retirement cleanup failed")
+                );
+            } else {
+                assert_eq!(
+                    result.unwrap().unwrap().finish_reason,
+                    FinishReason::Cancelled
+                );
+            }
+            assert!(driver.pending_approvals.is_empty());
+            assert!(driver.pending_approval_order.is_empty());
+            assert!(driver.active_tool_round.is_none());
+            assert!(driver.lifecycle.active_turn.is_none());
+            assert!(driver.retire_interrupted_turn().await.unwrap().is_none());
+            assert!(matches!(
+                driver.next().await.unwrap(),
+                LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_))
+            ));
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            validate_transcript_invariants(&driver.snapshot().transcript).unwrap();
+            let events = events.lock().unwrap();
+            assert_eq!(
+                turn_lifecycle_events(&events),
+                vec![
+                    (turn_id.clone(), None),
+                    (turn_id, Some(FinishReason::Cancelled))
+                ]
+            );
+            assert_eq!(events.iter().filter(|event| matches!(event,
+                AgentEvent::ToolResultReceived(result) if result.call_id == ToolCallId::new("call-1") && result.is_error
+            )).count(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn retire_interrupted_turn_preserves_detached_background_task() {
+        let calls = StdArc::new(AtomicUsize::new(0));
+        let entered = StdArc::new(AtomicBool::new(false));
+        let release = StdArc::new(Notify::new());
+        let task_manager = AsyncTaskManager::new().routing(NameRoutingPolicy::new([(
+            "detaching-wait",
+            RoutingDecision::ForegroundThenDetachAfter(Duration::from_millis(10)),
+        )]));
+        let handle = task_manager.handle();
+        let agent = Agent::builder()
+            .model(RetirementCountingAdapter(calls.clone()))
+            .add_tool_source(ToolRegistry::new().with(BlockingTool::new(
+                "detaching-wait",
+                entered.clone(),
+                release.clone(),
+                "background-done",
+            )))
+            .permissions(AllowAllPermissions)
+            .task_manager(task_manager)
+            .build()
+            .unwrap();
+        let mut driver = agent
+            .start(SessionConfig::new("retire-background"))
+            .await
+            .unwrap();
+        driver
+            .submit_input(vec![Item::text(ItemKind::User, "ping")])
+            .unwrap();
+        assert!(matches!(
+            driver.next().await.unwrap(),
+            LoopStep::Interrupt(LoopInterrupt::AfterToolResult(_))
+        ));
+        assert!(matches!(
+            wait_for_task_event(&handle).await,
+            TaskEvent::Started(_)
+        ));
+        assert!(matches!(
+            wait_for_task_event(&handle).await,
+            TaskEvent::Detached(_)
+        ));
+        wait_until_entered(entered.as_ref()).await;
+        let transcript = driver.snapshot().transcript;
+        assert_eq!(
+            driver
+                .retire_interrupted_turn()
+                .await
+                .unwrap()
+                .unwrap()
+                .finish_reason,
+            FinishReason::Cancelled
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(driver.snapshot().transcript, transcript);
+        let running = handle.list_running().await;
+        assert_eq!(running.len(), 1);
+        assert_eq!(running[0].tool_name, "detaching-wait");
+        release.notify_one();
+        match wait_for_task_event(&handle).await {
+            TaskEvent::Completed(_, result) => {
+                assert_eq!(result.output, ToolOutput::Text("background-done".into()))
+            }
+            other => panic!("retired turn must preserve background completion, got {other:?}"),
+        }
     }
 
     #[tokio::test]
