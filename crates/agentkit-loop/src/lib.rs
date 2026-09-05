@@ -90,6 +90,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+mod retry;
+pub use retry::{
+    ProviderClassification, ProviderFailure, ProviderFailureReason, ProviderRetryEvent,
+    ProviderRoute, RetryAccounting, RetryObserver, RetryProgress, UpstreamErrorKind,
+};
+
 const INTERRUPTED_METADATA_KEY: &str = "agentkit.interrupted";
 const INTERRUPT_REASON_METADATA_KEY: &str = "agentkit.interrupt_reason";
 const INTERRUPT_STAGE_METADATA_KEY: &str = "agentkit.interrupt_stage";
@@ -663,6 +669,10 @@ pub trait ModelAdapter: Send + Sync {
 /// [`ModelTurn`].
 #[async_trait]
 pub trait ModelSession: Send {
+    /// Install a per-session observer for retries inside both begin_turn and next_event.
+    /// The default is a no-op for adapters without retry observations.
+    fn set_retry_observer(&mut self, _observer: Option<Arc<dyn RetryObserver>>) {}
+
     /// The turn type produced by this session.
     type Turn: ModelTurn;
 
@@ -709,6 +719,11 @@ pub trait ModelSession: Send {
 /// `Ok(Some(ModelTurnEvent::Finished(_)))`.
 #[async_trait]
 pub trait ModelTurn: Send {
+    /// Notifies the turn before the driver drops it after explicit cancellation
+    /// observed between events. This synchronous hook must not block.
+    /// The default is a no-op; adapters can finalize retry accounting here.
+    fn on_cancelled(&mut self) {}
+
     /// Retrieve the next event from the model's response stream.
     ///
     /// Returns `Ok(None)` when the stream is exhausted.
@@ -908,6 +923,8 @@ pub trait LoopMutator: Send + Sync {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum AgentEvent {
+    /// Sanitized provider retry lifecycle, separate from content and effects.
+    ProviderRetry(ProviderRetryEvent),
     /// The agent run has been initialised.
     RunStarted { session_id: SessionId },
     /// A new logical turn is starting.
@@ -1386,7 +1403,18 @@ where
     pub async fn start(&self, config: SessionConfig) -> Result<LoopDriver<M::Session>, LoopError> {
         let session_id = config.session_id.clone();
         let default_cache = config.cache.clone();
-        let session = self.model.start_session(config).await?;
+        let mut session = self.model.start_session(config).await?;
+        if !self.observers.is_empty() {
+            let observers = self.observers.clone();
+            let observed_session_id = Arc::new(session_id.clone());
+            session.set_retry_observer(Some(Arc::new(move |event| {
+                fan_out_observed_event(
+                    &observers,
+                    &observed_session_id,
+                    AgentEvent::ProviderRetry(event),
+                );
+            })));
+        }
         let provider_name = self.model.provider_name().map(str::to_owned);
         let tool_executor = self
             .tool_executor
@@ -2390,6 +2418,7 @@ where
                 .as_ref()
                 .is_some_and(TurnCancellation::is_cancelled)
             {
+                turn.on_cancelled();
                 self.task_manager
                     .on_turn_interrupted(&turn_id)
                     .await
@@ -4226,6 +4255,9 @@ fn tool_result_not_started(item: &Item) -> bool {
 /// Errors that can occur while driving the agent loop.
 #[derive(Debug, Error)]
 pub enum LoopError {
+    /// Typed, sanitized model failure with retry accounting.
+    #[error(transparent)]
+    ProviderFailure(Box<ProviderFailure>),
     /// The driver was in an unexpected state for the requested operation.
     #[error("invalid driver state: {0}")]
     InvalidState(String),
@@ -4244,6 +4276,16 @@ pub enum LoopError {
     /// The requested operation is not supported.
     #[error("unsupported operation: {0}")]
     Unsupported(String),
+}
+
+impl LoopError {
+    /// Returns structured provider metadata without parsing a rendered error.
+    pub fn provider_failure(&self) -> Option<&ProviderFailure> {
+        match self {
+            Self::ProviderFailure(failure) => Some(failure),
+            _ => None,
+        }
+    }
 }
 
 /// Internal [`EventEmitter`] backed by the driver's observer slice. Lives

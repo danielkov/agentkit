@@ -21,13 +21,18 @@ use agentkit_http::{
 };
 use agentkit_loop::{
     LoopError, ModelAdapter, ModelSession, ModelTurn, ModelTurnEvent, ModelTurnResult,
-    PromptCacheMode, PromptCacheStrategy, SessionConfig, TurnRequest, set_provider_finish_reasons,
+    PromptCacheMode, PromptCacheStrategy, ProviderClassification, ProviderFailure,
+    ProviderFailureReason, ProviderRetryEvent, ProviderRoute, RetryAccounting, RetryObserver,
+    RetryProgress, SessionConfig, TurnRequest, UpstreamErrorKind, set_provider_finish_reasons,
 };
 use async_trait::async_trait;
 use futures_util::future::{Either, select};
 use serde_json::{Map, Value, json};
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
+
+mod retry;
+use retry::{RetryTracker, local_error, provider_error, stream_classification};
 
 const PUBLIC_ENDPOINT: &str = "https://api.openai.com/v1/responses";
 const PRIVATE_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
@@ -346,6 +351,7 @@ impl ModelAdapter for OpenAIResponsesAdapter {
             client: self.client.clone(),
             config: self.config.clone(),
             session: config,
+            retry_observer: None,
         })
     }
 
@@ -359,61 +365,82 @@ pub struct OpenAIResponsesSession {
     client: Http,
     config: Arc<OpenAIResponsesConfig>,
     session: SessionConfig,
+    retry_observer: Option<Arc<dyn RetryObserver>>,
 }
 
 #[async_trait]
 impl ModelSession for OpenAIResponsesSession {
     type Turn = OpenAIResponsesTurn;
 
+    fn set_retry_observer(&mut self, observer: Option<Arc<dyn RetryObserver>>) {
+        self.retry_observer = observer;
+    }
+
     async fn begin_turn(
         &mut self,
         request: TurnRequest,
         cancellation: Option<TurnCancellation>,
     ) -> Result<Self::Turn, LoopError> {
-        if cancelled(cancellation.as_ref()) {
-            return Err(LoopError::Cancelled);
+        let mut tracker = RetryTracker::new(self.config.profile, self.retry_observer.clone());
+        let prepared = async {
+            if cancelled(cancellation.as_ref()) {
+                return Err(LoopError::Cancelled);
+            }
+            // One logical deadline starts before encoding and initial authentication.
+            let deadline = self
+                .config
+                .resilience
+                .as_ref()
+                .map(|config| LogicalDeadline {
+                    started_at: tracker.started_at,
+                    budget: config.retry_budget,
+                });
+            deadline_remaining(deadline.as_ref()).map_err(http_loop_error)?;
+            let auth_timeout = self
+                .config
+                .resilience
+                .as_ref()
+                .and_then(|config| config.attempt_timeout);
+            let auth = cancellable(
+                run_bounded_http(
+                    self.config.authentication.authenticate(None),
+                    auth_timeout,
+                    deadline.as_ref(),
+                    "OpenAI authentication",
+                ),
+                cancellation.as_ref(),
+            )
+            .await?
+            .map_err(|error| match error {
+                HttpError::Timeout {
+                    operation: "logical request retry budget",
+                    ..
+                } => http_loop_error(error),
+                _ => local_error(ProviderFailureReason::Authentication),
+            })?;
+            let mut value = encode_request_bound(&self.config, &request, auth.binding())
+                .map_err(|_| local_error(ProviderFailureReason::InvalidRequest))?;
+            // Serialize once. Every status, transport, and stream retry reuses these exact bytes.
+            let body = agentkit_http::Bytes::from_owner(Zeroizing::new(
+                serde_json::to_vec(&value)
+                    .map_err(OpenAIResponsesError::Serialize)
+                    .map_err(|_| local_error(ProviderFailureReason::InvalidRequest))?,
+            ));
+            zeroize_encrypted_content(&mut value);
+            let idempotency_key = stable_idempotency_key(
+                &self.session.session_id.to_string(),
+                &request.turn_id.to_string(),
+                &body,
+            );
+            let supersession_enabled = self
+                .session
+                .consumer_capabilities
+                .response_attempt_supersession;
+            Ok((body, idempotency_key, auth, deadline, supersession_enabled))
         }
-        // One logical deadline starts before encoding and initial authentication.
-        let deadline = self
-            .config
-            .resilience
-            .as_ref()
-            .map(|config| LogicalDeadline::new(config.retry_budget));
-        deadline_remaining(deadline.as_ref()).map_err(http_loop_error)?;
-        let auth_timeout = self
-            .config
-            .resilience
-            .as_ref()
-            .and_then(|config| config.attempt_timeout);
-        let auth = cancellable(
-            run_bounded_http(
-                self.config.authentication.authenticate(None),
-                auth_timeout,
-                deadline.as_ref(),
-                "OpenAI authentication",
-            ),
-            cancellation.as_ref(),
-        )
-        .await?
-        .map_err(http_loop_error)?;
-        let mut value = encode_request_bound(&self.config, &request, auth.binding())
-            .map_err(|error| LoopError::Provider(error.to_string()))?;
-        // Serialize once. Every status, transport, and stream retry reuses these exact bytes.
-        let body = agentkit_http::Bytes::from_owner(Zeroizing::new(
-            serde_json::to_vec(&value)
-                .map_err(OpenAIResponsesError::Serialize)
-                .map_err(|error| LoopError::Provider(error.to_string()))?,
-        ));
-        zeroize_encrypted_content(&mut value);
-        let idempotency_key = stable_idempotency_key(
-            &self.session.session_id.to_string(),
-            &request.turn_id.to_string(),
-            &body,
-        );
-        let supersession_enabled = self
-            .session
-            .consumer_capabilities
-            .response_attempt_supersession;
+        .await;
+        let (body, idempotency_key, auth, deadline, supersession_enabled) =
+            prepared.map_err(|error| tracker.finish(error))?;
         OpenAIResponsesTurn::open(
             ResponsesRequestContext {
                 client: self.client.clone(),
@@ -427,6 +454,7 @@ impl ModelSession for OpenAIResponsesSession {
                 retries: 0,
                 refreshed: false,
                 wire_bytes: 0,
+                tracker,
             },
             supersession_enabled,
             cancellation.as_ref(),
@@ -456,11 +484,34 @@ pub struct OpenAIResponsesTurn {
 
 #[async_trait]
 impl ModelTurn for OpenAIResponsesTurn {
+    fn on_cancelled(&mut self) {
+        if !self.finished {
+            self.finished = true;
+            self.attempt = None;
+            let _ = self.context.tracker.finish(LoopError::Cancelled);
+        }
+    }
+
     async fn next_event(
         &mut self,
         cancellation: Option<TurnCancellation>,
     ) -> Result<Option<ModelTurnEvent>, LoopError> {
-        self.next_event_inner(cancellation.as_ref()).await
+        if self.finished {
+            return Ok(None);
+        }
+        match self.next_event_inner(cancellation.as_ref()).await {
+            Ok(event) => {
+                if matches!(event, Some(ModelTurnEvent::Finished(_))) {
+                    self.context.tracker.succeed();
+                }
+                Ok(event)
+            }
+            Err(error) => {
+                self.finished = true;
+                self.attempt = None;
+                Err(self.context.tracker.finish(error))
+            }
+        }
     }
 }
 
@@ -479,7 +530,9 @@ impl OpenAIResponsesTurn {
             pending_delay: Duration::ZERO,
             finished: false,
         };
-        turn.reopen(cancellation).await?;
+        if let Err(error) = turn.reopen(cancellation).await {
+            return Err(turn.context.tracker.finish(error));
+        }
         Ok(turn)
     }
 
@@ -501,6 +554,7 @@ impl OpenAIResponsesTurn {
             )
             .await?
             .map_err(http_loop_error)?;
+            self.context.tracker.completed_wait(delay);
         }
         self.attempt = Some(open_live_attempt(&mut self.context, cancellation).await?);
         self.pending_reopen = false;
@@ -515,6 +569,8 @@ impl OpenAIResponsesTurn {
             if cancelled(cancellation) {
                 return Err(LoopError::Cancelled);
             }
+            // Buffered events and EOF must not bypass the logical request budget.
+            deadline_remaining(self.context.deadline.as_ref()).map_err(http_loop_error)?;
             if self.pending_reopen {
                 self.reopen(cancellation).await?;
             }
@@ -641,6 +697,7 @@ impl OpenAIResponsesTurn {
                 }
             };
             if let Err(failure) = result {
+                self.context.tracker.note_failure(&failure.error);
                 if !failure.retryable
                     || self.context.retries
                         >= self
@@ -650,10 +707,10 @@ impl OpenAIResponsesTurn {
                             .as_ref()
                             .map_or(0, |config| config.max_retries)
                 {
-                    return Err(*failure.error);
+                    return Err(stopped_attempt(&self.context, failure));
                 }
                 if self.attempt_output_emitted && !self.supersession_enabled {
-                    return Err(*failure.error);
+                    return Err(local_error(ProviderFailureReason::ReplayUnsafe));
                 }
                 let delay = self
                     .context
@@ -662,6 +719,12 @@ impl OpenAIResponsesTurn {
                     .as_ref()
                     .expect("retry requires resilience")
                     .retry_delay(self.context.retries, failure.headers.as_ref());
+                self.context.tracker.scheduled(&failure.error, delay);
+                // Observers may request cancellation without re-entering this turn.
+                // Finalize now: the driver can drop the turn after this event.
+                if cancelled(cancellation) {
+                    return Err(LoopError::Cancelled);
+                }
                 self.context.retries += 1;
                 self.attempt = None;
                 self.pending_reopen = true;
@@ -1517,20 +1580,38 @@ where
     futures_util::pin_mut!(future);
     let timer = sleep(timeout);
     futures_util::pin_mut!(timer);
-    match select(future, timer).await {
-        Either::Left((result, _)) => result,
-        Either::Right((_, _)) if budget_limited => Err(HttpError::Timeout {
+    match select(timer, future).await {
+        Either::Right((result, _)) => {
+            deadline_remaining(deadline)?;
+            result
+        }
+        Either::Left((_, _)) if budget_limited => Err(HttpError::Timeout {
             operation: "logical request retry budget",
             timeout: deadline
                 .expect("budget-limited operation has deadline")
                 .budget,
         }),
-        Either::Right((_, _)) => Err(HttpError::Timeout { operation, timeout }),
+        Either::Left((_, _)) => Err(HttpError::Timeout { operation, timeout }),
     }
 }
 
 fn http_loop_error(error: HttpError) -> LoopError {
-    LoopError::Provider(format!("OpenAI Responses {error}"))
+    let reason = match error {
+        HttpError::Timeout {
+            operation: "logical request retry budget",
+            ..
+        } => ProviderFailureReason::RetryBudget,
+        HttpError::Timeout {
+            operation: "response stream idle",
+            ..
+        } => ProviderFailureReason::IdleTimeout,
+        HttpError::Timeout { .. } => ProviderFailureReason::AttemptTimeout,
+        HttpError::InvalidUrl(_) | HttpError::InvalidHeader(_) | HttpError::Serialize(_) => {
+            ProviderFailureReason::InvalidRequest
+        }
+        _ => ProviderFailureReason::Transport,
+    };
+    local_error(reason)
 }
 
 #[derive(Debug)]
@@ -1552,6 +1633,7 @@ struct ResponsesRequestContext {
     retries: usize,
     refreshed: bool,
     wire_bytes: usize,
+    tracker: RetryTracker,
 }
 
 struct LiveAttempt {
@@ -1572,6 +1654,22 @@ impl LiveAttempt {
     }
 }
 
+fn stopped_attempt(context: &ResponsesRequestContext, failure: AttemptFailure) -> LoopError {
+    if failure
+        .error
+        .provider_failure()
+        .is_some_and(|failure| matches!(failure.upstream.http_status, Some(401 | 403)))
+    {
+        local_error(ProviderFailureReason::Authentication)
+    } else if !failure.retryable {
+        *failure.error
+    } else if context.config.resilience.is_none() {
+        local_error(ProviderFailureReason::RetryDisabled)
+    } else {
+        local_error(ProviderFailureReason::RetryExhausted)
+    }
+}
+
 async fn open_live_attempt(
     context: &mut ResponsesRequestContext,
     cancellation: Option<&TurnCancellation>,
@@ -1583,19 +1681,24 @@ async fn open_live_attempt(
             .as_ref()
             .and_then(|config| config.attempt_timeout);
         let attempt_deadline = attempt_timeout.map(LogicalDeadline::new);
+        let logical_deadline = context.deadline.clone();
         let result = attempt_with_timeout(
             send_live_attempt(context, cancellation),
             attempt_timeout,
-            context.deadline.as_ref(),
+            logical_deadline.as_ref(),
             cancellation,
         )
         .await;
+        if let Err(failure) = &result {
+            context.tracker.note_failure(&failure.error);
+        }
         match result {
             Ok(mut attempt) => {
                 attempt.deadline = attempt_deadline;
                 return Ok(attempt);
             }
             Err(failure) if is_unauthorized(&failure.error) && !context.refreshed => {
+                context.tracker.scheduled(&failure.error, Duration::ZERO);
                 let binding = context.auth.binding().map(str::to_owned);
                 let refreshed = cancellable(
                     run_bounded_http(
@@ -1614,11 +1717,15 @@ async fn open_live_attempt(
                     cancellation,
                 )
                 .await?
-                .map_err(http_loop_error)?;
+                .map_err(|error| match error {
+                    HttpError::Timeout {
+                        operation: "logical request retry budget",
+                        ..
+                    } => http_loop_error(error),
+                    _ => local_error(ProviderFailureReason::Authentication),
+                })?;
                 if refreshed.binding() != binding.as_deref() {
-                    return Err(LoopError::Provider(
-                        "OpenAI authentication binding changed during reactive refresh".into(),
-                    ));
+                    return Err(local_error(ProviderFailureReason::Authentication));
                 }
                 context.auth = refreshed;
                 context.refreshed = true;
@@ -1638,6 +1745,7 @@ async fn open_live_attempt(
                     .as_ref()
                     .expect("retry requires resilience")
                     .retry_delay(context.retries, failure.headers.as_ref());
+                context.tracker.scheduled(&failure.error, delay);
                 context.retries += 1;
                 cancellable(
                     run_bounded_http(
@@ -1653,14 +1761,15 @@ async fn open_live_attempt(
                 )
                 .await?
                 .map_err(http_loop_error)?;
+                context.tracker.completed_wait(delay);
             }
-            Err(failure) => return Err(*failure.error),
+            Err(failure) => return Err(stopped_attempt(context, failure)),
         }
     }
 }
 
 async fn send_live_attempt(
-    context: &ResponsesRequestContext,
+    context: &mut ResponsesRequestContext,
     cancellation: Option<&TurnCancellation>,
 ) -> Result<LiveAttempt, AttemptFailure> {
     deadline_remaining(context.deadline.as_ref())
@@ -1672,7 +1781,7 @@ async fn send_live_attempt(
         headers.insert(
             "user-agent",
             HeaderValue::from_str(user_agent)
-                .map_err(|_| protocol_failure("invalid user-agent header"))?,
+                .map_err(|_| nonretryable(local_error(ProviderFailureReason::InvalidRequest)))?,
         );
     } else {
         headers
@@ -1716,13 +1825,20 @@ async fn send_live_attempt(
         None
     };
     headers.extend(context.auth.headers().clone());
+    let request = context
+        .client
+        .post(&context.config.endpoint)
+        .headers(headers)
+        .body(context.body.clone())
+        .build()
+        .map_err(|error| nonretryable(http_loop_error(error)))?;
     let response = cancellable(
-        context
-            .client
-            .post(&context.config.endpoint)
-            .headers(headers)
-            .body(context.body.clone())
-            .send(),
+        async {
+            // Count only a polled send, after preflight and cancellation checks.
+            context.tracker.accounting.attempts =
+                context.tracker.accounting.attempts.saturating_add(1);
+            context.client.execute(request).await
+        },
         cancellation,
     )
     .await
@@ -1732,8 +1848,12 @@ async fn send_live_attempt(
     let status = response.status();
     if status == StatusCode::UNAUTHORIZED {
         return Err(AttemptFailure {
-            error: Box::new(LoopError::Provider(
-                "OpenAI Responses returned 401 Unauthorized".into(),
+            error: Box::new(provider_error(
+                ProviderFailureReason::HttpStatus,
+                ProviderClassification {
+                    http_status: Some(401),
+                    ..ProviderClassification::default()
+                },
             )),
             retryable: false,
             headers: None,
@@ -1741,9 +1861,13 @@ async fn send_live_attempt(
     }
     if !status.is_success() {
         return Err(AttemptFailure {
-            error: Box::new(LoopError::Provider(format!(
-                "OpenAI Responses returned HTTP {status}"
-            ))),
+            error: Box::new(provider_error(
+                ProviderFailureReason::HttpStatus,
+                ProviderClassification {
+                    http_status: Some(status.as_u16()),
+                    ..ProviderClassification::default()
+                },
+            )),
             retryable: retryable_response_status(status, context.config.profile),
             headers: retry_headers(response.headers()),
         });
@@ -1797,11 +1921,9 @@ fn retryable_response_status(status: StatusCode, profile: OpenAIResponsesProfile
             && matches!(status.as_u16(), 404 | 529))
 }
 
-fn attempt_timeout_failure(timeout: Duration) -> AttemptFailure {
+fn attempt_timeout_failure(_timeout: Duration) -> AttemptFailure {
     AttemptFailure {
-        error: Box::new(LoopError::Provider(format!(
-            "Responses attempt timed out after {timeout:?}"
-        ))),
+        error: Box::new(local_error(ProviderFailureReason::AttemptTimeout)),
         retryable: true,
         headers: None,
     }
@@ -1831,15 +1953,19 @@ where
         futures_util::pin_mut!(future);
         let timer = sleep(timeout);
         futures_util::pin_mut!(timer);
-        match select(future, timer).await {
-            Either::Left((result, _)) => result,
-            Either::Right((_, _)) if budget_limited => {
+        match select(timer, future).await {
+            Either::Right((result, _)) => {
+                deadline_remaining(deadline)
+                    .map_err(|error| nonretryable(http_loop_error(error)))?;
+                result
+            }
+            Either::Left((_, _)) if budget_limited => {
                 Err(nonretryable(http_loop_error(HttpError::Timeout {
                     operation: "logical request retry budget",
                     timeout: deadline.expect("budget timeout has deadline").budget,
                 })))
             }
-            Either::Right((_, _)) => Err(attempt_timeout_failure(timeout)),
+            Either::Left((_, _)) => Err(attempt_timeout_failure(timeout)),
         }
     };
     match cancellable(timed, cancellation).await {
@@ -2189,17 +2315,12 @@ impl ResponsesState {
                         }
                     }
                 }
-                let code = value
-                    .pointer("/response/error/code")
-                    .or_else(|| value.pointer("/error/code"))
-                    .or_else(|| value.get("code"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown");
                 let retryable = stream_failure_retryable(self.profile, value, kind);
                 Err(AttemptFailure {
-                    error: Box::new(LoopError::Provider(format!(
-                        "OpenAI Responses stream failed ({code})"
-                    ))),
+                    error: Box::new(provider_error(
+                        ProviderFailureReason::ResponseFailed,
+                        stream_classification(value, kind),
+                    )),
                     retryable,
                     headers: None,
                 })
@@ -3264,9 +3385,7 @@ fn stable_idempotency_key(session: &str, turn: &str, body: &[u8]) -> String {
 fn transport_failure(error: HttpError) -> AttemptFailure {
     let retryable = error.is_retryable_transport();
     AttemptFailure {
-        error: Box::new(LoopError::Provider(format!(
-            "OpenAI Responses transport failed: {error}"
-        ))),
+        error: Box::new(http_loop_error(error)),
         retryable,
         headers: None,
     }
@@ -3348,7 +3467,10 @@ fn nonretryable(error: LoopError) -> AttemptFailure {
 }
 
 fn is_unauthorized(error: &LoopError) -> bool {
-    matches!(error, LoopError::Provider(message) if message.contains("401 Unauthorized"))
+    error.provider_failure().is_some_and(|failure| {
+        failure.reason == ProviderFailureReason::HttpStatus
+            && failure.upstream.http_status == Some(401)
+    })
 }
 
 fn cancelled(cancellation: Option<&TurnCancellation>) -> bool {
@@ -3371,14 +3493,28 @@ where
     futures_util::pin_mut!(future);
     let cancelled = cancellation.cancelled();
     futures_util::pin_mut!(cancelled);
-    match select(future, cancelled).await {
-        Either::Left((result, _)) => Ok(result),
-        Either::Right((_, _)) => Err(LoopError::Cancelled),
-    }
+    let raced = select(cancelled, future);
+    futures_util::pin_mut!(raced);
+    futures_util::future::poll_fn(|cx| {
+        // TurnCancellation's notification future polls on a timer. Check the
+        // generation on every wake too, so a ready request cannot outrun it.
+        if cancellation.is_cancelled() {
+            return std::task::Poll::Ready(Err(LoopError::Cancelled));
+        }
+        match raced.as_mut().poll(cx) {
+            std::task::Poll::Ready(Either::Right((result, _))) if !cancellation.is_cancelled() => {
+                std::task::Poll::Ready(Ok(result))
+            }
+            std::task::Poll::Ready(_) => std::task::Poll::Ready(Err(LoopError::Cancelled)),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    })
+    .await
 }
 
 #[cfg(test)]
 mod tests {
+    mod retry_observability;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -3733,7 +3869,10 @@ data: {"type":"response.completed","sequence_number":18,"response":{"id":"resp-1
             Ok(_) => panic!("changed authentication binding unexpectedly succeeded"),
             Err(error) => error,
         };
-        assert!(error.to_string().contains("authentication binding changed"));
+        assert_eq!(
+            error.provider_failure().unwrap().reason,
+            ProviderFailureReason::Authentication
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(client.requests.lock().unwrap().len(), 1);
     }
@@ -4198,7 +4337,10 @@ data: {"type":"response.completed","sequence_number":18,"response":{"id":"resp-1
             .await
             .unwrap();
         let error = session.begin_turn(request(), None).await.err().unwrap();
-        assert!(error.to_string().contains("logical request retry budget"));
+        assert_eq!(
+            error.provider_failure().unwrap().reason,
+            ProviderFailureReason::RetryBudget
+        );
         assert!(client.requests.lock().unwrap().is_empty());
     }
 
@@ -4249,7 +4391,10 @@ data: {"type":"response.completed","sequence_number":18,"response":{"id":"resp-1
             .await
             .unwrap();
         let error = session.begin_turn(request(), None).await.err().unwrap();
-        assert!(error.to_string().contains("logical request retry budget"));
+        assert_eq!(
+            error.provider_failure().unwrap().reason,
+            ProviderFailureReason::RetryBudget
+        );
     }
 
     #[test]
@@ -4418,7 +4563,10 @@ data: {"type":"response.completed","sequence_number":18,"response":{"id":"resp-1
             }
         };
         assert!(saw_visible);
-        assert!(matches!(error, LoopError::Provider(_)));
+        assert_eq!(
+            error.provider_failure().unwrap().reason,
+            ProviderFailureReason::ReplayUnsafe
+        );
         assert_eq!(client.requests.lock().unwrap().len(), 1);
     }
 
@@ -4867,7 +5015,10 @@ data: {"type":"response.completed","sequence_number":18,"response":{"id":"resp-1
             .unwrap();
         let mut turn = session.begin_turn(request(), None).await.unwrap();
         let error = turn.next_event(None).await.unwrap_err();
-        assert!(error.to_string().contains("attempt timed out"));
+        assert_eq!(
+            error.provider_failure().unwrap().last_attempt_reason,
+            Some(ProviderFailureReason::AttemptTimeout)
+        );
         assert_eq!(client.requests.load(Ordering::SeqCst), 1);
     }
 
@@ -4911,7 +5062,10 @@ data: {"type":"response.completed","sequence_number":18,"response":{"id":"resp-1
             .unwrap();
         let mut turn = session.begin_turn(request(), None).await.unwrap();
         let error = turn.next_event(None).await.unwrap_err();
-        assert!(error.to_string().contains("wire-byte limit"));
+        assert_eq!(
+            error.provider_failure().unwrap().reason,
+            ProviderFailureReason::Protocol
+        );
         assert_eq!(client.requests.lock().unwrap().len(), 2);
     }
 }
