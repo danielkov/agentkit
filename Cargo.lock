@@ -3111,9 +3111,9 @@ dependencies = [
 
 [[package]]
 name = "runlet"
-version = "0.5.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "927f293f868ee447cfc55b1e5220f1717a907c566f45d836c8810e5155b3b6c8"
+checksum = "057e0864428c5a79a68683942d3750d05e9ffae541aa0185fde9ae1c87eca100"
 dependencies = [
  "hex",
  "regex",
