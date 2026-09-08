@@ -26,6 +26,120 @@ use crate::{
     BackendRun, CallKey, ComposeBackend, ComposeOutcome, DispatchError, render_catalog_shapes,
 };
 
+// Single writer: the async execute guard commits host outcome, or invalidates on
+// drop/unwind. The blocking executor and consumer only read/share this atomic.
+// No new locks, callbacks, or observation workers; executor ownership is unchanged.
+type ProgressSink = (
+    tokio::sync::mpsc::Sender<RunletProgress>,
+    std::num::NonZeroUsize,
+    Arc<std::sync::atomic::AtomicU8>,
+);
+static NEXT_INCARNATION: AtomicU64 = AtomicU64::new(1);
+const ACTIVE: u8 = 0;
+const SUCCEEDED: u8 = 1;
+const FAILED: u8 = 2;
+const INTERRUPTED: u8 = 3;
+const INCOMPLETE: u8 = 4;
+
+struct ProgressGuard(Arc<std::sync::atomic::AtomicU8>);
+impl Drop for ProgressGuard {
+    fn drop(&mut self) {
+        let _ = self
+            .0
+            .compare_exchange(ACTIVE, INCOMPLETE, Ordering::Release, Ordering::Relaxed);
+    }
+}
+
+/// Host-authoritative terminal or observation gap. A gap never stops execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunletProgressEnd {
+    /// Compose completed successfully, and the complete runtime stream was read.
+    Succeeded,
+    /// Compose failed, and the complete runtime stream was read.
+    Failed,
+    /// Approval suspended execution. Invalidate all observations of this incarnation.
+    Interrupted,
+    /// Execution future dropped/cancelled, or publication ended abnormally.
+    /// Invalidate all observations of this incarnation.
+    Incomplete,
+    /// Queue overflow: state after the received prefix is unknown.
+    Lagged,
+}
+
+/// A Started envelope for one successfully compiled execution.
+///
+/// Delivered with `try_send` into a host-owned bounded Tokio channel. A full or
+/// dropped sink leaves the execution unobserved; absence never proves inactivity.
+/// The host polls this receiver in its own scoped task; no worker is spawned.
+/// Dropping either receiver cannot block or fail execution.
+///
+/// Events contain no arguments, outputs, error text, or tool-name ownership guesses.
+/// Node IDs and sequences are local to `(parent_call_id, incarnation)`. Unobserved
+/// expressions have unknown state. Raw runtime Finished is suppressed: only the
+/// host-authoritative end below establishes compose completion.
+pub struct RunletProgress {
+    /// Exact parent compose call, not a tool-name match.
+    pub parent_call_id: agentkit_core::ToolCallId,
+    /// Unique within this loaded library's process lifetime (not durable identity).
+    /// Approval replay and concurrent executions receive fresh incarnations.
+    pub incarnation: u64,
+    /// SHA-256 of exact compiled source bytes, including auto-healing.
+    pub source_digest: String,
+    /// If true, NEVER map byte spans onto the submitted source. Source text is
+    /// deliberately omitted: scripts can contain secrets. Without independently
+    /// available digest-matching source, display metadata without source snippets.
+    pub healed: bool,
+    receiver: runlet::ProgressReceiver,
+    state: Arc<std::sync::atomic::AtomicU8>,
+    ended: Option<RunletProgressEnd>,
+    cancellation: Option<agentkit_core::TurnCancellation>,
+}
+
+impl RunletProgress {
+    /// Nonblocking poll. `Ok(None)` means still open, not completion.
+    /// Poll until terminal; Interrupted/Incomplete invalidate the entire prefix.
+    pub fn try_recv(&mut self) -> Result<Option<runlet::ProgressEvent>, RunletProgressEnd> {
+        if let Some(end) = self.ended {
+            return Err(end);
+        }
+        let state = self.state.load(Ordering::Acquire);
+        let invalid = match state {
+            ACTIVE if self.cancellation.as_ref().is_some_and(|c| c.is_cancelled()) => {
+                Some(RunletProgressEnd::Incomplete)
+            }
+            INTERRUPTED => Some(RunletProgressEnd::Interrupted),
+            INCOMPLETE => Some(RunletProgressEnd::Incomplete),
+            _ => None,
+        };
+        if let Some(end) = invalid {
+            self.ended = Some(end);
+            return Err(end);
+        }
+        match self.receiver.try_recv() {
+            Ok(Some(event)) if matches!(event.change, runlet::ProgressChange::Finished(_)) => {
+                // Do not expose runtime success before the host checks approval.
+                self.try_recv()
+            }
+            Ok(event) => Ok(event),
+            Err(runlet::ProgressRecvError::Closed) if state == ACTIVE => Ok(None),
+            Err(error) => {
+                let end = match error {
+                    runlet::ProgressRecvError::Closed if state == SUCCEEDED => {
+                        RunletProgressEnd::Succeeded
+                    }
+                    runlet::ProgressRecvError::Closed if state == FAILED => {
+                        RunletProgressEnd::Failed
+                    }
+                    runlet::ProgressRecvError::Lagged => RunletProgressEnd::Lagged,
+                    _ => RunletProgressEnd::Incomplete,
+                };
+                self.ended = Some(end);
+                Err(end)
+            }
+        }
+    }
+}
+
 /// Loop concurrency defaults for compose runs. Each active iteration pins one
 /// OS thread while its tool call blocks on the async executor, so these are
 /// deliberately far below runlet's own defaults.
@@ -293,6 +407,41 @@ impl ComposeBackend for RunletBackend {
     }
 
     async fn execute(&self, run: BackendRun) -> Result<Value, ComposeOutcome> {
+        self.execute_inner(run, None).await
+    }
+}
+
+impl RunletBackend {
+    /// Executes with bounded, payload-free progress. See [`RunletProgress`].
+    pub async fn execute_with_progress(
+        &self,
+        run: BackendRun,
+        sink: tokio::sync::mpsc::Sender<RunletProgress>,
+        capacity: std::num::NonZeroUsize,
+    ) -> Result<Value, ComposeOutcome> {
+        let guard = ProgressGuard(Arc::new(std::sync::atomic::AtomicU8::new(ACTIVE)));
+        let cancellation = run.cancellation.clone();
+        let result = self
+            .execute_inner(run, Some((sink, capacity, guard.0.clone())))
+            .await;
+        let state = if cancellation.as_ref().is_some_and(|c| c.is_cancelled()) {
+            INCOMPLETE
+        } else {
+            match &result {
+                Ok(_) => SUCCEEDED,
+                Err(ComposeOutcome::Interrupted(_)) => INTERRUPTED,
+                Err(_) => FAILED,
+            }
+        };
+        guard.0.store(state, Ordering::Release);
+        result
+    }
+
+    async fn execute_inner(
+        &self,
+        run: BackendRun,
+        progress: Option<ProgressSink>,
+    ) -> Result<Value, ComposeOutcome> {
         if std::env::var_os("COMPOSE_RUNLET_DEBUG").is_some() {
             eprintln!("[compose-runlet] executing program:\n{}\n---", run.script);
         }
@@ -380,6 +529,8 @@ impl ComposeBackend for RunletBackend {
             )))
         })?;
 
+        let parent_call_id = run.dispatcher.parent_call_id().clone();
+        let cancellation = run.cancellation.clone();
         let script = run.script.clone();
         let result = tokio::task::spawn_blocking(move || {
             let (program, heal_notes) = match runtime.compile(&script) {
@@ -407,8 +558,29 @@ impl ComposeBackend for RunletBackend {
                     }
                 }
             };
-            runtime
-                .run(&program)
+            let execution = if let Some((sink, capacity, state)) = progress {
+                let (sender, receiver) = runlet::progress_channel(capacity.get());
+                // Exhaustion disables observation rather than reusing an identity.
+                if let Ok(incarnation) =
+                    NEXT_INCARNATION
+                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+                {
+                    let _ = sink.try_send(RunletProgress {
+                        parent_call_id,
+                        incarnation,
+                        source_digest: program.source_digest.clone(),
+                        healed: program.source != script,
+                        receiver,
+                        state,
+                        ended: None,
+                        cancellation,
+                    });
+                }
+                runtime.run_with_progress(&program, sender)
+            } else {
+                runtime.run(&program)
+            };
+            execution
                 .map(|execution| (execution, heal_notes))
                 .map_err(RunletRunError::Run)
         })
