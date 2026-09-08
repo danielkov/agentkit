@@ -422,7 +422,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-tool-compose"
-version = "0.10.10"
+version = "0.10.11"
 dependencies = [
  "agentkit-core",
  "agentkit-tools-core",
