@@ -69,6 +69,30 @@ Use `connect_all_settled().await` when startup should be best effort: it attempt
 
 For slow or unresponsive servers, register with `with_server_options(config, McpServerOptions::new().with_timeout(duration))`. The timeout bounds connection establishment — transport setup and the MCP initialize handshake — together with initial discovery, and bounds refresh discovery on its own; exceeding it returns `McpError::Timeout`.
 
+## Tool response timeouts
+
+`McpConnection::call_tool_with_timeout(name, arguments, Duration)` is an opt-in,
+fixed **response-wait timeout**. Existing `call_tool` calls remain unlimited.
+Progress notifications do not extend the timeout. On expiry, RMCP attempts a
+`notifications/cancelled` notification for that request and removes local pending
+state when the cancellation send finishes, including on a send error (a response
+or request-send error can remove it earlier). The method returns
+`McpError::Timeout { operation: "tools/call", duration }`, including when sending
+cancellation failed.
+
+This is **not a hard wall-clock deadline**. With RMCP 3.1.2 the timer starts after
+outbound queue admission, while the original transport send can still be in
+flight. Admission and cancellation transport I/O are outside the budget: a
+stalled cancellation send can indefinitely delay timeout return and pending
+cleanup. A zero duration still admits the request and can dispatch it. Dropping
+the future or wrapping it in an outer timeout does not guarantee cancellation or
+cleanup. Await the method to completion to use RMCP's request lifecycle.
+
+Cancellation is best effort, not confirmation that the server stopped and not a
+rollback guarantee. Remote side effects can still complete; inspect remote state
+before retrying. Hard-deadline integrations must wait for an RMCP API that
+separates local abandonment from transport I/O and bounds request admission.
+
 ## Discovering tools
 
 After connecting, each server's capabilities are available through its discovery snapshot. The `tools`/`resources`/`prompts` fields hold the raw rmcp types — pattern-match on them directly for `output_schema`, `annotations`, `mime_type`, and friends.

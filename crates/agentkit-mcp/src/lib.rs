@@ -45,7 +45,9 @@ use http::{HeaderName, HeaderValue};
 use rmcp::ServiceExt;
 use rmcp::handler::client::ClientHandler;
 use rmcp::model as rmcp_model;
-use rmcp::service::{ClientInitializeError, Peer, RoleClient, RunningService, ServiceError};
+use rmcp::service::{
+    ClientInitializeError, Peer, PeerRequestOptions, RoleClient, RunningService, ServiceError,
+};
 use rmcp::transport::streamable_http_client::{
     AuthRequiredError, InsufficientScopeError, StreamableHttpClient as RmcpStreamableHttpClient,
     StreamableHttpClientTransportConfig as RmcpStreamableHttpClientTransportConfig,
@@ -1750,6 +1752,50 @@ impl McpConnection {
         name: &str,
         arguments: Value,
     ) -> Result<CallToolResult, McpError> {
+        self.call_tool_with_request_options(name, arguments, PeerRequestOptions::default())
+            .await
+    }
+
+    /// Invokes a tool with a fixed response-wait timeout.
+    ///
+    /// The timeout starts after RMCP admits the request to its outbound queue;
+    /// the transport send may still be in flight. Progress does not extend it.
+    /// On expiry, RMCP attempts one `notifications/cancelled` for this request
+    /// and removes its local pending entry when the cancellation send completes
+    /// (including a send error), unless a response or request-send error already
+    /// removed it. This method then returns [`McpError::Timeout`] for `tools/call`,
+    /// even if the cancellation send failed.
+    ///
+    /// This is **not a wall-clock deadline**: queue admission and cancellation
+    /// transport I/O are outside the response-wait budget. A stalled cancellation
+    /// send can delay both timeout return and pending cleanup indefinitely.
+    /// Dropping this future (including via an outer timeout) does not guarantee
+    /// cancellation or cleanup. Await it to completion to use RMCP's lifecycle.
+    ///
+    /// Cancellation is best effort, not an acknowledgement of remote termination
+    /// or a rollback guarantee. A remote side effect can still complete; inspect
+    /// remote state before retrying. A response ready at expiry may win the race.
+    /// A zero timeout still admits the request and can dispatch it.
+    pub async fn call_tool_with_timeout(
+        &self,
+        name: &str,
+        arguments: Value,
+        timeout: Duration,
+    ) -> Result<CallToolResult, McpError> {
+        self.call_tool_with_request_options(
+            name,
+            arguments,
+            PeerRequestOptions::with_timeout(timeout),
+        )
+        .await
+    }
+
+    async fn call_tool_with_request_options(
+        &self,
+        name: &str,
+        arguments: Value,
+        options: PeerRequestOptions,
+    ) -> Result<CallToolResult, McpError> {
         let arguments_for_auth = arguments.clone();
         let mut params = rmcp_model::CallToolRequestParams::new(name.to_string());
         if !arguments.is_null() {
@@ -1769,13 +1815,34 @@ impl McpConnection {
             "error.type" = tracing::field::Empty,
         );
         use tracing::Instrument;
-        let result = self.peer().call_tool(params).instrument(span.clone()).await;
+        let result = async {
+            let request = rmcp_model::ClientRequest::CallToolRequest(
+                rmcp_model::CallToolRequest::new(params),
+            );
+            let handle = self
+                .peer()
+                .send_request_with_option(request, options)
+                .await?;
+            match handle.await_response().await? {
+                rmcp_model::ServerResult::CallToolResult(result) => Ok(result),
+                _ => Err(ServiceError::UnexpectedResponse),
+            }
+        }
+        .instrument(span.clone())
+        .await;
         match result {
             Ok(result) => {
                 if result.is_error == Some(true) {
                     span.record("error.type", "tool_error");
                 }
                 Ok(result)
+            }
+            Err(ServiceError::Timeout { timeout }) => {
+                span.record("error.type", "timeout");
+                Err(McpError::Timeout {
+                    operation: "tools/call",
+                    duration: timeout,
+                })
             }
             Err(error) => {
                 span.record("error.type", "mcp_error");
@@ -3742,7 +3809,7 @@ pub enum McpError {
     /// A transport-level error.
     #[error("transport error: {0}")]
     Transport(String),
-    /// A manager lifecycle operation exceeded its configured timeout.
+    /// An operation exceeded its configured timeout.
     #[error("{operation} timed out after {duration:?}")]
     Timeout {
         /// Operation that timed out.

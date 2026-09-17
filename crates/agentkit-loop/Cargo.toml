@@ -4,7 +4,7 @@ homepage.workspace = true
 name = "agentkit-loop"
 readme = "README.md"
 repository.workspace = true
-version = "0.10.11"
+version = "0.10.12"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -22,8 +22,8 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-opentelemetry = { version = "0.31", default-features = false, optional = true }
-tracing-opentelemetry = { version = "0.32", default-features = false, optional = true }
+opentelemetry = { version = "0.32", default-features = false, optional = true }
+tracing-opentelemetry = { version = "0.33", default-features = false, optional = true }
 
 [dev-dependencies]
 tokio.workspace = true

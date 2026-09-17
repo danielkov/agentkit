@@ -36,7 +36,7 @@ mod runlet_backend;
 #[cfg(feature = "lua")]
 pub use lua::LuaBackend;
 #[cfg(feature = "runlet")]
-pub use runlet_backend::RunletBackend;
+pub use runlet_backend::{RunletBackend, RunletProgress, RunletProgressEnd};
 
 pub const COMPOSE_TOOL_NAME: &str = "compose";
 
@@ -222,6 +222,11 @@ pub struct ChildDispatcher {
 }
 
 impl ChildDispatcher {
+    /// Exact compose call that owns this dispatcher, including approval replays.
+    pub fn parent_call_id(&self) -> &ToolCallId {
+        &self.parent_call_id
+    }
+
     pub fn is_cancelled(&self) -> bool {
         self.cancellation
             .as_ref()

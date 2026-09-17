@@ -320,7 +320,8 @@ async fn compose_is_not_callable_from_runlet() {
 
 #[tokio::test]
 async fn nested_approval_interrupts_and_resumes_with_replay() {
-    let compose = ComposeTool::new(ComposeConfig::default()).with_backend(RunletBackend);
+    let (backend, mut progress_receiver) = progress_backend(1024);
+    let compose = ComposeTool::new(ComposeConfig::default()).with_backend(backend);
     let first = EchoTool::new();
     let gated = ApprovalEchoTool::new();
     let first_calls = first.calls.clone();
@@ -331,7 +332,7 @@ async fn nested_approval_interrupts_and_resumes_with_replay() {
     let permissions: Arc<dyn PermissionChecker> = Arc::new(RequireApproval);
     let req = request(
         "a = echo({ value: 1 })\n\
-         b = approval_echo({ value: a.value + 1 })\n\
+         b = boundary { return approval_echo({ value: a.value + 1 }) } catch err { return { value: 0 } }\n\
          return b",
         Value::Null,
     );
@@ -361,6 +362,18 @@ async fn nested_approval_interrupts_and_resumes_with_replay() {
     // dispatching again; only the approved call executes.
     assert_eq!(first_calls.load(Ordering::SeqCst), 1);
     assert_eq!(gated_calls.load(Ordering::SeqCst), 1);
+    let mut first = progress_receiver.try_recv().unwrap();
+    let mut replay = progress_receiver.try_recv().unwrap();
+    assert_eq!(first.parent_call_id, replay.parent_call_id);
+    assert_ne!(first.incarnation, replay.incarnation);
+    assert_eq!(
+        collect_progress(&mut first).1,
+        crate::RunletProgressEnd::Interrupted
+    );
+    assert_eq!(
+        collect_progress(&mut replay).1,
+        crate::RunletProgressEnd::Succeeded
+    );
 }
 
 #[tokio::test]
@@ -464,4 +477,373 @@ async fn prelude_intrinsics_and_folds_run_locally_without_consuming_call_budget(
         }
         other => panic!("unexpected outcome: {other:?}"),
     }
+}
+
+struct ProgressBackend {
+    sink: tokio::sync::mpsc::Sender<crate::RunletProgress>,
+    capacity: std::num::NonZeroUsize,
+}
+
+#[async_trait::async_trait]
+impl crate::ComposeBackend for ProgressBackend {
+    fn name(&self) -> &'static str {
+        RunletBackend.name()
+    }
+    fn description(&self, catalog: Option<&[ToolSpec]>) -> String {
+        RunletBackend.description(catalog)
+    }
+    fn script_description(&self) -> &'static str {
+        RunletBackend.script_description()
+    }
+    async fn execute(&self, run: crate::BackendRun) -> Result<Value, crate::ComposeOutcome> {
+        RunletBackend
+            .execute_with_progress(run, self.sink.clone(), self.capacity)
+            .await
+    }
+}
+
+fn progress_backend(
+    capacity: usize,
+) -> (
+    ProgressBackend,
+    tokio::sync::mpsc::Receiver<crate::RunletProgress>,
+) {
+    let (sink, receiver) = tokio::sync::mpsc::channel(4);
+    (
+        ProgressBackend {
+            sink,
+            capacity: std::num::NonZeroUsize::new(capacity).unwrap(),
+        },
+        receiver,
+    )
+}
+
+fn collect_progress(
+    progress: &mut crate::RunletProgress,
+) -> (Vec<runlet::ProgressEvent>, crate::RunletProgressEnd) {
+    let mut events = Vec::new();
+    loop {
+        match progress.try_recv() {
+            Ok(Some(event)) => events.push(event),
+            Ok(None) => panic!("execution was already awaited"),
+            Err(end) => return (events, end),
+        }
+    }
+}
+
+#[tokio::test]
+async fn progress_namespaces_concurrent_parents_and_orders_repeated_calls() {
+    let (backend, mut receiver) = progress_backend(1024);
+    let compose = ComposeTool::new(ComposeConfig::default()).with_backend(backend);
+    let executor: Arc<dyn ToolExecutor> = Arc::new(BasicToolExecutor::from_registry(
+        ToolRegistry::new().with(compose).with(EchoTool::new()),
+    ));
+    let script = "a = echo({ value: 1 })\nb = echo({ value: a.value + 1 })\nreturn b";
+    let run = |id: &'static str| {
+        let executor = executor.clone();
+        async move {
+            let owned = owned_context(executor.clone(), Arc::new(AllowAllPermissions));
+            let mut ctx = owned.borrowed();
+            let mut req = request(script, Value::Null);
+            req.call_id = ToolCallId::new(id);
+            assert!(matches!(
+                executor.execute(req, &mut ctx).await,
+                ToolExecutionOutcome::Completed(_)
+            ));
+        }
+    };
+    tokio::join!(run("parent-a"), run("parent-b"));
+    let mut a = receiver.try_recv().unwrap();
+    let mut b = receiver.try_recv().unwrap();
+    assert_ne!(a.parent_call_id, b.parent_call_id);
+    assert!(
+        (a.parent_call_id == ToolCallId::new("parent-a")
+            && b.parent_call_id == ToolCallId::new("parent-b"))
+            || (a.parent_call_id == ToolCallId::new("parent-b")
+                && b.parent_call_id == ToolCallId::new("parent-a"))
+    );
+    assert_ne!(a.incarnation, b.incarnation);
+    assert_eq!(a.source_digest, b.source_digest);
+    assert!(!a.healed);
+    for progress in [&mut a, &mut b] {
+        let (events, end) = collect_progress(progress);
+        assert_eq!(end, crate::RunletProgressEnd::Succeeded);
+        let mut first_succeeded = None;
+        let mut second_running = None;
+        for event in events {
+            if let runlet::ProgressChange::NodeUpdated(node) = event.change {
+                if node.span.start == script.find("echo").unwrap()
+                    && node.state == runlet::ProgressState::Succeeded
+                {
+                    first_succeeded = Some(event.sequence);
+                }
+                if node.span.start == script.rfind("echo").unwrap()
+                    && node.state == runlet::ProgressState::Running
+                {
+                    second_running = Some(event.sequence);
+                }
+            }
+        }
+        assert!(first_succeeded.unwrap() < second_running.unwrap());
+    }
+}
+
+#[tokio::test]
+async fn progress_overflow_and_dropped_sink_do_not_fail_execution() {
+    for drop_sink in [false, true] {
+        let (backend, mut receiver) = progress_backend(1);
+        if drop_sink {
+            receiver.close();
+        }
+        let compose = ComposeTool::new(ComposeConfig::default()).with_backend(backend);
+        let executor: Arc<dyn ToolExecutor> = Arc::new(BasicToolExecutor::from_registry(
+            ToolRegistry::new().with(compose),
+        ));
+        let owned = owned_context(executor.clone(), Arc::new(AllowAllPermissions));
+        let mut ctx = owned.borrowed();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            executor.execute(request("return 1 + 2", Value::Null), &mut ctx),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, ToolExecutionOutcome::Completed(_)));
+        if !drop_sink {
+            let mut progress = receiver.try_recv().unwrap();
+            assert_eq!(
+                collect_progress(&mut progress).1,
+                crate::RunletProgressEnd::Lagged
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn progress_healing_identifies_compiled_not_submitted_source() {
+    let (backend, mut receiver) = progress_backend(1024);
+    let compose = ComposeTool::new(ComposeConfig::default()).with_backend(backend);
+    let executor: Arc<dyn ToolExecutor> = Arc::new(BasicToolExecutor::from_registry(
+        ToolRegistry::new().with(compose),
+    ));
+    let owned = owned_context(executor.clone(), Arc::new(AllowAllPermissions));
+    let mut ctx = owned.borrowed();
+    let script = "if true { x = 1 }\nreturn 2";
+    assert!(matches!(
+        executor
+            .execute(request(script, Value::Null), &mut ctx)
+            .await,
+        ToolExecutionOutcome::Completed(_)
+    ));
+    let mut progress = receiver.try_recv().unwrap();
+    assert!(progress.healed);
+    let healed = runlet::heal(script).unwrap();
+    let runtime = runlet::Runtime::builder().with_prelude().build().unwrap();
+    assert_eq!(
+        progress.source_digest,
+        runtime.compile(&healed.source).unwrap().source_digest
+    );
+    assert_eq!(
+        collect_progress(&mut progress).1,
+        crate::RunletProgressEnd::Succeeded
+    );
+}
+
+#[derive(Clone)]
+struct ProgressGate {
+    spec: ToolSpec,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+    finished: Arc<tokio::sync::Notify>,
+}
+
+impl ProgressGate {
+    fn new() -> Self {
+        Self {
+            spec: ToolSpec::new(
+                "progress_gate",
+                "hold at a real child boundary",
+                json!({"type":"object"}),
+            ),
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+            finished: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for ProgressGate {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+    async fn invoke(
+        &self,
+        request: ToolRequest,
+        _ctx: &mut ToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        self.finished.notify_one();
+        Ok(ToolResult::new(ToolResultPart::success(
+            request.call_id,
+            ToolOutput::structured(json!(null)),
+        )))
+    }
+}
+
+#[tokio::test]
+async fn progress_future_drop_invalidates_and_consumer_drop_is_harmless() {
+    for disposition in 0..3 {
+        let abort = disposition == 2;
+        let (backend, mut receiver) = progress_backend(1024);
+        let compose = ComposeTool::new(ComposeConfig::default()).with_backend(backend);
+        let gate = ProgressGate::new();
+        let executor: Arc<dyn ToolExecutor> = Arc::new(BasicToolExecutor::from_registry(
+            ToolRegistry::new().with(compose).with(gate.clone()),
+        ));
+        let task = tokio::spawn(async move {
+            let owned = owned_context(executor.clone(), Arc::new(AllowAllPermissions));
+            let mut ctx = owned.borrowed();
+            executor
+                .execute(request("return progress_gate({})", Value::Null), &mut ctx)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+            .await
+            .unwrap();
+        let mut progress = receiver.try_recv().unwrap();
+        assert!(matches!(progress.try_recv(), Ok(Some(_))));
+        if abort {
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            assert_eq!(
+                progress.try_recv(),
+                Err(crate::RunletProgressEnd::Incomplete)
+            );
+            gate.release.notify_one();
+            // Explicitly release existing blocking execution, not an observer worker.
+            tokio::time::timeout(Duration::from_secs(5), gate.finished.notified())
+                .await
+                .unwrap();
+        } else {
+            if disposition == 1 {
+                assert!(
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                        let _consumer = progress;
+                        panic!("consumer failure outside the executor");
+                    }))
+                    .is_err()
+                );
+            } else {
+                drop(progress);
+            }
+            gate.release.notify_one();
+            assert!(matches!(
+                tokio::time::timeout(Duration::from_secs(5), task)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                ToolExecutionOutcome::Completed(_)
+            ));
+        }
+    }
+}
+
+#[tokio::test]
+async fn progress_external_cancellation_invalidates_before_runtime_finishes() {
+    let (backend, mut receiver) = progress_backend(1024);
+    let compose = ComposeTool::new(ComposeConfig::default()).with_backend(backend);
+    let gate = ProgressGate::new();
+    let controller = agentkit_core::CancellationController::new();
+    let cancellation = controller.handle().checkpoint();
+    let executor: Arc<dyn ToolExecutor> = Arc::new(BasicToolExecutor::from_registry(
+        ToolRegistry::new().with(compose).with(gate.clone()),
+    ));
+    let task = tokio::spawn(async move {
+        let mut owned = owned_context(executor.clone(), Arc::new(AllowAllPermissions));
+        owned.cancellation = Some(cancellation);
+        let mut ctx = owned.borrowed();
+        executor
+            .execute(request("return progress_gate({})", Value::Null), &mut ctx)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+        .await
+        .unwrap();
+    let mut progress = receiver.try_recv().unwrap();
+    controller.interrupt();
+    assert_eq!(
+        progress.try_recv(),
+        Err(crate::RunletProgressEnd::Incomplete)
+    );
+    gate.release.notify_one();
+    let _ = tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        progress.try_recv(),
+        Err(crate::RunletProgressEnd::Incomplete)
+    );
+}
+
+#[tokio::test]
+async fn progress_full_host_sink_is_unobserved_and_events_are_payload_free() {
+    let (backend, mut receiver) = progress_backend(1024);
+    let compose = ComposeTool::new(ComposeConfig::default()).with_backend(backend);
+    let executor: Arc<dyn ToolExecutor> = Arc::new(BasicToolExecutor::from_registry(
+        ToolRegistry::new().with(compose).with(EchoTool::new()),
+    ));
+    for i in 0..5 {
+        let owned = owned_context(executor.clone(), Arc::new(AllowAllPermissions));
+        let mut ctx = owned.borrowed();
+        let mut req = request(
+            "return echo({ secret: input.secret })",
+            json!({"secret":"private-input-output-marker"}),
+        );
+        req.call_id = ToolCallId::new(format!("bounded-parent-{i}"));
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), executor.execute(req, &mut ctx))
+                .await
+                .unwrap(),
+            ToolExecutionOutcome::Completed(_)
+        ));
+    }
+    for _ in 0..4 {
+        let mut progress = receiver.try_recv().unwrap();
+        let (events, end) = collect_progress(&mut progress);
+        assert_eq!(end, crate::RunletProgressEnd::Succeeded);
+        let serialized = serde_json::to_string(&events).unwrap();
+        assert!(!serialized.contains("private-input-output-marker"));
+        assert!(!serialized.contains("secret"));
+        assert!(!serialized.contains("echo"));
+    }
+    assert!(receiver.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn progress_failure_omits_runtime_error_text() {
+    let (backend, mut receiver) = progress_backend(1024);
+    let compose = ComposeTool::new(ComposeConfig::default()).with_backend(backend);
+    let executor: Arc<dyn ToolExecutor> = Arc::new(BasicToolExecutor::from_registry(
+        ToolRegistry::new().with(compose),
+    ));
+    let owned = owned_context(executor.clone(), Arc::new(AllowAllPermissions));
+    let mut ctx = owned.borrowed();
+    let outcome = executor
+        .execute(
+            request(
+                "return fail(\"PRIVATE_CODE\", \"private-error-marker\")",
+                Value::Null,
+            ),
+            &mut ctx,
+        )
+        .await;
+    assert!(!matches!(outcome, ToolExecutionOutcome::Completed(_)));
+    let mut progress = receiver.try_recv().unwrap();
+    let (events, end) = collect_progress(&mut progress);
+    assert_eq!(end, crate::RunletProgressEnd::Failed);
+    let serialized = serde_json::to_string(&events).unwrap();
+    assert!(!serialized.contains("PRIVATE_CODE"));
+    assert!(!serialized.contains("private-error-marker"));
 }
