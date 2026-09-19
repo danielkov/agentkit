@@ -65,8 +65,9 @@ fn assert_text(pending: &PendingInject, expected: &str) {
     assert!(matches!(&pending.items[0].parts[0], Part::Text(text) if text.text == expected));
     assert_eq!(
         pending.bytes,
-        serde_json::to_vec(&pending.content).unwrap().len()
+        validate_inject_content(&pending.content).unwrap().1
     );
+    assert_eq!(pending.bytes.media, 0);
     assert_eq!(pending.commitment, InjectCommitment::Ready);
 }
 
@@ -108,7 +109,11 @@ async fn replacement_preserves_fifo_identity_and_acceptance_count() {
         assert_eq!(state.pending.len(), 3);
         assert_eq!(
             state.pending_bytes,
-            state.pending.iter().map(|p| p.bytes).sum::<usize>()
+            state
+                .pending
+                .iter()
+                .map(|p| p.bytes)
+                .fold(InjectionBytes::default(), InjectionBytes::saturating_add)
         );
     }
     for (id, text) in [(first, "first"), (second, "final second"), (third, "third")] {
@@ -119,7 +124,7 @@ async fn replacement_preserves_fifo_identity_and_acceptance_count() {
     }
     let state = injection.state.lock().unwrap();
     assert!(state.pending.is_empty());
-    assert_eq!(state.pending_bytes, 0);
+    assert_eq!(state.pending_bytes, InjectionBytes::default());
     assert_eq!(state.accepted_count, 3);
 }
 
@@ -131,15 +136,20 @@ async fn replacement_grows_shrinks_and_rejects_over_budget_atomically() {
     let injection = &session.session.injection;
     let in_flight = take_delivery(injection);
     assert_eq!(in_flight.message_id, first);
-    let overhead = serde_json::to_vec(&text_content("")).unwrap().len();
-    let full = "x".repeat(MAX_PENDING_INJECTION_BYTES - in_flight.bytes - overhead);
+    let overhead = validate_inject_content(&text_content("")).unwrap().1;
+    assert_eq!(overhead.media, 0);
+    assert_eq!(in_flight.bytes.media, 0);
+    let full = "x".repeat(MAX_PENDING_INJECTION_BYTES - in_flight.bytes.content - overhead.content);
     integration
         .replace_inject(request(&session, &second, &full))
         .await
         .unwrap();
     assert_eq!(
         injection.state.lock().unwrap().pending_bytes,
-        MAX_PENDING_INJECTION_BYTES
+        InjectionBytes {
+            content: MAX_PENDING_INJECTION_BYTES,
+            media: 0
+        }
     );
 
     let error = integration
@@ -149,7 +159,13 @@ async fn replacement_grows_shrinks_and_rejects_over_budget_atomically() {
     assert_eq!(i32::from(error.code), -32602);
     {
         let state = injection.state.lock().unwrap();
-        assert_eq!(state.pending_bytes, MAX_PENDING_INJECTION_BYTES);
+        assert_eq!(
+            state.pending_bytes,
+            InjectionBytes {
+                content: MAX_PENDING_INJECTION_BYTES,
+                media: 0
+            }
+        );
         assert_eq!(state.accepted_count, 2);
         assert_eq!(state.delivering.as_ref(), Some(&first));
         assert_eq!(state.pending.len(), 1);
@@ -161,17 +177,21 @@ async fn replacement_grows_shrinks_and_rejects_over_budget_atomically() {
         .replace_inject(request(&session, &second, "small"))
         .await
         .unwrap();
-    let small_bytes = serde_json::to_vec(&text_content("small")).unwrap().len();
+    let small_bytes = validate_inject_content(&text_content("small")).unwrap().1;
+    assert_eq!(small_bytes.media, 0);
     assert_eq!(
         injection.state.lock().unwrap().pending_bytes,
-        in_flight.bytes + small_bytes
+        in_flight.bytes.saturating_add(small_bytes)
     );
     injection.finish_delivery(&in_flight, true);
     assert_eq!(injection.state.lock().unwrap().pending_bytes, small_bytes);
     let pending = take_delivery(injection);
     assert_text(&pending, "small");
     injection.finish_delivery(&pending, true);
-    assert_eq!(injection.state.lock().unwrap().pending_bytes, 0);
+    assert_eq!(
+        injection.state.lock().unwrap().pending_bytes,
+        InjectionBytes::default()
+    );
 }
 
 #[tokio::test]
@@ -223,7 +243,7 @@ async fn replacement_of_abandoned_reservation_wakes_with_unknown_id() {
     assert_inject_error(error, "unknown_message_id", &id);
     let state = session.session.injection.state.lock().unwrap();
     assert!(state.pending.is_empty());
-    assert_eq!(state.pending_bytes, 0);
+    assert_eq!(state.pending_bytes, InjectionBytes::default());
     assert_eq!(state.accepted_count, 0);
 }
 
@@ -296,7 +316,7 @@ async fn delivery_winner_blocks_replacement_until_delivery_outcome() {
                 .lock()
                 .unwrap()
                 .pending_bytes,
-            0
+            InjectionBytes::default()
         );
     }
 }
@@ -308,8 +328,8 @@ fn simultaneous_delivery_and_replacement_have_one_linearized_outcome() {
         let id = accept(&integration, &session, "original");
         let injection = &session.session.injection;
         let content = text_content("replacement");
-        let items = content_blocks_to_items(&content).unwrap();
-        let bytes = serde_json::to_vec(&content).unwrap().len();
+        let (items, bytes) = validate_inject_content(&content).unwrap();
+        assert_eq!(bytes.media, 0);
         let barrier = std::sync::Barrier::new(2);
         let (transition, pending) = std::thread::scope(|scope| {
             let replacing = scope.spawn(|| {
@@ -331,7 +351,7 @@ fn simultaneous_delivery_and_replacement_have_one_linearized_outcome() {
         injection.finish_delivery(&pending, true);
         let state = injection.state.lock().unwrap();
         assert!(state.pending.is_empty());
-        assert_eq!(state.pending_bytes, 0);
+        assert_eq!(state.pending_bytes, InjectionBytes::default());
         assert_eq!(state.accepted_count, 1);
         assert_eq!(state.delivered.len(), 1);
     }
@@ -387,7 +407,7 @@ async fn close_wakes_waiting_replacements_and_discards_pending_bytes() {
         }
         let state = session.session.injection.state.lock().unwrap();
         assert!(state.pending.is_empty());
-        assert_eq!(state.pending_bytes, 0);
+        assert_eq!(state.pending_bytes, InjectionBytes::default());
     }
 
     let (integration, session) = fixture();
@@ -410,7 +430,7 @@ async fn close_wakes_waiting_replacements_and_discards_pending_bytes() {
             .lock()
             .unwrap()
             .pending_bytes,
-        0
+        InjectionBytes::default()
     );
 }
 
