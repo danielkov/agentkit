@@ -1103,7 +1103,8 @@ where
 /// Maximum number of pending unstable ACP v2 injections per session.
 #[cfg(feature = "unstable-inject")]
 pub const MAX_PENDING_INJECTIONS: usize = 64;
-/// Maximum serialized content bytes retained by pending unstable injections.
+/// Maximum serialized non-media content bytes retained by pending unstable injections.
+/// Includes text, metadata, URIs, and JSON structure, but excludes inline payloads.
 #[cfg(feature = "unstable-inject")]
 pub const MAX_PENDING_INJECTION_BYTES: usize = 256 * 1024;
 /// Maximum accepted unstable injections tracked during one session lifetime.
@@ -1114,14 +1115,106 @@ pub const MAX_PENDING_INJECTION_BYTES: usize = 256 * 1024;
 #[cfg(feature = "unstable-inject")]
 pub const MAX_ACCEPTED_INJECTIONS: usize = 4_096;
 
+/// Maximum serialized inline image, audio, and embedded blob payload bytes per
+/// session, including in-flight delivery. 28 MiB accommodates 20 MiB of source
+/// media after base64 expansion and padding. Both original content and converted
+/// Items retain payloads, so retained media can occupy twice this limit, plus
+/// bounded metadata/data-URL overhead. This is not a transport or transcript cap.
+#[cfg(feature = "unstable-inject")]
+pub const MAX_PENDING_INJECTION_MEDIA_BYTES: usize = 28 * 1024 * 1024;
+
+#[cfg(feature = "unstable-inject")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct InjectionBytes {
+    content: usize,
+    media: usize,
+}
+
+#[cfg(feature = "unstable-inject")]
+impl InjectionBytes {
+    fn saturating_add(self, other: Self) -> Self {
+        Self {
+            content: self.content.saturating_add(other.content),
+            media: self.media.saturating_add(other.media),
+        }
+    }
+
+    fn saturating_sub(self, other: Self) -> Self {
+        Self {
+            content: self.content.saturating_sub(other.content),
+            media: self.media.saturating_sub(other.media),
+        }
+    }
+
+    fn exceeds_budget(self) -> bool {
+        self.content > MAX_PENDING_INJECTION_BYTES || self.media > MAX_PENDING_INJECTION_MEDIA_BYTES
+    }
+}
+
+// Count serialized bytes without allocating a second serialized media buffer.
+// Stop once even the combined budgets cannot accommodate the input.
+#[cfg(feature = "unstable-inject")]
+#[derive(Default)]
+struct InjectionByteCounter(usize);
+
+#[cfg(feature = "unstable-inject")]
+impl std::io::Write for InjectionByteCounter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(bytes.len());
+        if self.0 > MAX_PENDING_INJECTION_BYTES + MAX_PENDING_INJECTION_MEDIA_BYTES {
+            return Err(std::io::Error::other(
+                "pending session injection budget exceeded",
+            ));
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(feature = "unstable-inject")]
+fn injection_budget_error() -> agent_client_protocol::Error {
+    agent_client_protocol::Error::new(-32602, "pending session injection budget exceeded")
+}
+
 #[cfg(feature = "unstable-inject")]
 fn validate_inject_content(
     content: &[wire::ContentBlock],
-) -> Result<(Vec<Item>, usize), agent_client_protocol::Error> {
+) -> Result<(Vec<Item>, InjectionBytes), agent_client_protocol::Error> {
+    let mut total = InjectionByteCounter::default();
+    serde_json::to_writer(&mut total, content).map_err(|_| injection_budget_error())?;
+    let mut media = 0usize;
+    for block in content {
+        let payload: Option<&str> = match block {
+            wire::ContentBlock::Image(image) => Some(image.data.as_ref()),
+            wire::ContentBlock::Audio(audio) => Some(audio.data.as_ref()),
+            wire::ContentBlock::Resource(resource) => match &resource.resource {
+                wire::EmbeddedResourceResource::BlobResourceContents(blob) => {
+                    Some(blob.blob.as_ref())
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(payload) = payload {
+            let mut counter = InjectionByteCounter::default();
+            serde_json::to_writer(&mut counter, payload).map_err(|_| injection_budget_error())?;
+            // Keep the string quotes in the non-media budget. Counting serialized
+            // strings also charges JSON escapes if the payload is malformed.
+            media = media.saturating_add(counter.0 - 2);
+        }
+    }
+    let bytes = InjectionBytes {
+        content: total.0 - media,
+        media,
+    };
+    if bytes.exceeds_budget() {
+        return Err(injection_budget_error());
+    }
+    // Validate bounds before cloning media into the converted Items.
     let items = content_blocks_to_items(content).map_err(crate::sdk_error)?;
-    let bytes = serde_json::to_vec(content)
-        .map_err(|error| agent_client_protocol::Error::new(-32603, error.to_string()))?
-        .len();
     Ok((items, bytes))
 }
 
@@ -1130,7 +1223,7 @@ struct PendingInject {
     message_id: wire::MessageId,
     content: Vec<wire::ContentBlock>,
     items: Vec<Item>,
-    bytes: usize,
+    bytes: InjectionBytes,
     commitment: InjectCommitment,
 }
 
@@ -1150,7 +1243,7 @@ struct InjectionState {
     at_boundary: bool,
     pending: VecDeque<PendingInject>,
     delivering: Option<wire::MessageId>,
-    pending_bytes: usize,
+    pending_bytes: InjectionBytes,
     accepted_count: usize,
     delivered: VecDeque<wire::MessageId>,
 }
@@ -1158,6 +1251,11 @@ struct InjectionState {
 #[cfg(feature = "unstable-inject")]
 #[derive(Default)]
 struct InjectionController {
+    // Both counters cover the queue plus an in-flight delivery. Synchronous
+    // accounting transitions prepare allocations/clones before committing and
+    // invoke no external callbacks between mutation and counter updates. This
+    // preserves accounting on unwind before a commit and permits the existing
+    // poison recovery below; it does not make async delivery cancellation-safe.
     state: Mutex<InjectionState>,
     changed: Notify,
 }
@@ -1213,15 +1311,19 @@ impl InjectionController {
             })));
         }
         if state.pending.len() + usize::from(state.delivering.is_some()) >= MAX_PENDING_INJECTIONS
-            || state.pending_bytes.saturating_add(pending.bytes) > MAX_PENDING_INJECTION_BYTES
+            || state
+                .pending_bytes
+                .saturating_add(pending.bytes)
+                .exceeds_budget()
         {
             return Err(agent_client_protocol::Error::new(
                 -32602,
                 "pending session injection budget exceeded",
             ));
         }
-        state.pending_bytes += pending.bytes;
+        let pending_bytes = state.pending_bytes.saturating_add(pending.bytes);
         state.pending.push_back(pending);
+        state.pending_bytes = pending_bytes;
         Ok(())
     }
 
@@ -1318,7 +1420,7 @@ impl InjectionController {
         message_id: &wire::MessageId,
         content: &[wire::ContentBlock],
         items: &[Item],
-        bytes: usize,
+        bytes: InjectionBytes,
     ) -> Result<PendingTransition, agent_client_protocol::Error> {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         if let Some(index) = state
@@ -1331,18 +1433,26 @@ impl InjectionController {
             }
             // Include other pending entries and any in-flight delivery in the
             // budget. Check before mutation so failure preserves the old content.
-            let pending_bytes = state.pending_bytes - state.pending[index].bytes;
-            if pending_bytes.saturating_add(bytes) > MAX_PENDING_INJECTION_BYTES {
+            let pending_bytes = state
+                .pending_bytes
+                .saturating_sub(state.pending[index].bytes);
+            if pending_bytes.saturating_add(bytes).exceeds_budget() {
                 return Err(agent_client_protocol::Error::new(
                     -32602,
                     "pending session injection budget exceeded",
                 ));
             }
+            // Prepare both clones before changing any guarded state. These are
+            // concrete data types; cloning invokes no external callbacks.
+            let content = content.to_vec();
+            let items = items.to_vec();
             let pending = &mut state.pending[index];
-            pending.content = content.to_vec();
-            pending.items = items.to_vec();
+            let old_content = std::mem::replace(&mut pending.content, content);
+            let old_items = std::mem::replace(&mut pending.items, items);
             pending.bytes = bytes;
-            state.pending_bytes = pending_bytes + bytes;
+            state.pending_bytes = pending_bytes.saturating_add(bytes);
+            drop(state);
+            drop((old_content, old_items));
             // Do not remove/re-enqueue: identity, commitment, and FIFO position
             // must survive replacement. The state lock also serializes delivery.
             Ok(PendingTransition::Applied)
@@ -1407,7 +1517,7 @@ impl InjectionController {
             .iter()
             .filter(|pending| pending.commitment == InjectCommitment::Ready)
             .map(|pending| pending.bytes)
-            .sum::<usize>();
+            .fold(InjectionBytes::default(), InjectionBytes::saturating_add);
         state
             .pending
             .retain(|pending| pending.commitment != InjectCommitment::Ready);
@@ -6119,7 +6229,7 @@ mod tests {
                     message_id: message_id.clone(),
                     content: Vec::new(),
                     items: Vec::new(),
-                    bytes: 0,
+                    bytes: InjectionBytes::default(),
                     commitment: InjectCommitment::Reserved,
                 })
                 .expect("injection below lifetime cap");
@@ -6136,7 +6246,7 @@ mod tests {
                 message_id: wire::MessageId::new("over-limit"),
                 content: Vec::new(),
                 items: Vec::new(),
-                bytes: 0,
+                bytes: InjectionBytes::default(),
                 commitment: InjectCommitment::Reserved,
             })
             .expect_err("accepted injection lifetime cap must reject new reservations");
@@ -7083,3 +7193,7 @@ mod tests {
 #[cfg(all(test, feature = "unstable-inject"))]
 #[path = "v2/replace_tests.rs"]
 mod replace_tests;
+
+#[cfg(all(test, feature = "unstable-inject"))]
+#[path = "v2/injection_budget_tests.rs"]
+mod injection_budget_tests;
