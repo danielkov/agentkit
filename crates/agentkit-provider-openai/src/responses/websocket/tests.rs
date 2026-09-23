@@ -654,6 +654,69 @@ async fn unsolicited_buffered_frames_force_reconnect_before_next_send() {
     peer.join().unwrap();
 }
 
+#[tokio::test]
+async fn partial_stale_error_on_reused_socket_never_replays_new_request() {
+    let (partial_tx, partial_rx) = tokio::sync::oneshot::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let (endpoint, peer) = server(move |listener| {
+        let mut ws = socket(&listener);
+        receive(&mut ws);
+        success(&mut ws);
+        let error = br#"{"type":"error","status":429,"error":{"code":"rate_limit_exceeded"}}"#;
+        assert!(error.len() < 126);
+        // An unmasked text frame, split before the next request is sent.
+        ws.get_mut().write_all(&[0x81, error.len() as u8]).unwrap();
+        let split = error.len() / 2;
+        ws.get_mut().write_all(&error[..split]).unwrap();
+        partial_tx.send(()).unwrap();
+        receive(&mut ws);
+        ws.get_mut().write_all(&error[split..]).unwrap();
+        let start = Instant::now();
+        loop {
+            if done_rx.try_recv().is_ok() {
+                assert!(
+                    matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock)
+                );
+                break;
+            }
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    stream.set_read_timeout(Some(WAIT)).unwrap();
+                    stream.set_write_timeout(Some(WAIT)).unwrap();
+                    let mut replay = tungstenite::accept(stream).unwrap();
+                    receive(&mut replay);
+                    success_id(&mut replay, "unexpected-replay");
+                    panic!("replayed a request after an uncorrelated stale error");
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => panic!("accept: {e}"),
+            }
+            assert!(start.elapsed() < WAIT);
+            thread::sleep(Duration::from_millis(2));
+        }
+    });
+    let mut cfg = config(&endpoint, OpenAIResponsesTransport::WebSocket);
+    cfg.resilience.as_mut().unwrap().max_retries = 1;
+    let adapter = OpenAIResponsesAdapter::new(cfg).unwrap();
+    let mut session = adapter
+        .start_session(SessionConfig::new("session"))
+        .await
+        .unwrap();
+    let mut first = session.begin_turn(request(), None).await.unwrap();
+    finished(&drain(&mut first).await.unwrap());
+    partial_rx.await.unwrap();
+    let mut second = session.begin_turn(request(), None).await.unwrap();
+    let result = drain(&mut second).await;
+    done_tx.send(()).ok();
+    peer.join().unwrap();
+    let error = result.unwrap_err();
+    assert_eq!(
+        error.provider_failure().unwrap().upstream.http_status,
+        Some(429)
+    );
+}
+
 struct SuspendedRefresh {
     started: Arc<std::sync::atomic::AtomicBool>,
     calls: Arc<std::sync::atomic::AtomicUsize>,

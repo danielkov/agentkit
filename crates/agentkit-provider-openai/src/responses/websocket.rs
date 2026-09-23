@@ -104,6 +104,12 @@ pub(super) struct Connection {
 }
 
 impl Connection {
+    pub(super) fn can_retry_rejection(&self) -> bool {
+        // Wrapped errors have no reliable request correlation. On a reused
+        // socket they may belong to a previous turn, even after a pending read.
+        self.completed_ids.is_empty()
+    }
+
     pub(super) async fn recv(&mut self) -> Result<Option<agentkit_http::Bytes>, HttpError> {
         // Bound control traffic as well as data, including peers that only ping.
         for _ in 0..128 {

@@ -119,7 +119,10 @@ WebSocket retries are intentionally more conservative than HTTP retries:
 
 - Handshake status failures use the existing bounded retry policy and observer.
 - A wrapped HTTP error before `response.created` (and before visible output)
-  may reconnect and retry. An accepted response is never automatically replayed.
+  may reconnect and retry only on a fresh socket. On reused sockets, errors lack
+  reliable request correlation and may belong to a previous turn, so they never
+  trigger automatic replay or authentication refresh. An accepted response is
+  never automatically replayed.
 - An interrupted send, socket EOF, receive failure, or timeout after sending is
   **not replayed**: the server may already have accepted the request.
 - Visible WebSocket output is never superseded/replayed, even when the consumer

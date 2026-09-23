@@ -768,13 +768,15 @@ impl OpenAIResponsesTurn {
                     .as_ref()
                     .is_some_and(|attempt| matches!(attempt.body, LiveBody::WebSocket(_)));
                 // A sent WebSocket request has no idempotency guarantee. Only explicit
-                // provider rejections before visible output can be retried.
+                // provider rejections before visible output on a fresh socket
+                // can be retried; reused sockets can deliver uncorrelated stale errors.
                 if websocket
                     && (self.attempt_output_emitted
-                        || !self
-                            .attempt
-                            .as_ref()
-                            .is_some_and(|attempt| attempt.decoder.request_rejected))
+                        || !self.attempt.as_ref().is_some_and(|attempt| {
+                            attempt.decoder.request_rejected
+                                && matches!(&attempt.body, LiveBody::WebSocket(connection)
+                                        if connection.can_retry_rejection())
+                        }))
                 {
                     return Err(*failure.error);
                 }
