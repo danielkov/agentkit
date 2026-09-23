@@ -145,6 +145,7 @@ pub struct OpenAIResponsesConfig {
     user_agent: Option<String>,
     originator: Option<String>,
     transport: OpenAIResponsesTransport,
+    websocket_no_proxy: bool,
 }
 
 impl fmt::Debug for OpenAIResponsesConfig {
@@ -155,6 +156,7 @@ impl fmt::Debug for OpenAIResponsesConfig {
             .field("endpoint", &self.endpoint)
             .field("profile", &self.profile)
             .field("transport", &self.transport)
+            .field("websocket_no_proxy", &self.websocket_no_proxy)
             .field("header_names", &self.headers.keys().collect::<Vec<_>>())
             .field("request_policy", &self.request_policy)
             .field("reasoning_effort", &self.reasoning_effort)
@@ -197,6 +199,7 @@ impl OpenAIResponsesConfig {
             user_agent: None,
             originator: None,
             transport: OpenAIResponsesTransport::Http,
+            websocket_no_proxy: false,
         }
     }
 
@@ -223,12 +226,25 @@ impl OpenAIResponsesConfig {
             user_agent: None,
             originator: None,
             transport: OpenAIResponsesTransport::Http,
+            websocket_no_proxy: false,
         }
     }
 
     /// Selects the transport without changing request or authentication semantics.
     pub fn with_transport(mut self, transport: OpenAIResponsesTransport) -> Self {
         self.transport = transport;
+        self
+    }
+
+    /// Disables proxy discovery for WebSocket upgrades when `true`.
+    ///
+    /// Defaults to `false`, preserving reqwest's environment/system proxy discovery.
+    /// Applies to both `WebSocket` and `Auto`, but not HTTP/SSE (including Auto fallback).
+    /// A custom HTTP client's proxy policy is not inherited by the dedicated WebSocket
+    /// client. Set this explicitly to preserve a no-proxy policy across transports.
+    /// HTTP/1, redirect/retry restrictions, and handshake timeouts remain enforced.
+    pub fn with_websocket_no_proxy(mut self, no_proxy: bool) -> Self {
+        self.websocket_no_proxy = no_proxy;
         self
     }
 
