@@ -76,6 +76,86 @@ these with `OpenAIResponsesLimits` and
 Limits must be non-zero; the per-field bound must fit both request and attempt
 bounds, and the per-attempt bound must fit the aggregate wire bound.
 
+## Responses WebSocket transport
+
+HTTP/SSE remains the default. Select a transport explicitly on the Responses
+configuration (public API and ChatGPT private profiles both support selection):
+
+```rust
+use agentkit_provider_openai::{OpenAIResponsesConfig, OpenAIResponsesTransport};
+
+let config = OpenAIResponsesConfig::new("token", "gpt-5")
+    .with_transport(OpenAIResponsesTransport::Auto);
+```
+
+- `Http`: the existing HTTP/SSE path, including custom `Http` clients.
+- `WebSocket`: require an HTTP/1 WebSocket upgrade; never silently use SSE.
+- `Auto`: try WebSocket. An upgrade response of HTTP **426** switches this
+  session to HTTP/SSE for all remaining turns. No fallback is attempted after a
+  `response.create` has been sent, or for arbitrary authentication/protocol errors.
+
+The configured `https://.../responses` endpoint is upgraded on that same path
+(the wire equivalent of `wss://.../responses`); `http://` endpoints support local
+mock servers. Authentication comes from the same refresh-capable provider used
+by HTTP. The handshake sends `OpenAI-Beta: responses_websockets=2026-02-06` and
+requests are JSON text messages with `type: "response.create"` plus the normal
+Responses fields, excluding HTTP-only `stream` and `background` controls as
+required by the [public WebSocket guide](https://developers.openai.com/api/docs/guides/websocket-mode). JSON events use the same semantic decoder as SSE, preserving
+reasoning, tool, usage, image, and credential-bound continuation metadata.
+No browser or separate authentication flow is required.
+
+Each `ModelSession` owns an independent connection slot. A turn checks out that
+slot and releases it **when `Finished` is delivered**, not when the owned turn
+value is eventually dropped. Only one active turn is allowed in a WebSocket/Auto
+session; a concurrent `begin_turn` is rejected. A validated terminal response
+makes the socket reusable. Cancellation, dropping an unfinished turn, malformed
+messages, missing completion, and terminal errors discard it. Buffered unsolicited
+frames force reconnection before another request; known completed response IDs
+are rejected if they reappear on a reused socket. Cancellation never
+sends `response.cancel`. Changed authentication headers or credential binding
+force a new connection; a 401 can refresh once only if the binding is unchanged.
+
+WebSocket retries are intentionally more conservative than HTTP retries:
+
+- Handshake status failures use the existing bounded retry policy and observer.
+- A wrapped HTTP error before `response.created` (and before visible output)
+  may reconnect and retry. An accepted response is never automatically replayed.
+- An interrupted send, socket EOF, receive failure, or timeout after sending is
+  **not replayed**: the server may already have accepted the request.
+- Visible WebSocket output is never superseded/replayed, even when the consumer
+  opts into HTTP response-attempt supersession. No WebSocket idempotency guarantee
+  is assumed. Wrapped error statuses and allowlisted retry headers are retained
+  in normal retry observations; raw provider error messages are not exposed.
+- Dropping a pending `next_event` future during authentication refresh or a
+  WebSocket opening operation makes a retained turn fail safely on its next
+  poll. It does not resume with stale credentials or replay an uncertain send.
+
+Request, per-attempt, aggregate wire, field, and item bounds remain in force.
+Frame/message sizes are bounded before JSON decoding; binary messages are
+rejected and consecutive control frames are bounded. Upgrade and send operations
+have a 30-second ceiling; configured attempt, idle, logical retry-budget, and
+cancellation bounds also apply. As with HTTP, configure `with_resilience` to set
+stream idle and whole-turn deadlines.
+
+### Current limitations
+
+The **full credential-bound transcript is always authoritative and always sent**.
+This release deliberately does not send `previous_response_id` or maintain an
+incremental response-ID cache: reconstructing an exact prefix from normalized
+text/tool/reasoning/image output without losing provider fields requires a
+separate lossless compatibility proof. Reuse therefore saves connection setup,
+not request transcript bytes. Compaction, changed inputs, and reconnection do not
+risk a stale server-side prefix.
+
+WebSocket upgrades use a dedicated reqwest HTTP/1 client with redirects and
+implicit HTTP retries disabled, using the existing reqwest TLS stack. A custom
+`Http` passed to `with_client` applies only to HTTP/SSE, **not** to WebSocket
+upgrades; applications requiring custom transport middleware should keep `Http`.
+
+Wire contract reference: OpenAI Codex commit
+[`6824dabe0393337a38cb257d5fe75ae5ca168470`](https://github.com/openai/codex/tree/6824dabe0393337a38cb257d5fe75ae5ca168470),
+`codex-rs/codex-api/src/endpoint/responses_websocket.rs` and `common.rs`.
+
 ## Retry observations and typed failures
 
 Responses emits `agentkit_loop::ProviderRetryEvent` through

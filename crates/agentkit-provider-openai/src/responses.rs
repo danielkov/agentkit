@@ -32,6 +32,7 @@ use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
 mod retry;
+mod websocket;
 use retry::{RetryTracker, local_error, provider_error, stream_classification};
 
 const PUBLIC_ENDPOINT: &str = "https://api.openai.com/v1/responses";
@@ -54,6 +55,17 @@ pub enum OpenAIResponsesProfile {
     Public,
     /// `https://chatgpt.com/backend-api/codex/responses`, with its narrower field policy.
     ChatGptPrivate,
+}
+
+/// Transport selection for a Responses session. HTTP/SSE remains the default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OpenAIResponsesTransport {
+    #[default]
+    Http,
+    /// Require a real WebSocket upgrade; never fall back to HTTP.
+    WebSocket,
+    /// Try WebSocket, then use HTTP for this session after HTTP 426.
+    Auto,
 }
 
 /// Bounds serialized requests, streamed responses, counts, and individual fields.
@@ -132,6 +144,7 @@ pub struct OpenAIResponsesConfig {
     limits: OpenAIResponsesLimits,
     user_agent: Option<String>,
     originator: Option<String>,
+    transport: OpenAIResponsesTransport,
 }
 
 impl fmt::Debug for OpenAIResponsesConfig {
@@ -141,6 +154,7 @@ impl fmt::Debug for OpenAIResponsesConfig {
             .field("model", &self.model)
             .field("endpoint", &self.endpoint)
             .field("profile", &self.profile)
+            .field("transport", &self.transport)
             .field("header_names", &self.headers.keys().collect::<Vec<_>>())
             .field("request_policy", &self.request_policy)
             .field("reasoning_effort", &self.reasoning_effort)
@@ -182,6 +196,7 @@ impl OpenAIResponsesConfig {
             limits: OpenAIResponsesLimits::default(),
             user_agent: None,
             originator: None,
+            transport: OpenAIResponsesTransport::Http,
         }
     }
 
@@ -207,7 +222,14 @@ impl OpenAIResponsesConfig {
             limits: OpenAIResponsesLimits::default(),
             user_agent: None,
             originator: None,
+            transport: OpenAIResponsesTransport::Http,
         }
+    }
+
+    /// Selects the transport without changing request or authentication semantics.
+    pub fn with_transport(mut self, transport: OpenAIResponsesTransport) -> Self {
+        self.transport = transport;
+        self
     }
 
     pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
@@ -352,6 +374,7 @@ impl ModelAdapter for OpenAIResponsesAdapter {
             config: self.config.clone(),
             session: config,
             retry_observer: None,
+            websocket: Arc::new(Mutex::new(websocket::Session::default())),
         })
     }
 
@@ -366,6 +389,7 @@ pub struct OpenAIResponsesSession {
     config: Arc<OpenAIResponsesConfig>,
     session: SessionConfig,
     retry_observer: Option<Arc<dyn RetryObserver>>,
+    websocket: Arc<Mutex<websocket::Session>>,
 }
 
 #[async_trait]
@@ -381,6 +405,11 @@ impl ModelSession for OpenAIResponsesSession {
         request: TurnRequest,
         cancellation: Option<TurnCancellation>,
     ) -> Result<Self::Turn, LoopError> {
+        let websocket = if self.config.transport != OpenAIResponsesTransport::Http {
+            Some(websocket::Lease::checkout(self.websocket.clone())?)
+        } else {
+            None
+        };
         let mut tracker = RetryTracker::new(self.config.profile, self.retry_observer.clone());
         let prepared = async {
             if cancelled(cancellation.as_ref()) {
@@ -455,6 +484,8 @@ impl ModelSession for OpenAIResponsesSession {
                 refreshed: false,
                 wire_bytes: 0,
                 tracker,
+                websocket,
+                websocket_sent: false,
             },
             supersession_enabled,
             cancellation.as_ref(),
@@ -479,6 +510,7 @@ pub struct OpenAIResponsesTurn {
     attempt_output_emitted: bool,
     pending_reopen: bool,
     pending_delay: Duration,
+    interrupted_operation: Option<ProviderFailureReason>,
     finished: bool,
 }
 
@@ -488,6 +520,7 @@ impl ModelTurn for OpenAIResponsesTurn {
         if !self.finished {
             self.finished = true;
             self.attempt = None;
+            self.context.websocket = None;
             let _ = self.context.tracker.finish(LoopError::Cancelled);
         }
     }
@@ -503,12 +536,19 @@ impl ModelTurn for OpenAIResponsesTurn {
             Ok(event) => {
                 if matches!(event, Some(ModelTurnEvent::Finished(_))) {
                     self.context.tracker.succeed();
+                    if let Some(mut lease) = self.context.websocket.take()
+                        && let Some(attempt) = self.attempt.take()
+                        && let LiveBody::WebSocket(connection) = attempt.body
+                    {
+                        lease.complete(connection, attempt.decoder.state.response_id.as_deref());
+                    }
                 }
                 Ok(event)
             }
             Err(error) => {
                 self.finished = true;
                 self.attempt = None;
+                self.context.websocket = None;
                 Err(self.context.tracker.finish(error))
             }
         }
@@ -528,6 +568,7 @@ impl OpenAIResponsesTurn {
             attempt_output_emitted: false,
             pending_reopen: true,
             pending_delay: Duration::ZERO,
+            interrupted_operation: None,
             finished: false,
         };
         if let Err(error) = turn.reopen(cancellation).await {
@@ -537,9 +578,13 @@ impl OpenAIResponsesTurn {
     }
 
     async fn reopen(&mut self, cancellation: Option<&TurnCancellation>) -> Result<(), LoopError> {
+        // Dropping a pending next_event future can interrupt a send without
+        // dropping the owned turn. Do not replay that ambiguous attempt on repoll.
+        if self.context.websocket_sent {
+            return Err(local_error(ProviderFailureReason::ReplayUnsafe));
+        }
         if !self.pending_delay.is_zero() {
             let delay = self.pending_delay;
-            self.pending_delay = Duration::ZERO;
             cancellable(
                 run_bounded_http(
                     async {
@@ -554,9 +599,17 @@ impl OpenAIResponsesTurn {
             )
             .await?
             .map_err(http_loop_error)?;
+            self.pending_delay = Duration::ZERO;
             self.context.tracker.completed_wait(delay);
         }
+        // An owned turn can outlive a dropped next_event future. Conservatively
+        // terminate an interrupted WS opening operation on repoll: it may have
+        // suspended in authentication, backoff, or a partially delivered send.
+        if self.context.websocket.is_some() {
+            self.interrupted_operation = Some(ProviderFailureReason::ReplayUnsafe);
+        }
         self.attempt = Some(open_live_attempt(&mut self.context, cancellation).await?);
+        self.interrupted_operation = None;
         self.pending_reopen = false;
         Ok(())
     }
@@ -566,6 +619,9 @@ impl OpenAIResponsesTurn {
         cancellation: Option<&TurnCancellation>,
     ) -> Result<Option<ModelTurnEvent>, LoopError> {
         loop {
+            if let Some(reason) = self.interrupted_operation {
+                return Err(local_error(reason));
+            }
             if cancelled(cancellation) {
                 return Err(LoopError::Cancelled);
             }
@@ -644,7 +700,7 @@ impl OpenAIResponsesTurn {
                     .min();
                 let chunk = {
                     let attempt = self.attempt.as_mut().expect("live attempt is open");
-                    cancellable(next_body_chunk(&mut attempt.body, timeout), cancellation).await
+                    cancellable(attempt.body.next_chunk(timeout), cancellation).await
                 };
                 match chunk {
                     Err(error) => Err(nonretryable(error)),
@@ -683,7 +739,16 @@ impl OpenAIResponsesTurn {
                             } else {
                                 let attempt = self.attempt.as_mut().expect("live attempt is open");
                                 attempt.truncated.observe(&chunk);
-                                attempt.decoder.push(&chunk)
+                                match &attempt.body {
+                                    LiveBody::Http(_) => attempt.decoder.push(&chunk),
+                                    LiveBody::WebSocket(_) => {
+                                        let result = attempt.decoder.push_json(&chunk);
+                                        if result.is_ok() && attempt.decoder.state.terminal {
+                                            attempt.eof = true;
+                                        }
+                                        result
+                                    }
+                                }
                             }
                         } else {
                             Err(protocol_failure("Responses wire-byte count overflowed"))
@@ -698,6 +763,43 @@ impl OpenAIResponsesTurn {
             };
             if let Err(failure) = result {
                 self.context.tracker.note_failure(&failure.error);
+                let websocket = self
+                    .attempt
+                    .as_ref()
+                    .is_some_and(|attempt| matches!(attempt.body, LiveBody::WebSocket(_)));
+                // A sent WebSocket request has no idempotency guarantee. Only explicit
+                // provider rejections before visible output can be retried.
+                if websocket
+                    && (self.attempt_output_emitted
+                        || !self
+                            .attempt
+                            .as_ref()
+                            .is_some_and(|attempt| attempt.decoder.request_rejected))
+                {
+                    return Err(*failure.error);
+                }
+                if websocket {
+                    self.context.websocket_sent = false;
+                }
+                if websocket
+                    && failure
+                        .error
+                        .provider_failure()
+                        .is_some_and(|f| f.upstream.http_status == Some(401))
+                    && !self.context.refreshed
+                {
+                    self.context
+                        .tracker
+                        .scheduled(&failure.error, Duration::ZERO);
+                    // Commit a safe repoll state before discarding the attempt
+                    // and awaiting a refresh that may itself be cancelled by Drop.
+                    self.interrupted_operation = Some(ProviderFailureReason::Authentication);
+                    self.attempt = None;
+                    refresh_authentication(&mut self.context, cancellation).await?;
+                    self.pending_reopen = true;
+                    self.interrupted_operation = None;
+                    continue;
+                }
                 if !failure.retryable
                     || self.context.retries
                         >= self
@@ -1634,10 +1736,31 @@ struct ResponsesRequestContext {
     refreshed: bool,
     wire_bytes: usize,
     tracker: RetryTracker,
+    websocket: Option<websocket::Lease>,
+    websocket_sent: bool,
+}
+
+enum LiveBody {
+    Http(agentkit_http::BodyStream),
+    WebSocket(Box<websocket::Connection>),
+}
+
+impl LiveBody {
+    async fn next_chunk(
+        &mut self,
+        timeout: Option<Duration>,
+    ) -> Result<Option<agentkit_http::Bytes>, HttpError> {
+        match self {
+            Self::Http(body) => next_body_chunk(body, timeout).await,
+            Self::WebSocket(connection) => {
+                run_bounded_http(connection.recv(), timeout, None, "WebSocket receive").await
+            }
+        }
+    }
 }
 
 struct LiveAttempt {
-    body: agentkit_http::BodyStream,
+    body: LiveBody,
     truncated: TruncatedStreamDetector,
     decoder: ResponsesSseDecoder,
     deadline: Option<LogicalDeadline>,
@@ -1670,6 +1793,43 @@ fn stopped_attempt(context: &ResponsesRequestContext, failure: AttemptFailure) -
     }
 }
 
+async fn refresh_authentication(
+    context: &mut ResponsesRequestContext,
+    cancellation: Option<&TurnCancellation>,
+) -> Result<(), LoopError> {
+    let binding = context.auth.binding().map(str::to_owned);
+    let refreshed = cancellable(
+        run_bounded_http(
+            context
+                .config
+                .authentication
+                .authenticate(Some(&context.auth)),
+            context
+                .config
+                .resilience
+                .as_ref()
+                .and_then(|config| config.attempt_timeout),
+            context.deadline.as_ref(),
+            "OpenAI reauthentication",
+        ),
+        cancellation,
+    )
+    .await?
+    .map_err(|error| match error {
+        HttpError::Timeout {
+            operation: "logical request retry budget",
+            ..
+        } => http_loop_error(error),
+        _ => local_error(ProviderFailureReason::Authentication),
+    })?;
+    if refreshed.binding() != binding.as_deref() {
+        return Err(local_error(ProviderFailureReason::Authentication));
+    }
+    context.auth = refreshed;
+    context.refreshed = true;
+    Ok(())
+}
+
 async fn open_live_attempt(
     context: &mut ResponsesRequestContext,
     cancellation: Option<&TurnCancellation>,
@@ -1682,13 +1842,20 @@ async fn open_live_attempt(
             .and_then(|config| config.attempt_timeout);
         let attempt_deadline = attempt_timeout.map(LogicalDeadline::new);
         let logical_deadline = context.deadline.clone();
-        let result = attempt_with_timeout(
+        context.websocket_sent = false;
+        let mut result = attempt_with_timeout(
             send_live_attempt(context, cancellation),
             attempt_timeout,
             logical_deadline.as_ref(),
             cancellation,
         )
         .await;
+        if context.websocket_sent
+            && let Err(failure) = &mut result
+        {
+            // A timeout may have interrupted the send future after bytes left.
+            failure.retryable = false;
+        }
         if let Err(failure) = &result {
             context.tracker.note_failure(&failure.error);
         }
@@ -1699,36 +1866,7 @@ async fn open_live_attempt(
             }
             Err(failure) if is_unauthorized(&failure.error) && !context.refreshed => {
                 context.tracker.scheduled(&failure.error, Duration::ZERO);
-                let binding = context.auth.binding().map(str::to_owned);
-                let refreshed = cancellable(
-                    run_bounded_http(
-                        context
-                            .config
-                            .authentication
-                            .authenticate(Some(&context.auth)),
-                        context
-                            .config
-                            .resilience
-                            .as_ref()
-                            .and_then(|config| config.attempt_timeout),
-                        context.deadline.as_ref(),
-                        "OpenAI reauthentication",
-                    ),
-                    cancellation,
-                )
-                .await?
-                .map_err(|error| match error {
-                    HttpError::Timeout {
-                        operation: "logical request retry budget",
-                        ..
-                    } => http_loop_error(error),
-                    _ => local_error(ProviderFailureReason::Authentication),
-                })?;
-                if refreshed.binding() != binding.as_deref() {
-                    return Err(local_error(ProviderFailureReason::Authentication));
-                }
-                context.auth = refreshed;
-                context.refreshed = true;
+                refresh_authentication(context, cancellation).await?;
             }
             Err(failure)
                 if failure.retryable
@@ -1831,6 +1969,15 @@ async fn send_live_attempt(
         None
     };
     headers.extend(context.auth.headers().clone());
+    if context
+        .websocket
+        .as_ref()
+        .is_some_and(|lease| !lease.http_only())
+        && let Some(attempt) = websocket::send(context, headers.clone()).await?
+    {
+        return Ok(attempt);
+    }
+    // Auto: rejected upgrade (426), never a sent response.create.
     let request = context
         .client
         .post(&context.config.endpoint)
@@ -1904,7 +2051,7 @@ async fn send_live_attempt(
     }
     let truncated = TruncatedStreamDetector::from_headers(response.headers());
     Ok(LiveAttempt {
-        body: response.bytes_stream(),
+        body: LiveBody::Http(response.bytes_stream()),
         truncated,
         decoder: ResponsesSseDecoder::with_policy(
             &context.config.model,
@@ -1988,6 +2135,7 @@ struct ResponsesSseDecoder {
     buffer: Zeroizing<Vec<u8>>,
     buffer_start: usize,
     received: usize,
+    request_rejected: bool,
     max_attempt_bytes: usize,
     state: ResponsesState,
 }
@@ -2019,6 +2167,7 @@ impl ResponsesSseDecoder {
             buffer: Zeroizing::new(Vec::new()),
             buffer_start: 0,
             received: 0,
+            request_rejected: false,
             max_attempt_bytes: limits.max_attempt_bytes,
             state: ResponsesState::new(
                 model,
@@ -2152,7 +2301,21 @@ impl ResponsesSseDecoder {
                 "Responses SSE used an unsupported terminal marker",
             ));
         }
-        let mut value: Value = serde_json::from_str(data.as_str())
+        self.consume_json(data.as_bytes(), event)
+    }
+
+    fn push_json(&mut self, bytes: &[u8]) -> Result<(), AttemptFailure> {
+        self.received = self.received.saturating_add(bytes.len());
+        if self.received > self.max_attempt_bytes {
+            return Err(protocol_failure(
+                "Responses WebSocket attempt exceeds byte limit",
+            ));
+        }
+        self.consume_json(bytes, None)
+    }
+
+    fn consume_json(&mut self, data: &[u8], event: Option<&str>) -> Result<(), AttemptFailure> {
+        let mut value: Value = serde_json::from_slice(data)
             .map_err(|_| protocol_failure("Responses SSE data is malformed JSON"))?;
         let kind = value
             .get("type")
@@ -2163,7 +2326,40 @@ impl ResponsesSseDecoder {
             zeroize_encrypted_content(&mut value);
             return Err(protocol_failure("Responses SSE event name/type mismatch"));
         }
-        let result = self.state.consume(&kind, &value);
+        let mut result = self.state.consume(&kind, &value);
+        if kind == "error"
+            && let Err(failure) = &mut result
+        {
+            if let Some(status) = value
+                .get("status")
+                .or_else(|| value.get("status_code"))
+                .and_then(Value::as_u64)
+                .and_then(|s| u16::try_from(s).ok())
+                .and_then(|s| StatusCode::from_u16(s).ok())
+            {
+                // A wrapped HTTP error before response.created is an explicit
+                // request rejection. A failure of an accepted response is not.
+                self.request_rejected = !self.state.created && !status.is_success();
+                let mut classification = stream_classification(&value, &kind);
+                classification.http_status = Some(status.as_u16());
+                *failure.error =
+                    provider_error(ProviderFailureReason::ResponseFailed, classification);
+                failure.retryable = retryable_response_status(status, self.state.profile);
+            }
+            if let Some(headers) = value.get("headers").and_then(Value::as_object) {
+                let mut parsed = HeaderMap::new();
+                for name in ["retry-after", "retry-after-ms"] {
+                    if let Some(value) = headers
+                        .get(name)
+                        .and_then(Value::as_str)
+                        .and_then(|v| HeaderValue::from_str(v).ok())
+                    {
+                        parsed.insert(name, value);
+                    }
+                }
+                failure.headers = retry_headers(&parsed);
+            }
+        }
         zeroize_encrypted_content(&mut value);
         result
     }
