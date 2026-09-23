@@ -353,7 +353,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-provider-openai"
-version = "0.10.11"
+version = "0.10.12"
 dependencies = [
  "agentkit-adapter-completions",
  "agentkit-core",

@@ -355,7 +355,13 @@ pub(super) async fn send(
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())
             .connect_timeout(HANDSHAKE_TIMEOUT)
-            .timeout(HANDSHAKE_TIMEOUT)
+            .timeout(HANDSHAKE_TIMEOUT);
+        let client = if context.config.websocket_no_proxy {
+            client.no_proxy()
+        } else {
+            client
+        };
+        let client = client
             .build()
             .map_err(|_| protocol_failure("could not build WebSocket upgrade client"))?;
         context.tracker.accounting.attempts = context.tracker.accounting.attempts.saturating_add(1);
