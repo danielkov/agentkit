@@ -31,7 +31,7 @@ mod responses;
 pub use responses::{
     OpenAIResponsesAdapter, OpenAIResponsesConfig, OpenAIResponsesError, OpenAIResponsesLimits,
     OpenAIResponsesProfile, OpenAIResponsesRequestPolicy, OpenAIResponsesSession,
-    OpenAIResponsesTurn,
+    OpenAIResponsesTransport, OpenAIResponsesTurn,
 };
 
 use std::fmt;
