@@ -67,11 +67,17 @@ impl Lease {
     }
 
     pub(super) fn complete(&mut self, mut connection: Box<Connection>, response_id: Option<&str>) {
-        // Keep bounded replay correlation, not a server-side continuation cache.
+        // Only successful response.completed checkpoints may survive the lease.
         if let Some(id) = response_id
+            && id.len() <= 1024
             && connection.completed_ids.len() < 1024
         {
             connection.completed_ids.insert(id.to_owned());
+            if !connection.checkpoint.as_ref().is_some_and(|c| c.completed) {
+                connection.checkpoint = None;
+            } else if let Some(checkpoint) = &mut connection.checkpoint {
+                checkpoint.response_id = id.to_owned();
+            }
             self.connection = Some(connection);
             self.reusable = true;
         }
@@ -101,9 +107,163 @@ pub(super) struct Connection {
     auth_headers: HeaderMap,
     binding: Option<String>,
     completed_ids: BTreeSet<String>,
+    checkpoint: Option<Checkpoint>,
+    previous_response_id: Option<String>,
+}
+
+// All fields are private to the leased connection: no new lock or persistent
+// state. Serialized buffers zeroize encrypted reasoning on every exit path.
+struct Checkpoint {
+    request: Zeroizing<String>,
+    response_id: String,
+    raw_output: BTreeMap<u64, Zeroizing<String>>,
+    replay_output: BTreeMap<u64, Zeroizing<String>>,
+    bytes: usize,
+    completed: bool,
+}
+
+impl Checkpoint {
+    fn suffix(&self, current: &Value) -> Option<Vec<Value>> {
+        if !self.completed || self.response_id.is_empty() {
+            return None;
+        }
+        let mut previous: Value = serde_json::from_str(&self.request).ok()?;
+        let result = (|| {
+            let old = previous.as_object()?;
+            let new = current.as_object()?;
+            if old.len() != new.len()
+                || old
+                    .iter()
+                    .any(|(key, value)| key != "input" && new.get(key) != Some(value))
+            {
+                return None;
+            }
+            let old_input = old.get("input")?.as_array()?;
+            let input = new.get("input")?.as_array()?;
+            if !input.starts_with(old_input) {
+                return None;
+            }
+            let mut offset = old_input.len();
+            for encoded in self.replay_output.values() {
+                let mut replay: Value = serde_json::from_str(encoded).ok()?;
+                let matches = replay.as_array().is_some_and(|items| {
+                    let end = offset + items.len();
+                    let matches = input.get(offset..end) == Some(items.as_slice());
+                    offset = end;
+                    matches
+                });
+                zeroize_encrypted_content(&mut replay);
+                if !matches {
+                    return None;
+                }
+            }
+            Some(input[offset..].to_vec())
+        })();
+        zeroize_encrypted_content(&mut previous);
+        result
+    }
 }
 
 impl Connection {
+    pub(super) fn missing_previous(&self, decoder: &ResponsesSseDecoder) -> bool {
+        // Successful-completion-only, single-flight reuse and unique response IDs
+        // ensure this predecessor was never used by an earlier request. A delayed
+        // rejection naming an older predecessor cannot authorize a replay here.
+        self.previous_response_id.as_ref().is_some_and(|id| {
+            decoder.previous_response_missing.as_ref() == Some(id) && !decoder.state.created
+        })
+    }
+
+    pub(super) fn observe(
+        &mut self,
+        chunk: &[u8],
+        state: &ResponsesState,
+        context: &ResponsesRequestContext,
+    ) {
+        let Some(checkpoint) = &mut self.checkpoint else {
+            return;
+        };
+        let Ok(mut event) = serde_json::from_slice::<Value>(chunk) else {
+            self.checkpoint = None;
+            return;
+        };
+        let valid = (|| {
+            match event.get("type").and_then(Value::as_str) {
+                Some("response.completed") => {
+                    let response = event.get("response")?;
+                    if response
+                        .get("status")
+                        .is_some_and(|status| status != "completed")
+                    {
+                        return None;
+                    }
+                    // Streamed output_item.done items are the indexed source of
+                    // truth used by Finished and the checkpoint. Live WS completion
+                    // envelopes can omit output or send output:[] despite those
+                    // items. An empty terminal array must not erase them. Validate
+                    // any nonempty terminal copy against the observed raw items.
+                    if let Some(output) = response.get("output") {
+                        let output = output.as_array()?;
+                        if !output.is_empty() && output.len() != checkpoint.raw_output.len() {
+                            return None;
+                        }
+                        for (item, raw) in output.iter().zip(checkpoint.raw_output.values()) {
+                            let mut observed: Value = serde_json::from_str(raw).ok()?;
+                            let same = *item == observed;
+                            zeroize_encrypted_content(&mut observed);
+                            if !same {
+                                return None;
+                            }
+                        }
+                    }
+                    checkpoint.completed = true;
+                }
+                Some("response.output_item.done") => {
+                    let index = event.get("output_index")?.as_u64()?;
+                    // The same representation the next real transcript produces:
+                    // status/annotations and readable reasoning summaries are not
+                    // request continuation fields in this adapter.
+                    let item = state.output.get(&index)?;
+                    let mut replay = Value::Array(
+                        encode_item(
+                            &context.config,
+                            &context.session_id,
+                            context.auth.binding(),
+                            item,
+                        )
+                        .ok()?,
+                    );
+                    let encoded = serde_json::to_string(&replay).ok().map(Zeroizing::new);
+                    let empty = replay.as_array().is_none_or(Vec::is_empty);
+                    zeroize_encrypted_content(&mut replay);
+                    if empty {
+                        return None;
+                    }
+                    let encoded = encoded?;
+                    let raw = Zeroizing::new(serde_json::to_string(event.get("item")?).ok()?);
+                    checkpoint.bytes = checkpoint
+                        .bytes
+                        .checked_add(raw.len())?
+                        .checked_add(encoded.len())?;
+                    if checkpoint.raw_output.len() >= context.config.limits.max_items
+                        || checkpoint.bytes > context.config.limits.max_request_bytes
+                    {
+                        return None;
+                    }
+                    checkpoint.raw_output.insert(index, raw);
+                    checkpoint.replay_output.insert(index, encoded);
+                }
+                _ => {}
+            }
+            Some(())
+        })()
+        .is_some();
+        zeroize_encrypted_content(&mut event);
+        if !valid {
+            self.checkpoint = None;
+        }
+    }
+
     pub(super) fn can_retry_rejection(&self) -> bool {
         // Wrapped errors have no reliable request correlation. On a reused
         // socket they may belong to a previous turn, even after a pending read.
@@ -261,20 +421,41 @@ pub(super) async fn send(
             auth_headers: context.auth.headers().clone(),
             binding: context.auth.binding().map(str::to_owned),
             completed_ids: BTreeSet::new(),
+            checkpoint: None,
+            previous_response_id: None,
         })
     };
-    // Always send the authoritative, credential-bound full transcript. Incremental
-    // previous_response_id is intentionally not used without a lossless prefix proof.
+    // Encode the complete credential-bound transcript first. The connection-local
+    // checkpoint is only an optimization, never an alternative source of history.
     let mut value: Value = serde_json::from_slice(&context.body)
         .map_err(|_| protocol_failure("invalid encoded Responses request"))?;
     let fields = value
         .as_object_mut()
         .ok_or_else(|| protocol_failure("invalid Responses request object"))?;
-    // Public Responses WebSocket mode excludes HTTP transport controls.
-    // https://developers.openai.com/api/docs/guides/websocket-mode
     fields.remove("stream");
     fields.remove("background");
     fields.insert("type".into(), json!("response.create"));
+    let full = Zeroizing::new(
+        serde_json::to_string(&value)
+            .map_err(|_| protocol_failure("could not serialize WebSocket request"))?,
+    );
+    connection.previous_response_id = None;
+    if let Some(checkpoint) = connection.checkpoint.take()
+        && let Some(suffix) = checkpoint.suffix(&value)
+    {
+        connection.previous_response_id = Some(checkpoint.response_id.clone());
+        zeroize_encrypted_content(&mut value["input"]);
+        value["input"] = Value::Array(suffix);
+        value["previous_response_id"] = json!(checkpoint.response_id);
+    }
+    connection.checkpoint = Some(Checkpoint {
+        request: full,
+        response_id: String::new(),
+        raw_output: BTreeMap::new(),
+        replay_output: BTreeMap::new(),
+        bytes: 0,
+        completed: false,
+    });
     let serialized = serde_json::to_string(&value);
     zeroize_encrypted_content(&mut value);
     let request = Zeroizing::new(

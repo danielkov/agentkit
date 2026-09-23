@@ -739,10 +739,17 @@ impl OpenAIResponsesTurn {
                             } else {
                                 let attempt = self.attempt.as_mut().expect("live attempt is open");
                                 attempt.truncated.observe(&chunk);
-                                match &attempt.body {
+                                match &mut attempt.body {
                                     LiveBody::Http(_) => attempt.decoder.push(&chunk),
-                                    LiveBody::WebSocket(_) => {
+                                    LiveBody::WebSocket(connection) => {
                                         let result = attempt.decoder.push_json(&chunk);
+                                        if result.is_ok() {
+                                            connection.observe(
+                                                &chunk,
+                                                &attempt.decoder.state,
+                                                &self.context,
+                                            );
+                                        }
                                         if result.is_ok() && attempt.decoder.state.terminal {
                                             attempt.eof = true;
                                         }
@@ -761,7 +768,7 @@ impl OpenAIResponsesTurn {
                     }
                 }
             };
-            if let Err(failure) = result {
+            if let Err(mut failure) = result {
                 self.context.tracker.note_failure(&failure.error);
                 let websocket = self
                     .attempt
@@ -770,11 +777,23 @@ impl OpenAIResponsesTurn {
                 // A sent WebSocket request has no idempotency guarantee. Only explicit
                 // provider rejections before visible output on a fresh socket
                 // can be retried; reused sockets can deliver uncorrelated stale errors.
+                let missing_previous = self.attempt.as_ref().is_some_and(|attempt| {
+                    matches!(&attempt.body, LiveBody::WebSocket(connection)
+                        if connection.missing_previous(&attempt.decoder))
+                });
+                // A precise missing-continuation rejection is recoverable by dropping
+                // this socket and using the authoritative full request. The new socket
+                // has no checkpoint, so this exception cannot repeat. It shares the
+                // existing retry budget, observer and cancellation-safe reopen path.
+                if missing_previous {
+                    failure.retryable = true;
+                }
                 if websocket
                     && (self.attempt_output_emitted
                         || !self.attempt.as_ref().is_some_and(|attempt| {
-                            attempt.decoder.request_rejected
-                                && matches!(&attempt.body, LiveBody::WebSocket(connection)
+                            missing_previous
+                                || attempt.decoder.request_rejected
+                                    && matches!(&attempt.body, LiveBody::WebSocket(connection)
                                         if connection.can_retry_rejection())
                         }))
                 {
@@ -2138,6 +2157,7 @@ struct ResponsesSseDecoder {
     buffer_start: usize,
     received: usize,
     request_rejected: bool,
+    previous_response_missing: Option<String>,
     max_attempt_bytes: usize,
     state: ResponsesState,
 }
@@ -2170,6 +2190,7 @@ impl ResponsesSseDecoder {
             buffer_start: 0,
             received: 0,
             request_rejected: false,
+            previous_response_missing: None,
             max_attempt_bytes: limits.max_attempt_bytes,
             state: ResponsesState::new(
                 model,
@@ -2328,10 +2349,46 @@ impl ResponsesSseDecoder {
             zeroize_encrypted_content(&mut value);
             return Err(protocol_failure("Responses SSE event name/type mismatch"));
         }
+        self.previous_response_missing = None;
         let mut result = self.state.consume(&kind, &value);
         if kind == "error"
             && let Err(failure) = &mut result
+            && failure
+                .error
+                .provider_failure()
+                .is_some_and(|failure| failure.reason == ProviderFailureReason::ResponseFailed)
         {
+            // Only a validated rejection may authorize recovery, never a sequence
+            // or lifecycle protocol failure containing an error-shaped payload.
+            let error = value.get("error").unwrap_or(&value);
+            if !self.state.created
+                && value
+                    .get("status")
+                    .or_else(|| value.get("status_code"))
+                    .and_then(Value::as_u64)
+                    == Some(400)
+                && error.get("type").and_then(Value::as_str) == Some("invalid_request_error")
+                && error
+                    .get("param")
+                    .is_none_or(|param| param == "previous_response_id")
+                && error
+                    .get("code")
+                    .or_else(|| value.get("code"))
+                    .and_then(Value::as_str)
+                    == Some("previous_response_not_found")
+            {
+                // https://developers.openai.com/api/docs/guides/websocket-mode#errors-to-handle
+                // The code alone is uncorrelated on a reused socket. Extract only
+                // the bounded ID from the provider's precise rejection message;
+                // never retain or expose arbitrary provider message text.
+                self.previous_response_missing = error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .and_then(|message| message.strip_prefix("Previous response with id '"))
+                    .and_then(|message| message.strip_suffix("' not found."))
+                    .filter(|id| !id.is_empty() && id.len() <= 512)
+                    .map(str::to_owned);
+            }
             if let Some(status) = value
                 .get("status")
                 .or_else(|| value.get("status_code"))
