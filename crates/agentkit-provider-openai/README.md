@@ -120,9 +120,10 @@ WebSocket retries are intentionally more conservative than HTTP retries:
 - Handshake status failures use the existing bounded retry policy and observer.
 - A wrapped HTTP error before `response.created` (and before visible output)
   may reconnect and retry only on a fresh socket. On reused sockets, errors lack
-  reliable request correlation and may belong to a previous turn, so they never
-  trigger automatic replay or authentication refresh. An accepted response is
-  never automatically replayed.
+  reliable request correlation and may belong to a previous turn, so generic
+  errors never trigger automatic replay or authentication refresh. The narrowly
+  scoped missing-continuation recovery is described below. An accepted response
+  is never automatically replayed.
 - An interrupted send, socket EOF, receive failure, or timeout after sending is
   **not replayed**: the server may already have accepted the request.
 - Visible WebSocket output is never superseded/replayed, even when the consumer
@@ -140,15 +141,44 @@ have a 30-second ceiling; configured attempt, idle, logical retry-budget, and
 cancellation bounds also apply. As with HTTP, configure `with_resilience` to set
 stream idle and whole-turn deadlines.
 
-### Current limitations
+The optional [live continuation suite](../../docs/live-responses-websocket.md)
+verifies incremental wire requests and server acceptance using environment credentials.
+It is ignored by default and makes billable requests when explicitly enabled.
 
-The **full credential-bound transcript is always authoritative and always sent**.
-This release deliberately does not send `previous_response_id` or maintain an
-incremental response-ID cache: reconstructing an exact prefix from normalized
-text/tool/reasoning/image output without losing provider fields requires a
-separate lossless compatibility proof. Reuse therefore saves connection setup,
-not request transcript bytes. Compaction, changed inputs, and reconnection do not
-risk a stale server-side prefix.
+### Incremental continuation and limitations
+
+The **full credential-bound transcript remains authoritative**. After a successful
+`response.completed`, the live connection retains a bounded, memory-only checkpoint:
+the response ID, full encoded request, raw completed output items, and their normal
+transcript replay encoding. When all non-input request fields match and the next
+input begins with the previous input plus that replay output, the next
+`response.create` sends `previous_response_id` and only the new input suffix.
+This includes tool results and later user messages, including rounds containing
+encrypted reasoning or generated images. No continuation state is persisted.
+
+Compatibility uses the same credential-bound encoder as an ordinary full request.
+In particular, function arguments are serialized from parsed JSON, message output
+metadata such as status and annotations is not replayed, and reasoning replays its
+ID and encrypted content with an empty summary. These are the adapter's transcript
+semantics, not byte equality against the server's raw output. Changes to retained
+text, call IDs/arguments, protected reasoning or image data fail the prefix proof.
+Unreadable/unrepresentable or oversized checkpoints disable the optimization.
+Changes to model, tools, instructions, reasoning settings, or compacted/edited
+history send the full input without an ID. Reconnection, authentication changes,
+cancellation and failures discard the connection checkpoint. Checkpoint request
+and output buffers are bounded by the configured request/item limits and zeroized
+on drop; the socket also bounds completed response-ID correlation history.
+
+An explicit `previous_response_not_found` rejection before acceptance or visible
+output may reconnect and retry once with the full request, **within the configured
+resilience retry budget**. Recovery requires the documented 400
+`invalid_request_error` message naming the exact predecessor sent by this request
+(`Previous response with id '<id>' not found.`). Code-only errors, older IDs, changed
+message formats, and malformed error events fail closed: they cannot safely
+correlate a rejection on a reused socket. Set `with_resilience` with `max_retries >= 1` to allow
+this recovery. The full retry has no previous ID, so this special recovery cannot
+repeat. Accepted responses, visible output, and ambiguous sends/disconnects are
+never replayed. Recovery uses the existing retry observations and deadline budget.
 
 WebSocket upgrades use a dedicated reqwest HTTP/1 client with redirects and
 implicit HTTP retries disabled, using the existing reqwest TLS stack. A custom

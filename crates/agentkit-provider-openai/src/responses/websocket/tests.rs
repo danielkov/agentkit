@@ -6,7 +6,9 @@ use std::net::{TcpListener, TcpStream};
 use std::thread;
 use tokio_tungstenite::tungstenite::{self, WebSocket};
 
-// Same text/tool/reasoning/usage fixture as the HTTP decoder tests.
+// Same text/tool/reasoning/usage events as the HTTP decoder tests. Live WS
+// completion envelopes can contain output:[] even after output_item.done; the
+// streamed items, not this empty terminal field, supply the real transcript.
 const SUCCESS: &str = r#"event: response.created
 data: {"type":"response.created","sequence_number":1,"response":{"id":"resp-1","model":"gpt-test"}}
 
@@ -59,7 +61,7 @@ event: response.output_item.done
 data: {"type":"response.output_item.done","sequence_number":17,"output_index":2,"item":{"id":"call-item","type":"function_call","call_id":"call-1","name":"lookup","arguments":"{\"q\":1}"}}
 
 event: response.completed
-data: {"type":"response.completed","sequence_number":18,"response":{"id":"resp-1","model":"gpt-test","usage":{"input_tokens":3,"output_tokens":5,"output_tokens_details":{"reasoning_tokens":2}}}}
+data: {"type":"response.completed","sequence_number":18,"response":{"id":"resp-1","model":"gpt-test","output":[],"usage":{"input_tokens":3,"output_tokens":5,"output_tokens_details":{"reasoning_tokens":2}}}}
 
 "#;
 
@@ -97,10 +99,14 @@ fn socket(listener: &TcpListener) -> Socket {
     tungstenite::accept(accept(listener)).unwrap()
 }
 fn receive(ws: &mut Socket) -> Value {
+    let value = receive_continuation(ws);
+    assert!(value.get("previous_response_id").is_none());
+    value
+}
+fn receive_continuation(ws: &mut Socket) -> Value {
     let message = ws.read().unwrap();
     let value: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
     assert_eq!(value["type"], "response.create");
-    assert!(value.get("previous_response_id").is_none());
     assert!(
         value.get("stream").is_none(),
         "HTTP stream field on WS wire"
@@ -821,6 +827,873 @@ async fn dropped_refresh_future_repolls_safely_without_replaying_stale_credentia
         // Terminal failure released the claim even though the owned turn remains alive.
         let mut fresh = session.begin_turn(request(), None).await.unwrap();
         finished(&drain(&mut fresh).await.unwrap());
+        peer.join().unwrap();
+    }
+}
+
+// Like the loop, append Finished's canonical items rather than synthesizing
+// continuation metadata from raw wire output or incremental text deltas.
+async fn append_completed(turn: &mut OpenAIResponsesTurn, request: &mut TurnRequest) {
+    let events = drain(turn).await.unwrap();
+    finished(&events);
+    let result = events
+        .into_iter()
+        .find_map(|event| match event {
+            ModelTurnEvent::Finished(result) => Some(result),
+            _ => None,
+        })
+        .unwrap();
+    assert!(
+        result
+            .output_items
+            .iter()
+            .flat_map(|item| &item.parts)
+            .any(|part| matches!(part, Part::Reasoning(_)))
+    );
+    assert!(
+        result
+            .output_items
+            .iter()
+            .flat_map(|item| &item.parts)
+            .any(|part| matches!(part, Part::ToolCall(_)))
+    );
+    request.transcript.extend(result.output_items);
+}
+fn append_tool_result(request: &mut TurnRequest) {
+    request.transcript.push(Item::new(
+        ItemKind::Tool,
+        vec![Part::ToolResult(agentkit_core::ToolResultPart::success(
+            "call-1",
+            ToolOutput::text("found"),
+        ))],
+    ));
+}
+fn missing_previous(ws: &mut Socket) {
+    ws.send(Message::Text(r#"{"type":"error","status":400,"error":{"type":"invalid_request_error","code":"previous_response_not_found","message":"Previous response with id 'resp-1' not found."}}"#.into())).unwrap();
+}
+
+#[tokio::test]
+async fn continuation_reduces_real_tool_reasoning_rounds_and_new_user_turn() {
+    let (endpoint, peer) = server(|listener| {
+        let mut ws = socket(&listener);
+        receive(&mut ws);
+        normalized_success(&mut ws);
+        for (previous, next) in [("resp-1", "resp-2"), ("resp-2", "resp-3")] {
+            let wire = receive_continuation(&mut ws);
+            assert_eq!(wire["previous_response_id"], previous);
+            assert_eq!(
+                wire["input"],
+                json!([{
+                    "type": "function_call_output", "call_id": "call-1", "output": "found"
+                }])
+            );
+            success_id(&mut ws, next);
+        }
+        let wire = receive_continuation(&mut ws);
+        assert_eq!(wire["previous_response_id"], "resp-3");
+        assert_eq!(wire["input"].as_array().unwrap().len(), 2);
+        assert_eq!(wire["input"][0]["type"], "function_call_output");
+        assert_eq!(wire["input"][1]["role"], "user");
+        assert_eq!(wire["input"][1]["content"][0]["text"], "next question");
+        success_id(&mut ws, "resp-4");
+    });
+    let adapter =
+        OpenAIResponsesAdapter::new(config(&endpoint, OpenAIResponsesTransport::WebSocket))
+            .unwrap();
+    let mut session = adapter
+        .start_session(SessionConfig::new("session"))
+        .await
+        .unwrap();
+    let mut request = request();
+    for _ in 0..3 {
+        let mut turn = session.begin_turn(request.clone(), None).await.unwrap();
+        append_completed(&mut turn, &mut request).await;
+        append_tool_result(&mut request);
+    }
+    request.turn_id = TurnId::new("next-user-turn");
+    request
+        .transcript
+        .push(Item::text(ItemKind::User, "next question"));
+    let mut turn = session.begin_turn(request, None).await.unwrap();
+    finished(&drain(&mut turn).await.unwrap());
+    peer.join().unwrap();
+}
+
+#[tokio::test]
+async fn continuation_falls_back_to_full_input_for_mutated_history_or_settings() {
+    for mutation in ["user", "tools", "system", "compaction", "call", "reasoning"] {
+        let (endpoint, peer) = server(move |listener| {
+            let mut ws = socket(&listener);
+            let initial = receive(&mut ws);
+            decorated_success(&mut ws);
+            let full = receive(&mut ws);
+            assert!(
+                full["input"].as_array().unwrap().len()
+                    > initial["input"].as_array().unwrap().len()
+            );
+            assert!(
+                full["input"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|item| item["type"] == "reasoning")
+            );
+            assert!(
+                full["input"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|item| item["type"] == "function_call")
+            );
+            if mutation == "tools" {
+                assert_ne!(full["tools"], initial["tools"]);
+            } else if matches!(mutation, "system" | "compaction") {
+                assert_ne!(full["input"][0], initial["input"][0]);
+            }
+            assert_canonical_output(
+                &full,
+                if mutation == "reasoning" {
+                    "changed-opaque"
+                } else {
+                    "opaque"
+                },
+                if mutation == "call" {
+                    json!({"q":2})
+                } else {
+                    json!({"q":1})
+                },
+            );
+            success_id(&mut ws, "resp-2");
+        });
+        let adapter =
+            OpenAIResponsesAdapter::new(config(&endpoint, OpenAIResponsesTransport::WebSocket))
+                .unwrap();
+        let mut session = adapter
+            .start_session(SessionConfig::new("session"))
+            .await
+            .unwrap();
+        let mut request = request();
+        request
+            .transcript
+            .insert(0, Item::text(ItemKind::System, "original instructions"));
+        let mut turn = session.begin_turn(request.clone(), None).await.unwrap();
+        append_completed(&mut turn, &mut request).await;
+        append_tool_result(&mut request);
+        if mutation == "tools" {
+            request.available_tools.push(
+                serde_json::from_value(json!({
+                    "name": "lookup", "description": "changed tools",
+                    "input_schema": {"type": "object"}, "annotations": {"read_only_hint": false, "destructive_hint": false,
+                    "idempotent_hint": false, "needs_approval_hint": false,
+                    "supports_streaming_hint": false}, "metadata": {}
+                }))
+                .unwrap(),
+            );
+        } else {
+            match mutation {
+                "user" => request.transcript[1] = Item::text(ItemKind::User, "edited history"),
+                "system" => {
+                    request.transcript[0] = Item::text(ItemKind::System, "new instructions")
+                }
+                "compaction" => {
+                    request.transcript.drain(..2);
+                    request
+                        .transcript
+                        .insert(0, Item::text(ItemKind::User, "compacted history"));
+                }
+                "call" | "reasoning" => {
+                    for part in request
+                        .transcript
+                        .iter_mut()
+                        .flat_map(|item| &mut item.parts)
+                    {
+                        match part {
+                            Part::ToolCall(call) if mutation == "call" => {
+                                call.input = json!({"q":2})
+                            }
+                            Part::Reasoning(reasoning) if mutation == "reasoning" => {
+                                reasoning.metadata.get_mut(CONTINUATION_METADATA).unwrap()["encrypted_content"] =
+                                    json!("changed-opaque");
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+        let mut next = session.begin_turn(request, None).await.unwrap();
+        finished(&drain(&mut next).await.unwrap());
+        peer.join().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn continuation_missing_previous_recovers_once_on_fresh_socket() {
+    for reject_full_retry in [false, true] {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let (endpoint, peer) =
+            server(move |listener| {
+                let mut ws = socket(&listener);
+                receive(&mut ws);
+                success(&mut ws);
+                let suffix = receive_continuation(&mut ws);
+                assert_eq!(suffix["previous_response_id"], "resp-1");
+                assert_eq!(suffix["input"].as_array().unwrap().len(), 1);
+                missing_previous(&mut ws);
+                assert!(ws.read().is_err(), "rejected socket must be discarded");
+                let mut fresh = socket(&listener);
+                let full = receive(&mut fresh);
+                let input = full["input"].as_array().unwrap();
+                assert_eq!(input.len(), 5); // user, text, reasoning, call, result
+                assert_eq!(input.last(), suffix["input"].as_array().unwrap().last());
+                assert_eq!(input[0]["role"], "user");
+                assert!(input.iter().any(
+                    |item| item["type"] == "reasoning" && item["encrypted_content"] == "opaque"
+                ));
+                if reject_full_retry {
+                    missing_previous(&mut fresh);
+                } else {
+                    success_id(&mut fresh, "resp-recovered");
+                }
+                done_rx.recv_timeout(WAIT).unwrap();
+                assert_eq!(
+                    listener.accept().unwrap_err().kind(),
+                    std::io::ErrorKind::WouldBlock
+                );
+            });
+        let mut cfg = config(&endpoint, OpenAIResponsesTransport::WebSocket);
+        cfg.resilience.as_mut().unwrap().max_retries = 3;
+        let adapter = OpenAIResponsesAdapter::new(cfg).unwrap();
+        let mut session = adapter
+            .start_session(SessionConfig::new("session"))
+            .await
+            .unwrap();
+        let mut request = request();
+        let mut turn = session.begin_turn(request.clone(), None).await.unwrap();
+        append_completed(&mut turn, &mut request).await;
+        append_tool_result(&mut request);
+        let mut next = session.begin_turn(request, None).await.unwrap();
+        let result = drain(&mut next).await;
+        if reject_full_retry {
+            assert!(result.is_err());
+            assert!(next.next_event(None).await.unwrap().is_none());
+        } else {
+            finished(&result.unwrap());
+        }
+        done_tx.send(()).unwrap();
+        peer.join().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn continuation_missing_previous_after_created_or_output_never_replays() {
+    for case in ["created", "output", "code_only", "stale_id", "out_of_order"] {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let (endpoint, peer) = server(move |listener| {
+            let mut ws = socket(&listener);
+            receive(&mut ws);
+            success(&mut ws);
+            assert_eq!(
+                receive_continuation(&mut ws)["previous_response_id"],
+                "resp-1"
+            );
+            for line in SUCCESS
+                .replace("resp-1", "accepted")
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .take(match case {
+                    "output" => 4,
+                    "created" => 1,
+                    _ => 0,
+                })
+            {
+                ws.send(Message::Text(line.into())).unwrap();
+            }
+            if matches!(case, "created" | "output") {
+                missing_previous(&mut ws);
+            } else {
+                let mut error = json!({"type":"error", "status":400, "error":{
+                    "type":"invalid_request_error", "code":"previous_response_not_found"
+                }});
+                if case == "stale_id" {
+                    error["error"]["message"] =
+                        json!("Previous response with id 'resp-stale' not found.");
+                } else if case == "out_of_order" {
+                    ws.send(Message::Text(
+                        json!({"type":"keepalive", "sequence_number":1})
+                            .to_string()
+                            .into(),
+                    ))
+                    .unwrap();
+                    error["sequence_number"] = json!(1);
+                    error["error"]["message"] =
+                        json!("Previous response with id 'resp-1' not found.");
+                }
+                ws.send(Message::Text(error.to_string().into())).unwrap();
+            }
+            assert!(ws.read().is_err(), "failed socket must be discarded");
+            done_rx.recv_timeout(WAIT).unwrap();
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        });
+        let mut cfg = config(&endpoint, OpenAIResponsesTransport::WebSocket);
+        cfg.resilience.as_mut().unwrap().max_retries = 3;
+        let adapter = OpenAIResponsesAdapter::new(cfg).unwrap();
+        let mut session = adapter
+            .start_session(SessionConfig::new("session"))
+            .await
+            .unwrap();
+        let mut request = request();
+        let mut turn = session.begin_turn(request.clone(), None).await.unwrap();
+        append_completed(&mut turn, &mut request).await;
+        append_tool_result(&mut request);
+        let mut next = session.begin_turn(request, None).await.unwrap();
+        assert!(drain(&mut next).await.is_err());
+        assert!(next.next_event(None).await.unwrap().is_none());
+        done_tx.send(()).unwrap();
+        peer.join().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn continuation_raw_output_is_bounded_and_overflow_uses_full_request() {
+    for overflow in [false, true] {
+        let (endpoint, peer) = server(move |listener| {
+            let mut ws = socket(&listener);
+            receive(&mut ws);
+            for line in SUCCESS
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+            {
+                let mut event: Value = serde_json::from_str(line).unwrap();
+                if event["type"] == "response.output_item.done" && event["output_index"] == 0 {
+                    // Real output may contain provider-only fields absent from the
+                    // canonical replay representation. They still consume the bound.
+                    event["item"]["provider_padding"] =
+                        json!("x".repeat(if overflow { 8192 } else { 16 }));
+                }
+                ws.send(Message::Text(event.to_string().into())).unwrap();
+            }
+            let wire = if overflow {
+                receive(&mut ws)
+            } else {
+                receive_continuation(&mut ws)
+            };
+            if overflow {
+                assert_eq!(wire["input"].as_array().unwrap().len(), 5);
+            } else {
+                assert_eq!(wire["previous_response_id"], "resp-1");
+                assert_eq!(wire["input"].as_array().unwrap().len(), 1);
+            }
+            success_id(&mut ws, "resp-2");
+        });
+        let mut cfg = config(&endpoint, OpenAIResponsesTransport::WebSocket);
+        cfg.limits.max_request_bytes = 4096;
+        cfg.limits.max_text_bytes = 4096;
+        let adapter = OpenAIResponsesAdapter::new(cfg).unwrap();
+        let mut session = adapter
+            .start_session(SessionConfig::new("session"))
+            .await
+            .unwrap();
+        let mut request = request();
+        let mut turn = session.begin_turn(request.clone(), None).await.unwrap();
+        append_completed(&mut turn, &mut request).await;
+        {
+            let state = session.websocket.lock().unwrap();
+            let connection = state.idle.as_ref().unwrap();
+            if overflow {
+                assert!(connection.checkpoint.is_none());
+            } else {
+                let checkpoint = connection.checkpoint.as_ref().unwrap();
+                assert_eq!(checkpoint.raw_output.len(), 3);
+                assert!(checkpoint.bytes <= 4096);
+                let raw: Value = serde_json::from_str(&checkpoint.raw_output[&0]).unwrap();
+                assert_eq!(raw["provider_padding"], "x".repeat(16));
+            }
+        }
+        append_tool_result(&mut request);
+        let mut next = session.begin_turn(request, None).await.unwrap();
+        finished(&drain(&mut next).await.unwrap());
+        peer.join().unwrap();
+    }
+}
+
+fn decorated_success(ws: &mut Socket) {
+    let fixture = SUCCESS.replace(r#"{\"q\":1}"#, r#"{ \"q\" : 1 }"#);
+    for line in fixture
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+    {
+        let mut event: Value = serde_json::from_str(line).unwrap();
+        if event["type"] == "response.output_item.done" {
+            event["item"]["status"] = json!("completed");
+            event["item"]["annotations"] = json!([{"type":"provider_only"}]);
+        }
+        ws.send(Message::Text(event.to_string().into())).unwrap();
+    }
+}
+fn assert_canonical_output(wire: &Value, encrypted: &str, arguments: Value) {
+    let input = wire["input"].as_array().unwrap();
+    assert_eq!(
+        input
+            .iter()
+            .find(|item| item["type"] == "reasoning")
+            .unwrap(),
+        &json!({
+            "id":"reason-1", "type":"reasoning", "summary":[], "encrypted_content":encrypted
+        })
+    );
+    assert_eq!(
+        input
+            .iter()
+            .find(|item| item["type"] == "function_call")
+            .unwrap(),
+        &json!({
+            "id":"call-item", "type":"function_call", "call_id":"call-1", "name":"lookup",
+            "arguments":arguments.to_string()
+        })
+    );
+}
+
+#[tokio::test]
+async fn continuation_generated_image_reduces_into_real_transcript() {
+    let (endpoint, peer) = server(|listener| {
+        let mut ws = socket(&listener);
+        receive(&mut ws);
+        let item = json!({"id":"image-1", "type":"image_generation_call", "status":"completed",
+            "revised_prompt":"safer prompt", "result":"AQID"});
+        for event in [
+            json!({"type":"response.created", "sequence_number":1, "response":{"id":"resp-image", "model":"gpt-test"}}),
+            json!({"type":"response.output_item.added", "sequence_number":2, "output_index":0, "item":{"id":"image-1", "type":"image_generation_call"}}),
+            json!({"type":"response.output_item.done", "sequence_number":3, "output_index":0, "item":item}),
+            json!({"type":"response.completed", "sequence_number":4, "response":{"id":"resp-image", "model":"gpt-test", "status":"completed", "output":[item]}}),
+        ] {
+            ws.send(Message::Text(event.to_string().into())).unwrap();
+        }
+        let wire = receive_continuation(&mut ws);
+        assert_eq!(wire["previous_response_id"], "resp-image");
+        assert_eq!(
+            wire["input"],
+            json!([{"type":"message", "role":"user", "content":[{"type":"input_text", "text":"describe image"}]}])
+        );
+        success_id(&mut ws, "resp-after-image");
+    });
+    let adapter =
+        OpenAIResponsesAdapter::new(config(&endpoint, OpenAIResponsesTransport::WebSocket))
+            .unwrap();
+    let mut session = adapter
+        .start_session(SessionConfig::new("session"))
+        .await
+        .unwrap();
+    let mut request = request();
+    let mut turn = session.begin_turn(request.clone(), None).await.unwrap();
+    let events = drain(&mut turn).await.unwrap();
+    let result = events
+        .into_iter()
+        .find_map(|event| match event {
+            ModelTurnEvent::Finished(result) => Some(result),
+            _ => None,
+        })
+        .unwrap();
+    let Part::Media(media) = &result.output_items[0].parts[0] else {
+        panic!("missing generated image")
+    };
+    assert_eq!(media.data, DataRef::InlineBytes(vec![1, 2, 3]));
+    request.transcript.extend(result.output_items);
+    request
+        .transcript
+        .push(Item::text(ItemKind::User, "describe image"));
+    let mut next = session.begin_turn(request, None).await.unwrap();
+    finished(&drain(&mut next).await.unwrap());
+    peer.join().unwrap();
+}
+
+#[test]
+fn continuation_checkpoint_requires_identical_model_and_reasoning_settings() {
+    let previous = json!({"type":"response.create", "model":"gpt-test", "reasoning":{"effort":"low", "summary":"auto"}, "input":[{"role":"user","content":"hello"}]});
+    let output = json!({"type":"reasoning","id":"r", "summary":[], "encrypted_content":"opaque"});
+    let checkpoint = Checkpoint {
+        request: Zeroizing::new(previous.to_string()),
+        response_id: "resp-1".into(),
+        raw_output: BTreeMap::new(),
+        replay_output: BTreeMap::from([(0, Zeroizing::new(json!([output]).to_string()))]),
+        bytes: 0,
+        completed: true,
+    };
+    let mut current = previous.clone();
+    current["input"]
+        .as_array_mut()
+        .unwrap()
+        .extend([output, json!({"role":"user","content":"next"})]);
+    assert_eq!(
+        checkpoint.suffix(&current),
+        Some(vec![json!({"role":"user","content":"next"})])
+    );
+    for (key, value) in [
+        ("model", json!("other-model")),
+        ("reasoning", json!({"effort":"high","summary":"auto"})),
+    ] {
+        let mut changed = current.clone();
+        changed[key] = value;
+        assert!(checkpoint.suffix(&changed).is_none(), "changed {key}");
+    }
+}
+
+#[tokio::test]
+async fn continuation_terminal_output_preserves_streamed_items_or_discards_conflicts() {
+    for variant in [
+        "malformed",
+        "missing_item",
+        "mismatch",
+        "status",
+        "matching",
+        "empty",
+    ] {
+        let (endpoint, peer) = server(move |listener| {
+            let mut ws = socket(&listener);
+            receive(&mut ws);
+            let mut output = vec![];
+            for line in SUCCESS
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+            {
+                let mut event: Value = serde_json::from_str(line).unwrap();
+                if event["type"] == "response.output_item.done" {
+                    output.push(event["item"].clone());
+                }
+                if event["type"] == "response.completed" {
+                    event["response"]["status"] = json!("completed");
+                    event["response"]["output"] = json!(output);
+                    match variant {
+                        "malformed" => event["response"]["output"] = json!({"unexpected":"object"}),
+                        "missing_item" => {
+                            event["response"]["output"].as_array_mut().unwrap().pop();
+                        }
+                        "mismatch" => {
+                            event["response"]["output"][1]["encrypted_content"] = json!("different")
+                        }
+                        "status" => event["response"]["status"] = json!("in_progress"),
+                        "matching" => {}
+                        "empty" => event["response"]["output"] = json!([]),
+                        _ => unreachable!(),
+                    }
+                }
+                ws.send(Message::Text(event.to_string().into())).unwrap();
+            }
+            if matches!(variant, "matching" | "empty") {
+                let wire = receive_continuation(&mut ws);
+                assert_eq!(wire["previous_response_id"], "resp-1");
+                assert_eq!(wire["input"].as_array().unwrap().len(), 1);
+            } else {
+                let full = receive(&mut ws);
+                assert_eq!(full["input"].as_array().unwrap().len(), 5);
+                assert_canonical_output(&full, "opaque", json!({"q":1}));
+            }
+            success_id(&mut ws, "resp-2");
+        });
+        let adapter =
+            OpenAIResponsesAdapter::new(config(&endpoint, OpenAIResponsesTransport::WebSocket))
+                .unwrap();
+        let mut session = adapter
+            .start_session(SessionConfig::new("session"))
+            .await
+            .unwrap();
+        let mut request = request();
+        let mut turn = session.begin_turn(request.clone(), None).await.unwrap();
+        append_completed(&mut turn, &mut request).await;
+        append_tool_result(&mut request);
+        let mut next = session.begin_turn(request, None).await.unwrap();
+        finished(&drain(&mut next).await.unwrap());
+        peer.join().unwrap();
+    }
+}
+
+// Change every arguments-bearing frame, not just output_item.done: the real
+// decoder observes identical values with noncanonical whitespace and key order.
+fn normalized_success(ws: &mut Socket) {
+    let fixture = SUCCESS.replace(r#"{\"q\":1}"#, r#"{ \"z\" : 2, \"q\" : 1 }"#);
+    assert_ne!(fixture, SUCCESS);
+    for line in fixture
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+    {
+        let mut event: Value = serde_json::from_str(line).unwrap();
+        if event["type"] == "response.output_item.done" {
+            event["item"]["status"] = json!("completed");
+            if event["item"]["type"] == "message" {
+                event["item"]["content"][0]["annotations"] = json!([]);
+            }
+        }
+        ws.send(Message::Text(event.to_string().into())).unwrap();
+    }
+}
+
+struct RotatingInitialAuth {
+    calls: std::sync::atomic::AtomicUsize,
+    change_binding: bool,
+}
+#[async_trait]
+impl AuthenticationProvider for RotatingInitialAuth {
+    async fn authenticate(
+        &self,
+        previous: Option<&AuthenticationAttempt>,
+    ) -> Result<AuthenticationAttempt, HttpError> {
+        assert!(
+            previous.is_none(),
+            "this test must not refresh a rejected attempt"
+        );
+        let generation = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer loopback-{generation}")).unwrap(),
+        );
+        Ok(
+            AuthenticationAttempt::stateless(headers).with_binding(if self.change_binding {
+                format!("loopback-identity-{generation}")
+            } else {
+                "loopback-identity".to_owned()
+            }),
+        )
+    }
+}
+
+#[tokio::test]
+async fn continuation_reconnect_or_rotated_headers_sends_full_reduced_history() {
+    for rotate_headers in [false, true] {
+        let (close_tx, close_rx) = tokio::sync::oneshot::channel();
+        let (endpoint, peer) = server(move |listener| {
+            let mut first = socket(&listener);
+            receive(&mut first);
+            success(&mut first);
+            if !rotate_headers {
+                first.close(None).unwrap();
+                close_tx.send(()).unwrap();
+                assert!(matches!(first.read(), Ok(Message::Close(_))));
+                drop(first);
+            }
+            let mut fresh = socket(&listener);
+            let full = receive(&mut fresh);
+            assert_eq!(full["input"].as_array().unwrap().len(), 5);
+            assert_canonical_output(&full, "opaque", json!({"q":1}));
+            assert_eq!(full["input"][0]["role"], "user");
+            assert_eq!(
+                full["input"][4],
+                json!({"type":"function_call_output", "call_id":"call-1", "output":"found"})
+            );
+            success_id(&mut fresh, "resp-fresh");
+        });
+        let mut cfg = config(&endpoint, OpenAIResponsesTransport::WebSocket);
+        if rotate_headers {
+            cfg = cfg.with_authentication_provider(RotatingInitialAuth {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                change_binding: false,
+            });
+        }
+        let adapter = OpenAIResponsesAdapter::new(cfg).unwrap();
+        let mut session = adapter
+            .start_session(SessionConfig::new("session"))
+            .await
+            .unwrap();
+        let mut request = request();
+        let mut turn = session.begin_turn(request.clone(), None).await.unwrap();
+        append_completed(&mut turn, &mut request).await;
+        append_tool_result(&mut request);
+        if !rotate_headers {
+            tokio::time::timeout(WAIT, close_rx).await.unwrap().unwrap();
+            // Synchronize receipt of the peer's Close, not a sleep or a race
+            // against send's nonblocking boundary check. Leave the completed
+            // checkpoint on the closed connection for normal checkout to reject.
+            let mut connection = session.websocket.lock().unwrap().idle.take().unwrap();
+            let frame = tokio::time::timeout(WAIT, connection.stream.next())
+                .await
+                .unwrap();
+            assert!(matches!(frame, Some(Ok(Message::Close(_)))));
+            connection.stream.flush().await.unwrap();
+            assert!(
+                tokio::time::timeout(WAIT, connection.stream.next())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(connection.checkpoint.as_ref().unwrap().completed);
+            session.websocket.lock().unwrap().idle = Some(connection);
+        }
+        let mut next = session.begin_turn(request, None).await.unwrap();
+        finished(&drain(&mut next).await.unwrap());
+        peer.join().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn continuation_changed_binding_reconnects_with_full_text_history() {
+    let (endpoint, peer) = server(|listener| {
+        let mut first = socket(&listener);
+        receive(&mut first);
+        // Text-only output has no authentication-bound protected metadata.
+        for line in SUCCESS
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .take(7)
+        {
+            first.send(Message::Text(line.into())).unwrap();
+        }
+        first
+            .send(Message::Text(
+                json!({"type":"response.completed", "sequence_number":8,
+            "response":{"id":"resp-1", "model":"gpt-test", "status":"completed"}})
+                .to_string()
+                .into(),
+            ))
+            .unwrap();
+        let mut fresh = socket(&listener);
+        let full = receive(&mut fresh);
+        assert_eq!(
+            full["input"],
+            json!([
+                {"type":"message", "role":"user", "content":[{"type":"input_text", "text":"hello"}]},
+                {"type":"message", "role":"assistant", "content":[{"type":"output_text", "text":"hello"}]},
+                {"type":"message", "role":"user", "content":[{"type":"input_text", "text":"next"}]}
+            ])
+        );
+        success_id(&mut fresh, "resp-2");
+    });
+    let cfg = config(&endpoint, OpenAIResponsesTransport::WebSocket).with_authentication_provider(
+        RotatingInitialAuth {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            change_binding: true,
+        },
+    );
+    let adapter = OpenAIResponsesAdapter::new(cfg).unwrap();
+    let mut session = adapter
+        .start_session(SessionConfig::new("session"))
+        .await
+        .unwrap();
+    let mut request = request();
+    let mut turn = session.begin_turn(request.clone(), None).await.unwrap();
+    let events = drain(&mut turn).await.unwrap();
+    finished(&events);
+    for event in events {
+        if let ModelTurnEvent::Finished(result) = event {
+            request.transcript.extend(result.output_items);
+        }
+    }
+    request.transcript.push(Item::text(ItemKind::User, "next"));
+    let mut next = session.begin_turn(request, None).await.unwrap();
+    finished(&drain(&mut next).await.unwrap());
+    peer.join().unwrap();
+}
+
+#[tokio::test]
+async fn interrupted_missing_previous_backoff_releases_session_without_replay() {
+    use std::future::Future;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::Poll;
+
+    for cancel in [false, true] {
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let (checked_tx, checked_rx) = tokio::sync::oneshot::channel();
+        let (endpoint, peer) = server(move |listener| {
+            let mut ws = socket(&listener);
+            receive(&mut ws);
+            success(&mut ws);
+            let incremental = receive_continuation(&mut ws);
+            assert_eq!(incremental["previous_response_id"], "resp-1");
+            assert_eq!(incremental["input"].as_array().unwrap().len(), 1);
+            missing_previous(&mut ws);
+            assert!(ws.read().is_err(), "rejected socket must be discarded");
+            // The client signals only after interrupting the suspended backoff.
+            // No recovery connection may have been opened in the meantime.
+            resume_rx.recv_timeout(WAIT).unwrap();
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            checked_tx.send(()).unwrap();
+            let mut fresh = socket(&listener);
+            let full = receive(&mut fresh);
+            let input = full["input"].as_array().unwrap();
+            assert_eq!(input.len(), 6);
+            assert_eq!(input[0]["content"][0]["text"], "hello");
+            assert_eq!(input[2]["type"], "reasoning");
+            assert_eq!(input[2]["encrypted_content"], "opaque");
+            assert_eq!(input[4], incremental["input"][0]);
+            assert_eq!(input[5]["content"][0]["text"], "after interrupted recovery");
+            success_id(&mut fresh, "fresh-after-interruption");
+        });
+        let mut cfg = config(&endpoint, OpenAIResponsesTransport::WebSocket);
+        let resilience = cfg.resilience.as_mut().unwrap();
+        resilience.max_retries = 1;
+        // Never wait for this duration: an observed Scheduled event followed by
+        // Poll::Pending proves suspension, without sleep-based timing assertions.
+        resilience.initial_backoff = Duration::from_secs(3600);
+        resilience.max_backoff = Duration::from_secs(3600);
+        resilience.retry_budget = Duration::from_secs(7200);
+        let adapter = OpenAIResponsesAdapter::new(cfg).unwrap();
+        let mut session = adapter
+            .start_session(SessionConfig::new("session"))
+            .await
+            .unwrap();
+        let mut history = request();
+        let mut first = session.begin_turn(history.clone(), None).await.unwrap();
+        append_completed(&mut first, &mut history).await;
+        append_tool_result(&mut history);
+
+        let scheduled = Arc::new(AtomicBool::new(false));
+        let observed = scheduled.clone();
+        session.set_retry_observer(Some(Arc::new(move |event: ProviderRetryEvent| {
+            if let ProviderRetryEvent::Scheduled(progress) = event {
+                assert_eq!(progress.accounting.attempts, 1);
+                assert_eq!(progress.accounting.completed_backoff, Duration::ZERO);
+                assert!(!progress.next_delay.is_zero());
+                assert!(!observed.swap(true, Ordering::SeqCst));
+            }
+        })));
+        let controller = agentkit_core::CancellationController::new();
+        let cancellation = controller.handle().checkpoint();
+        let mut interrupted = session.begin_turn(history.clone(), None).await.unwrap();
+        let mut pending = Box::pin(interrupted.next_event(Some(cancellation.clone())));
+        tokio::time::timeout(
+            WAIT,
+            futures_util::future::poll_fn(|cx| {
+                assert!(pending.as_mut().poll(cx).is_pending());
+                if scheduled.load(Ordering::SeqCst) {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            }),
+        )
+        .await
+        .unwrap();
+        if cancel {
+            controller.interrupt();
+            assert!(matches!(pending.await, Err(LoopError::Cancelled)));
+            // Cancellation finalizes the lease even while the owned turn lives.
+            assert!(interrupted.next_event(None).await.unwrap().is_none());
+        } else {
+            drop(pending);
+            drop(interrupted);
+        }
+        resume_tx.send(()).unwrap();
+        // Do not open the legitimate next socket until the server has completed
+        // its no-replay assertion; channel ordering, not elapsed time, controls it.
+        tokio::time::timeout(WAIT, checked_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        history
+            .transcript
+            .push(Item::text(ItemKind::User, "after interrupted recovery"));
+        let mut fresh = session.begin_turn(history, None).await.unwrap();
+        let events = drain(&mut fresh).await.unwrap();
+        finished(&events);
+        assert!(events.iter().any(|event| matches!(event,
+            ModelTurnEvent::Finished(result)
+                if result.response_id.as_deref() == Some("fresh-after-interruption"))));
         peer.join().unwrap();
     }
 }
