@@ -124,12 +124,18 @@ WebSocket retries are intentionally more conservative than HTTP retries:
   errors never trigger automatic replay or authentication refresh. The narrowly
   scoped missing-continuation recovery is described below. An accepted response
   is never automatically replayed.
-- An interrupted send, socket EOF, receive failure, or timeout after sending is
-  **not replayed**: the server may already have accepted the request.
-- Visible WebSocket output is never superseded/replayed, even when the consumer
-  opts into HTTP response-attempt supersession. No WebSocket idempotency guarantee
-  is assumed. Wrapped error statuses and allowlisted retry headers are retained
-  in normal retry observations; raw provider error messages are not exposed.
+- A send failure, socket close, receive failure, stall, or timeout after sending
+  reconnects and resends the full request (no `previous_response_id`) within the
+  retry budget, when the request policy sends `store: false`. The server keeps no
+  response state for such a request, so a lost or unfinished delivery cannot
+  create a duplicate stored response or corrupt a continuation. With any other
+  `store` setting these failures are not replayed.
+- After visible output, that resend happens only when the consumer opts into
+  response-attempt supersession, exactly as for HTTP: the adapter emits
+  `ModelTurnEvent::ResponseAttemptSuperseded` before the replacement attempt.
+  Otherwise visible WebSocket output is never replayed. Wrapped error statuses and
+  allowlisted retry headers are retained in normal retry observations; raw
+  provider error messages are not exposed.
 - Dropping a pending `next_event` future during authentication refresh or a
   WebSocket opening operation makes a retained turn fail safely on its next
   poll. It does not resume with stale credentials or replay an uncertain send.
@@ -140,6 +146,15 @@ rejected and consecutive control frames are bounded. Upgrade and send operations
 have a 30-second ceiling; configured attempt, idle, logical retry-budget, and
 cancellation bounds also apply. As with HTTP, configure `with_resilience` to set
 stream idle and whole-turn deadlines.
+
+Both transports also bound each attempt by response progress
+(`with_progress_timeouts`, default 120s to the first progress event and 300s
+between progress events). Only `response.*` events other than `response.queued`,
+`response.in_progress` and `response.metadata` count as progress. Keepalives,
+`codex.*` rate-limit/metadata events, SSE comments and ping/pong keep the idle
+timer alive but cannot keep a stalled response open. A stall is a retryable
+failure. The 300s gap matches the Codex CLI's stream idle timeout, leaving room
+for reasoning that runs silently between events.
 
 The optional [live continuation suite](../../docs/live-responses-websocket.md)
 verifies incremental wire requests and server acceptance using environment credentials.
@@ -177,8 +192,8 @@ resilience retry budget**. Recovery requires the documented 400
 message formats, and malformed error events fail closed: they cannot safely
 correlate a rejection on a reused socket. Set `with_resilience` with `max_retries >= 1` to allow
 this recovery. The full retry has no previous ID, so this special recovery cannot
-repeat. Accepted responses, visible output, and ambiguous sends/disconnects are
-never replayed. Recovery uses the existing retry observations and deadline budget.
+repeat. This recovery never replays accepted responses, visible output, or ambiguous
+sends/disconnects. Recovery uses the existing retry observations and deadline budget.
 
 WebSocket upgrades use a dedicated reqwest HTTP/1 client with redirects and
 implicit HTTP retries disabled, using the existing reqwest TLS stack. A custom
@@ -305,12 +320,18 @@ default. Context content is sent unchanged: the public profile keeps system and
 Context items as system messages, while the private profile downgrades both to
 developer messages,
 defaults `parallel_tool_calls` to `true`,
-omits unsupported `max_output_tokens`, sends `originator`/`session-id`, and
-replays validated `x-codex-turn-state` only within one logical turn and its
-retries. HTTP turn state is accepted only from a successful SSE response; the
-equivalent `response.metadata` headers can update retry context, and all header,
-metadata, and retry values must agree. It does not perform credential discovery
-or model catalog lookups.
+omits unsupported `max_output_tokens`, and sends `originator`,
+`x-codex-routing-hint: model=<model>`, `thread-id` (the agentkit session ID) and
+`session-id`. `session-id` is the request's prompt cache key when one is set,
+otherwise the session ID, so sessions sharing a cache key (for example forked
+subagents in other processes) route to the same backend and its prompt cache.
+It also replays validated `x-codex-turn-state` for sticky routing. Turn state spans one user turn: every request from the latest
+user message through its tool rounds and retries. A new user message or a changed
+authentication binding clears it. HTTP turn state is accepted only from a
+successful SSE response or upgrade; `response.metadata` and
+`codex.response.metadata` headers can also update it, and a changed value replaces the old one. Over WebSocket it is also sent as
+`client_metadata` on each `response.create`. It does not perform credential
+discovery or model catalog lookups.
 
 Continuation metadata is versioned and bound to the authentication binding,
 session, provider item ID, and item kind. It records the originating model as

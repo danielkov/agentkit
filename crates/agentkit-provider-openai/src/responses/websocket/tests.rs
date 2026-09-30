@@ -1,6 +1,7 @@
 //! Loopback-only transport tests; no live inference.
 use super::*;
 use agentkit_core::{SessionId, TurnId};
+use agentkit_loop::PromptCacheRequest;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::thread;
@@ -1782,4 +1783,267 @@ fn websocket_proxy_policy_child_process() {
     );
     blocked.join().unwrap();
     direct.join().unwrap();
+}
+
+fn private_config(endpoint: &str) -> OpenAIResponsesConfig {
+    let base = config(endpoint, OpenAIResponsesTransport::WebSocket);
+    OpenAIResponsesConfig::chatgpt_private("gpt-test", Authentication::bearer("loopback-test"))
+        .with_endpoint(endpoint)
+        .with_transport(OpenAIResponsesTransport::WebSocket)
+        .with_resilience(base.resilience.unwrap())
+}
+
+#[tokio::test]
+#[allow(
+    clippy::result_large_err,
+    reason = "tungstenite fixes the handshake callback error type"
+)]
+async fn private_handshake_routes_by_cache_key_and_sends_turn_state_per_message() {
+    for key in [None, Some("shared-key")] {
+        let (endpoint, peer) = server(move |listener| {
+            let mut ws = tungstenite::accept_hdr(
+                accept(&listener),
+                |request: &tungstenite::handshake::server::Request,
+                 mut response: tungstenite::handshake::server::Response| {
+                    let headers = request.headers();
+                    assert_eq!(headers[X_CODEX_ROUTING_HINT], "model=gpt-test");
+                    assert_eq!(headers["session-id"], key.unwrap_or("ws-session"));
+                    assert_eq!(headers["thread-id"], "ws-session");
+                    assert!(!headers.contains_key(X_CODEX_TURN_STATE));
+                    response
+                        .headers_mut()
+                        .insert(X_CODEX_TURN_STATE, "ws-state".parse().unwrap());
+                    Ok(response)
+                },
+            )
+            .unwrap();
+            let first = receive(&mut ws);
+            assert_eq!(first["client_metadata"][X_CODEX_TURN_STATE], "ws-state");
+            success(&mut ws);
+            let next = receive_continuation(&mut ws);
+            assert_eq!(next["previous_response_id"], "resp-1");
+            assert_eq!(next["client_metadata"][X_CODEX_TURN_STATE], "ws-state");
+            success_id(&mut ws, "resp-2");
+        });
+        let adapter = OpenAIResponsesAdapter::new(private_config(&endpoint)).unwrap();
+        let mut session = adapter
+            .start_session(SessionConfig::new("ws-session"))
+            .await
+            .unwrap();
+        let mut request = request();
+        request.session_id = SessionId::new("ws-session");
+        request.cache = key.map(|key| PromptCacheRequest::automatic().with_key(key));
+        let mut turn = session.begin_turn(request.clone(), None).await.unwrap();
+        let events = drain(&mut turn).await.unwrap();
+        finished(&events);
+        request.transcript.extend(
+            events
+                .into_iter()
+                .find_map(|event| match event {
+                    ModelTurnEvent::Finished(result) => Some(result.output_items),
+                    _ => None,
+                })
+                .unwrap(),
+        );
+        append_tool_result(&mut request);
+        let mut turn = session.begin_turn(request, None).await.unwrap();
+        finished(&drain(&mut turn).await.unwrap());
+        peer.join().unwrap();
+    }
+}
+
+const STALL: Duration = Duration::from_millis(300);
+
+fn stall_config(endpoint: &str) -> OpenAIResponsesConfig {
+    let mut cfg = private_config(endpoint).with_progress_timeouts(Some(STALL), Some(STALL));
+    cfg.resilience = Some(ResilienceConfig {
+        max_retries: 1,
+        retry_budget: WAIT,
+        attempt_timeout: Some(Duration::from_secs(4)),
+        stream_idle_timeout: Some(Duration::from_secs(4)),
+        initial_backoff: Duration::ZERO,
+        max_backoff: Duration::ZERO,
+    });
+    cfg
+}
+fn created(ws: &mut Socket) {
+    ws.send(Message::Text(
+        r#"{"type":"response.created","sequence_number":1,"response":{"id":"stalled","model":"gpt-test"}}"#.into(),
+    ))
+    .unwrap();
+}
+// Keeps a stalled socket busy with non-progress traffic until the client drops it.
+fn keepalive_until_closed(ws: &mut Socket) {
+    let start = Instant::now();
+    while start.elapsed() < WAIT {
+        let sent = ws
+            .send(Message::Text(r#"{"type":"keepalive"}"#.into()))
+            .and_then(|()| {
+                ws.send(Message::Text(
+                    r#"{"type":"codex.rate_limits","primary":{"used_percent":1}}"#.into(),
+                ))
+            });
+        if sent.is_err() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    panic!("client kept a stalled socket open");
+}
+fn no_connection_within(listener: &TcpListener, wait: Duration) {
+    thread::sleep(wait);
+    assert!(
+        listener
+            .accept()
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::WouldBlock),
+        "unexpected retry connection"
+    );
+}
+
+#[tokio::test]
+async fn non_progress_traffic_stalls_attempt_and_retries_full_request_on_fresh_socket() {
+    for accepted in [false, true] {
+        let (endpoint, peer) = server(move |listener| {
+            let mut first = socket(&listener);
+            let original = receive(&mut first);
+            if accepted {
+                created(&mut first);
+            }
+            keepalive_until_closed(&mut first);
+            let mut second = socket(&listener);
+            assert_eq!(receive(&mut second), original);
+            success(&mut second);
+        });
+        let adapter = OpenAIResponsesAdapter::new(stall_config(&endpoint)).unwrap();
+        let mut session = adapter
+            .start_session(SessionConfig::new("session"))
+            .await
+            .unwrap();
+        let mut turn = session.begin_turn(request(), None).await.unwrap();
+        finished(&drain(&mut turn).await.unwrap());
+        peer.join().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn silent_socket_after_send_is_retried_on_fresh_socket() {
+    let (endpoint, peer) = server(|listener| {
+        let mut first = socket(&listener);
+        receive(&mut first);
+        let mut second = socket(&listener);
+        receive(&mut second);
+        success(&mut second);
+        drop(first);
+    });
+    let adapter = OpenAIResponsesAdapter::new(stall_config(&endpoint)).unwrap();
+    let mut session = adapter
+        .start_session(SessionConfig::new("session"))
+        .await
+        .unwrap();
+    let mut turn = session.begin_turn(request(), None).await.unwrap();
+    let start = Instant::now();
+    finished(&drain(&mut turn).await.unwrap());
+    assert!(start.elapsed() >= STALL);
+    peer.join().unwrap();
+}
+
+#[tokio::test]
+async fn stall_after_visible_output_fails_without_retry() {
+    let (endpoint, peer) = server(|listener| {
+        let mut ws = socket(&listener);
+        receive(&mut ws);
+        for line in SUCCESS
+            .replace("resp-1", "stalled")
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .take(4)
+        {
+            ws.send(Message::Text(line.into())).unwrap();
+        }
+        keepalive_until_closed(&mut ws);
+        no_connection_within(&listener, Duration::from_millis(500));
+    });
+    let adapter = OpenAIResponsesAdapter::new(stall_config(&endpoint)).unwrap();
+    let mut session = adapter
+        .start_session(SessionConfig::new("session"))
+        .await
+        .unwrap();
+    let mut turn = session.begin_turn(request(), None).await.unwrap();
+    let error = drain(&mut turn).await.unwrap_err();
+    assert_eq!(
+        error.provider_failure().unwrap().reason,
+        ProviderFailureReason::IdleTimeout
+    );
+    peer.join().unwrap();
+}
+
+#[tokio::test]
+async fn lost_socket_after_visible_output_supersedes_and_resends_when_opted_in() {
+    for stalled in [true, false] {
+        let (endpoint, peer) = server(move |listener| {
+            let mut first = socket(&listener);
+            let original = receive(&mut first);
+            for line in SUCCESS
+                .replace("resp-1", "lost")
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .take(4)
+            {
+                first.send(Message::Text(line.into())).unwrap();
+            }
+            if stalled {
+                keepalive_until_closed(&mut first);
+            } else {
+                drop(first);
+            }
+            let mut second = socket(&listener);
+            assert_eq!(receive(&mut second), original);
+            success(&mut second);
+        });
+        let adapter = OpenAIResponsesAdapter::new(stall_config(&endpoint)).unwrap();
+        let mut session = adapter
+            .start_session(SessionConfig::new("session").with_response_attempt_supersession())
+            .await
+            .unwrap();
+        let mut turn = session.begin_turn(request(), None).await.unwrap();
+        let events = drain(&mut turn).await.unwrap();
+        let superseded = events
+            .iter()
+            .position(|event| matches!(event, ModelTurnEvent::ResponseAttemptSuperseded))
+            .expect("visible attempt was not superseded");
+        assert!(
+            events[superseded..]
+                .iter()
+                .any(|event| matches!(event, ModelTurnEvent::Finished(_)))
+        );
+        peer.join().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn slow_progressing_stream_outlives_progress_gap() {
+    let (endpoint, peer) = server(|listener| {
+        let mut ws = socket(&listener);
+        receive(&mut ws);
+        for line in SUCCESS
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+        {
+            thread::sleep(STALL / 2);
+            ws.send(Message::Text(r#"{"type":"keepalive"}"#.into()))
+                .unwrap();
+            ws.send(Message::Text(line.into())).unwrap();
+        }
+        no_connection_within(&listener, Duration::from_millis(100));
+    });
+    let adapter = OpenAIResponsesAdapter::new(stall_config(&endpoint)).unwrap();
+    let mut session = adapter
+        .start_session(SessionConfig::new("session"))
+        .await
+        .unwrap();
+    let mut turn = session.begin_turn(request(), None).await.unwrap();
+    let start = Instant::now();
+    finished(&drain(&mut turn).await.unwrap());
+    assert!(start.elapsed() > STALL * 2);
+    peer.join().unwrap();
 }
