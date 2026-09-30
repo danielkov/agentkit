@@ -5737,8 +5737,9 @@ data: {"type":"response.completed","sequence_number":18,"response":{"id":"resp-1
 
     #[tokio::test]
     async fn first_progress_bound_covers_waiting_for_response_headers() {
-        const FIRST: Duration = Duration::from_millis(200);
-        for delay in [None, Some(FIRST * 3 / 4)] {
+        const FIRST: Duration = Duration::from_millis(600);
+        const DELAY: Duration = Duration::from_millis(450);
+        for delay in [None, Some(DELAY)] {
             let client = Arc::new(DelayedHeadersClient {
                 delay,
                 sent: Mutex::new(Vec::new()),
@@ -5778,9 +5779,10 @@ data: {"type":"response.completed","sequence_number":18,"response":{"id":"resp-1
             assert_eq!(sent.len(), 2, "{delay:?}");
             let first_attempt = sent[1] - sent[0];
             assert!(first_attempt >= FIRST, "{delay:?}: {first_attempt:?}");
-            // Time spent waiting for headers counts against the same bound.
+            // Waiting for headers counts against the same bound; without that the
+            // delayed attempt would last at least FIRST + DELAY.
             assert!(
-                first_attempt < FIRST * 3 / 2,
+                first_attempt < FIRST + DELAY,
                 "{delay:?}: {first_attempt:?}"
             );
         }

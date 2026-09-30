@@ -1940,8 +1940,8 @@ async fn silent_socket_after_send_is_retried_on_fresh_socket() {
         .start_session(SessionConfig::new("session"))
         .await
         .unwrap();
-    let mut turn = session.begin_turn(request(), None).await.unwrap();
     let start = Instant::now();
+    let mut turn = session.begin_turn(request(), None).await.unwrap();
     finished(&drain(&mut turn).await.unwrap());
     assert!(start.elapsed() >= STALL);
     peer.join().unwrap();
