@@ -46,7 +46,10 @@ const CONTINUATION_METADATA: &str = "openai.responses.continuation.v1";
 const CONTINUATION_SCHEMA_VERSION: u64 = 3;
 const GENERATED_IMAGE_METADATA: &str = "openai.responses.generated_image.v1";
 const X_CODEX_TURN_STATE: &str = "x-codex-turn-state";
+const X_CODEX_ROUTING_HINT: &str = "x-codex-routing-hint";
 const MAX_CACHE_KEY_BYTES: usize = 256;
+const DEFAULT_FIRST_PROGRESS_TIMEOUT: Duration = Duration::from_secs(120);
+const DEFAULT_PROGRESS_GAP_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Selects the public Responses API or ChatGPT's private Codex-shaped profile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -146,6 +149,8 @@ pub struct OpenAIResponsesConfig {
     originator: Option<String>,
     transport: OpenAIResponsesTransport,
     websocket_no_proxy: bool,
+    first_progress_timeout: Option<Duration>,
+    progress_gap_timeout: Option<Duration>,
 }
 
 impl fmt::Debug for OpenAIResponsesConfig {
@@ -157,6 +162,8 @@ impl fmt::Debug for OpenAIResponsesConfig {
             .field("profile", &self.profile)
             .field("transport", &self.transport)
             .field("websocket_no_proxy", &self.websocket_no_proxy)
+            .field("first_progress_timeout", &self.first_progress_timeout)
+            .field("progress_gap_timeout", &self.progress_gap_timeout)
             .field("header_names", &self.headers.keys().collect::<Vec<_>>())
             .field("request_policy", &self.request_policy)
             .field("reasoning_effort", &self.reasoning_effort)
@@ -200,6 +207,8 @@ impl OpenAIResponsesConfig {
             originator: None,
             transport: OpenAIResponsesTransport::Http,
             websocket_no_proxy: false,
+            first_progress_timeout: Some(DEFAULT_FIRST_PROGRESS_TIMEOUT),
+            progress_gap_timeout: Some(DEFAULT_PROGRESS_GAP_TIMEOUT),
         }
     }
 
@@ -227,6 +236,8 @@ impl OpenAIResponsesConfig {
             originator: None,
             transport: OpenAIResponsesTransport::Http,
             websocket_no_proxy: false,
+            first_progress_timeout: Some(DEFAULT_FIRST_PROGRESS_TIMEOUT),
+            progress_gap_timeout: Some(DEFAULT_PROGRESS_GAP_TIMEOUT),
         }
     }
 
@@ -245,6 +256,29 @@ impl OpenAIResponsesConfig {
     /// HTTP/1, redirect/retry restrictions, and handshake timeouts remain enforced.
     pub fn with_websocket_no_proxy(mut self, no_proxy: bool) -> Self {
         self.websocket_no_proxy = no_proxy;
+        self
+    }
+
+    /// Bounds an attempt by response progress rather than by raw traffic.
+    ///
+    /// `first` limits the wait from opening an attempt to its first progress event
+    /// (normally `response.created`); `gap` limits the wait between later progress
+    /// events. Progress is any `response.*` event except `response.queued`,
+    /// `response.in_progress` and `response.metadata`: keepalives, rate-limit,
+    /// metadata and timing events can arrive indefinitely without the response
+    /// advancing, so they do not reset these timers. A stalled attempt is a
+    /// retryable failure. `None` disables a bound.
+    ///
+    /// Defaults are 120s and 300s. Reasoning can run silently between progress
+    /// events, so the gap matches the Codex CLI's 300s stream idle timeout: no stream
+    /// it would keep open is cut short by this bound.
+    pub fn with_progress_timeouts(
+        mut self,
+        first: Option<Duration>,
+        gap: Option<Duration>,
+    ) -> Self {
+        self.first_progress_timeout = first;
+        self.progress_gap_timeout = gap;
         self
     }
 
@@ -391,6 +425,8 @@ impl ModelAdapter for OpenAIResponsesAdapter {
             session: config,
             retry_observer: None,
             websocket: Arc::new(Mutex::new(websocket::Session::default())),
+            turn_state: Arc::new(Mutex::new(None)),
+            turn_scope: None,
         })
     }
 
@@ -406,6 +442,8 @@ pub struct OpenAIResponsesSession {
     session: SessionConfig,
     retry_observer: Option<Arc<dyn RetryObserver>>,
     websocket: Arc<Mutex<websocket::Session>>,
+    turn_state: Arc<Mutex<Option<HeaderValue>>>,
+    turn_scope: Option<(Option<String>, agentkit_core::TurnId)>,
 }
 
 #[async_trait]
@@ -486,6 +524,18 @@ impl ModelSession for OpenAIResponsesSession {
         .await;
         let (body, idempotency_key, auth, deadline, supersession_enabled) =
             prepared.map_err(|error| tracker.finish(error))?;
+        // x-codex-turn-state is scoped to one logical turn (every request from
+        // its input through its tool rounds) and one account. The turn ID, not
+        // a transcript position, identifies it: compaction can move or reuse
+        // positions.
+        let scope = (auth.binding().map(str::to_owned), request.turn_id.clone());
+        if self.turn_scope.as_ref() != Some(&scope) {
+            self.turn_scope = Some(scope);
+            *self
+                .turn_state
+                .lock()
+                .map_err(|_| tracker.finish(local_error(ProviderFailureReason::Protocol)))? = None;
+        }
         OpenAIResponsesTurn::open(
             ResponsesRequestContext {
                 client: self.client.clone(),
@@ -493,7 +543,12 @@ impl ModelSession for OpenAIResponsesSession {
                 body,
                 idempotency_key,
                 session_id: request.session_id.to_string(),
-                turn_state: Arc::new(Mutex::new(None)),
+                prompt_cache_key: request
+                    .cache
+                    .as_ref()
+                    .filter(|cache| !matches!(cache.mode, PromptCacheMode::Disabled))
+                    .and_then(|cache| cache.key.clone()),
+                turn_state: self.turn_state.clone(),
                 auth,
                 deadline,
                 retries: 0,
@@ -666,6 +721,10 @@ impl OpenAIResponsesTurn {
             }
 
             let pending = if let Some(timeout) = expired_attempt_timeout {
+                self.attempt
+                    .as_mut()
+                    .expect("live attempt is open")
+                    .connection_lost = true;
                 Err(attempt_timeout_failure(timeout))
             } else {
                 self.attempt
@@ -710,11 +769,21 @@ impl OpenAIResponsesTurn {
                             .budget
                             .saturating_sub(deadline.started_at.elapsed())
                     });
-                let timeout = [idle_timeout, remaining, attempt_remaining]
+                let stall_remaining = self
+                    .attempt
+                    .as_mut()
+                    .expect("live attempt is open")
+                    .stall_remaining(&self.context.config);
+                let timeout = [idle_timeout, remaining, attempt_remaining, stall_remaining]
                     .into_iter()
                     .flatten()
                     .min();
-                let chunk = {
+                let chunk = if stall_remaining.is_some_and(|remaining| remaining.is_zero()) {
+                    Ok(Err(HttpError::Timeout {
+                        operation: "response progress",
+                        timeout: Duration::ZERO,
+                    }))
+                } else {
                     let attempt = self.attempt.as_mut().expect("live attempt is open");
                     cancellable(attempt.body.next_chunk(timeout), cancellation).await
                 };
@@ -733,16 +802,30 @@ impl OpenAIResponsesTurn {
                                     .expect("checked logical deadline")
                                     .budget,
                             })))
-                        } else if let Some(timeout) = self
-                            .attempt
-                            .as_ref()
-                            .and_then(|attempt| attempt.deadline.as_ref())
-                            .filter(|deadline| deadline.started_at.elapsed() >= deadline.budget)
-                            .map(|deadline| deadline.budget)
-                        {
-                            Err(attempt_timeout_failure(timeout))
                         } else {
-                            Err(transport_failure(error))
+                            let attempt = self.attempt.as_mut().expect("live attempt is open");
+                            attempt.connection_lost = true;
+                            if let Some(timeout) = attempt
+                                .deadline
+                                .as_ref()
+                                .filter(|deadline| deadline.started_at.elapsed() >= deadline.budget)
+                                .map(|deadline| deadline.budget)
+                            {
+                                Err(attempt_timeout_failure(timeout))
+                            } else if attempt
+                                .stall_remaining(&self.context.config)
+                                .is_some_and(|remaining| remaining.is_zero())
+                            {
+                                Err(AttemptFailure {
+                                    error: Box::new(local_error(
+                                        ProviderFailureReason::IdleTimeout,
+                                    )),
+                                    retryable: true,
+                                    headers: None,
+                                })
+                            } else {
+                                Err(transport_failure(error))
+                            }
                         }
                     }
                     Ok(Ok(Some(chunk))) => {
@@ -780,6 +863,7 @@ impl OpenAIResponsesTurn {
                     Ok(Ok(None)) => {
                         let attempt = self.attempt.as_mut().expect("live attempt is open");
                         attempt.eof = true;
+                        attempt.connection_lost = true;
                         attempt.truncated.finish().map_err(transport_failure)
                     }
                 }
@@ -790,9 +874,9 @@ impl OpenAIResponsesTurn {
                     .attempt
                     .as_ref()
                     .is_some_and(|attempt| matches!(attempt.body, LiveBody::WebSocket(_)));
-                // A sent WebSocket request has no idempotency guarantee. Only explicit
-                // provider rejections before visible output on a fresh socket
-                // can be retried; reused sockets can deliver uncorrelated stale errors.
+                // A sent WebSocket request has no idempotency guarantee. Explicit
+                // provider rejections before visible output can be retried only on a
+                // fresh socket; reused sockets can deliver uncorrelated stale errors.
                 let missing_previous = self.attempt.as_ref().is_some_and(|attempt| {
                     matches!(&attempt.body, LiveBody::WebSocket(connection)
                         if connection.missing_previous(&attempt.decoder))
@@ -804,13 +888,29 @@ impl OpenAIResponsesTurn {
                 if missing_previous {
                     failure.retryable = true;
                 }
+                // A stalled, timed-out or lost socket is resent in full on a fresh
+                // socket before visible output, or after it when the session accepts
+                // superseded attempts. With store:false the server keeps no response
+                // state, so an unfinished delivery cannot become a duplicate stored
+                // response or poison a continuation.
+                let resendable = websocket
+                    && (!self.attempt_output_emitted || self.supersession_enabled)
+                    && self.context.config.request_policy.store == Some(false)
+                    && self
+                        .attempt
+                        .as_ref()
+                        .is_some_and(|attempt| attempt.connection_lost);
+                if resendable {
+                    failure.retryable = true;
+                }
                 if websocket
+                    && !resendable
                     && (self.attempt_output_emitted
                         || !self.attempt.as_ref().is_some_and(|attempt| {
                             missing_previous
                                 || attempt.decoder.request_rejected
                                     && matches!(&attempt.body, LiveBody::WebSocket(connection)
-                                        if connection.can_retry_rejection())
+                                            if connection.can_retry_rejection())
                         }))
                 {
                     return Err(*failure.error);
@@ -1766,6 +1866,7 @@ struct ResponsesRequestContext {
     body: agentkit_http::Bytes,
     idempotency_key: String,
     session_id: String,
+    prompt_cache_key: Option<String>,
     turn_state: Arc<Mutex<Option<HeaderValue>>>,
     auth: AuthenticationAttempt,
     deadline: Option<LogicalDeadline>,
@@ -1803,9 +1904,43 @@ struct LiveAttempt {
     deadline: Option<LogicalDeadline>,
     eof: bool,
     closed: bool,
+    progress: u64,
+    progress_at: Instant,
+    connection_lost: bool,
 }
 
 impl LiveAttempt {
+    fn new(
+        body: LiveBody,
+        truncated: TruncatedStreamDetector,
+        decoder: ResponsesSseDecoder,
+    ) -> Self {
+        Self {
+            body,
+            truncated,
+            decoder,
+            deadline: None,
+            eof: false,
+            closed: false,
+            progress: 0,
+            progress_at: Instant::now(),
+            connection_lost: false,
+        }
+    }
+
+    fn stall_remaining(&mut self, config: &OpenAIResponsesConfig) -> Option<Duration> {
+        if self.decoder.state.progress != self.progress {
+            self.progress = self.decoder.state.progress;
+            self.progress_at = Instant::now();
+        }
+        let budget = if self.progress == 0 {
+            config.first_progress_timeout
+        } else {
+            config.progress_gap_timeout
+        }?;
+        Some(budget.saturating_sub(self.progress_at.elapsed()))
+    }
+
     fn pop_event(&mut self) -> Option<ModelTurnEvent> {
         if !self.closed && matches!(self.decoder.peek_event(), Some(ModelTurnEvent::Finished(_))) {
             return None;
@@ -1880,9 +2015,16 @@ async fn open_live_attempt(
         let attempt_deadline = attempt_timeout.map(LogicalDeadline::new);
         let logical_deadline = context.deadline.clone();
         context.websocket_sent = false;
+        // The first-progress bound covers opening the attempt too (connecting,
+        // sending, and waiting for response headers), not only the stream after it.
+        let opened_at = Instant::now();
+        let open_timeout = [attempt_timeout, context.config.first_progress_timeout]
+            .into_iter()
+            .flatten()
+            .min();
         let mut result = attempt_with_timeout(
             send_live_attempt(context, cancellation),
-            attempt_timeout,
+            open_timeout,
             logical_deadline.as_ref(),
             cancellation,
         )
@@ -1890,8 +2032,18 @@ async fn open_live_attempt(
         if context.websocket_sent
             && let Err(failure) = &mut result
         {
-            // A timeout may have interrupted the send future after bytes left.
-            failure.retryable = false;
+            // A timeout may have interrupted the send future after bytes left. With
+            // store:false a lost or partial delivery holds no server state, so a
+            // transport-level send failure is resent in full on a fresh socket.
+            failure.retryable = context.config.request_policy.store == Some(false)
+                && failure.error.provider_failure().is_some_and(|failure| {
+                    matches!(
+                        failure.reason,
+                        ProviderFailureReason::Transport
+                            | ProviderFailureReason::AttemptTimeout
+                            | ProviderFailureReason::IdleTimeout
+                    )
+                });
         }
         if let Err(failure) = &result {
             context.tracker.note_failure(&failure.error);
@@ -1899,6 +2051,7 @@ async fn open_live_attempt(
         match result {
             Ok(mut attempt) => {
                 attempt.deadline = attempt_deadline;
+                attempt.progress_at = opened_at;
                 return Ok(attempt);
             }
             Err(failure) if is_unauthorized(&failure.error) && !context.refreshed => {
@@ -1984,27 +2137,36 @@ async fn send_live_attempt(
                 .map_err(|_| nonretryable(local_error(ProviderFailureReason::InvalidRequest)))?,
         );
     }
-    let sent_turn_state = if context.config.profile == OpenAIResponsesProfile::ChatGptPrivate {
+    if context.config.profile == OpenAIResponsesProfile::ChatGptPrivate {
         headers.remove(X_CODEX_TURN_STATE);
         headers
             .entry("originator")
             .or_insert(HeaderValue::from_static("agentkit"));
         headers.entry("session-id").or_insert(
+            HeaderValue::from_str(
+                context
+                    .prompt_cache_key
+                    .as_deref()
+                    .unwrap_or(&context.session_id),
+            )
+            .map_err(|_| nonretryable(local_error(ProviderFailureReason::InvalidRequest)))?,
+        );
+        headers.entry("thread-id").or_insert(
             HeaderValue::from_str(&context.session_id)
                 .map_err(|_| nonretryable(local_error(ProviderFailureReason::InvalidRequest)))?,
         );
-        let state = context
+        if let Ok(hint) = HeaderValue::from_str(&format!("model={}", context.config.model)) {
+            headers.entry(X_CODEX_ROUTING_HINT).or_insert(hint);
+        }
+        if let Some(value) = context
             .turn_state
             .lock()
             .map_err(|_| protocol_failure("turn-state lock poisoned"))?
-            .clone();
-        if let Some(value) = &state {
-            headers.insert(X_CODEX_TURN_STATE, value.clone());
+            .clone()
+        {
+            headers.insert(X_CODEX_TURN_STATE, value);
         }
-        state
-    } else {
-        None
-    };
+    }
     headers.extend(context.auth.headers().clone());
     if context
         .websocket
@@ -2075,22 +2237,16 @@ async fn send_live_attempt(
     if context.config.profile == OpenAIResponsesProfile::ChatGptPrivate
         && let Some(captured) = validated_turn_state_header(response.headers())?
     {
-        if sent_turn_state
-            .as_ref()
-            .is_some_and(|expected| expected != captured)
-        {
-            return Err(protocol_failure("provider changed x-codex-turn-state"));
-        }
         *context
             .turn_state
             .lock()
             .map_err(|_| protocol_failure("turn-state lock poisoned"))? = Some(captured);
     }
     let truncated = TruncatedStreamDetector::from_headers(response.headers());
-    Ok(LiveAttempt {
-        body: LiveBody::Http(response.bytes_stream()),
+    Ok(LiveAttempt::new(
+        LiveBody::Http(response.bytes_stream()),
         truncated,
-        decoder: ResponsesSseDecoder::with_policy(
+        ResponsesSseDecoder::with_policy(
             &context.config.model,
             &context.session_id,
             context.config.profile,
@@ -2099,10 +2255,7 @@ async fn send_live_attempt(
             context.turn_state.clone(),
             context.config.limits,
         ),
-        deadline: None,
-        eof: false,
-        closed: false,
-    })
+    ))
 }
 
 fn retryable_response_status(status: StatusCode, profile: OpenAIResponsesProfile) -> bool {
@@ -2479,6 +2632,7 @@ struct ResponsesState {
     provider_finish_reason: Option<String>,
     tool_call: bool,
     next_media: usize,
+    progress: u64,
 }
 
 impl ResponsesState {
@@ -2525,6 +2679,7 @@ impl ResponsesState {
             provider_finish_reason: None,
             tool_call: false,
             next_media: 0,
+            progress: 0,
         }
     }
 
@@ -2533,6 +2688,14 @@ impl ResponsesState {
             return Err(protocol_failure(
                 "Responses event followed a terminal event",
             ));
+        }
+        if kind.starts_with("response.")
+            && !matches!(
+                kind,
+                "response.queued" | "response.in_progress" | "response.metadata"
+            )
+        {
+            self.progress = self.progress.saturating_add(1);
         }
         if let Some(sequence) = value.get("sequence_number").and_then(Value::as_u64) {
             let expected = self
@@ -2603,25 +2766,27 @@ impl ResponsesState {
                 })
             }
             "keepalive" => Ok(()),
+            "codex.response.metadata" => {
+                if let Some(captured) = responses_turn_state(value)? {
+                    *self
+                        .turn_state
+                        .lock()
+                        .map_err(|_| protocol_failure("turn-state lock poisoned"))? =
+                        Some(captured);
+                }
+                Ok(())
+            }
             "response.metadata" => {
                 self.require_created()?;
                 if let Some(response) = value.get("response") {
                     self.observe_response(Some(response), "response.metadata")?;
                 }
                 if let Some(captured) = responses_turn_state(value)? {
-                    let mut turn_state = self
+                    *self
                         .turn_state
                         .lock()
-                        .map_err(|_| protocol_failure("turn-state lock poisoned"))?;
-                    if turn_state
-                        .as_ref()
-                        .is_some_and(|expected| expected != captured)
-                    {
-                        return Err(protocol_failure(
-                            "response metadata changed x-codex-turn-state",
-                        ));
-                    }
-                    *turn_state = Some(captured);
+                        .map_err(|_| protocol_failure("turn-state lock poisoned"))? =
+                        Some(captured);
                 }
                 Ok(())
             }
@@ -3797,6 +3962,7 @@ mod tests {
 
     use agentkit_core::{Item, SessionId, TurnId};
     use agentkit_http::{HeaderValue, HttpClient, HttpRequest, HttpResponse, StatusCode, header};
+    use agentkit_loop::PromptCacheRequest;
     use async_trait::async_trait;
     use futures_util::stream;
 
@@ -3837,6 +4003,52 @@ mod tests {
     impl HttpClient for ActiveStreamClient {
         async fn execute(&self, request: HttpRequest) -> Result<HttpResponse, HttpError> {
             self.requests.fetch_add(1, Ordering::SeqCst);
+            let body = stream::unfold((), |_| async {
+                sleep(Duration::from_millis(1)).await;
+                Some((
+                    Ok(agentkit_http::Bytes::from_static(b": keepalive\n\n")),
+                    (),
+                ))
+            });
+            Ok(HttpResponse::new(
+                StatusCode::OK,
+                sse_headers(),
+                request.url,
+                Box::pin(body),
+            ))
+        }
+    }
+
+    /// The first request's headers arrive after `delay` (never when `None`) and
+    /// its stream carries only keepalives; later requests succeed.
+    struct DelayedHeadersClient {
+        delay: Option<Duration>,
+        sent: Mutex<Vec<Instant>>,
+    }
+
+    #[async_trait]
+    impl HttpClient for DelayedHeadersClient {
+        async fn execute(&self, request: HttpRequest) -> Result<HttpResponse, HttpError> {
+            let first = {
+                let mut sent = self.sent.lock().unwrap();
+                sent.push(Instant::now());
+                sent.len() == 1
+            };
+            if !first {
+                let body = stream::once(async {
+                    Ok(agentkit_http::Bytes::from_static(SUCCESS.as_bytes()))
+                });
+                return Ok(HttpResponse::new(
+                    StatusCode::OK,
+                    sse_headers(),
+                    request.url,
+                    Box::pin(body),
+                ));
+            }
+            match self.delay {
+                Some(delay) => sleep(delay).await,
+                None => std::future::pending::<()>().await,
+            }
             let body = stream::unfold((), |_| async {
                 sleep(Duration::from_millis(1)).await;
                 Some((
@@ -4459,26 +4671,28 @@ data: {"type":"response.completed","sequence_number":18,"response":{"id":"resp-1
     }
 
     #[tokio::test]
-    async fn private_profile_scopes_turn_state_to_accepted_logical_turn() {
-        let mut headers = sse_headers();
-        headers.insert(X_CODEX_TURN_STATE, HeaderValue::from_static("state-1"));
+    async fn private_turn_state_spans_user_turn_adopts_changes_and_resets_on_new_input() {
+        let state = |value: &'static str| {
+            let mut headers = sse_headers();
+            headers.insert(X_CODEX_TURN_STATE, HeaderValue::from_static(value));
+            headers
+        };
+        let ok = |headers| WireResponse {
+            status: StatusCode::OK,
+            headers,
+            body: SUCCESS,
+        };
         let client = Arc::new(ScriptedClient {
             responses: Mutex::new(VecDeque::from([
                 WireResponse {
                     status: StatusCode::SERVICE_UNAVAILABLE,
-                    headers: headers.clone(),
+                    headers: state("state-1"),
                     body: "",
                 },
-                WireResponse {
-                    status: StatusCode::OK,
-                    headers: headers.clone(),
-                    body: SUCCESS,
-                },
-                WireResponse {
-                    status: StatusCode::OK,
-                    headers,
-                    body: SUCCESS,
-                },
+                ok(state("state-1")),
+                ok(state("state-2")),
+                ok(sse_headers()),
+                ok(sse_headers()),
             ])),
             requests: Mutex::new(Vec::new()),
         });
@@ -4497,21 +4711,212 @@ data: {"type":"response.completed","sequence_number":18,"response":{"id":"resp-1
             .start_session(SessionConfig::new("session"))
             .await
             .unwrap();
-        session.begin_turn(request(), None).await.unwrap();
-        let mut second = request();
-        second.turn_id = TurnId::new("turn-2");
-        session.begin_turn(second, None).await.unwrap();
+        let mut request = request();
+        session.begin_turn(request.clone(), None).await.unwrap();
+        for _ in 0..2 {
+            request
+                .transcript
+                .push(Item::text(ItemKind::Assistant, "tool round"));
+            session.begin_turn(request.clone(), None).await.unwrap();
+        }
+        request.transcript.push(Item::text(ItemKind::User, "next"));
+        request.turn_id = TurnId::new("next-turn");
+        session.begin_turn(request, None).await.unwrap();
         let requests = client.requests.lock().unwrap();
         assert_eq!(requests[0].headers["originator"], "agentkit");
         assert_eq!(requests[0].headers["session-id"], "session");
+        assert_eq!(requests[0].headers[X_CODEX_ROUTING_HINT], "model=gpt-test");
         assert!(!requests[0].headers.contains_key(X_CODEX_TURN_STATE));
         assert!(!requests[1].headers.contains_key(X_CODEX_TURN_STATE));
-        assert!(!requests[2].headers.contains_key(X_CODEX_TURN_STATE));
+        assert_eq!(requests[2].headers[X_CODEX_TURN_STATE], "state-1");
+        assert_eq!(requests[3].headers[X_CODEX_TURN_STATE], "state-2");
+        assert!(!requests[4].headers.contains_key(X_CODEX_TURN_STATE));
         assert_eq!(requests[0].body, requests[1].body);
         assert_eq!(
             requests[0].headers["idempotency-key"],
             requests[1].headers["idempotency-key"]
         );
+    }
+
+    #[tokio::test]
+    async fn private_turn_state_follows_turn_identity_not_transcript_position() {
+        let state = |value: &'static str| {
+            let mut headers = sse_headers();
+            headers.insert(X_CODEX_TURN_STATE, HeaderValue::from_static(value));
+            headers
+        };
+        let ok = |headers| WireResponse {
+            status: StatusCode::OK,
+            headers,
+            body: SUCCESS,
+        };
+        let client = Arc::new(ScriptedClient {
+            responses: Mutex::new(VecDeque::from([
+                ok(state("state-1")),
+                ok(sse_headers()),
+                ok(state("state-2")),
+                ok(sse_headers()),
+            ])),
+            requests: Mutex::new(Vec::new()),
+        });
+        let adapter = OpenAIResponsesAdapter::with_client(
+            OpenAIResponsesConfig::chatgpt_private("gpt-test", Authentication::bearer("secret")),
+            Http::from_arc(client.clone()),
+        );
+        let mut session = adapter
+            .start_session(SessionConfig::new("session"))
+            .await
+            .unwrap();
+        let mut first = request();
+        first.transcript = vec![
+            Item::text(ItemKind::User, "old"),
+            Item::text(ItemKind::Assistant, "old answer"),
+            Item::text(ItemKind::User, "current"),
+        ];
+        session.begin_turn(first.clone(), None).await.unwrap();
+        // Compaction drops a prefix during a tool round: the user message moves.
+        let mut compacted = first.clone();
+        compacted.transcript = vec![
+            Item::text(ItemKind::User, "current"),
+            Item::text(ItemKind::Assistant, "tool round"),
+        ];
+        session.begin_turn(compacted, None).await.unwrap();
+        // A rolling window puts the next turn's user message at the old index.
+        let mut next = first.clone();
+        next.turn_id = TurnId::new("next-turn");
+        next.transcript = vec![
+            Item::text(ItemKind::User, "current"),
+            Item::text(ItemKind::Assistant, "answer"),
+            Item::text(ItemKind::User, "next"),
+        ];
+        session.begin_turn(next.clone(), None).await.unwrap();
+        next.transcript
+            .push(Item::text(ItemKind::Assistant, "tool round"));
+        session.begin_turn(next, None).await.unwrap();
+        let requests = client.requests.lock().unwrap();
+        assert!(!requests[0].headers.contains_key(X_CODEX_TURN_STATE));
+        assert_eq!(requests[1].headers[X_CODEX_TURN_STATE], "state-1");
+        assert!(!requests[2].headers.contains_key(X_CODEX_TURN_STATE));
+        assert_eq!(requests[3].headers[X_CODEX_TURN_STATE], "state-2");
+    }
+
+    #[tokio::test]
+    async fn private_session_id_header_follows_prompt_cache_key() {
+        let ok = || WireResponse {
+            status: StatusCode::OK,
+            headers: sse_headers(),
+            body: SUCCESS,
+        };
+        let client = Arc::new(ScriptedClient {
+            responses: Mutex::new(VecDeque::from([ok(), ok(), ok()])),
+            requests: Mutex::new(Vec::new()),
+        });
+        let adapter = OpenAIResponsesAdapter::with_client(
+            OpenAIResponsesConfig::chatgpt_private("gpt-test", Authentication::bearer("secret")),
+            Http::from_arc(client.clone()),
+        );
+        let mut session = adapter
+            .start_session(SessionConfig::new("session"))
+            .await
+            .unwrap();
+        for cache in [
+            None,
+            Some(PromptCacheRequest::automatic().with_key("shared-key")),
+            Some(PromptCacheRequest::disabled().with_key("shared-key")),
+        ] {
+            let mut request = request();
+            request.cache = cache;
+            session.begin_turn(request, None).await.unwrap();
+        }
+        let requests = client.requests.lock().unwrap();
+        for (request, session_id) in requests.iter().zip(["session", "shared-key", "session"]) {
+            assert_eq!(request.headers["session-id"], session_id);
+            assert_eq!(request.headers["thread-id"], "session");
+        }
+    }
+
+    #[test]
+    fn codex_response_metadata_before_created_captures_turn_state() {
+        let turn_state = Arc::new(Mutex::new(Some(HeaderValue::from_static("old"))));
+        let mut decoder = ResponsesSseDecoder::with_policy(
+            "gpt-test",
+            "session",
+            OpenAIResponsesProfile::ChatGptPrivate,
+            true,
+            None,
+            turn_state.clone(),
+            OpenAIResponsesLimits::default(),
+        );
+        decoder
+            .push_json(
+                br#"{"type":"codex.response.metadata","headers":{"x-codex-turn-state":"new"}}"#,
+            )
+            .unwrap();
+        decoder
+            .push_json(br#"{"type":"response.created","sequence_number":1,"response":{"id":"resp-1","model":"gpt-test"}}"#)
+            .unwrap();
+        assert_eq!(
+            *turn_state.lock().unwrap(),
+            Some(HeaderValue::from_static("new"))
+        );
+    }
+
+    #[tokio::test]
+    async fn private_turn_state_resets_on_authentication_binding_change() {
+        let mut headers = sse_headers();
+        headers.insert(X_CODEX_TURN_STATE, HeaderValue::from_static("state-1"));
+        let response = WireResponse {
+            status: StatusCode::OK,
+            headers,
+            body: SUCCESS,
+        };
+        let client = Arc::new(ScriptedClient {
+            responses: Mutex::new(VecDeque::from([response.clone(), response])),
+            requests: Mutex::new(Vec::new()),
+        });
+        let config = OpenAIResponsesConfig::chatgpt_private(
+            "gpt-test",
+            Authentication::new(BindingChangingAuth {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        let adapter = OpenAIResponsesAdapter::with_client(config, Http::from_arc(client.clone()));
+        let mut session = adapter
+            .start_session(SessionConfig::new("session"))
+            .await
+            .unwrap();
+        let mut request = request();
+        session.begin_turn(request.clone(), None).await.unwrap();
+        request
+            .transcript
+            .push(Item::text(ItemKind::Assistant, "tool round"));
+        session.begin_turn(request, None).await.unwrap();
+        let requests = client.requests.lock().unwrap();
+        assert!(!requests[1].headers.contains_key(X_CODEX_TURN_STATE));
+    }
+
+    #[tokio::test]
+    async fn public_profile_sends_no_routing_hint() {
+        let client = Arc::new(ScriptedClient {
+            responses: Mutex::new(VecDeque::from([WireResponse {
+                status: StatusCode::OK,
+                headers: sse_headers(),
+                body: SUCCESS,
+            }])),
+            requests: Mutex::new(Vec::new()),
+        });
+        let adapter = OpenAIResponsesAdapter::with_client(
+            OpenAIResponsesConfig::public("gpt-test", Authentication::bearer("secret")),
+            Http::from_arc(client.clone()),
+        );
+        let mut session = adapter
+            .start_session(SessionConfig::new("session"))
+            .await
+            .unwrap();
+        session.begin_turn(request(), None).await.unwrap();
+        let requests = client.requests.lock().unwrap();
+        assert!(!requests[0].headers.contains_key(X_CODEX_ROUTING_HINT));
+        assert!(!requests[0].headers.contains_key(X_CODEX_TURN_STATE));
     }
 
     #[tokio::test]
@@ -5297,6 +5702,90 @@ data: {"type":"response.completed","sequence_number":18,"response":{"id":"resp-1
             Some(ProviderFailureReason::AttemptTimeout)
         );
         assert_eq!(client.requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn keepalive_only_sse_stream_stalls_and_retries() {
+        let client = Arc::new(ActiveStreamClient {
+            requests: AtomicUsize::new(0),
+        });
+        let config = OpenAIResponsesConfig::new("secret", "gpt-test")
+            .with_progress_timeouts(Some(Duration::from_millis(20)), None)
+            .with_resilience(ResilienceConfig {
+                max_retries: 1,
+                retry_budget: Duration::from_secs(1),
+                attempt_timeout: None,
+                stream_idle_timeout: Some(Duration::from_millis(100)),
+                initial_backoff: Duration::ZERO,
+                max_backoff: Duration::ZERO,
+            });
+        let adapter = OpenAIResponsesAdapter::with_client(config, Http::from_arc(client.clone()));
+        let mut session = adapter
+            .start_session(SessionConfig::new("session"))
+            .await
+            .unwrap();
+        let mut turn = session.begin_turn(request(), None).await.unwrap();
+        let error = turn.next_event(None).await.unwrap_err();
+        let failure = error.provider_failure().unwrap();
+        assert_eq!(failure.reason, ProviderFailureReason::RetryExhausted);
+        assert_eq!(
+            failure.last_attempt_reason,
+            Some(ProviderFailureReason::IdleTimeout)
+        );
+        assert_eq!(client.requests.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn first_progress_bound_covers_waiting_for_response_headers() {
+        const FIRST: Duration = Duration::from_millis(600);
+        const DELAY: Duration = Duration::from_millis(450);
+        for delay in [None, Some(DELAY)] {
+            let client = Arc::new(DelayedHeadersClient {
+                delay,
+                sent: Mutex::new(Vec::new()),
+            });
+            let config = OpenAIResponsesConfig::new("secret", "gpt-test")
+                .with_progress_timeouts(Some(FIRST), None)
+                .with_resilience(ResilienceConfig {
+                    max_retries: 1,
+                    retry_budget: Duration::from_secs(5),
+                    attempt_timeout: None,
+                    stream_idle_timeout: None,
+                    initial_backoff: Duration::ZERO,
+                    max_backoff: Duration::ZERO,
+                });
+            let adapter =
+                OpenAIResponsesAdapter::with_client(config, Http::from_arc(client.clone()));
+            let mut session = adapter
+                .start_session(SessionConfig::new("session"))
+                .await
+                .unwrap();
+            let mut turn = session.begin_turn(request(), None).await.unwrap();
+            let events = tokio::time::timeout(Duration::from_secs(3), async {
+                let mut events = Vec::new();
+                while let Some(event) = turn.next_event(None).await.unwrap() {
+                    events.push(event);
+                }
+                events
+            })
+            .await
+            .expect("an attempt without headers or progress must not hang");
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, ModelTurnEvent::Finished(_)))
+            );
+            let sent = client.sent.lock().unwrap();
+            assert_eq!(sent.len(), 2, "{delay:?}");
+            let first_attempt = sent[1] - sent[0];
+            assert!(first_attempt >= FIRST, "{delay:?}: {first_attempt:?}");
+            // Waiting for headers counts against the same bound; without that the
+            // delayed attempt would last at least FIRST + DELAY.
+            assert!(
+                first_attempt < FIRST + DELAY,
+                "{delay:?}: {first_attempt:?}"
+            );
+        }
     }
 
     #[tokio::test]

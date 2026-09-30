@@ -314,8 +314,22 @@ impl Connection {
 
 pub(super) async fn send(
     context: &mut ResponsesRequestContext,
-    mut headers: HeaderMap,
+    headers: HeaderMap,
 ) -> Result<Option<LiveAttempt>, AttemptFailure> {
+    // Encode the complete credential-bound transcript first. The connection-local
+    // checkpoint is only an optimization, never an alternative source of history.
+    let mut value: Value = serde_json::from_slice(&context.body)
+        .map_err(|_| protocol_failure("invalid encoded Responses request"))?;
+    let fields = value
+        .as_object_mut()
+        .ok_or_else(|| protocol_failure("invalid Responses request object"))?;
+    fields.remove("stream");
+    fields.remove("background");
+    fields.insert("type".into(), json!("response.create"));
+    let full = Zeroizing::new(
+        serde_json::to_string(&value)
+            .map_err(|_| protocol_failure("could not serialize WebSocket request"))?,
+    );
     let previous = context
         .websocket
         .as_mut()
@@ -335,116 +349,11 @@ pub(super) async fn send(
         context.tracker.accounting.attempts = context.tracker.accounting.attempts.saturating_add(1);
         connection
     } else {
-        headers.remove("idempotency-key"); // WebSocket response.create has no idempotency contract.
-        headers.remove("accept");
-        headers.remove("content-type");
-        headers.insert(
-            "openai-beta",
-            HeaderValue::from_static("responses_websockets=2026-02-06"),
-        );
-        let key = generate_key();
-        headers.insert("connection", HeaderValue::from_static("Upgrade"));
-        headers.insert("upgrade", HeaderValue::from_static("websocket"));
-        headers.insert("sec-websocket-version", HeaderValue::from_static("13"));
-        headers.insert(
-            "sec-websocket-key",
-            HeaderValue::from_str(&key).map_err(|_| protocol_failure("invalid WebSocket nonce"))?,
-        );
-        let client = reqwest::Client::builder()
-            .http1_only()
-            .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never())
-            .connect_timeout(HANDSHAKE_TIMEOUT)
-            .timeout(HANDSHAKE_TIMEOUT);
-        let client = if context.config.websocket_no_proxy {
-            client.no_proxy()
-        } else {
-            client
-        };
-        let client = client
-            .build()
-            .map_err(|_| protocol_failure("could not build WebSocket upgrade client"))?;
-        context.tracker.accounting.attempts = context.tracker.accounting.attempts.saturating_add(1);
-        // HTTP/1 upgrade on https uses reqwest's existing rustls trust/proxy stack;
-        // it is the same wire operation as connecting to the corresponding wss URL.
-        let response = client
-            .get(&context.config.endpoint)
-            .headers(headers)
-            .send()
-            .await
-            .map_err(|error| transport_failure(HttpError::request(error)))?;
-        let status = response.status();
-        if status == StatusCode::UPGRADE_REQUIRED
-            && context.config.transport == OpenAIResponsesTransport::Auto
-        {
-            context
-                .websocket
-                .as_mut()
-                .expect("WebSocket lease")
-                .fallback()?;
+        let Some(connection) = connect(context, headers).await? else {
             return Ok(None);
-        }
-        if status != StatusCode::SWITCHING_PROTOCOLS {
-            return Err(AttemptFailure {
-                error: Box::new(provider_error(
-                    ProviderFailureReason::HttpStatus,
-                    ProviderClassification {
-                        http_status: Some(status.as_u16()),
-                        ..ProviderClassification::default()
-                    },
-                )),
-                retryable: retryable_response_status(status, context.config.profile),
-                headers: retry_headers(response.headers()),
-            });
-        }
-        validate_handshake(response.headers(), &key)?;
-        let turn_state = if context.config.profile == OpenAIResponsesProfile::ChatGptPrivate {
-            validated_turn_state_header(response.headers())?
-        } else {
-            None
         };
-        if let Some(captured) = turn_state {
-            let mut state = context
-                .turn_state
-                .lock()
-                .map_err(|_| protocol_failure("turn-state lock poisoned"))?;
-            if state.as_ref().is_some_and(|expected| expected != captured) {
-                return Err(protocol_failure("provider changed x-codex-turn-state"));
-            }
-            *state = Some(captured);
-        }
-        let socket = response
-            .upgrade()
-            .await
-            .map_err(|_| protocol_failure("WebSocket upgrade failed"))?;
-        let limit = context.config.limits.max_attempt_bytes;
-        let config = WebSocketConfig::default()
-            .max_message_size(Some(limit))
-            .max_frame_size(Some(limit))
-            .write_buffer_size(0);
-        Box::new(Connection {
-            stream: WebSocketStream::from_raw_socket(socket, Role::Client, Some(config)).await,
-            auth_headers: context.auth.headers().clone(),
-            binding: context.auth.binding().map(str::to_owned),
-            completed_ids: BTreeSet::new(),
-            checkpoint: None,
-            previous_response_id: None,
-        })
+        connection
     };
-    // Encode the complete credential-bound transcript first. The connection-local
-    // checkpoint is only an optimization, never an alternative source of history.
-    let mut value: Value = serde_json::from_slice(&context.body)
-        .map_err(|_| protocol_failure("invalid encoded Responses request"))?;
-    let fields = value
-        .as_object_mut()
-        .ok_or_else(|| protocol_failure("invalid Responses request object"))?;
-    fields.remove("stream");
-    fields.remove("background");
-    fields.insert("type".into(), json!("response.create"));
-    let full = Zeroizing::new(
-        serde_json::to_string(&value)
-            .map_err(|_| protocol_failure("could not serialize WebSocket request"))?,
-    );
     connection.previous_response_id = None;
     if let Some(checkpoint) = connection.checkpoint.take()
         && let Some(suffix) = checkpoint.suffix(&value)
@@ -462,16 +371,9 @@ pub(super) async fn send(
         bytes: 0,
         completed: false,
     });
-    let serialized = serde_json::to_string(&value);
+    let request = serialize_request(context, &mut value);
     zeroize_encrypted_content(&mut value);
-    let request = Zeroizing::new(
-        serialized.map_err(|_| protocol_failure("could not serialize WebSocket request"))?,
-    );
-    if request.len() > context.config.limits.max_request_bytes {
-        return Err(protocol_failure(
-            "Responses WebSocket request exceeds byte limit",
-        ));
-    }
+    let request = request?;
     // Once send is polled, delivery is ambiguous. Never retry send/timeout errors.
     context.websocket_sent = true;
     run_bounded_http(
@@ -488,10 +390,10 @@ pub(super) async fn send(
     )
     .await
     .map_err(|e| nonretryable(http_loop_error(e)))?;
-    Ok(Some(LiveAttempt {
-        body: LiveBody::WebSocket(connection),
-        truncated: TruncatedStreamDetector::from_headers(&HeaderMap::new()),
-        decoder: ResponsesSseDecoder::with_policy(
+    Ok(Some(LiveAttempt::new(
+        LiveBody::WebSocket(connection),
+        TruncatedStreamDetector::from_headers(&HeaderMap::new()),
+        ResponsesSseDecoder::with_policy(
             &context.config.model,
             &context.session_id,
             context.config.profile,
@@ -500,10 +402,128 @@ pub(super) async fn send(
             context.turn_state.clone(),
             context.config.limits,
         ),
-        deadline: None,
-        eof: false,
-        closed: false,
-    }))
+    )))
+}
+
+/// Adds per-message fields that are excluded from checkpoint comparison.
+fn serialize_request(
+    context: &ResponsesRequestContext,
+    value: &mut Value,
+) -> Result<Zeroizing<String>, AttemptFailure> {
+    if context.config.profile == OpenAIResponsesProfile::ChatGptPrivate
+        && let Some(state) = context
+            .turn_state
+            .lock()
+            .map_err(|_| protocol_failure("turn-state lock poisoned"))?
+            .as_ref()
+            .and_then(|state| state.to_str().ok())
+    {
+        value["client_metadata"] = json!({ X_CODEX_TURN_STATE: state });
+    }
+    let request = Zeroizing::new(
+        serde_json::to_string(value)
+            .map_err(|_| protocol_failure("could not serialize WebSocket request"))?,
+    );
+    if request.len() > context.config.limits.max_request_bytes {
+        return Err(protocol_failure(
+            "Responses WebSocket request exceeds byte limit",
+        ));
+    }
+    Ok(request)
+}
+
+async fn connect(
+    context: &mut ResponsesRequestContext,
+    mut headers: HeaderMap,
+) -> Result<Option<Box<Connection>>, AttemptFailure> {
+    headers.remove("idempotency-key"); // WebSocket response.create has no idempotency contract.
+    headers.remove("accept");
+    headers.remove("content-type");
+    headers.insert(
+        "openai-beta",
+        HeaderValue::from_static("responses_websockets=2026-02-06"),
+    );
+    let key = generate_key();
+    headers.insert("connection", HeaderValue::from_static("Upgrade"));
+    headers.insert("upgrade", HeaderValue::from_static("websocket"));
+    headers.insert("sec-websocket-version", HeaderValue::from_static("13"));
+    headers.insert(
+        "sec-websocket-key",
+        HeaderValue::from_str(&key).map_err(|_| protocol_failure("invalid WebSocket nonce"))?,
+    );
+    let client = reqwest::Client::builder()
+        .http1_only()
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        .connect_timeout(HANDSHAKE_TIMEOUT)
+        .timeout(HANDSHAKE_TIMEOUT);
+    let client = if context.config.websocket_no_proxy {
+        client.no_proxy()
+    } else {
+        client
+    };
+    let client = client
+        .build()
+        .map_err(|_| protocol_failure("could not build WebSocket upgrade client"))?;
+    context.tracker.accounting.attempts = context.tracker.accounting.attempts.saturating_add(1);
+    // HTTP/1 upgrade on https uses reqwest's existing rustls trust/proxy stack;
+    // it is the same wire operation as connecting to the corresponding wss URL.
+    let response = client
+        .get(&context.config.endpoint)
+        .headers(headers)
+        .send()
+        .await
+        .map_err(|error| transport_failure(HttpError::request(error)))?;
+    let status = response.status();
+    if status == StatusCode::UPGRADE_REQUIRED
+        && context.config.transport == OpenAIResponsesTransport::Auto
+    {
+        context
+            .websocket
+            .as_mut()
+            .expect("WebSocket lease")
+            .fallback()?;
+        return Ok(None);
+    }
+    if status != StatusCode::SWITCHING_PROTOCOLS {
+        return Err(AttemptFailure {
+            error: Box::new(provider_error(
+                ProviderFailureReason::HttpStatus,
+                ProviderClassification {
+                    http_status: Some(status.as_u16()),
+                    ..ProviderClassification::default()
+                },
+            )),
+            retryable: retryable_response_status(status, context.config.profile),
+            headers: retry_headers(response.headers()),
+        });
+    }
+    validate_handshake(response.headers(), &key)?;
+    if context.config.profile == OpenAIResponsesProfile::ChatGptPrivate
+        && let Some(captured) = validated_turn_state_header(response.headers())?
+    {
+        *context
+            .turn_state
+            .lock()
+            .map_err(|_| protocol_failure("turn-state lock poisoned"))? = Some(captured);
+    }
+    let socket = response
+        .upgrade()
+        .await
+        .map_err(|_| protocol_failure("WebSocket upgrade failed"))?;
+    let limit = context.config.limits.max_attempt_bytes;
+    let config = WebSocketConfig::default()
+        .max_message_size(Some(limit))
+        .max_frame_size(Some(limit))
+        .write_buffer_size(0);
+    Ok(Some(Box::new(Connection {
+        stream: WebSocketStream::from_raw_socket(socket, Role::Client, Some(config)).await,
+        auth_headers: context.auth.headers().clone(),
+        binding: context.auth.binding().map(str::to_owned),
+        completed_ids: BTreeSet::new(),
+        checkpoint: None,
+        previous_response_id: None,
+    })))
 }
 
 fn validate_handshake(headers: &HeaderMap, key: &str) -> Result<(), AttemptFailure> {
