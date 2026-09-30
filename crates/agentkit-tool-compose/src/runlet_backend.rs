@@ -175,8 +175,9 @@ const RULES_PRIMER: &str = "Run a Runlet program that composes available tools. 
              `result = after earlier { return publish_item({ id: 4 }) }`. Calls lexically created \
              inside the `after` block wait for every prerequisite to succeed. Source order alone \
              does not sequence calls.\n\
-             - Objects `{ key: value }`, lists `[a, b]`, strings, integers, floats, booleans, \
-             null. String concat with `+`; `a + b` on two objects merges them shallowly (right \
+             - Objects `{ key: value }`, lists `[a, b]`, strings (`\"…\"` or `'…'`, newlines \
+             allowed; escapes \\n \\t \\\" \\' \\\\ \\uXXXX, any other backslash stays as written), \
+             integers, floats, booleans, null. String concat with `+`; `a + b` on two objects merges them shallowly (right \
              side wins). `{ [expr]: value }` computes a property key (scalars stringify: \
              `{ [u.id]: u }` keys by \"42\"). Comparisons, `and`/`or`/`not`, and `x in xs` \
              (list membership, substring, object key).\n\
@@ -237,7 +238,9 @@ const RULES_PRIMER: &str = "Run a Runlet program that composes available tools. 
              time.parse(\"2026-07-12T09:30:00Z\") -> epoch ms, time.format(ms) -> RFC 3339; \
              time math is plain integer ms (86400000 per day). \
              Substring check is the `in` operator (`\"x\" in s`) — there is no text.contains.\n\
-             - The global `input` holds the JSON value passed alongside the program.\n\n\
+             - The global `input` holds the JSON value passed alongside the program; its strings \
+             are used verbatim, never parsed as Runlet. Text that would need escaping as a literal \
+             goes there.\n\n\
              Example — fetch and filter concurrently, aggregate with fold:\n\
              listing = list_items({ page: 1 })\n\
              open_items = for item in listing.items {\n\
@@ -273,9 +276,12 @@ remaining = for page in list.range(2, first.total_pages + 1) {
     return result.items
 }
 listing = fold acc = first.items for page in remaining { return acc + page }
-config = json.parse(input.settings)                   # `input` is the JSON value submitted with the program
+saved = write_file({ path: input.path, content: input.source })
+                                                      # `input` is the JSON value submitted with the program;
+                                                      # its strings are used verbatim, never parsed as Runlet.
+                                                      # Text that would need escaping as a literal goes there.
 
-# `config` and the listing work share no data, so they run IN PARALLEL — this
+# `saved` and the listing work share no data, so they run IN PARALLEL — this
 # includes effectful calls. There is no await; ordinary result references create
 # dependencies. Source order alone never sequences independent calls.
 
@@ -302,8 +308,8 @@ shaped = for record in listing {                      # concurrent loop; the hos
 # lexically created in this block wait until `shaped` succeeds; this is a real
 # ordering edge, unlike source order.
 _ = after shaped {                                  # explicit discard still evaluates even pure work
-    return log_event({ kind: "shaping_complete" })
-}
+    return log_event({ kind: 'shaping_complete' })  # strings: "…" or '…', newlines allowed; escapes \n \t \" \'
+}                                                   # \\ \uXXXX, any other \x stays as written
 
 total = fold acc = 0 for row in shaped {              # fold is THE way to aggregate: sequential reduce,
     return acc + row.amount                           # the body's return becomes the next accumulator;
@@ -314,7 +320,7 @@ by_id = fold acc = {} for row in shaped {
 }                                                     # object + object merges shallowly, right side wins.
 # grouping idiom: acc + { [row.kind]: (acc[row.kind] if row.kind in acc else []) + [row] }
 
-label = if total >= config.threshold {                # block-bodied if is an expression; every branch
+label = if total >= input.threshold {                # block-bodied if is an expression; every branch
     audit = log_event({ kind: "high", total })        # is a block ending in `return`; only the selected
     return "high"                                     # branch runs (including its writes).
 } else if total > 0 {

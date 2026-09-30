@@ -701,12 +701,12 @@ impl ComposeTool {
             json!({
                 "type": "object",
                 "properties": {
+                    "input": {
+                        "description": "Optional JSON value exposed to the script as global input. Its strings are used verbatim. When text would need escaping to fit in a script string literal, such as file contents or code containing quotes or backslashes, pass it here and reference it instead of escaping it."
+                    },
                     "script": {
                         "type": "string",
                         "description": backend.script_description()
-                    },
-                    "input": {
-                        "description": "Optional JSON value exposed to the script as global input."
                     }
                 },
                 "required": ["script"],
