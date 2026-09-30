@@ -1697,3 +1697,89 @@ async fn interrupted_missing_previous_backoff_releases_session_without_replay() 
         peer.join().unwrap();
     }
 }
+
+#[test]
+fn websocket_proxy_policy_child_process() {
+    const ENDPOINT: &str = "AGENTKIT_TEST_WEBSOCKET_PROXY_ENDPOINT";
+    if let Ok(endpoint) = std::env::var(ENDPOINT) {
+        // Only this child inherits the proxy environment; never mutate process globals.
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            for transport in [
+                OpenAIResponsesTransport::WebSocket,
+                OpenAIResponsesTransport::Auto,
+            ] {
+                for no_proxy in [None, Some(false), Some(true)] {
+                    let config = config(&endpoint, transport);
+                    let config = match no_proxy {
+                        Some(value) => config.with_websocket_no_proxy(value),
+                        None => config,
+                    };
+                    // An explicitly direct HTTP client must not silently change the
+                    // independent WebSocket client's default proxy policy.
+                    let http = Http::new(reqwest::Client::builder().no_proxy().build().unwrap());
+                    let adapter = OpenAIResponsesAdapter::with_client(config, http);
+                    let mut session = adapter
+                        .start_session(SessionConfig::new("proxy-policy"))
+                        .await
+                        .unwrap();
+                    let result = session.begin_turn(request(), None).await;
+                    if no_proxy == Some(true) {
+                        let mut turn = result.expect("direct WebSocket upgrade must succeed");
+                        finished(&drain(&mut turn).await.unwrap());
+                    } else {
+                        assert!(result.is_err(), "proxy must block the upgrade");
+                    }
+                }
+            }
+        });
+        return;
+    }
+
+    let (endpoint, direct) = server(|listener| {
+        for _ in 0..2 {
+            let mut ws = socket(&listener);
+            receive(&mut ws);
+            success(&mut ws);
+        }
+    });
+    let expected_endpoint = endpoint.clone();
+    let (proxy, blocked) = server(move |listener| {
+        for _ in 0..4 {
+            let (headers, _) = http(&listener, "403 Forbidden", "proxy blocked upgrade");
+            assert!(headers.starts_with(&format!("GET {expected_endpoint} HTTP/1.1\r\n")));
+            assert!(
+                headers
+                    .to_ascii_lowercase()
+                    .contains("upgrade: websocket\r\n")
+            );
+        }
+    });
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+    child.args([
+        "--exact",
+        "responses::websocket::tests::websocket_proxy_policy_child_process",
+        "--nocapture",
+    ]);
+    // Clear inherited bypasses and conflicting proxy variables in the child only.
+    for key in [
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ] {
+        child.env(key, &proxy);
+    }
+    child.env("NO_PROXY", "").env("no_proxy", "");
+    child.env_remove("REQUEST_METHOD");
+    let output = child.env(ENDPOINT, endpoint).output().unwrap();
+    assert!(
+        output.status.success(),
+        "proxy policy child failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    blocked.join().unwrap();
+    direct.join().unwrap();
+}

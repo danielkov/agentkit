@@ -183,7 +183,11 @@ never replayed. Recovery uses the existing retry observations and deadline budge
 WebSocket upgrades use a dedicated reqwest HTTP/1 client with redirects and
 implicit HTTP retries disabled, using the existing reqwest TLS stack. A custom
 `Http` passed to `with_client` applies only to HTTP/SSE, **not** to WebSocket
-upgrades; applications requiring custom transport middleware should keep `Http`.
+upgrades. Proxy discovery from the environment/system remains enabled by default.
+Set `OpenAIResponsesConfig::with_websocket_no_proxy(true)` to disable it for
+`WebSocket` and `Auto` upgrades without relaxing the client's hardening or timeouts.
+This does not change HTTP/SSE (including Auto fallback): configure its client
+separately. Applications requiring custom transport middleware should keep `Http`.
 
 Wire contract reference: OpenAI Codex commit
 [`6824dabe0393337a38cb257d5fe75ae5ca168470`](https://github.com/openai/codex/tree/6824dabe0393337a38cb257d5fe75ae5ca168470),
