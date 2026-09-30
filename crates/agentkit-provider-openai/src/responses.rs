@@ -443,7 +443,7 @@ pub struct OpenAIResponsesSession {
     retry_observer: Option<Arc<dyn RetryObserver>>,
     websocket: Arc<Mutex<websocket::Session>>,
     turn_state: Arc<Mutex<Option<HeaderValue>>>,
-    turn_scope: Option<(Option<String>, Option<usize>)>,
+    turn_scope: Option<(Option<String>, agentkit_core::TurnId)>,
 }
 
 #[async_trait]
@@ -524,15 +524,11 @@ impl ModelSession for OpenAIResponsesSession {
         .await;
         let (body, idempotency_key, auth, deadline, supersession_enabled) =
             prepared.map_err(|error| tracker.finish(error))?;
-        // x-codex-turn-state is scoped to one user turn (every request from a
-        // user message through its tool rounds) and one account.
-        let scope = (
-            auth.binding().map(str::to_owned),
-            request
-                .transcript
-                .iter()
-                .rposition(|item| item.kind == ItemKind::User),
-        );
+        // x-codex-turn-state is scoped to one logical turn (every request from
+        // its input through its tool rounds) and one account. The turn ID, not
+        // a transcript position, identifies it: compaction can move or reuse
+        // positions.
+        let scope = (auth.binding().map(str::to_owned), request.turn_id.clone());
         if self.turn_scope.as_ref() != Some(&scope) {
             self.turn_scope = Some(scope);
             *self
@@ -2019,9 +2015,16 @@ async fn open_live_attempt(
         let attempt_deadline = attempt_timeout.map(LogicalDeadline::new);
         let logical_deadline = context.deadline.clone();
         context.websocket_sent = false;
+        // The first-progress bound covers opening the attempt too (connecting,
+        // sending, and waiting for response headers), not only the stream after it.
+        let opened_at = Instant::now();
+        let open_timeout = [attempt_timeout, context.config.first_progress_timeout]
+            .into_iter()
+            .flatten()
+            .min();
         let mut result = attempt_with_timeout(
             send_live_attempt(context, cancellation),
-            attempt_timeout,
+            open_timeout,
             logical_deadline.as_ref(),
             cancellation,
         )
@@ -2048,6 +2051,7 @@ async fn open_live_attempt(
         match result {
             Ok(mut attempt) => {
                 attempt.deadline = attempt_deadline;
+                attempt.progress_at = opened_at;
                 return Ok(attempt);
             }
             Err(failure) if is_unauthorized(&failure.error) && !context.refreshed => {
@@ -4015,6 +4019,52 @@ mod tests {
         }
     }
 
+    /// The first request's headers arrive after `delay` (never when `None`) and
+    /// its stream carries only keepalives; later requests succeed.
+    struct DelayedHeadersClient {
+        delay: Option<Duration>,
+        sent: Mutex<Vec<Instant>>,
+    }
+
+    #[async_trait]
+    impl HttpClient for DelayedHeadersClient {
+        async fn execute(&self, request: HttpRequest) -> Result<HttpResponse, HttpError> {
+            let first = {
+                let mut sent = self.sent.lock().unwrap();
+                sent.push(Instant::now());
+                sent.len() == 1
+            };
+            if !first {
+                let body = stream::once(async {
+                    Ok(agentkit_http::Bytes::from_static(SUCCESS.as_bytes()))
+                });
+                return Ok(HttpResponse::new(
+                    StatusCode::OK,
+                    sse_headers(),
+                    request.url,
+                    Box::pin(body),
+                ));
+            }
+            match self.delay {
+                Some(delay) => sleep(delay).await,
+                None => std::future::pending::<()>().await,
+            }
+            let body = stream::unfold((), |_| async {
+                sleep(Duration::from_millis(1)).await;
+                Some((
+                    Ok(agentkit_http::Bytes::from_static(b": keepalive\n\n")),
+                    (),
+                ))
+            });
+            Ok(HttpResponse::new(
+                StatusCode::OK,
+                sse_headers(),
+                request.url,
+                Box::pin(body),
+            ))
+        }
+    }
+
     struct RefreshingAuth {
         calls: Arc<AtomicUsize>,
     }
@@ -4670,6 +4720,7 @@ data: {"type":"response.completed","sequence_number":18,"response":{"id":"resp-1
             session.begin_turn(request.clone(), None).await.unwrap();
         }
         request.transcript.push(Item::text(ItemKind::User, "next"));
+        request.turn_id = TurnId::new("next-turn");
         session.begin_turn(request, None).await.unwrap();
         let requests = client.requests.lock().unwrap();
         assert_eq!(requests[0].headers["originator"], "agentkit");
@@ -4685,6 +4736,68 @@ data: {"type":"response.completed","sequence_number":18,"response":{"id":"resp-1
             requests[0].headers["idempotency-key"],
             requests[1].headers["idempotency-key"]
         );
+    }
+
+    #[tokio::test]
+    async fn private_turn_state_follows_turn_identity_not_transcript_position() {
+        let state = |value: &'static str| {
+            let mut headers = sse_headers();
+            headers.insert(X_CODEX_TURN_STATE, HeaderValue::from_static(value));
+            headers
+        };
+        let ok = |headers| WireResponse {
+            status: StatusCode::OK,
+            headers,
+            body: SUCCESS,
+        };
+        let client = Arc::new(ScriptedClient {
+            responses: Mutex::new(VecDeque::from([
+                ok(state("state-1")),
+                ok(sse_headers()),
+                ok(state("state-2")),
+                ok(sse_headers()),
+            ])),
+            requests: Mutex::new(Vec::new()),
+        });
+        let adapter = OpenAIResponsesAdapter::with_client(
+            OpenAIResponsesConfig::chatgpt_private("gpt-test", Authentication::bearer("secret")),
+            Http::from_arc(client.clone()),
+        );
+        let mut session = adapter
+            .start_session(SessionConfig::new("session"))
+            .await
+            .unwrap();
+        let mut first = request();
+        first.transcript = vec![
+            Item::text(ItemKind::User, "old"),
+            Item::text(ItemKind::Assistant, "old answer"),
+            Item::text(ItemKind::User, "current"),
+        ];
+        session.begin_turn(first.clone(), None).await.unwrap();
+        // Compaction drops a prefix during a tool round: the user message moves.
+        let mut compacted = first.clone();
+        compacted.transcript = vec![
+            Item::text(ItemKind::User, "current"),
+            Item::text(ItemKind::Assistant, "tool round"),
+        ];
+        session.begin_turn(compacted, None).await.unwrap();
+        // A rolling window puts the next turn's user message at the old index.
+        let mut next = first.clone();
+        next.turn_id = TurnId::new("next-turn");
+        next.transcript = vec![
+            Item::text(ItemKind::User, "current"),
+            Item::text(ItemKind::Assistant, "answer"),
+            Item::text(ItemKind::User, "next"),
+        ];
+        session.begin_turn(next.clone(), None).await.unwrap();
+        next.transcript
+            .push(Item::text(ItemKind::Assistant, "tool round"));
+        session.begin_turn(next, None).await.unwrap();
+        let requests = client.requests.lock().unwrap();
+        assert!(!requests[0].headers.contains_key(X_CODEX_TURN_STATE));
+        assert_eq!(requests[1].headers[X_CODEX_TURN_STATE], "state-1");
+        assert!(!requests[2].headers.contains_key(X_CODEX_TURN_STATE));
+        assert_eq!(requests[3].headers[X_CODEX_TURN_STATE], "state-2");
     }
 
     #[tokio::test]
@@ -5620,6 +5733,57 @@ data: {"type":"response.completed","sequence_number":18,"response":{"id":"resp-1
             Some(ProviderFailureReason::IdleTimeout)
         );
         assert_eq!(client.requests.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn first_progress_bound_covers_waiting_for_response_headers() {
+        const FIRST: Duration = Duration::from_millis(200);
+        for delay in [None, Some(FIRST * 3 / 4)] {
+            let client = Arc::new(DelayedHeadersClient {
+                delay,
+                sent: Mutex::new(Vec::new()),
+            });
+            let config = OpenAIResponsesConfig::new("secret", "gpt-test")
+                .with_progress_timeouts(Some(FIRST), None)
+                .with_resilience(ResilienceConfig {
+                    max_retries: 1,
+                    retry_budget: Duration::from_secs(5),
+                    attempt_timeout: None,
+                    stream_idle_timeout: None,
+                    initial_backoff: Duration::ZERO,
+                    max_backoff: Duration::ZERO,
+                });
+            let adapter =
+                OpenAIResponsesAdapter::with_client(config, Http::from_arc(client.clone()));
+            let mut session = adapter
+                .start_session(SessionConfig::new("session"))
+                .await
+                .unwrap();
+            let mut turn = session.begin_turn(request(), None).await.unwrap();
+            let events = tokio::time::timeout(Duration::from_secs(3), async {
+                let mut events = Vec::new();
+                while let Some(event) = turn.next_event(None).await.unwrap() {
+                    events.push(event);
+                }
+                events
+            })
+            .await
+            .expect("an attempt without headers or progress must not hang");
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, ModelTurnEvent::Finished(_)))
+            );
+            let sent = client.sent.lock().unwrap();
+            assert_eq!(sent.len(), 2, "{delay:?}");
+            let first_attempt = sent[1] - sent[0];
+            assert!(first_attempt >= FIRST, "{delay:?}: {first_attempt:?}");
+            // Time spent waiting for headers counts against the same bound.
+            assert!(
+                first_attempt < FIRST * 3 / 2,
+                "{delay:?}: {first_attempt:?}"
+            );
+        }
     }
 
     #[tokio::test]
