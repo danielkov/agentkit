@@ -2,7 +2,8 @@
 
 Agent Client Protocol integration for agentkit hosts.
 
-This crate re-exports ACP wire types from a pinned `agent-client-protocol` fork and
+This crate re-exports ACP wire types from [`agentkit-acp-sdk`](https://crates.io/crates/agentkit-acp-sdk), a published
+`agent-client-protocol` fork, and
 adds only agentkit-specific glue: session binding, observer routing, prompt
 conversion, cancellation handles, and approval resolver abstractions.
 
@@ -24,7 +25,7 @@ experimental upstream ACP v2 protocol, enable the additive feature:
 agentkit-acp = { version = "0.10.11", features = ["protocol-v2"] }
 ```
 
-The feature maps directly to the pinned fork's
+The feature maps directly to the SDK fork's
 `agent-client-protocol/unstable_protocol_v2` feature. V2 APIs and v2 wire
 types live only under `agentkit_acp::v2` (and
 `agentkit_acp::v2::wire`). Enable `unstable-inject` instead to add the unstable
@@ -68,9 +69,8 @@ approval requests are resolved as denials while retaining a provider-valid
 transcript, so the prompt ends with the custom `_error` stop reason rather than
 `Refusal`. Already accepted steers remain pending and are delivered at the next
 safe boundary. Because the SDK marks
-protocol v2 unstable, all APIs in the `v2` namespace can evolve with the pinned
-SDK fork. The workspace patch is intentionally unpublishable until these SDK
-APIs are available in an upstream release.
+protocol v2 unstable, all APIs in the `v2` namespace can evolve with the
+[`agentkit-acp-sdk`](https://crates.io/crates/agentkit-acp-sdk) fork.
 
 Run the stable v1 in-memory end-to-end example with:
 

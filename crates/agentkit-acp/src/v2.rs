@@ -546,7 +546,7 @@ impl AcpIntegration {
         session_id: &wire::SessionId,
         owner: u64,
         cancellation: TurnCancellation,
-    ) -> Result<wire::MessageId, AcpRuntimeError> {
+    ) -> Result<(), AcpRuntimeError> {
         let session = self.session(session_id)?;
         {
             let mut prompt_state = session
@@ -561,10 +561,7 @@ impl AcpIntegration {
                 cancellation,
             });
         }
-        let sequence = session.next_message.fetch_add(1, Ordering::Relaxed);
-        Ok(wire::MessageId::new(format!(
-            "{session_id}-user-{sequence}"
-        )))
+        Ok(())
     }
 
     fn finish_prompt_owner(&self, session_id: &wire::SessionId, owner: u64) {
@@ -1002,8 +999,8 @@ where
                         let state = Arc::clone(&state);
                         cx.spawn(async move {
                             match state.prompt(request).await {
-                                Ok(start) => {
-                                    responder.respond(wire::PromptResponse::new())?;
+                                Ok((start, message_id)) => {
+                                    responder.respond(wire::PromptResponse::new(message_id))?;
                                     let _ = start.send(());
                                     Ok(())
                                 }
@@ -1973,6 +1970,7 @@ enum SessionCommand {
     Prompt {
         request: wire::PromptRequest,
         items: Vec<Item>,
+        message_id: wire::MessageId,
         prompt_cancellation: TurnCancellation,
         cancellation_generation: u64,
         owner: u64,
@@ -2200,7 +2198,7 @@ where
     async fn prompt(
         &self,
         request: wire::PromptRequest,
-    ) -> Result<oneshot::Sender<()>, AcpRuntimeError> {
+    ) -> Result<(oneshot::Sender<()>, wire::MessageId), AcpRuntimeError> {
         let items = self.integration.prompt_to_items(&request)?;
         let entry = self
             .sessions
@@ -2235,6 +2233,7 @@ where
                     "session is already running a prompt".into(),
                 ));
             }
+            let message_id = self.integration.next_user_message_id(&request.session_id)?;
             let prompt_cancellation = entry.cancellation.handle().checkpoint();
             #[cfg(feature = "unstable-inject")]
             entry.session.prepare_injection_turn();
@@ -2244,6 +2243,7 @@ where
                 .send(SessionCommand::Prompt {
                     request,
                     items,
+                    message_id: message_id.clone(),
                     prompt_cancellation,
                     cancellation_generation,
                     owner,
@@ -2254,8 +2254,8 @@ where
                 release_prompt(&entry.active_prompt, owner);
                 return Err(AcpRuntimeError::ClientClosed);
             }
+            Ok((start_tx, message_id))
         }
-        Ok(start_tx)
     }
 
     async fn cancel(
@@ -2493,6 +2493,7 @@ async fn session_worker<S>(
         let SessionCommand::Prompt {
             request,
             items,
+            message_id: user_message_id,
             prompt_cancellation,
             cancellation_generation,
             owner,
@@ -2543,27 +2544,24 @@ async fn session_worker<S>(
             );
             continue;
         }
-        let user_message_id =
-            match integration.begin_prompt_owner(&session_id, owner, prompt_cancellation) {
-                Ok(message_id) => message_id,
-                Err(error) => {
-                    tracing::debug!(%error, owner, "failed to begin accepted ACP v2 prompt");
-                    #[cfg(feature = "unstable-inject")]
-                    session.stop_injection_turn();
-                    fail_accepted_prompt(
-                        &client,
-                        &integration,
-                        &session_id,
-                        &active_prompt,
-                        &driving_prompt,
-                        &cancelled_prompt,
-                        &lifecycle,
-                        owner,
-                        false,
-                    );
-                    continue;
-                }
-            };
+        if let Err(error) = integration.begin_prompt_owner(&session_id, owner, prompt_cancellation)
+        {
+            tracing::debug!(%error, owner, "failed to begin accepted ACP v2 prompt");
+            #[cfg(feature = "unstable-inject")]
+            session.stop_injection_turn();
+            fail_accepted_prompt(
+                &client,
+                &integration,
+                &session_id,
+                &active_prompt,
+                &driving_prompt,
+                &cancelled_prompt,
+                &lifecycle,
+                owner,
+                false,
+            );
+            continue;
+        }
 
         if let Err(error) = client.update_for(
             session_id.clone(),
@@ -7117,6 +7115,9 @@ mod tests {
             )
             .expect("install prompt state");
         let cancellation = CancellationController::new();
+        integration
+            .next_user_message_id(&acp_id)
+            .expect("accept prompt");
         integration
             .begin_prompt_owner(&acp_id, 1, cancellation.handle().checkpoint())
             .expect("begin prompt");

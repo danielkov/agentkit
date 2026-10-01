@@ -43,7 +43,7 @@ There is already an official Rust ACP SDK:
 - `agent-client-protocol-schema`
 - `agent-client-protocol-rmcp`
 
-So agentkit should not build a parallel protocol crate by default. The current implementation uses a commit-pinned source fork of that SDK for experimental session injection; it still re-exports the SDK wire types and owns only the lifecycle and conversion glue. A separate `racp` crate would make sense only if the SDK API became unsuitable.
+So agentkit should not build a parallel protocol crate by default. The current implementation uses `agentkit-acp-sdk`, a published fork of that SDK, for experimental session injection; it still re-exports the SDK wire types and owns only the lifecycle and conversion glue. A separate `racp` crate would make sense only if the SDK API became unsuitable.
 
 ## Non-goals
 
@@ -58,7 +58,7 @@ So agentkit should not build a parallel protocol crate by default. The current i
 - long-term session persistence
 - policy storage for remembered approval choices
 
-The crate integrates agentkit into ACP. Its pinned SDK source fork must not become a divergent ACP protocol, and the crate must not turn agentkit into a single opinionated coding-agent product.
+The crate integrates agentkit into ACP. Its SDK fork must not become a divergent ACP protocol, and the crate must not turn agentkit into a single opinionated coding-agent product.
 
 ## Dependencies
 
@@ -66,8 +66,7 @@ Recommended initial crate:
 
 ```toml
 [dependencies]
-# Registry-shaped so every workspace consumer resolves one patched type identity.
-agent-client-protocol = "=2.0.0"
+agent-client-protocol = { package = "agentkit-acp-sdk", version = "=2.2.0" }
 agentkit-core = { path = "../agentkit-core", version = "0.10.5" }
 agentkit-loop = { path = "../agentkit-loop", version = "0.10.7" }
 agentkit-tools-core = { path = "../agentkit-tools-core", version = "0.10.5" }
@@ -77,10 +76,6 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }
-
-[patch.crates-io]
-# Intentionally unpublishable until these SDK APIs are released upstream.
-agent-client-protocol = { git = "https://github.com/danielkov/rust-sdk", rev = "2f039993d1d6ed8da35b38c31f54a7cbb7338c70" }
 
 [features]
 default = ["stdio"]

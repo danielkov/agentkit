@@ -4,10 +4,10 @@ The [Agent Client Protocol (ACP)](https://agentclientprotocol.com) standardizes 
 
 ## Built on the ACP Rust SDK
 
-Like `agentkit-mcp`, this crate does not define a parallel protocol vocabulary. It currently builds on a commit-pinned [`agent-client-protocol` fork](https://github.com/danielkov/rust-sdk), needed for experimental session injection support, and re-exports the stable v1 wire types (`SessionId`, `ContentBlock`, `SessionUpdate`, `ToolCallUpdate`, `StopReason`, …) at the crate root and under `agentkit_acp::wire`. The full SDK is available as `agentkit_acp::sdk`. Agentkit owns only the host-facing glue: session binding, observer routing, prompt conversion, cancellation handles, and approval resolution.
+Like `agentkit-mcp`, this crate does not define a parallel protocol vocabulary. It builds on [`agentkit-acp-sdk`](https://crates.io/crates/agentkit-acp-sdk), a published fork of the `agent-client-protocol` SDK that adds experimental session injection, and re-exports the stable v1 wire types (`SessionId`, `ContentBlock`, `SessionUpdate`, `ToolCallUpdate`, `StopReason`, …) at the crate root and under `agentkit_acp::wire`. The full SDK is available as `agentkit_acp::sdk`. Agentkit owns only the host-facing glue: session binding, observer routing, prompt conversion, cancellation handles, and approval resolution.
 
 - **Protocol docs:** [agentclientprotocol.com](https://agentclientprotocol.com/protocol/v1/overview)
-- **Rust SDK fork:** [`danielkov/rust-sdk`](https://github.com/danielkov/rust-sdk), pinned in `Cargo.toml` and `Cargo.lock`
+- **Rust SDK fork:** [`agentkit-acp-sdk`](https://crates.io/crates/agentkit-acp-sdk) ([source](https://github.com/danielkov/rust-sdk/tree/agentkit-acp-sdk))
 
 ## Opt-in ACP v2 runtime
 
@@ -67,8 +67,7 @@ The initial v2 foundation routes text, reasoning, and tool lifecycle updates.
 ACP v2 permission callbacks are intentionally deferred; unsupported approval
 requests are denied while accepted steers remain pending for the next safe
 boundary. The SDK labels v2 unstable, so opt-in callers should expect the `v2`
-namespace to track the pinned fork. The workspace patch is intentionally
-unpublishable until the required APIs are released upstream.
+namespace to track the SDK fork.
 
 ## Two integration shapes
 
@@ -245,4 +244,4 @@ The `agentkit-acp` crate itself has a default `stdio` feature that gates `serve_
 
 > **Example:** [`openrouter-acp-trio`](https://github.com/danielkov/agentkit/tree/main/examples/openrouter-acp-trio) runs three OpenRouter-backed agents (orchestrator, worker, reviewer) that call each other over in-memory ACP endpoints while a REPL drives the orchestrator through a persistent ACP session — session binding, streamed updates, tool call reporting, and agent-to-agent handoffs in one program.
 >
-> **Crate:** [`agentkit-acp`](https://github.com/danielkov/agentkit/tree/main/crates/agentkit-acp) — depends on [`agentkit-core`](https://github.com/danielkov/agentkit/tree/main/crates/agentkit-core), [`agentkit-loop`](https://github.com/danielkov/agentkit/tree/main/crates/agentkit-loop), [`agentkit-tools-core`](https://github.com/danielkov/agentkit/tree/main/crates/agentkit-tools-core), and a commit-pinned [`agent-client-protocol` fork](https://github.com/danielkov/rust-sdk). Design notes: [`docs/acp.md`](https://github.com/danielkov/agentkit/blob/main/docs/acp.md).
+> **Crate:** [`agentkit-acp`](https://github.com/danielkov/agentkit/tree/main/crates/agentkit-acp) — depends on [`agentkit-core`](https://github.com/danielkov/agentkit/tree/main/crates/agentkit-core), [`agentkit-loop`](https://github.com/danielkov/agentkit/tree/main/crates/agentkit-loop), [`agentkit-tools-core`](https://github.com/danielkov/agentkit/tree/main/crates/agentkit-tools-core), and [`agentkit-acp-sdk`](https://crates.io/crates/agentkit-acp-sdk), a published `agent-client-protocol` fork. Design notes: [`docs/acp.md`](https://github.com/danielkov/agentkit/blob/main/docs/acp.md).
