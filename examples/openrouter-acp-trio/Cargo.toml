@@ -7,7 +7,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-agent-client-protocol = "2.0.0"
+agent-client-protocol = { package = "agentkit-acp-sdk", version = "2.2.0" }
 agentkit-acp = { path = "../../crates/agentkit-acp" }
 agentkit-core = { path = "../../crates/agentkit-core" }
 agentkit-loop = { path = "../../crates/agentkit-loop" }

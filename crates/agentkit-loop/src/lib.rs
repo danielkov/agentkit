@@ -66,8 +66,8 @@ use std::sync::Arc;
 
 use agentkit_core::{
     CancellationHandle, DataRef, Delta, FinishReason, Item, ItemKind, MetadataMap, Modality, Part,
-    SessionId, TaskId, TextPart, Timestamp, ToolCallId, ToolCallPart, ToolOutput, ToolResultPart,
-    TurnCancellation, Usage,
+    PartId, PartKind, ReasoningPart, SessionId, StructuredPart, TaskId, TextPart, Timestamp,
+    ToolCallId, ToolCallPart, ToolOutput, ToolResultPart, TurnCancellation, Usage,
 };
 use agentkit_task_manager::{
     PendingLoopUpdates, SimpleTaskManager, TOOL_RESULT_NOT_STARTED_METADATA_KEY, TaskApproval,
@@ -103,6 +103,8 @@ const USER_CANCELLED_REASON: &str = "user_cancelled";
 const DETACHED_NOTIFICATION_TEXT_MAX_CHARS: usize = 512;
 const DETACHED_TEXT_PREVIEW_MAX_CHARS: usize = 160;
 const DETACHED_CALL_ID_MAX_CHARS: usize = 80;
+const MAX_STREAMED_ASSISTANT_CONTENT_BYTES: usize = 1024 * 1024;
+const MAX_STREAMED_ASSISTANT_CONTENT_PARTS: usize = 256;
 
 /// Metadata key used by adapters to retain provider-native finish reasons.
 pub const PROVIDER_FINISH_REASONS_METADATA_KEY: &str = "agentkit.provider_finish_reasons";
@@ -2398,6 +2400,9 @@ where
         let mut saw_tool_call = false;
         let mut finished_result = None;
         let mut latest_usage = None;
+        let mut streamed_content = cancellation
+            .is_some()
+            .then(StreamedAssistantContent::default);
 
         while let Some(event) = match turn
             .next_event(cancellation.clone())
@@ -2410,10 +2415,22 @@ where
                     .on_turn_interrupted(&turn_id)
                     .await
                     .map_err(|error| LoopError::Tool(ToolError::Internal(error.to_string())))?;
-                return self.finish_cancelled(turn_id, interrupted_assistant_items());
+                return self.finish_cancelled(
+                    turn_id,
+                    interrupted_stream_items(streamed_content.as_ref()),
+                );
             }
             Err(error) => return Err(error),
         } {
+            let attempt_superseded = matches!(event, ModelTurnEvent::ResponseAttemptSuperseded);
+            if attempt_superseded {
+                saw_tool_call = false;
+                latest_usage = None;
+                if let Some(content) = &mut streamed_content {
+                    content.reset();
+                }
+                self.emit(AgentEvent::ResponseAttemptSuperseded);
+            }
             if cancellation
                 .as_ref()
                 .is_some_and(TurnCancellation::is_cancelled)
@@ -2423,22 +2440,34 @@ where
                     .on_turn_interrupted(&turn_id)
                     .await
                     .map_err(|error| LoopError::Tool(ToolError::Internal(error.to_string())))?;
-                return self.finish_cancelled(turn_id, interrupted_assistant_items());
+                return self.finish_cancelled(
+                    turn_id,
+                    interrupted_stream_items(streamed_content.as_ref()),
+                );
+            }
+            if attempt_superseded {
+                continue;
             }
             match event {
-                ModelTurnEvent::Delta(delta) => self.emit(AgentEvent::ContentDelta(delta)),
+                ModelTurnEvent::Delta(delta) => {
+                    if let Some(content) = &mut streamed_content {
+                        content.apply_delta(&delta);
+                    }
+                    self.emit(AgentEvent::ContentDelta(delta));
+                }
                 ModelTurnEvent::Usage(usage) => {
                     latest_usage = Some(usage.clone());
                     self.emit(AgentEvent::UsageUpdated(usage));
                 }
                 ModelTurnEvent::ToolCall(call) => {
                     saw_tool_call = true;
-                    self.emit(AgentEvent::ToolCallRequested(call.clone()));
+                    if let Some(content) = &mut streamed_content {
+                        content.commit_tool_call(&call);
+                    }
+                    self.emit(AgentEvent::ToolCallRequested(call));
                 }
                 ModelTurnEvent::ResponseAttemptSuperseded => {
-                    saw_tool_call = false;
-                    latest_usage = None;
-                    self.emit(AgentEvent::ResponseAttemptSuperseded);
+                    unreachable!("response-attempt supersession is handled before cancellation")
                 }
                 ModelTurnEvent::Finished(result) => {
                     finished_result = Some(result);
@@ -2703,8 +2732,8 @@ where
     ) -> Result<LoopStep, LoopError> {
         let pending = self.drain_pending_approval_items();
         self.reject_drained_approvals(pending);
-        self.close_interrupted_tool_calls();
         self.extend_transcript(items.clone());
+        self.close_interrupted_tool_calls();
         let turn_result = TurnResult {
             turn_id,
             finish_reason: FinishReason::Cancelled,
@@ -2915,6 +2944,42 @@ where
         self.finish_cancelled(turn_id, Vec::new()).map(Some)
     }
 
+    /// Retire the active logical turn without resuming model or tool execution.
+    ///
+    /// Use this after an interrupt (including [`LoopInterrupt::AfterToolResult`])
+    /// when the host wants to abandon the continuation. Pending approvals are
+    /// denied, foreground task cleanup is requested, and unanswered tool calls
+    /// receive cancellation results. Background work and queued input are kept;
+    /// the next call to [`Self::next`] can start a fresh logical turn.
+    ///
+    /// Returns `None` when no logical turn is active, including on repeated calls.
+    /// Otherwise emits exactly one cancelled [`AgentEvent::TurnFinished`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the first task cleanup error, after completing local cleanup and
+    /// emitting the cancelled terminal event. The turn is retired even on error;
+    /// a failing task manager may leave external tasks running.
+    pub async fn retire_interrupted_turn(&mut self) -> Result<Option<TurnResult>, LoopError> {
+        let Some(turn_id) = self.lifecycle.active_turn.clone() else {
+            return Ok(None);
+        };
+        // This is a logical presentation id, not a task-manager turn id.
+        // At AfterToolResult the foreground task round has already completed.
+        self.pending_round_resume = None;
+        let cleanup = self.cleanup_interrupted_turn().await;
+        let result = TurnResult {
+            turn_id,
+            finish_reason: FinishReason::Cancelled,
+            items: Vec::new(),
+            usage: None,
+            metadata: interrupted_metadata("turn"),
+        };
+        self.finish_logical_turn(&result);
+        cleanup?;
+        Ok(Some(result))
+    }
+
     /// Take a read-only snapshot of the driver's current transcript and input queue.
     pub fn snapshot(&self) -> LoopSnapshot {
         LoopSnapshot {
@@ -2990,7 +3055,9 @@ where
             Ok(LoopStep::Finished(turn)) => self.finish_logical_turn(turn),
             Err(_) => {
                 if let Some(turn_id) = self.lifecycle.active_turn.clone() {
-                    self.recover_from_next_error().await;
+                    if let Err(error) = self.cleanup_interrupted_turn().await {
+                        tracing::debug!(%error, "failed to clean up turn after loop error");
+                    }
                     self.finish_logical_turn(&TurnResult {
                         turn_id,
                         finish_reason: FinishReason::Error,
@@ -3005,7 +3072,7 @@ where
         result
     }
 
-    async fn recover_from_next_error(&mut self) {
+    async fn cleanup_interrupted_turn(&mut self) -> Result<(), LoopError> {
         let mut seen_turns = HashSet::new();
         let mut interrupted_turns = Vec::new();
         if let Some(active) = self.active_tool_round.take()
@@ -3026,13 +3093,20 @@ where
         }
 
         let pending = self.drain_pending_approval_items();
+        let mut cleanup_error = None;
         for turn_id in interrupted_turns {
-            if let Err(error) = self.task_manager.on_turn_interrupted(&turn_id).await {
-                tracing::debug!(%error, %turn_id, "failed to clean up turn after loop error");
+            if let Err(error) = self.task_manager.on_turn_interrupted(&turn_id).await
+                && cleanup_error.is_none()
+            {
+                cleanup_error = Some(LoopError::Tool(ToolError::Internal(error.to_string())));
             }
         }
         self.reject_drained_approvals(pending);
         self.close_interrupted_tool_calls();
+        match cleanup_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     async fn next_inner(&mut self) -> Result<LoopStep, LoopError> {
@@ -4141,20 +4215,501 @@ fn main() {
 "#;
 }
 
+#[derive(Default)]
+struct StreamedAssistantContent {
+    parts: Vec<StreamedPart>,
+    retained_bytes: usize,
+    overflowed: bool,
+}
+
+enum StreamedPart {
+    Open {
+        id: PartId,
+        kind: PartKind,
+        text: String,
+        bytes: Vec<u8>,
+        structured: Option<Value>,
+        structured_bytes: usize,
+        metadata: MetadataMap,
+        metadata_bytes: usize,
+        retained_bytes: usize,
+    },
+    Committed {
+        part: Part,
+        retained_bytes: usize,
+    },
+}
+
+impl StreamedAssistantContent {
+    fn apply_delta(&mut self, delta: &Delta) {
+        if self.overflowed {
+            return;
+        }
+
+        match delta {
+            Delta::BeginPart { part_id, kind } => {
+                let index = self.open_part_index(part_id);
+                let retained_bytes = part_id.0.len();
+                if !self.reserve_slot(index, retained_bytes) {
+                    return;
+                }
+                let open = StreamedPart::Open {
+                    id: part_id.clone(),
+                    kind: *kind,
+                    text: String::new(),
+                    bytes: Vec::new(),
+                    structured: None,
+                    structured_bytes: 0,
+                    metadata: MetadataMap::new(),
+                    metadata_bytes: 0,
+                    retained_bytes,
+                };
+                if let Some(index) = index {
+                    self.parts[index] = open;
+                } else {
+                    self.parts.push(open);
+                }
+            }
+            Delta::AppendText { part_id, chunk } => {
+                let Some(index) = self.open_part_index(part_id) else {
+                    return;
+                };
+                if self.grow_slot(index, chunk.len())
+                    && let StreamedPart::Open { text, .. } = &mut self.parts[index]
+                {
+                    text.push_str(chunk);
+                }
+            }
+            Delta::AppendBytes { part_id, chunk } => {
+                let Some(index) = self.open_part_index(part_id) else {
+                    return;
+                };
+                if matches!(
+                    self.parts[index],
+                    StreamedPart::Open {
+                        kind: PartKind::Media,
+                        ..
+                    }
+                ) {
+                    return;
+                }
+                if self.grow_slot(index, chunk.len())
+                    && let StreamedPart::Open { bytes, .. } = &mut self.parts[index]
+                {
+                    bytes.extend_from_slice(chunk);
+                }
+            }
+            Delta::ReplaceStructured { part_id, value } => {
+                let Some(index) = self.open_part_index(part_id) else {
+                    return;
+                };
+                let old_bytes = match &self.parts[index] {
+                    StreamedPart::Open {
+                        structured_bytes, ..
+                    } => *structured_bytes,
+                    StreamedPart::Committed { .. } => unreachable!(),
+                };
+                let limit = self.available_after_replacing(old_bytes);
+                let Some(new_bytes) = serialized_size_with_limit(value, limit) else {
+                    self.overflow();
+                    return;
+                };
+                self.replace_slot_bytes(index, old_bytes, new_bytes);
+                if let StreamedPart::Open {
+                    structured,
+                    structured_bytes,
+                    ..
+                } = &mut self.parts[index]
+                {
+                    *structured = Some(value.clone());
+                    *structured_bytes = new_bytes;
+                }
+            }
+            Delta::SetMetadata { part_id, metadata } => {
+                let Some(index) = self.open_part_index(part_id) else {
+                    return;
+                };
+                let old_bytes = match &self.parts[index] {
+                    StreamedPart::Open { metadata_bytes, .. } => *metadata_bytes,
+                    StreamedPart::Committed { .. } => unreachable!(),
+                };
+                let limit = self.available_after_replacing(old_bytes);
+                let Some(new_bytes) = serialized_size_with_limit(metadata, limit) else {
+                    self.overflow();
+                    return;
+                };
+                self.replace_slot_bytes(index, old_bytes, new_bytes);
+                if let StreamedPart::Open {
+                    metadata: target,
+                    metadata_bytes,
+                    ..
+                } = &mut self.parts[index]
+                {
+                    *target = metadata.clone();
+                    *metadata_bytes = new_bytes;
+                }
+            }
+            Delta::CommitPart { part } => self.commit_part(part),
+        }
+    }
+
+    fn open_part_index(&self, id: &PartId) -> Option<usize> {
+        self.parts.iter().position(
+            |part| matches!(part, StreamedPart::Open { id: open_id, .. } if open_id == id),
+        )
+    }
+
+    fn commit_part(&mut self, part: &Part) {
+        if self.overflowed {
+            return;
+        }
+
+        let duplicate_tool_call = if let Part::ToolCall(call) = part {
+            self.parts.iter().position(|slot| {
+                matches!(
+                    slot,
+                    StreamedPart::Committed {
+                        part: Part::ToolCall(existing),
+                        ..
+                    } if existing.id == call.id
+                )
+            })
+        } else {
+            None
+        };
+
+        let kind = part_kind(part);
+        let matching_open = self
+            .parts
+            .iter()
+            .position(|slot| slot.open_matches_part(part));
+        let mut open_with_kind = self.parts.iter().enumerate().filter_map(|(index, slot)| {
+            matches!(slot, StreamedPart::Open { kind: open_kind, .. } if *open_kind == kind)
+                .then_some(index)
+        });
+        let only_open_with_kind = match (open_with_kind.next(), open_with_kind.next()) {
+            (Some(index), None) => Some(index),
+            _ => None,
+        };
+        let index = duplicate_tool_call
+            .or(matching_open)
+            .or(only_open_with_kind);
+        let limit = self.available_for_slot(index);
+        let Some(retained_bytes) = serialized_size_with_limit(part, limit) else {
+            self.overflow();
+            return;
+        };
+        if !self.reserve_slot(index, retained_bytes) {
+            return;
+        }
+        let committed = StreamedPart::Committed {
+            part: part.clone(),
+            retained_bytes,
+        };
+        if let Some(index) = index {
+            self.parts[index] = committed;
+        } else {
+            self.parts.push(committed);
+        }
+    }
+
+    fn commit_tool_call(&mut self, call: &ToolCallPart) {
+        if self.overflowed {
+            return;
+        }
+        let duplicate_tool_call = self.parts.iter().position(|slot| {
+            matches!(
+                slot,
+                StreamedPart::Committed {
+                    part: Part::ToolCall(existing),
+                    ..
+                } if existing.id == call.id
+            )
+        });
+        let mut open_tool_calls = self.parts.iter().enumerate().filter_map(|(index, slot)| {
+            matches!(
+                slot,
+                StreamedPart::Open {
+                    kind: PartKind::ToolCall,
+                    ..
+                }
+            )
+            .then_some(index)
+        });
+        let only_open_tool_call = match (open_tool_calls.next(), open_tool_calls.next()) {
+            (Some(index), None) => Some(index),
+            _ => None,
+        };
+        let index = duplicate_tool_call.or(only_open_tool_call);
+        let limit = self.available_for_slot(index);
+        let borrowed_part = BorrowedPart::ToolCall(call);
+        let Some(retained_bytes) = serialized_size_with_limit(&borrowed_part, limit) else {
+            self.overflow();
+            return;
+        };
+        if !self.reserve_slot(index, retained_bytes) {
+            return;
+        }
+        let committed = StreamedPart::Committed {
+            part: Part::ToolCall(call.clone()),
+            retained_bytes,
+        };
+        if let Some(index) = index {
+            self.parts[index] = committed;
+        } else {
+            self.parts.push(committed);
+        }
+    }
+
+    fn reserve_slot(&mut self, index: Option<usize>, retained_bytes: usize) -> bool {
+        if index.is_none() && self.parts.len() >= MAX_STREAMED_ASSISTANT_CONTENT_PARTS {
+            self.overflow();
+            return false;
+        }
+        let replaced_bytes = index.map_or(0, |index| self.parts[index].retained_bytes());
+        let Some(total) = self
+            .retained_bytes
+            .checked_sub(replaced_bytes)
+            .and_then(|bytes| bytes.checked_add(retained_bytes))
+            .filter(|bytes| *bytes <= MAX_STREAMED_ASSISTANT_CONTENT_BYTES)
+        else {
+            self.overflow();
+            return false;
+        };
+        self.retained_bytes = total;
+        true
+    }
+
+    fn grow_slot(&mut self, index: usize, additional_bytes: usize) -> bool {
+        let Some(total) = self
+            .retained_bytes
+            .checked_add(additional_bytes)
+            .filter(|bytes| *bytes <= MAX_STREAMED_ASSISTANT_CONTENT_BYTES)
+        else {
+            self.overflow();
+            return false;
+        };
+        self.retained_bytes = total;
+        *self.parts[index].retained_bytes_mut() += additional_bytes;
+        true
+    }
+
+    fn available_after_replacing(&self, replaced_bytes: usize) -> usize {
+        MAX_STREAMED_ASSISTANT_CONTENT_BYTES - (self.retained_bytes - replaced_bytes)
+    }
+
+    fn available_for_slot(&self, index: Option<usize>) -> usize {
+        self.available_after_replacing(index.map_or(0, |index| self.parts[index].retained_bytes()))
+    }
+
+    fn replace_slot_bytes(&mut self, index: usize, old_bytes: usize, new_bytes: usize) {
+        self.retained_bytes = self.retained_bytes - old_bytes + new_bytes;
+        let retained_bytes = self.parts[index].retained_bytes_mut();
+        *retained_bytes = *retained_bytes - old_bytes + new_bytes;
+    }
+
+    fn overflow(&mut self) {
+        self.parts.clear();
+        self.retained_bytes = 0;
+        self.overflowed = true;
+    }
+
+    fn reset(&mut self) {
+        self.parts.clear();
+        self.retained_bytes = 0;
+        self.overflowed = false;
+    }
+
+    fn interrupted_items(&self) -> Vec<Item> {
+        if self.overflowed {
+            return interrupted_assistant_items();
+        }
+        let parts = self
+            .parts
+            .iter()
+            .filter_map(StreamedPart::preserved_part)
+            .collect::<Vec<_>>();
+        if parts.is_empty() {
+            return interrupted_assistant_items();
+        }
+        vec![Item::new(ItemKind::Assistant, parts).with_metadata(interrupted_metadata("assistant"))]
+    }
+}
+
+impl StreamedPart {
+    fn retained_bytes(&self) -> usize {
+        match self {
+            Self::Open { retained_bytes, .. } | Self::Committed { retained_bytes, .. } => {
+                *retained_bytes
+            }
+        }
+    }
+
+    fn retained_bytes_mut(&mut self) -> &mut usize {
+        match self {
+            Self::Open { retained_bytes, .. } | Self::Committed { retained_bytes, .. } => {
+                retained_bytes
+            }
+        }
+    }
+
+    fn open_matches_part(&self, committed: &Part) -> bool {
+        match (self, committed) {
+            (
+                Self::Open {
+                    kind: PartKind::Text,
+                    text,
+                    ..
+                },
+                Part::Text(part),
+            ) => text == &part.text,
+            (
+                Self::Open {
+                    kind: PartKind::Reasoning,
+                    text,
+                    bytes,
+                    ..
+                },
+                Part::Reasoning(part),
+            ) => {
+                part.summary.as_deref() == (!text.is_empty()).then_some(text.as_str())
+                    && match &part.data {
+                        Some(DataRef::InlineBytes(data)) => data == bytes,
+                        None => bytes.is_empty(),
+                        _ => false,
+                    }
+            }
+            (
+                Self::Open {
+                    kind: PartKind::Structured,
+                    structured: Some(value),
+                    ..
+                },
+                Part::Structured(part),
+            ) => value == &part.value,
+            _ => false,
+        }
+    }
+
+    fn preserved_part(&self) -> Option<Part> {
+        match self {
+            Self::Committed { part, .. } if useful_streamed_part(part) => Some(part.clone()),
+            Self::Committed { .. } => None,
+            Self::Open {
+                kind,
+                text,
+                bytes,
+                structured,
+                metadata,
+                ..
+            } => match kind {
+                PartKind::Text if !text.is_empty() => Some(Part::Text(
+                    TextPart::new(text).with_metadata(metadata.clone()),
+                )),
+                PartKind::Reasoning if !text.is_empty() || !bytes.is_empty() => {
+                    Some(Part::Reasoning(ReasoningPart {
+                        summary: (!text.is_empty()).then(|| text.clone()),
+                        data: (!bytes.is_empty()).then(|| DataRef::inline_bytes(bytes.clone())),
+                        redacted: false,
+                        metadata: metadata.clone(),
+                    }))
+                }
+                PartKind::Structured => structured.clone().map(|value| {
+                    Part::Structured(StructuredPart::new(value).with_metadata(metadata.clone()))
+                }),
+                // BeginPart does not carry media modality or MIME type, so an
+                // uncommitted media part cannot be reconstructed faithfully.
+                PartKind::Media => None,
+                _ => None,
+            },
+        }
+    }
+}
+
+#[derive(Serialize)]
+enum BorrowedPart<'a> {
+    ToolCall(&'a ToolCallPart),
+}
+
+struct PayloadSizeWriter {
+    remaining: usize,
+    written: usize,
+}
+
+impl std::io::Write for PayloadSizeWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > self.remaining {
+            return Err(std::io::Error::other(
+                "streamed assistant payload limit exceeded",
+            ));
+        }
+        self.remaining -= bytes.len();
+        self.written += bytes.len();
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialized_size_with_limit<T: Serialize + ?Sized>(value: &T, limit: usize) -> Option<usize> {
+    let mut writer = PayloadSizeWriter {
+        remaining: limit,
+        written: 0,
+    };
+    serde_json::to_writer(&mut writer, value).ok()?;
+    Some(writer.written)
+}
+
+fn part_kind(part: &Part) -> PartKind {
+    match part {
+        Part::Text(_) => PartKind::Text,
+        Part::Media(_) => PartKind::Media,
+        Part::File(_) => PartKind::File,
+        Part::Structured(_) => PartKind::Structured,
+        Part::Reasoning(_) => PartKind::Reasoning,
+        Part::ToolCall(_) => PartKind::ToolCall,
+        Part::ToolResult(_) => PartKind::ToolResult,
+        Part::Custom(_) => PartKind::Custom,
+    }
+}
+
+fn useful_streamed_part(part: &Part) -> bool {
+    match part {
+        Part::Text(text) => !text.text.is_empty(),
+        Part::Reasoning(reasoning) => {
+            reasoning
+                .summary
+                .as_ref()
+                .is_some_and(|text| !text.is_empty())
+                || reasoning.data.is_some()
+                || reasoning.redacted
+        }
+        Part::ToolResult(_) => false,
+        _ => true,
+    }
+}
+
+fn interrupted_stream_items(content: Option<&StreamedAssistantContent>) -> Vec<Item> {
+    content.map_or_else(
+        interrupted_assistant_items,
+        StreamedAssistantContent::interrupted_items,
+    )
+}
+
 fn interrupted_assistant_items() -> Vec<Item> {
-    vec![Item {
-        id: None,
-        kind: ItemKind::Assistant,
-        parts: vec![Part::Text(TextPart {
-            text: "Previous assistant response was interrupted by the user before completion."
-                .into(),
-            metadata: interrupted_metadata("assistant"),
-        })],
-        metadata: interrupted_metadata("assistant"),
-        usage: None,
-        finish_reason: None,
-        created_at: None,
-    }]
+    vec![
+        Item::new(
+            ItemKind::Assistant,
+            vec![Part::Text(TextPart {
+                text: "Previous assistant response was interrupted by the user before completion."
+                    .into(),
+                metadata: interrupted_metadata("assistant"),
+            })],
+        )
+        .with_metadata(interrupted_metadata("assistant")),
+    ]
 }
 
 /// Tool calls in `transcript` that no `tool_result` answers, in call order.
@@ -4397,6 +4952,10 @@ mod tests {
 
     struct FakeAdapter;
     struct SupersedingAdapter;
+    struct InterruptedStreamAdapter {
+        controller: CancellationController,
+        scenario: InterruptedStreamScenario,
+    }
     struct SlowAdapter;
     struct RecordingAdapter {
         seen_descriptions: StdArc<StdMutex<Vec<Vec<String>>>>,
@@ -4408,6 +4967,10 @@ mod tests {
     struct FakeSession;
     struct SupersedingSession {
         supersession_enabled: bool,
+    }
+    struct InterruptedStreamSession {
+        controller: CancellationController,
+        scenario: InterruptedStreamScenario,
     }
     struct SlowSession;
     struct RecordingSession {
@@ -4423,6 +4986,19 @@ mod tests {
 
     struct SupersedingTurn {
         events: VecDeque<ModelTurnEvent>,
+    }
+
+    #[derive(Clone, Copy)]
+    enum InterruptedStreamScenario {
+        PreserveContent,
+        CancelOnSupersession,
+        OverflowThenSupersession,
+    }
+
+    struct InterruptedStreamTurn {
+        controller: CancellationController,
+        events: VecDeque<ModelTurnEvent>,
+        cancel_on_supersession: bool,
     }
 
     struct SlowTurn {
@@ -4670,6 +5246,18 @@ mod tests {
     }
 
     #[async_trait]
+    impl ModelAdapter for InterruptedStreamAdapter {
+        type Session = InterruptedStreamSession;
+
+        async fn start_session(&self, _config: SessionConfig) -> Result<Self::Session, LoopError> {
+            Ok(InterruptedStreamSession {
+                controller: self.controller.clone(),
+                scenario: self.scenario,
+            })
+        }
+    }
+
+    #[async_trait]
     impl ModelAdapter for SlowAdapter {
         type Session = SlowSession;
 
@@ -4736,6 +5324,108 @@ mod tests {
                         response_id: None,
                     }),
                 ]),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl ModelSession for InterruptedStreamSession {
+        type Turn = InterruptedStreamTurn;
+
+        async fn begin_turn(
+            &mut self,
+            _request: TurnRequest,
+            _cancellation: Option<TurnCancellation>,
+        ) -> Result<Self::Turn, LoopError> {
+            let events = match self.scenario {
+                InterruptedStreamScenario::PreserveContent => {
+                    let mut reasoning_metadata = MetadataMap::new();
+                    reasoning_metadata.insert("provider.detail".into(), true.into());
+                    VecDeque::from([
+                        ModelTurnEvent::Delta(Delta::BeginPart {
+                            part_id: PartId::new("text"),
+                            kind: PartKind::Text,
+                        }),
+                        ModelTurnEvent::Delta(Delta::AppendText {
+                            part_id: PartId::new("text"),
+                            chunk: "partial answer".into(),
+                        }),
+                        ModelTurnEvent::Delta(Delta::CommitPart {
+                            part: Part::text("partial answer"),
+                        }),
+                        ModelTurnEvent::Delta(Delta::BeginPart {
+                            part_id: PartId::new("reasoning"),
+                            kind: PartKind::Reasoning,
+                        }),
+                        ModelTurnEvent::Delta(Delta::AppendText {
+                            part_id: PartId::new("reasoning"),
+                            chunk: "partial thought".into(),
+                        }),
+                        ModelTurnEvent::Delta(Delta::SetMetadata {
+                            part_id: PartId::new("reasoning"),
+                            metadata: reasoning_metadata,
+                        }),
+                        ModelTurnEvent::Delta(Delta::BeginPart {
+                            part_id: PartId::new("structured"),
+                            kind: PartKind::Structured,
+                        }),
+                        ModelTurnEvent::Delta(Delta::ReplaceStructured {
+                            part_id: PartId::new("structured"),
+                            value: json!({ "complete": false }),
+                        }),
+                        ModelTurnEvent::Delta(Delta::BeginPart {
+                            part_id: PartId::new("media"),
+                            kind: PartKind::Media,
+                        }),
+                        ModelTurnEvent::Delta(Delta::AppendBytes {
+                            part_id: PartId::new("media"),
+                            chunk: vec![1, 2, 3],
+                        }),
+                        ModelTurnEvent::ToolCall(ToolCallPart::new(
+                            "partial-call",
+                            "unfinished-tool",
+                            json!({}),
+                        )),
+                    ])
+                }
+                InterruptedStreamScenario::CancelOnSupersession => VecDeque::from([
+                    ModelTurnEvent::Delta(Delta::BeginPart {
+                        part_id: PartId::new("stale"),
+                        kind: PartKind::Text,
+                    }),
+                    ModelTurnEvent::Delta(Delta::AppendText {
+                        part_id: PartId::new("stale"),
+                        chunk: "discard me".into(),
+                    }),
+                    ModelTurnEvent::ResponseAttemptSuperseded,
+                ]),
+                InterruptedStreamScenario::OverflowThenSupersession => VecDeque::from([
+                    ModelTurnEvent::Delta(Delta::BeginPart {
+                        part_id: PartId::new("oversized"),
+                        kind: PartKind::Text,
+                    }),
+                    ModelTurnEvent::Delta(Delta::AppendText {
+                        part_id: PartId::new("oversized"),
+                        chunk: "x".repeat(MAX_STREAMED_ASSISTANT_CONTENT_BYTES),
+                    }),
+                    ModelTurnEvent::ResponseAttemptSuperseded,
+                    ModelTurnEvent::Delta(Delta::BeginPart {
+                        part_id: PartId::new("fresh"),
+                        kind: PartKind::Text,
+                    }),
+                    ModelTurnEvent::Delta(Delta::AppendText {
+                        part_id: PartId::new("fresh"),
+                        chunk: "preserve me".into(),
+                    }),
+                ]),
+            };
+            Ok(InterruptedStreamTurn {
+                controller: self.controller.clone(),
+                events,
+                cancel_on_supersession: matches!(
+                    self.scenario,
+                    InterruptedStreamScenario::CancelOnSupersession
+                ),
             })
         }
     }
@@ -5056,6 +5746,25 @@ mod tests {
             _cancellation: Option<TurnCancellation>,
         ) -> Result<Option<ModelTurnEvent>, LoopError> {
             Ok(self.events.pop_front())
+        }
+    }
+
+    #[async_trait]
+    impl ModelTurn for InterruptedStreamTurn {
+        async fn next_event(
+            &mut self,
+            _cancellation: Option<TurnCancellation>,
+        ) -> Result<Option<ModelTurnEvent>, LoopError> {
+            if let Some(event) = self.events.pop_front() {
+                if self.cancel_on_supersession
+                    && matches!(event, ModelTurnEvent::ResponseAttemptSuperseded)
+                {
+                    self.controller.interrupt();
+                }
+                return Ok(Some(event));
+            }
+            self.controller.interrupt();
+            Err(LoopError::Cancelled)
         }
     }
 
@@ -5523,6 +6232,356 @@ mod tests {
             .position(|event| matches!(event, AgentEvent::ResponseAttemptSuperseded))
             .unwrap();
         assert!(tool_call < superseded);
+    }
+
+    #[tokio::test]
+    async fn cancellation_preserves_streamed_content_in_result_and_transcript() {
+        let controller = CancellationController::new();
+        let agent = Agent::builder()
+            .model(InterruptedStreamAdapter {
+                controller: controller.clone(),
+                scenario: InterruptedStreamScenario::PreserveContent,
+            })
+            .cancellation(controller.handle())
+            .build()
+            .unwrap();
+        let mut driver = agent
+            .start(SessionConfig::new("preserve-interrupted-stream"))
+            .await
+            .unwrap();
+        driver
+            .submit_input(vec![Item::text(ItemKind::User, "start")])
+            .unwrap();
+
+        let LoopStep::Finished(result) = run_until_finished(&mut driver).await else {
+            panic!("turn did not finish");
+        };
+        assert_eq!(result.finish_reason, FinishReason::Cancelled);
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(
+            result.items[0].metadata.get(INTERRUPTED_METADATA_KEY),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(result.items[0].parts.len(), 4);
+        assert!(matches!(
+            &result.items[0].parts[0],
+            Part::Text(text) if text.text == "partial answer"
+        ));
+        assert!(matches!(
+            &result.items[0].parts[1],
+            Part::Reasoning(reasoning)
+                if reasoning.summary.as_deref() == Some("partial thought")
+                    && reasoning.metadata.get("provider.detail") == Some(&Value::Bool(true))
+        ));
+        assert!(matches!(
+            &result.items[0].parts[2],
+            Part::Structured(structured) if structured.value == json!({ "complete": false })
+        ));
+        assert!(matches!(
+            &result.items[0].parts[3],
+            Part::ToolCall(call) if call.id == ToolCallId::new("partial-call")
+        ));
+        assert!(
+            !result.items[0]
+                .parts
+                .iter()
+                .any(|part| matches!(part, Part::Media(_)))
+        );
+        assert!(!result.items[0].parts.iter().any(|part| {
+            matches!(part, Part::Text(text) if text.text.contains("response was interrupted"))
+        }));
+
+        let transcript = driver.snapshot().transcript;
+        let preserved = transcript
+            .iter()
+            .find(|item| {
+                item.kind == ItemKind::Assistant
+                    && item.metadata.get(INTERRUPTED_METADATA_KEY) == Some(&Value::Bool(true))
+            })
+            .expect("preserved assistant item in transcript");
+        assert_eq!(preserved.parts, result.items[0].parts);
+        assert!(transcript.iter().any(|item| {
+            item.parts.iter().any(|part| {
+                matches!(
+                    part,
+                    Part::ToolResult(tool_result)
+                        if tool_result.call_id == ToolCallId::new("partial-call")
+                            && tool_result.is_error
+                )
+            })
+        }));
+        validate_transcript_invariants(&transcript).unwrap();
+    }
+
+    #[test]
+    fn committed_part_matches_the_correct_interleaved_open_part() {
+        let mut content = StreamedAssistantContent::default();
+        for delta in [
+            Delta::BeginPart {
+                part_id: PartId::new("first"),
+                kind: PartKind::Text,
+            },
+            Delta::AppendText {
+                part_id: PartId::new("first"),
+                chunk: "one".into(),
+            },
+            Delta::BeginPart {
+                part_id: PartId::new("second"),
+                kind: PartKind::Text,
+            },
+            Delta::AppendText {
+                part_id: PartId::new("second"),
+                chunk: "two".into(),
+            },
+            Delta::CommitPart {
+                part: Part::text("two"),
+            },
+        ] {
+            content.apply_delta(&delta);
+        }
+
+        let items = content.interrupted_items();
+        assert!(matches!(
+            items[0].parts.as_slice(),
+            [Part::Text(first), Part::Text(second)]
+                if first.text == "one" && second.text == "two"
+        ));
+    }
+
+    #[test]
+    fn ambiguous_committed_part_does_not_duplicate_identical_open_parts() {
+        let mut content = StreamedAssistantContent::default();
+        for part_id in [PartId::new("first"), PartId::new("second")] {
+            content.apply_delta(&Delta::BeginPart {
+                part_id: part_id.clone(),
+                kind: PartKind::Text,
+            });
+            content.apply_delta(&Delta::AppendText {
+                part_id,
+                chunk: "same".into(),
+            });
+        }
+        content.apply_delta(&Delta::CommitPart {
+            part: Part::text("same"),
+        });
+
+        let items = content.interrupted_items();
+        assert_eq!(items[0].parts.len(), 2);
+        assert!(
+            items[0]
+                .parts
+                .iter()
+                .all(|part| matches!(part, Part::Text(text) if text.text == "same"))
+        );
+    }
+
+    #[test]
+    fn deltas_without_begin_part_are_not_guessed() {
+        let mut content = StreamedAssistantContent::default();
+        content.apply_delta(&Delta::AppendText {
+            part_id: PartId::new("missing"),
+            chunk: "orphan".into(),
+        });
+
+        let items = content.interrupted_items();
+        assert!(matches!(
+            items[0].parts.as_slice(),
+            [Part::Text(text)] if text.text.contains("response was interrupted")
+        ));
+    }
+
+    #[test]
+    fn streamed_content_byte_budget_covers_every_retained_payload() {
+        fn open_content(kind: PartKind) -> StreamedAssistantContent {
+            let mut content = StreamedAssistantContent::default();
+            content.apply_delta(&Delta::BeginPart {
+                part_id: PartId::new("part"),
+                kind,
+            });
+            content
+        }
+
+        let mut content = open_content(PartKind::Text);
+        content.apply_delta(&Delta::AppendText {
+            part_id: PartId::new("part"),
+            chunk: "x".repeat(MAX_STREAMED_ASSISTANT_CONTENT_BYTES),
+        });
+        assert!(content.overflowed);
+
+        let mut content = open_content(PartKind::Reasoning);
+        content.apply_delta(&Delta::AppendBytes {
+            part_id: PartId::new("part"),
+            chunk: vec![0; MAX_STREAMED_ASSISTANT_CONTENT_BYTES],
+        });
+        assert!(content.overflowed);
+
+        let mut content = open_content(PartKind::Structured);
+        content.apply_delta(&Delta::ReplaceStructured {
+            part_id: PartId::new("part"),
+            value: Value::String("x".repeat(MAX_STREAMED_ASSISTANT_CONTENT_BYTES)),
+        });
+        assert!(content.overflowed);
+
+        let mut metadata = MetadataMap::new();
+        metadata.insert(
+            "large".into(),
+            Value::String("x".repeat(MAX_STREAMED_ASSISTANT_CONTENT_BYTES)),
+        );
+        let mut content = open_content(PartKind::Text);
+        content.apply_delta(&Delta::SetMetadata {
+            part_id: PartId::new("part"),
+            metadata,
+        });
+        assert!(content.overflowed);
+
+        let mut content = StreamedAssistantContent::default();
+        content.apply_delta(&Delta::CommitPart {
+            part: Part::text("x".repeat(MAX_STREAMED_ASSISTANT_CONTENT_BYTES)),
+        });
+        assert!(content.overflowed);
+
+        let mut content = StreamedAssistantContent::default();
+        content.commit_tool_call(&ToolCallPart::new(
+            "call",
+            "tool",
+            Value::String("x".repeat(MAX_STREAMED_ASSISTANT_CONTENT_BYTES)),
+        ));
+        assert!(content.overflowed);
+    }
+
+    #[test]
+    fn streamed_content_part_budget_releases_all_parts() {
+        let mut content = StreamedAssistantContent::default();
+        for index in 0..MAX_STREAMED_ASSISTANT_CONTENT_PARTS {
+            content.apply_delta(&Delta::BeginPart {
+                part_id: PartId::new(format!("part-{index}")),
+                kind: PartKind::Text,
+            });
+        }
+        assert_eq!(content.parts.len(), MAX_STREAMED_ASSISTANT_CONTENT_PARTS);
+
+        content.apply_delta(&Delta::BeginPart {
+            part_id: PartId::new("overflow"),
+            kind: PartKind::Text,
+        });
+
+        assert!(content.overflowed);
+        assert!(content.parts.is_empty());
+        assert_eq!(content.retained_bytes, 0);
+    }
+
+    #[test]
+    fn streamed_content_overflow_uses_generic_interruption_fallback() {
+        let mut content = StreamedAssistantContent::default();
+        content.apply_delta(&Delta::BeginPart {
+            part_id: PartId::new("text"),
+            kind: PartKind::Text,
+        });
+        content.apply_delta(&Delta::AppendText {
+            part_id: PartId::new("text"),
+            chunk: "release me".into(),
+        });
+        content.apply_delta(&Delta::AppendText {
+            part_id: PartId::new("text"),
+            chunk: "x".repeat(MAX_STREAMED_ASSISTANT_CONTENT_BYTES),
+        });
+        content.apply_delta(&Delta::BeginPart {
+            part_id: PartId::new("ignored after overflow"),
+            kind: PartKind::Text,
+        });
+
+        assert!(content.parts.is_empty());
+        assert_eq!(content.retained_bytes, 0);
+        let items = content.interrupted_items();
+        assert!(matches!(
+            items[0].parts.as_slice(),
+            [Part::Text(text)]
+                if text.text.contains("response was interrupted")
+                    && !text.text.contains("release me")
+        ));
+    }
+
+    #[tokio::test]
+    async fn supersession_is_processed_before_concurrent_cancellation() {
+        let controller = CancellationController::new();
+        let events = StdArc::new(StdMutex::new(Vec::new()));
+        let agent = Agent::builder()
+            .model(InterruptedStreamAdapter {
+                controller: controller.clone(),
+                scenario: InterruptedStreamScenario::CancelOnSupersession,
+            })
+            .cancellation(controller.handle())
+            .observer(RecordingObserver {
+                events: events.clone(),
+            })
+            .build()
+            .unwrap();
+        let mut driver = agent
+            .start(SessionConfig::new("supersede-then-cancel").with_response_attempt_supersession())
+            .await
+            .unwrap();
+        driver
+            .submit_input(vec![Item::text(ItemKind::User, "start")])
+            .unwrap();
+
+        let LoopStep::Finished(result) = run_until_finished(&mut driver).await else {
+            panic!("turn did not finish");
+        };
+        assert_eq!(result.finish_reason, FinishReason::Cancelled);
+        assert_eq!(result.items.len(), 1);
+        assert!(matches!(
+            result.items[0].parts.as_slice(),
+            [Part::Text(text)]
+                if text.text.contains("response was interrupted")
+                    && !text.text.contains("discard me")
+        ));
+        assert!(!driver.snapshot().transcript.iter().any(|item| {
+            item.parts
+                .iter()
+                .any(|part| matches!(part, Part::Text(text) if text.text.contains("discard me")))
+        }));
+
+        let events = events.lock().unwrap();
+        let superseded = events
+            .iter()
+            .position(|event| matches!(event, AgentEvent::ResponseAttemptSuperseded))
+            .expect("supersession event");
+        let finished = events
+            .iter()
+            .position(|event| matches!(event, AgentEvent::TurnFinished(_)))
+            .expect("turn-finished event");
+        assert!(superseded < finished);
+    }
+
+    #[tokio::test]
+    async fn supersession_resets_streamed_content_budget() {
+        let controller = CancellationController::new();
+        let agent = Agent::builder()
+            .model(InterruptedStreamAdapter {
+                controller: controller.clone(),
+                scenario: InterruptedStreamScenario::OverflowThenSupersession,
+            })
+            .cancellation(controller.handle())
+            .build()
+            .unwrap();
+        let mut driver = agent
+            .start(
+                SessionConfig::new("overflow-then-supersede").with_response_attempt_supersession(),
+            )
+            .await
+            .unwrap();
+        driver
+            .submit_input(vec![Item::text(ItemKind::User, "start")])
+            .unwrap();
+
+        let LoopStep::Finished(result) = run_until_finished(&mut driver).await else {
+            panic!("turn did not finish");
+        };
+        assert_eq!(result.finish_reason, FinishReason::Cancelled);
+        assert!(matches!(
+            result.items[0].parts.as_slice(),
+            [Part::Text(text)] if text.text == "preserve me"
+        ));
     }
 
     fn turn_lifecycle_events(
@@ -8591,6 +9650,242 @@ mod tests {
         assert_eq!(seen.len(), 2);
         assert_eq!(seen[0], Some(default_cache));
         assert_eq!(seen[1], Some(override_cache));
+    }
+
+    // Count actual model requests, including continuations that emit no deltas.
+    struct RetirementCountingAdapter(StdArc<AtomicUsize>);
+    struct RetirementCountingSession(StdArc<AtomicUsize>);
+
+    #[async_trait]
+    impl ModelAdapter for RetirementCountingAdapter {
+        type Session = RetirementCountingSession;
+
+        async fn start_session(&self, _config: SessionConfig) -> Result<Self::Session, LoopError> {
+            Ok(RetirementCountingSession(self.0.clone()))
+        }
+    }
+
+    #[async_trait]
+    impl ModelSession for RetirementCountingSession {
+        type Turn = FakeTurn;
+
+        async fn begin_turn(
+            &mut self,
+            request: TurnRequest,
+            cancellation: Option<TurnCancellation>,
+        ) -> Result<Self::Turn, LoopError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            FakeSession.begin_turn(request, cancellation).await
+        }
+    }
+
+    #[tokio::test]
+    async fn retire_interrupted_turn_after_tool_result_starts_fresh_without_continuing() {
+        let calls = StdArc::new(AtomicUsize::new(0));
+        let events = StdArc::new(StdMutex::new(Vec::new()));
+        let agent = Agent::builder()
+            .model(RetirementCountingAdapter(calls.clone()))
+            .add_tool_source(ToolRegistry::new().with(EchoTool::default()))
+            .permissions(AllowAllPermissions)
+            .observer(RecordingObserver {
+                events: events.clone(),
+            })
+            .build()
+            .unwrap();
+        let mut driver = agent
+            .start(SessionConfig::new("retire-after-tool"))
+            .await
+            .unwrap();
+        assert!(driver.retire_interrupted_turn().await.unwrap().is_none());
+        driver
+            .submit_input(vec![Item::text(ItemKind::User, "ping")])
+            .unwrap();
+        let turn_id = match driver.next().await.unwrap() {
+            LoopStep::Interrupt(LoopInterrupt::AfterToolResult(info)) => info.turn_id,
+            other => panic!("expected AfterToolResult, got {other:?}"),
+        };
+        let transcript = driver.snapshot().transcript;
+        let queued = vec![Item::text(ItemKind::User, "fresh request")];
+        driver.submit_input(queued.clone()).unwrap();
+        let retired = driver.retire_interrupted_turn().await.unwrap().unwrap();
+        assert_eq!(retired.turn_id, turn_id);
+        assert_eq!(retired.finish_reason, FinishReason::Cancelled);
+        assert!(retired.items.is_empty());
+        assert!(driver.retire_interrupted_turn().await.unwrap().is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(driver.snapshot().transcript, transcript);
+        assert_eq!(driver.snapshot().pending_input, queued);
+        assert!(driver.pending_round_resume.is_none());
+        assert!(driver.lifecycle.active_turn.is_none());
+        let fresh = match driver.next().await.unwrap() {
+            LoopStep::Finished(turn) => turn,
+            other => panic!("expected fresh turn to finish, got {other:?}"),
+        };
+        assert_ne!(fresh.turn_id, turn_id);
+        assert_eq!(fresh.finish_reason, FinishReason::Completed);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(driver.snapshot().pending_input.is_empty());
+        assert!(
+            driver
+                .snapshot()
+                .transcript
+                .iter()
+                .any(|item| { item.kind == ItemKind::User && item.parts == queued[0].parts })
+        );
+        assert!(matches!(
+            driver.next().await.unwrap(),
+            LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_))
+        ));
+        assert!(driver.retire_interrupted_turn().await.unwrap().is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let lifecycle = turn_lifecycle_events(&events.lock().unwrap());
+        assert_eq!(
+            lifecycle,
+            vec![
+                (turn_id.clone(), None),
+                (turn_id, Some(FinishReason::Cancelled)),
+                (fresh.turn_id.clone(), None),
+                (fresh.turn_id, Some(FinishReason::Completed)),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn retire_interrupted_turn_denies_pending_approval_even_on_cleanup_error() {
+        for fail_cleanup in [false, true] {
+            let calls = StdArc::new(AtomicUsize::new(0));
+            let events = StdArc::new(StdMutex::new(Vec::new()));
+            let manager = TestTaskManager::new(SimpleTaskManager::new());
+            let manager = if fail_cleanup {
+                manager.fail_interrupt("retirement cleanup failed")
+            } else {
+                manager
+            };
+            let agent = Agent::builder()
+                .model(RetirementCountingAdapter(calls.clone()))
+                .add_tool_source(ToolRegistry::new().with(EchoTool::default()))
+                .permissions(ApproveFsReads)
+                .task_manager(manager)
+                .observer(RecordingObserver {
+                    events: events.clone(),
+                })
+                .build()
+                .unwrap();
+            let mut driver = agent
+                .start(SessionConfig::new("retire-approval"))
+                .await
+                .unwrap();
+            driver
+                .submit_input(vec![Item::text(ItemKind::User, "ping")])
+                .unwrap();
+            assert!(matches!(
+                driver.next().await.unwrap(),
+                LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(_))
+            ));
+            let turn_id = driver.lifecycle.active_turn.clone().unwrap();
+            let result = driver.retire_interrupted_turn().await;
+            if fail_cleanup {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("retirement cleanup failed")
+                );
+            } else {
+                assert_eq!(
+                    result.unwrap().unwrap().finish_reason,
+                    FinishReason::Cancelled
+                );
+            }
+            assert!(driver.pending_approvals.is_empty());
+            assert!(driver.pending_approval_order.is_empty());
+            assert!(driver.active_tool_round.is_none());
+            assert!(driver.lifecycle.active_turn.is_none());
+            assert!(driver.retire_interrupted_turn().await.unwrap().is_none());
+            assert!(matches!(
+                driver.next().await.unwrap(),
+                LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_))
+            ));
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            validate_transcript_invariants(&driver.snapshot().transcript).unwrap();
+            let events = events.lock().unwrap();
+            assert_eq!(
+                turn_lifecycle_events(&events),
+                vec![
+                    (turn_id.clone(), None),
+                    (turn_id, Some(FinishReason::Cancelled))
+                ]
+            );
+            assert_eq!(events.iter().filter(|event| matches!(event,
+                AgentEvent::ToolResultReceived(result) if result.call_id == ToolCallId::new("call-1") && result.is_error
+            )).count(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn retire_interrupted_turn_preserves_detached_background_task() {
+        let calls = StdArc::new(AtomicUsize::new(0));
+        let entered = StdArc::new(AtomicBool::new(false));
+        let release = StdArc::new(Notify::new());
+        let task_manager = AsyncTaskManager::new().routing(NameRoutingPolicy::new([(
+            "detaching-wait",
+            RoutingDecision::ForegroundThenDetachAfter(Duration::from_millis(10)),
+        )]));
+        let handle = task_manager.handle();
+        let agent = Agent::builder()
+            .model(RetirementCountingAdapter(calls.clone()))
+            .add_tool_source(ToolRegistry::new().with(BlockingTool::new(
+                "detaching-wait",
+                entered.clone(),
+                release.clone(),
+                "background-done",
+            )))
+            .permissions(AllowAllPermissions)
+            .task_manager(task_manager)
+            .build()
+            .unwrap();
+        let mut driver = agent
+            .start(SessionConfig::new("retire-background"))
+            .await
+            .unwrap();
+        driver
+            .submit_input(vec![Item::text(ItemKind::User, "ping")])
+            .unwrap();
+        assert!(matches!(
+            driver.next().await.unwrap(),
+            LoopStep::Interrupt(LoopInterrupt::AfterToolResult(_))
+        ));
+        assert!(matches!(
+            wait_for_task_event(&handle).await,
+            TaskEvent::Started(_)
+        ));
+        assert!(matches!(
+            wait_for_task_event(&handle).await,
+            TaskEvent::Detached(_)
+        ));
+        wait_until_entered(entered.as_ref()).await;
+        let transcript = driver.snapshot().transcript;
+        assert_eq!(
+            driver
+                .retire_interrupted_turn()
+                .await
+                .unwrap()
+                .unwrap()
+                .finish_reason,
+            FinishReason::Cancelled
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(driver.snapshot().transcript, transcript);
+        let running = handle.list_running().await;
+        assert_eq!(running.len(), 1);
+        assert_eq!(running[0].tool_name, "detaching-wait");
+        release.notify_one();
+        match wait_for_task_event(&handle).await {
+            TaskEvent::Completed(_, result) => {
+                assert_eq!(result.output, ToolOutput::Text("background-done".into()))
+            }
+            other => panic!("retired turn must preserve background completion, got {other:?}"),
+        }
     }
 
     #[tokio::test]

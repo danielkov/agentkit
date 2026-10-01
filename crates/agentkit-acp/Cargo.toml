@@ -4,7 +4,7 @@ homepage.workspace = true
 name = "agentkit-acp"
 readme = "README.md"
 repository.workspace = true
-version = "0.10.11"
+version = "0.10.12"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -14,11 +14,15 @@ default = ["stdio"]
 stdio = []
 unstable-acp = ["agent-client-protocol/unstable"]
 protocol-v2 = ["agent-client-protocol/unstable_protocol_v2"]
+unstable-inject = [
+    "protocol-v2",
+    "agent-client-protocol/unstable_session_inject",
+]
 
 [dependencies]
-agent-client-protocol = "=2.0.0"
+agent-client-protocol = { package = "agentkit-acp-sdk", version = "=2.2.0" }
 agentkit-core = { version = "0.10.5", path = "../agentkit-core" }
-agentkit-loop = { version = "0.10.10", path = "../agentkit-loop" }
+agentkit-loop = { version = "0.10.13", path = "../agentkit-loop" }
 agentkit-tools-core = { version = "0.10.5", path = "../agentkit-tools-core" }
 async-trait.workspace = true
 base64.workspace = true
@@ -28,6 +32,7 @@ tokio = { workspace = true, features = ["sync", "time"] }
 tracing.workspace = true
 
 [dev-dependencies]
+futures-util.workspace = true
 agentkit-integration-tests = { path = "../agentkit-integration-tests" }
 agentkit-task-manager = { path = "../agentkit-task-manager" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
