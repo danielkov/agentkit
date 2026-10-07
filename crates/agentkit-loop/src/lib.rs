@@ -792,9 +792,9 @@ pub struct ObservedEvent {
 /// replication, or audit.
 ///
 /// Observers are called *synchronously* from inside the driver, in the
-/// same order items land in the transcript. Compaction-driven transcript
-/// rewrites do **not** fire `on_transcript_event` — those are signaled by
-/// [`AgentEvent::CompactionFinished`] instead.
+/// same order items land in the transcript. Replacements are delivered through
+/// [`TranscriptObserver::on_transcript_rewrite`], not as fictitious appends.
+/// Persistence consumers that enable transcript editing must handle both methods.
 ///
 /// Register via [`AgentBuilder::transcript_observer`]; multiple observers
 /// may be registered and are called in registration order.
@@ -820,6 +820,10 @@ pub trait TranscriptObserver: Send + Sync {
     /// state behind interior mutability so the driver can share an
     /// `Arc<dyn TranscriptObserver>`.
     fn on_transcript_event(&self, event: TranscriptEvent<'_>);
+
+    /// Replace the persisted transcript with this complete committed snapshot.
+    /// The default preserves compatibility for append-only observers.
+    fn on_transcript_rewrite(&self, _event: TranscriptRewriteEvent<'_>) {}
 }
 
 /// Session-addressed transcript append event delivered to
@@ -832,6 +836,13 @@ pub struct TranscriptEvent<'a> {
     pub item: &'a Item,
 }
 
+/// A complete committed replacement, including staged turn-start input.
+#[derive(Clone, Debug)]
+pub struct TranscriptRewriteEvent<'a> {
+    pub session_id: &'a SessionId,
+    pub items: &'a [Item],
+}
+
 /// Where in the loop a [`LoopMutator`] is given a chance to modify the
 /// transcript. Mutators run synchronously at these points; mid-stream
 /// mutation (e.g. between content deltas) is intentionally not supported
@@ -842,8 +853,9 @@ pub enum MutationPoint {
     /// A tool result has just been appended; the next loop step will be
     /// another inference call.
     AfterToolResult,
-    /// A turn has fully ended (assistant final, interrupt, or cancellation)
-    /// and any new user input has not yet been dispatched.
+    /// Legacy name for the pre-inference transcript mutation pass on a new
+    /// logical turn, after input append. This is not a terminal callback;
+    /// use [`LoopMutator::on_turn_end`] for actual logical retirement.
     AfterTurnEnded,
 }
 
@@ -895,15 +907,233 @@ impl<'a> std::ops::DerefMut for TranscriptCursor<'a> {
     }
 }
 
+/// Read-only identity and cancellation context for awaited lifecycle callbacks.
+///
+/// A logical turn can contain several model calls and approval/tool continuations.
+/// `model_call_index` is session-local and counts calls, not provider retry attempts.
+/// Terminal callbacks run even when the cancellation token is cancelled.
+#[non_exhaustive]
+pub struct LifecycleCtx<'a> {
+    pub session_id: &'a SessionId,
+    pub turn_id: Option<&'a agentkit_core::TurnId>,
+    pub model_call_index: Option<u64>,
+    pub cancellation: Option<TurnCancellation>,
+    /// Selection snapshot; per-call routing inside `begin_turn` can change it.
+    pub provider_name: Option<&'a str>,
+    pub model_name: Option<&'a str>,
+    /// Original failure at a terminal boundary, never replaced by hook errors.
+    pub error: Option<&'a LoopError>,
+}
+
+/// Read-only state at explicit session closure. No detached work is awaited.
+pub struct SessionEndPayload<'a> {
+    pub transcript: &'a [Item],
+}
+
+/// Loop-owned logical progress. This is not arbitrary progress reported by tools.
+pub enum TurnProgress<'a> {
+    Model(&'a ModelTurnEvent),
+    ToolDetached(&'a ToolResultPart),
+}
+
+/// Editable session options; the session identity is available only in the context.
+pub struct SessionStartPayload<'a> {
+    pub metadata: &'a mut MetadataMap,
+    pub cache: &'a mut Option<PromptCacheRequest>,
+    pub consumer_capabilities: &'a mut SessionConsumerCapabilities,
+}
+
+/// Inference-local request options. Transcript edits affect only this model call;
+/// persistent history edits use [`LoopMutator::mutate`] or `on_turn_start`.
+/// Catalog changes do not install executable tools. Session/turn identity is read-only.
+/// Prompt edits are validated before the request is consumed.
+pub struct ModelRequestPayload<'a> {
+    pub transcript: &'a mut Vec<Item>,
+    pub available_tools: &'a mut Vec<ToolSpec>,
+    pub cache: &'a mut Option<PromptCacheRequest>,
+    pub metadata: &'a mut MetadataMap,
+}
+
+/// Editable content of one output item. Identity, role, accounting and timestamp
+/// remain read-only in `original`, the snapshot at entry to this callback.
+/// `parts` and `metadata` expose the current candidate, including earlier hooks.
+/// Tool linkage in `parts` is checked before commit.
+pub struct OutputItemPayload<'a> {
+    pub original: &'a Item,
+    pub parts: &'a mut Vec<Part>,
+    pub metadata: &'a mut MetadataMap,
+}
+
+/// Complete, uncommitted model output. Item identities, roles, accounting, timestamps,
+/// and tool-call/result identities must remain unchanged; content can be rewritten.
+/// The driver checks these constraints before committing any output.
+/// Already emitted streaming deltas cannot be retracted by this callback.
+pub struct ModelResponsePayload<'a> {
+    pub output: Vec<OutputItemPayload<'a>>,
+    pub finish_reason: &'a FinishReason,
+    pub usage: Option<&'a Usage>,
+    pub metadata: &'a MetadataMap,
+    pub model: Option<&'a str>,
+    pub response_id: Option<&'a str>,
+}
+
+/// Logical finalization candidate. `result` is the immutable snapshot at entry
+/// to this callback, including earlier hooks' edits.
+/// `output` is editable only for uncommitted successful final assistant output.
+/// Cancellation, failure, and already committed tool-bearing output are read-only.
+/// Output edits obey the same constraints as [`ModelResponsePayload`].
+pub struct TurnFinishPayload<'a> {
+    pub result: &'a TurnResult,
+    pub output: Option<Vec<OutputItemPayload<'a>>>,
+}
+
+/// A transcript-resolved top-level tool batch, not a nested execution batch.
+/// Results include cancellation/denial and background-detachment placeholders;
+/// a placeholder does not imply that background execution has completed.
+pub struct ToolBatchPayload<'a> {
+    /// Model-issued calls. Approved argument rewrites belong to executor facts.
+    pub calls: &'a [ToolCallPart],
+    pub results: &'a [ToolResultPart],
+}
+
 /// Async transcript mutator. Registered via [`AgentBuilder::mutator`] and
 /// invoked at each [`MutationPoint`]. Mutators own their derived state
 /// (e.g. running token totals via interior mutability) and decide for
 /// themselves whether and how to modify the transcript.
 ///
-/// The default implementation is a no-op so trait users override only
-/// `mutate`.
+/// Every method defaults to a no-op. Lifecycle callbacks are awaited in
+/// registration order at their typed boundaries; `mutate` remains the generic
+/// transcript editing seam. Staged edits are committed only after validation.
+/// Tool/executor, compaction, routing and application configuration remain
+/// separate extension seams; this trait does not intercept nested tools.
 #[async_trait]
 pub trait LoopMutator: Send + Sync {
+    /// Runs before session options are consumed by the model adapter.
+    async fn on_session_start(
+        &self,
+        _payload: SessionStartPayload<'_>,
+        _ctx: LifecycleCtx<'_>,
+    ) -> Result<(), LoopError> {
+        Ok(())
+    }
+
+    /// Runs once on explicit [`LoopDriver::close`], not on turn completion or Drop.
+    async fn on_session_end(
+        &self,
+        _payload: SessionEndPayload<'_>,
+        _ctx: LifecycleCtx<'_>,
+    ) -> Result<(), LoopError> {
+        Ok(())
+    }
+
+    /// Runs before input dispatch. Sync submission queues admission until `next`;
+    /// [`LoopDriver::submit_input_async`] awaits this callback before acceptance.
+    async fn on_input(
+        &self,
+        _input: &mut Vec<Item>,
+        _ctx: LifecycleCtx<'_>,
+    ) -> Result<(), LoopError> {
+        Ok(())
+    }
+
+    /// Runs once before work in a newly active logical turn. The cursor is a
+    /// staged transcript including admitted input. Edits are validated before
+    /// commit; failure leaves the live transcript unchanged and retires the turn.
+    async fn on_turn_start(
+        &self,
+        _transcript: &mut TranscriptCursor<'_>,
+        _ctx: LifecycleCtx<'_>,
+    ) -> Result<(), LoopError> {
+        Ok(())
+    }
+
+    /// Runs before logical finalization, including cancellation/error (read-only).
+    async fn on_turn_finish(
+        &self,
+        _payload: TurnFinishPayload<'_>,
+        _ctx: LifecycleCtx<'_>,
+    ) -> Result<(), LoopError> {
+        Ok(())
+    }
+
+    /// Runs once after logical retirement. Every registered callback is attempted.
+    /// On ordinary retirement, errors are logged without replacing the committed
+    /// result. Explicit `close` aggregates notification errors in its close result.
+    async fn on_turn_end(
+        &self,
+        _result: &TurnResult,
+        _ctx: LifecycleCtx<'_>,
+    ) -> Result<(), LoopError> {
+        Ok(())
+    }
+
+    /// Runs immediately before the inference request is consumed by the session.
+    async fn on_model_request(
+        &self,
+        _payload: ModelRequestPayload<'_>,
+        _ctx: LifecycleCtx<'_>,
+    ) -> Result<(), LoopError> {
+        Ok(())
+    }
+
+    /// Runs on complete output, before transcript commit and tool dispatch.
+    async fn on_model_response(
+        &self,
+        _payload: ModelResponsePayload<'_>,
+        _ctx: LifecycleCtx<'_>,
+    ) -> Result<(), LoopError> {
+        Ok(())
+    }
+
+    /// Read-only model failure notification, including cancellation. Hook errors
+    /// never replace the model error. This does not report tool or hook failures.
+    async fn on_model_error(
+        &self,
+        _error: &LoopError,
+        _ctx: LifecycleCtx<'_>,
+    ) -> Result<(), LoopError> {
+        Ok(())
+    }
+
+    /// Read-only logical progress before forwarding model events or committing
+    /// a background-detachment placeholder. Individual tool progress is external.
+    async fn on_turn_progress(
+        &self,
+        _progress: TurnProgress<'_>,
+        _ctx: LifecycleCtx<'_>,
+    ) -> Result<(), LoopError> {
+        Ok(())
+    }
+
+    /// Read-only notification of loop-owned background-detachment progress.
+    async fn on_tool_progress(
+        &self,
+        _progress: &ToolResultPart,
+        _ctx: LifecycleCtx<'_>,
+    ) -> Result<(), LoopError> {
+        Ok(())
+    }
+
+    /// Read-only stream/progress notification, before observer forwarding.
+    /// Includes usage, tool requests, Finished, and response-attempt supersession.
+    async fn on_model_progress(
+        &self,
+        _event: &ModelTurnEvent,
+        _ctx: LifecycleCtx<'_>,
+    ) -> Result<(), LoopError> {
+        Ok(())
+    }
+
+    /// Runs once when every top-level call in a model batch has a transcript result.
+    /// Individual and nested tool interception belongs at [`ToolExecutor`].
+    async fn on_tool_batch(
+        &self,
+        _payload: ToolBatchPayload<'_>,
+        _ctx: LifecycleCtx<'_>,
+    ) -> Result<(), LoopError> {
+        Ok(())
+    }
+
     /// Run this mutator. Returning without writing to `cursor` is a no-op.
     /// Errors abort the loop; protocol-violating mutations (orphaned tool
     /// uses or results) are detected by validation and turned into
@@ -1313,9 +1543,47 @@ struct ActiveToolRound {
     foreground_progressed: bool,
 }
 
+struct PendingToolBatch {
+    turn_id: agentkit_core::TurnId,
+    calls: Vec<ToolCallPart>,
+    results: BTreeMap<ToolCallId, ToolResultPart>,
+    next_mutator: usize,
+    error: Option<LoopError>,
+}
+
+struct TerminalState {
+    result: TurnResult,
+    original_items: Vec<Item>,
+    editable: bool,
+    output_committed: bool,
+    finish_index: usize,
+    finish_done: bool,
+    terminal_emitted: bool,
+    end_index: usize,
+    failure: Option<LoopError>,
+    finish_error: Option<LoopError>,
+    end_error: Option<LoopError>,
+}
+
+struct ClosingState {
+    cleanup_turns: Vec<agentkit_core::TurnId>,
+    cleanup_index: usize,
+    cleanup_done: bool,
+    session_index: usize,
+    error: Option<LoopError>,
+}
+
 #[derive(Default)]
 struct DriverLifecycle {
     active_turn: Option<agentkit_core::TurnId>,
+    closed: bool,
+    closing: Option<ClosingState>,
+    terminal: Option<TerminalState>,
+    model_call_index: u64,
+    pending_cancel: Option<agentkit_core::TurnId>,
+    finish_attempted: bool,
+    cancellation: Option<TurnCancellation>,
+    started_with_input: bool,
 }
 
 /// A configured agent ready to start a session.
@@ -1402,8 +1670,50 @@ where
     /// # Errors
     ///
     /// Returns [`LoopError`] if the model adapter fails to create a session.
-    pub async fn start(&self, config: SessionConfig) -> Result<LoopDriver<M::Session>, LoopError> {
+    pub async fn start(
+        &self,
+        mut config: SessionConfig,
+    ) -> Result<LoopDriver<M::Session>, LoopError> {
         let session_id = config.session_id.clone();
+        for mutator in &self.mutators {
+            mutator
+                .on_session_start(
+                    SessionStartPayload {
+                        metadata: &mut config.metadata,
+                        cache: &mut config.cache,
+                        consumer_capabilities: &mut config.consumer_capabilities,
+                    },
+                    LifecycleCtx {
+                        session_id: &session_id,
+                        turn_id: None,
+                        model_call_index: None,
+                        cancellation: None,
+                        provider_name: self.model.provider_name(),
+                        model_name: None,
+                        error: None,
+                    },
+                )
+                .await?;
+        }
+        let mut input = self.input.clone();
+        if !input.is_empty() {
+            for mutator in &self.mutators {
+                mutator
+                    .on_input(
+                        &mut input,
+                        LifecycleCtx {
+                            session_id: &session_id,
+                            turn_id: None,
+                            model_call_index: None,
+                            cancellation: None,
+                            provider_name: self.model.provider_name(),
+                            model_name: None,
+                            error: None,
+                        },
+                    )
+                    .await?;
+            }
+        }
         let default_cache = config.cache.clone();
         let mut session = self.model.start_session(config).await?;
         if !self.observers.is_empty() {
@@ -1439,7 +1749,9 @@ where
             observers: self.observers.clone(),
             transcript_observers: self.transcript_observers.clone(),
             transcript: self.transcript.clone(),
-            pending_input: self.input.clone(),
+            pending_input: input,
+            pending_admission: VecDeque::new(),
+            pending_tool_batches: Vec::new(),
             pending_approvals: BTreeMap::new(),
             pending_approval_order: VecDeque::new(),
             active_tool_round: None,
@@ -1453,6 +1765,12 @@ where
             tool_cancellations: HashMap::new(),
         };
         driver.emit(AgentEvent::RunStarted { session_id });
+        if !self.mutators.is_empty() && !driver.pending_input.is_empty() {
+            driver.emit(AgentEvent::InputAccepted {
+                session_id: driver.session_id.clone(),
+                items: driver.pending_input.clone(),
+            });
+        }
         Ok(driver)
     }
 }
@@ -1715,6 +2033,8 @@ where
     transcript_observers: Vec<Arc<dyn TranscriptObserver>>,
     transcript: Vec<Item>,
     pending_input: Vec<Item>,
+    pending_admission: VecDeque<Vec<Item>>,
+    pending_tool_batches: Vec<PendingToolBatch>,
     pending_approvals: BTreeMap<ToolCallId, PendingApprovalToolCall>,
     pending_approval_order: VecDeque<ToolCallId>,
     active_tool_round: Option<ActiveToolRound>,
@@ -1843,34 +2163,332 @@ where
         !self.pending_approvals.is_empty()
     }
 
-    fn start_logical_turn(&mut self) -> agentkit_core::TurnId {
+    async fn start_logical_turn(&mut self) -> Result<agentkit_core::TurnId, LoopError> {
         if let Some(turn_id) = &self.lifecycle.active_turn {
-            return turn_id.clone();
+            return Ok(turn_id.clone());
         }
         let turn_id = agentkit_core::TurnId::new(format!("turn-{}", self.next_turn_index));
         self.next_turn_index += 1;
-        self.start_logical_turn_with(turn_id)
+        self.start_logical_turn_with(turn_id).await
     }
 
-    fn start_logical_turn_with(&mut self, turn_id: agentkit_core::TurnId) -> agentkit_core::TurnId {
-        if let Some(active_turn) = &self.lifecycle.active_turn {
-            return active_turn.clone();
+    async fn start_logical_turn_with(
+        &mut self,
+        turn_id: agentkit_core::TurnId,
+    ) -> Result<agentkit_core::TurnId, LoopError> {
+        if self.lifecycle.active_turn.as_ref() == Some(&turn_id) {
+            return Ok(turn_id);
         }
         self.lifecycle.active_turn = Some(turn_id.clone());
         self.emit(AgentEvent::TurnStarted {
             session_id: self.session_id.clone(),
             turn_id: turn_id.clone(),
         });
-        turn_id
+        self.lifecycle.finish_attempted = false;
+        self.lifecycle.cancellation = self
+            .cancellation
+            .as_ref()
+            .map(CancellationHandle::checkpoint);
+        if !self.mutators.is_empty() {
+            let mut candidate = self.transcript.clone();
+            self.lifecycle.started_with_input = !self.pending_input.is_empty();
+            candidate.extend(std::mem::take(&mut self.pending_input));
+            let original = candidate.clone();
+            let mut cursor = TranscriptCursor {
+                items: &mut candidate,
+                dirty: false,
+            };
+            for mutator in &self.mutators {
+                mutator
+                    .on_turn_start(&mut cursor, self.lifecycle_ctx(Some(&turn_id), None))
+                    .await?;
+            }
+            validate_prompt_edits(&original, &candidate)?;
+            self.commit_transcript(candidate);
+        }
+        Ok(turn_id)
     }
 
-    fn finish_logical_turn(&mut self, result: &TurnResult) {
+    async fn finish_logical_turn(
+        &mut self,
+        result: &TurnResult,
+        failure: Option<&LoopError>,
+    ) -> Result<(), LoopError> {
         if self.pending_round_resume.as_ref() == Some(&result.turn_id) {
             self.pending_round_resume = None;
         }
-        if self.lifecycle.active_turn.as_ref() == Some(&result.turn_id) {
+        if self.lifecycle.terminal.is_none() {
+            self.begin_terminal(result, false, failure, false);
+            self.lifecycle
+                .terminal
+                .as_mut()
+                .expect("terminal state")
+                .finish_done = true;
+        }
+        let state = self.lifecycle.terminal.as_mut().expect("terminal state");
+        state.result = result.clone();
+        state.output_committed = true;
+        if let Some(error) = failure {
+            state.failure = Some(error.clone());
+        }
+        if !state.terminal_emitted {
+            if self.lifecycle.active_turn.as_ref() == Some(&result.turn_id) {
+                self.emit(AgentEvent::TurnFinished(result.clone()));
+            }
             self.lifecycle.active_turn = None;
-            self.emit(AgentEvent::TurnFinished(result.clone()));
+            self.lifecycle.started_with_input = false;
+            self.lifecycle
+                .terminal
+                .as_mut()
+                .expect("terminal state")
+                .terminal_emitted = true;
+        }
+        loop {
+            let state = self.lifecycle.terminal.as_ref().expect("terminal state");
+            if state.end_index == self.mutators.len() {
+                break;
+            }
+            let outcome = self.mutators[state.end_index]
+                .on_turn_end(
+                    &state.result,
+                    LifecycleCtx {
+                        error: state.failure.as_ref(),
+                        ..self.lifecycle_ctx(Some(&state.result.turn_id), None)
+                    },
+                )
+                .await;
+            let state = self.lifecycle.terminal.as_mut().expect("terminal state");
+            state.end_index += 1;
+            if let Err(error) = outcome {
+                state.end_error.get_or_insert(error);
+            }
+        }
+        let state = self.lifecycle.terminal.take().expect("terminal state");
+        if self.lifecycle.closing.is_some() {
+            return state.end_error.map_or(Ok(()), Err);
+        }
+        if let Some(error) = state.end_error {
+            tracing::debug!(%error, "turn end callback failed after retirement");
+        }
+        Ok(())
+    }
+
+    fn begin_terminal(
+        &mut self,
+        result: &TurnResult,
+        editable: bool,
+        failure: Option<&LoopError>,
+        append_output: bool,
+    ) {
+        self.lifecycle.terminal = Some(TerminalState {
+            result: result.clone(),
+            original_items: result.items.clone(),
+            editable,
+            output_committed: !append_output,
+            finish_index: 0,
+            finish_done: false,
+            terminal_emitted: false,
+            end_index: 0,
+            failure: failure.cloned(),
+            finish_error: None,
+            end_error: None,
+        });
+    }
+
+    fn mark_terminal_output_committed(&mut self, turn_id: &agentkit_core::TurnId) {
+        if let Some(state) = &mut self.lifecycle.terminal {
+            if &state.result.turn_id == turn_id {
+                state.output_committed = true;
+            }
+        }
+    }
+
+    fn lifecycle_ctx<'a>(
+        &'a self,
+        turn_id: Option<&'a agentkit_core::TurnId>,
+        model_call_index: Option<u64>,
+    ) -> LifecycleCtx<'a> {
+        LifecycleCtx {
+            session_id: &self.session_id,
+            turn_id,
+            model_call_index,
+            cancellation: if turn_id.is_some() {
+                self.lifecycle.cancellation.clone()
+            } else {
+                None
+            },
+            provider_name: self
+                .session
+                .as_ref()
+                .and_then(ModelSession::provider_name)
+                .or(self.provider_name.as_deref()),
+            model_name: self.session.as_ref().and_then(ModelSession::model_name),
+            error: None,
+        }
+    }
+
+    async fn run_turn_finish(
+        &mut self,
+        result: &mut TurnResult,
+        editable: bool,
+        failure: Option<&LoopError>,
+        append_output: bool,
+    ) -> Result<(), LoopError> {
+        self.lifecycle.finish_attempted = true;
+        if self.lifecycle.terminal.is_none() {
+            self.begin_terminal(result, editable, failure, append_output);
+        }
+        loop {
+            let state = self.lifecycle.terminal.as_ref().expect("terminal state");
+            if state.finish_done || state.finish_index == self.mutators.len() {
+                break;
+            }
+            let visible = state.result.clone();
+            let mut candidate = visible.clone();
+            let output = if state.editable {
+                Some(output_payload(&visible.items, &mut candidate.items))
+            } else {
+                None
+            };
+            let outcome = self.mutators[state.finish_index]
+                .on_turn_finish(
+                    TurnFinishPayload {
+                        result: &visible,
+                        output,
+                    },
+                    LifecycleCtx {
+                        error: state.failure.as_ref(),
+                        ..self.lifecycle_ctx(Some(&visible.turn_id), None)
+                    },
+                )
+                .await;
+            let state = self.lifecycle.terminal.as_mut().expect("terminal state");
+            state.result = candidate;
+            state.finish_index += 1;
+            if let Err(error) = outcome {
+                state.finish_error.get_or_insert(error);
+            }
+        }
+        let state = self.lifecycle.terminal.as_mut().expect("terminal state");
+        if !state.finish_done {
+            if let Err(error) = validate_output_edits(&state.original_items, &state.result.items) {
+                state.finish_error.get_or_insert(error);
+            }
+            state.finish_done = true;
+        }
+        *result = state.result.clone();
+        state.finish_error.clone().map_or(Ok(()), Err)
+    }
+
+    async fn resume_terminal_delivery(&mut self) -> Result<TurnResult, LoopError> {
+        let state = self.lifecycle.terminal.as_ref().expect("terminal state");
+        let mut result = state.result.clone();
+        let failure = state.failure.clone();
+        let editable = state.editable;
+        let append_output = !state.output_committed;
+        let mut first_error = failure.clone();
+        if let Err(error) = self
+            .run_turn_finish(&mut result, editable, failure.as_ref(), append_output)
+            .await
+        {
+            first_error.get_or_insert(error.clone());
+            let state = self.lifecycle.terminal.as_mut().expect("terminal state");
+            if !state.output_committed {
+                result.items.clear();
+                result.finish_reason = FinishReason::Error;
+                state.result = result.clone();
+                state.output_committed = true;
+            }
+            state.failure.get_or_insert(error);
+        }
+        if !self
+            .lifecycle
+            .terminal
+            .as_ref()
+            .expect("terminal state")
+            .output_committed
+        {
+            self.extend_transcript(result.items.clone());
+            self.mark_terminal_output_committed(&result.turn_id);
+            self.close_interrupted_tool_calls();
+        }
+        if let Err(error) = self.run_ready_tool_batches().await {
+            first_error.get_or_insert(error);
+        }
+        let failure = self
+            .lifecycle
+            .terminal
+            .as_ref()
+            .expect("terminal state")
+            .failure
+            .clone();
+        if let Err(error) = self.finish_logical_turn(&result, failure.as_ref()).await {
+            first_error.get_or_insert(error);
+        }
+        first_error.map_or(Ok(result), Err)
+    }
+
+    async fn notify_model_error(&mut self, error: &LoopError, turn_id: &agentkit_core::TurnId) {
+        for mutator in &self.mutators {
+            if let Err(hook_error) = mutator
+                .on_model_error(
+                    error,
+                    self.lifecycle_ctx(Some(turn_id), Some(self.lifecycle.model_call_index)),
+                )
+                .await
+            {
+                tracing::debug!(%hook_error, "model error callback failed");
+            }
+        }
+    }
+
+    async fn run_ready_tool_batches(&mut self) -> Result<(), LoopError> {
+        let mut index = 0;
+        let mut first_error = None;
+        while index < self.pending_tool_batches.len() {
+            let batch = &self.pending_tool_batches[index];
+            if batch.results.len() != batch.calls.len() {
+                index += 1;
+                continue;
+            }
+            while self.pending_tool_batches[index].next_mutator < self.mutators.len() {
+                let batch = &self.pending_tool_batches[index];
+                let results: Vec<ToolResultPart> = batch
+                    .calls
+                    .iter()
+                    .map(|call| batch.results[&call.id].clone())
+                    .collect();
+                let outcome = self.mutators[batch.next_mutator]
+                    .on_tool_batch(
+                        ToolBatchPayload {
+                            calls: &batch.calls,
+                            results: &results,
+                        },
+                        self.lifecycle_ctx(Some(&batch.turn_id), None),
+                    )
+                    .await;
+                let batch = &mut self.pending_tool_batches[index];
+                batch.next_mutator += 1;
+                if let Err(error) = outcome {
+                    batch.error.get_or_insert(error);
+                }
+            }
+            let batch = self.pending_tool_batches.remove(index);
+            if let Some(error) = batch.error {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    fn record_batch_result(&mut self, result: &ToolResultPart) {
+        for batch in &mut self.pending_tool_batches {
+            if batch.calls.iter().any(|call| call.id == result.call_id) {
+                batch
+                    .results
+                    .entry(result.call_id.clone())
+                    .or_insert_with(|| result.clone());
+            }
         }
     }
 
@@ -1985,7 +2603,7 @@ where
         self.collect_pending_loop_updates().await?;
         let mut resolutions = std::mem::take(&mut self.pending_loop_updates);
         if !resolutions.is_empty() {
-            self.start_logical_turn();
+            self.start_logical_turn().await?;
         }
         let mut saw_items = false;
         while let Some(resolution) = resolutions.pop_front() {
@@ -1995,7 +2613,7 @@ where
                     saw_items = true;
                 }
                 TaskResolution::Approval(task) => {
-                    let turn_id = self.start_logical_turn();
+                    let turn_id = self.start_logical_turn().await?;
                     self.enqueue_pending_approval(&turn_id, task, None);
                 }
             }
@@ -2044,8 +2662,9 @@ where
             session_id: &observed_session_id,
             observers: &observers,
         };
+        let mut candidate = self.transcript.clone();
         let mut cursor = TranscriptCursor {
-            items: &mut self.transcript,
+            items: &mut candidate,
             dirty: false,
         };
         for mutator in &mutators {
@@ -2066,6 +2685,7 @@ where
         }
         if cursor.dirty {
             validate_transcript_invariants(cursor.items)?;
+            self.commit_transcript(candidate);
         }
         Ok(())
     }
@@ -2094,6 +2714,7 @@ where
                 self.active_tool_round = None;
                 return self
                     .finish_cancelled(presentation_turn_id, Vec::new())
+                    .await
                     .map(Some);
             }
 
@@ -2144,7 +2765,8 @@ where
                     TaskStartOutcome::Pending { kind, .. } => {
                         self.emit(AgentEvent::ToolExecutionStarted(call.clone()));
                         if kind == agentkit_task_manager::TaskKind::Background {
-                            self.append_detach_placeholder(call.id.clone(), &call.name);
+                            self.append_detach_placeholder(call.id.clone(), &call.name)
+                                .await?;
                             if let Some(active) = self.active_tool_round.as_mut() {
                                 active.background_pending = true;
                             }
@@ -2179,7 +2801,8 @@ where
                     }
                 }
                 Some(TurnTaskUpdate::Detached(snapshot)) => {
-                    self.append_detach_placeholder(snapshot.call_id, &snapshot.tool_name);
+                    self.append_detach_placeholder(snapshot.call_id, &snapshot.tool_name)
+                        .await?;
                     if let Some(active) = self.active_tool_round.as_mut() {
                         active.background_pending = true;
                         active.foreground_progressed = true;
@@ -2199,6 +2822,7 @@ where
                         self.active_tool_round = None;
                         return self
                             .finish_cancelled(presentation_turn_id, Vec::new())
+                            .await
                             .map(Some);
                     }
                     let active = self.active_tool_round.take().ok_or_else(|| {
@@ -2253,17 +2877,33 @@ where
         turn_id: agentkit_core::TurnId,
         mutation_point: MutationPoint,
     ) -> Result<LoopStep, LoopError> {
+        // Preserve cancellation that arrived while awaiting a logical-start hook.
+        // Existing approval/tool continuations retain their checkpoint policy.
+        if mutation_point == MutationPoint::AfterTurnEnded
+            && self
+                .lifecycle
+                .cancellation
+                .as_ref()
+                .is_some_and(TurnCancellation::is_cancelled)
+        {
+            return self
+                .finish_cancelled(turn_id, interrupted_assistant_items())
+                .await;
+        }
         let cancellation = self
             .cancellation
             .as_ref()
             .map(CancellationHandle::checkpoint);
+        self.lifecycle.cancellation = cancellation.clone();
         match self
             .run_mutators(mutation_point, Some(&turn_id), cancellation.clone())
             .await
         {
             Ok(()) => {}
             Err(LoopError::Cancelled) => {
-                return self.finish_cancelled(turn_id, interrupted_assistant_items());
+                return self
+                    .finish_cancelled(turn_id, interrupted_assistant_items())
+                    .await;
             }
             Err(error) => return Err(error),
         }
@@ -2274,14 +2914,16 @@ where
         // for the model to respond to. Finish the turn rather than dispatch an
         // assistant-prefill request, which most providers reject.
         if !transcript_has_pending_input(&self.transcript) {
-            let turn_result = TurnResult {
+            let mut turn_result = TurnResult {
                 turn_id,
                 finish_reason: FinishReason::Completed,
                 items: Vec::new(),
                 usage: None,
                 metadata: MetadataMap::new(),
             };
-            self.finish_logical_turn(&turn_result);
+            self.run_turn_finish(&mut turn_result, true, None, true)
+                .await?;
+            self.finish_logical_turn(&turn_result, None).await?;
             return Ok(LoopStep::Finished(turn_result));
         }
 
@@ -2289,13 +2931,15 @@ where
             .as_ref()
             .is_some_and(TurnCancellation::is_cancelled)
         {
-            return self.finish_cancelled(turn_id, interrupted_assistant_items());
+            return self
+                .finish_cancelled(turn_id, interrupted_assistant_items())
+                .await;
         }
 
         let catalog_events = self.tool_executor.drain_catalog_events();
         self.emit_tool_catalog_events(catalog_events);
 
-        let request = TurnRequest {
+        let mut request = TurnRequest {
             session_id: self.session_id.clone(),
             turn_id: turn_id.clone(),
             transcript: self.transcript.clone(),
@@ -2307,6 +2951,25 @@ where
             metadata: MetadataMap::new(),
         };
 
+        self.run_ready_tool_batches().await?;
+        self.lifecycle.model_call_index += 1;
+        let original_request = request.transcript.clone();
+        for mutator in &self.mutators {
+            mutator
+                .on_model_request(
+                    ModelRequestPayload {
+                        transcript: &mut request.transcript,
+                        available_tools: &mut request.available_tools,
+                        cache: &mut request.cache,
+                        metadata: &mut request.metadata,
+                    },
+                    self.lifecycle_ctx(Some(&turn_id), Some(self.lifecycle.model_call_index)),
+                )
+                .await?;
+        }
+        if !self.mutators.is_empty() {
+            validate_prompt_edits(&original_request, &request.transcript)?;
+        }
         let session = self
             .session
             .as_mut()
@@ -2370,13 +3033,20 @@ where
         {
             Ok(turn) => turn,
             Err(LoopError::Cancelled) => {
+                self.notify_model_error(&LoopError::Cancelled, &turn_id)
+                    .await;
                 self.task_manager
                     .on_turn_interrupted(&turn_id)
                     .await
                     .map_err(|error| LoopError::Tool(ToolError::Internal(error.to_string())))?;
-                return self.finish_cancelled(turn_id, interrupted_assistant_items());
+                return self
+                    .finish_cancelled(turn_id, interrupted_assistant_items())
+                    .await;
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                self.notify_model_error(&error, &turn_id).await;
+                return Err(error);
+            }
         };
 
         // begin_turn may apply per-turn routing. Sample the effective selection
@@ -2397,7 +3067,6 @@ where
             }
         }
 
-        let mut saw_tool_call = false;
         let mut finished_result = None;
         let mut latest_usage = None;
         let mut streamed_content = cancellation
@@ -2411,20 +3080,39 @@ where
         {
             Ok(event) => event,
             Err(LoopError::Cancelled) => {
+                self.notify_model_error(&LoopError::Cancelled, &turn_id)
+                    .await;
                 self.task_manager
                     .on_turn_interrupted(&turn_id)
                     .await
                     .map_err(|error| LoopError::Tool(ToolError::Internal(error.to_string())))?;
-                return self.finish_cancelled(
-                    turn_id,
-                    interrupted_stream_items(streamed_content.as_ref()),
-                );
+                return self
+                    .finish_cancelled(turn_id, interrupted_stream_items(streamed_content.as_ref()))
+                    .await;
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                self.notify_model_error(&error, &turn_id).await;
+                return Err(error);
+            }
         } {
+            for mutator in &self.mutators {
+                mutator
+                    .on_model_progress(
+                        &event,
+                        self.lifecycle_ctx(Some(&turn_id), Some(self.lifecycle.model_call_index)),
+                    )
+                    .await?;
+            }
+            for mutator in &self.mutators {
+                mutator
+                    .on_turn_progress(
+                        TurnProgress::Model(&event),
+                        self.lifecycle_ctx(Some(&turn_id), Some(self.lifecycle.model_call_index)),
+                    )
+                    .await?;
+            }
             let attempt_superseded = matches!(event, ModelTurnEvent::ResponseAttemptSuperseded);
             if attempt_superseded {
-                saw_tool_call = false;
                 latest_usage = None;
                 if let Some(content) = &mut streamed_content {
                     content.reset();
@@ -2435,15 +3123,16 @@ where
                 .as_ref()
                 .is_some_and(TurnCancellation::is_cancelled)
             {
+                self.notify_model_error(&LoopError::Cancelled, &turn_id)
+                    .await;
                 turn.on_cancelled();
                 self.task_manager
                     .on_turn_interrupted(&turn_id)
                     .await
                     .map_err(|error| LoopError::Tool(ToolError::Internal(error.to_string())))?;
-                return self.finish_cancelled(
-                    turn_id,
-                    interrupted_stream_items(streamed_content.as_ref()),
-                );
+                return self
+                    .finish_cancelled(turn_id, interrupted_stream_items(streamed_content.as_ref()))
+                    .await;
             }
             if attempt_superseded {
                 continue;
@@ -2460,7 +3149,6 @@ where
                     self.emit(AgentEvent::UsageUpdated(usage));
                 }
                 ModelTurnEvent::ToolCall(call) => {
-                    saw_tool_call = true;
                     if let Some(content) = &mut streamed_content {
                         content.commit_tool_call(&call);
                     }
@@ -2476,10 +3164,31 @@ where
             }
         }
 
-        let mut result = finished_result.ok_or_else(|| {
-            LoopError::Provider("model turn ended without a Finished event".into())
-        })?;
+        let Some(mut result) = finished_result else {
+            let error = LoopError::Provider("model turn ended without a Finished event".into());
+            self.notify_model_error(&error, &turn_id).await;
+            return Err(error);
+        };
         result.usage = merge_usage(result.usage, latest_usage);
+        let original_output = result.output_items.clone();
+        for mutator in &self.mutators {
+            let visible = result.output_items.clone();
+            mutator
+                .on_model_response(
+                    ModelResponsePayload {
+                        output: output_payload(&visible, &mut result.output_items),
+                        finish_reason: &result.finish_reason,
+                        usage: result.usage.as_ref(),
+                        metadata: &result.metadata,
+                        model: result.model.as_deref(),
+                        response_id: result.response_id.as_deref(),
+                    },
+                    self.lifecycle_ctx(Some(&turn_id), Some(self.lifecycle.model_call_index)),
+                )
+                .await?;
+        }
+        validate_output_edits(&original_output, &result.output_items)?;
+        let saw_tool_call = !extract_tool_calls(&result.output_items).is_empty();
         if let Some(model) = &result.model {
             chat_span.record("gen_ai.response.model", model.as_str());
         }
@@ -2506,14 +3215,7 @@ where
             "gen_ai.response.finish_reasons",
             provider_finish_reasons(&result.metadata, &result.finish_reason),
         );
-        if let Some(capture) = self.telemetry.output_messages {
-            record_string_array_attribute(
-                &chat_span,
-                "gen_ai.output.messages",
-                capture_messages(&result.output_items, capture, CaptureOrder::OldestHead),
-            );
-        }
-        drop(chat_span);
+
         tracing::Span::current().record("saw_tool_call", saw_tool_call);
         tracing::Span::current().record(
             "finish_reason",
@@ -2540,9 +3242,41 @@ where
                 item
             })
             .collect();
-        self.extend_transcript(output_items.clone());
+        let mut turn_result = TurnResult {
+            turn_id: turn_id.clone(),
+            finish_reason: result.finish_reason.clone(),
+            items: output_items,
+            usage: result.usage.clone(),
+            metadata: result.metadata.clone(),
+        };
+        if !saw_tool_call {
+            let editable = !matches!(
+                turn_result.finish_reason,
+                FinishReason::Cancelled | FinishReason::Error | FinishReason::Blocked
+            );
+            self.run_turn_finish(&mut turn_result, editable, None, true)
+                .await?;
+        }
+        if let Some(capture) = self.telemetry.output_messages {
+            record_string_array_attribute(
+                &chat_span,
+                "gen_ai.output.messages",
+                capture_messages(&turn_result.items, capture, CaptureOrder::OldestHead),
+            );
+        }
+        drop(chat_span);
+        self.extend_transcript(turn_result.items.clone());
+        self.mark_terminal_output_committed(&turn_result.turn_id);
+        let output_items = turn_result.items.clone();
 
         if saw_tool_call {
+            self.pending_tool_batches.push(PendingToolBatch {
+                turn_id: turn_id.clone(),
+                calls: extract_tool_calls(&output_items),
+                results: BTreeMap::new(),
+                next_mutator: 0,
+                error: None,
+            });
             let pending_calls = extract_tool_calls(&output_items)
                 .into_iter()
                 .map(|call| {
@@ -2568,13 +3302,10 @@ where
             if let Some(step) = self.continue_active_tool_round().await? {
                 return Ok(step);
             }
-            self.finish_logical_turn(&TurnResult {
-                turn_id,
-                finish_reason: result.finish_reason,
-                items: output_items,
-                usage: result.usage,
-                metadata: result.metadata,
-            });
+            self.run_ready_tool_batches().await?;
+            self.run_turn_finish(&mut turn_result, false, None, false)
+                .await?;
+            self.finish_logical_turn(&turn_result, None).await?;
             return Ok(LoopStep::Interrupt(LoopInterrupt::AwaitingInput(
                 InputRequest {
                     session_id: self.session_id.clone(),
@@ -2583,14 +3314,7 @@ where
             )));
         }
 
-        let turn_result = TurnResult {
-            turn_id,
-            finish_reason: result.finish_reason,
-            items: output_items,
-            usage: result.usage,
-            metadata: result.metadata,
-        };
-        self.finish_logical_turn(&turn_result);
+        self.finish_logical_turn(&turn_result, None).await?;
         Ok(LoopStep::Finished(turn_result))
     }
 
@@ -2679,7 +3403,8 @@ where
                             self.append_detach_placeholder(
                                 pending.call.id.clone(),
                                 &pending.call.name,
-                            );
+                            )
+                            .await?;
                         } else {
                             self.active_tool_round = Some(ActiveToolRound {
                                 presentation_turn_id: pending.presentation_turn_id.clone(),
@@ -2725,26 +3450,53 @@ where
         }
     }
 
-    fn finish_cancelled(
+    async fn finish_cancelled(
+        &mut self,
+        turn_id: agentkit_core::TurnId,
+        items: Vec<Item>,
+    ) -> Result<LoopStep, LoopError> {
+        let result = self.finish_cancelled_inner(turn_id, items).await;
+        if let Err(error) = &result {
+            self.abort_active_turn(FinishReason::Cancelled, error).await;
+        }
+        result
+    }
+
+    async fn finish_cancelled_inner(
         &mut self,
         turn_id: agentkit_core::TurnId,
         items: Vec<Item>,
     ) -> Result<LoopStep, LoopError> {
         let pending = self.drain_pending_approval_items();
         self.reject_drained_approvals(pending);
-        self.extend_transcript(items.clone());
-        self.close_interrupted_tool_calls();
-        let turn_result = TurnResult {
+        let mut turn_result = TurnResult {
             turn_id,
             finish_reason: FinishReason::Cancelled,
             items,
             usage: None,
             metadata: interrupted_metadata("turn"),
         };
-        self.finish_logical_turn(&turn_result);
+        let now = Timestamp::now();
+        for item in &mut turn_result.items {
+            item.created_at.get_or_insert(now);
+            if matches!(item.kind, ItemKind::Assistant) {
+                item.finish_reason.get_or_insert(FinishReason::Cancelled);
+            }
+        }
+        self.run_turn_finish(&mut turn_result, false, None, true)
+            .await?;
+        self.extend_transcript(turn_result.items.clone());
+        self.mark_terminal_output_committed(&turn_result.turn_id);
+        self.close_interrupted_tool_calls();
+        self.run_ready_tool_batches().await?;
+        self.finish_logical_turn(&turn_result, None).await?;
         Ok(LoopStep::Finished(turn_result))
     }
 
+    /// Buffer new input. With mutators registered, callbacks are awaited by the
+    /// next `next()` call before dispatch and InputAccepted is emitted only after
+    /// successful interception. Use `submit_input_async` for awaited acceptance.
+    ///
     /// Internal entry point for buffering user input. Reachable only via
     /// [`InputRequest::submit`] (resolves an `AwaitingInput` interrupt,
     /// including the very first one after [`Agent::start`]) and
@@ -2755,16 +3507,72 @@ where
     /// after start-up always flows through one of the typed `submit`
     /// handles.
     pub fn submit_input(&mut self, input: Vec<Item>) -> Result<(), LoopError> {
+        self.check_input_submission()?;
+        if self.mutators.is_empty() {
+            self.accept_input(input);
+        } else {
+            self.pending_admission.push_back(input);
+        }
+        Ok(())
+    }
+
+    /// Await input interception before accepting this batch. On hook failure no
+    /// rejected input is committed and the active logical turn is unchanged.
+    /// Batches are processed in submission order. If an earlier queued batch is
+    /// rejected, this new batch remains queued for subsequent admission.
+    /// Sync [`Self::submit_input`] remains compatible but queues interception for
+    /// `next`, before dispatch, rather than awaiting acceptance in the caller.
+    pub async fn submit_input_async(&mut self, input: Vec<Item>) -> Result<(), LoopError> {
+        self.check_input_submission()?;
+        self.pending_admission.push_back(input);
+        self.admit_queued_input().await
+    }
+
+    fn check_input_submission(&self) -> Result<(), LoopError> {
+        if self.lifecycle.closed
+            || self.lifecycle.closing.is_some()
+            || self.lifecycle.pending_cancel.is_some()
+        {
+            return Err(LoopError::InvalidState(
+                "session is closed or retiring a turn".into(),
+            ));
+        }
         if self.has_pending_interrupts() {
             return Err(LoopError::InvalidState(
                 "cannot submit input while an interrupt is pending".into(),
             ));
         }
+        Ok(())
+    }
+
+    fn accept_input(&mut self, input: Vec<Item>) {
         self.emit(AgentEvent::InputAccepted {
             session_id: self.session_id.clone(),
             items: input.clone(),
         });
         self.pending_input.extend(input);
+    }
+
+    async fn intercept_input(&mut self, input: &mut Vec<Item>) -> Result<(), LoopError> {
+        for mutator in &self.mutators {
+            mutator
+                .on_input(
+                    input,
+                    self.lifecycle_ctx(self.lifecycle.active_turn.as_ref(), None),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn admit_queued_input(&mut self) -> Result<(), LoopError> {
+        while let Some(mut input) = self.pending_admission.front().cloned() {
+            let outcome = self.intercept_input(&mut input).await;
+            // Reject only this batch, preserving unrelated later submissions.
+            self.pending_admission.pop_front();
+            outcome?;
+            self.accept_input(input);
+        }
         Ok(())
     }
 
@@ -2773,6 +3581,11 @@ where
     /// The override is consumed the next time the driver starts a model turn.
     /// Session-level defaults still apply to later turns.
     pub fn set_next_turn_cache(&mut self, cache: PromptCacheRequest) -> Result<(), LoopError> {
+        if self.lifecycle.closed || self.lifecycle.closing.is_some() {
+            return Err(LoopError::InvalidState(
+                "session is closed or closing".into(),
+            ));
+        }
         if self.has_pending_interrupts() {
             return Err(LoopError::InvalidState(
                 "cannot update next-turn cache while an interrupt is pending".into(),
@@ -2806,6 +3619,11 @@ where
         call_id: ToolCallId,
         decision: ApprovalDecision,
     ) -> Result<(), LoopError> {
+        if self.lifecycle.closed || self.lifecycle.closing.is_some() {
+            return Err(LoopError::InvalidState(
+                "session is closed or closing".into(),
+            ));
+        }
         let Some(pending) = self.pending_approvals.get_mut(&call_id) else {
             return Err(LoopError::InvalidState(format!(
                 "no approval request is pending for call {}",
@@ -2836,6 +3654,11 @@ where
         call_id: ToolCallId,
         input: serde_json::Value,
     ) -> Result<(), LoopError> {
+        if self.lifecycle.closed || self.lifecycle.closing.is_some() {
+            return Err(LoopError::InvalidState(
+                "session is closed or closing".into(),
+            ));
+        }
         let Some(pending) = self.pending_approvals.get_mut(&call_id) else {
             return Err(LoopError::InvalidState(format!(
                 "no approval request is pending for call {}",
@@ -2875,7 +3698,13 @@ where
     ///
     /// This clears the blocking approval and appends an error tool result so
     /// the transcript remains provider-valid if the host continues the turn.
+    /// If this retires the turn, terminal hooks run on the next `next()` or `close()`.
     pub fn cancel_pending_approval_for(&mut self, call_id: ToolCallId) -> Result<(), LoopError> {
+        if self.lifecycle.closing.is_some() || self.lifecycle.closed {
+            return Err(LoopError::InvalidState(
+                "session is closed or closing".into(),
+            ));
+        }
         let Some(pending) = self.drain_pending_approval_for(&call_id) else {
             return Err(LoopError::InvalidState(format!(
                 "no approval request is pending for call {}",
@@ -2885,7 +3714,24 @@ where
         let turn_id = pending.presentation_turn_id.clone();
         self.reject_drained_approvals(vec![pending]);
         if self.pending_approvals.is_empty() && self.active_tool_round.is_none() {
-            let _ = self.finish_cancelled(turn_id, Vec::new())?;
+            if self.mutators.is_empty() {
+                self.close_interrupted_tool_calls();
+                if self.pending_round_resume.as_ref() == Some(&turn_id) {
+                    self.pending_round_resume = None;
+                }
+                if self.lifecycle.active_turn.as_ref() == Some(&turn_id) {
+                    self.lifecycle.active_turn = None;
+                    self.emit(AgentEvent::TurnFinished(TurnResult {
+                        turn_id,
+                        finish_reason: FinishReason::Cancelled,
+                        items: Vec::new(),
+                        usage: None,
+                        metadata: interrupted_metadata("turn"),
+                    }));
+                }
+            } else {
+                self.lifecycle.pending_cancel = Some(turn_id);
+            }
         }
         Ok(())
     }
@@ -2896,6 +3742,11 @@ where
     /// individual approval prompt. Each pending approval is resolved as denied
     /// and receives an error tool result so the transcript remains valid.
     pub async fn cancel_pending_approvals(&mut self) -> Result<Option<LoopStep>, LoopError> {
+        if self.lifecycle.closing.is_some() || self.lifecycle.closed {
+            return Err(LoopError::InvalidState(
+                "session is closed or closing".into(),
+            ));
+        }
         if self.pending_approvals.is_empty() {
             return Ok(None);
         }
@@ -2932,16 +3783,10 @@ where
         self.reject_drained_approvals(pending);
         if let Some(error) = cleanup_error {
             self.close_interrupted_tool_calls();
-            self.finish_logical_turn(&TurnResult {
-                turn_id,
-                finish_reason: FinishReason::Error,
-                items: Vec::new(),
-                usage: None,
-                metadata: MetadataMap::new(),
-            });
+            self.abort_active_turn(FinishReason::Error, &error).await;
             return Err(error);
         }
-        self.finish_cancelled(turn_id, Vec::new()).map(Some)
+        self.finish_cancelled(turn_id, Vec::new()).await.map(Some)
     }
 
     /// Retire the active logical turn without resuming model or tool execution.
@@ -2961,6 +3806,11 @@ where
     /// emitting the cancelled terminal event. The turn is retired even on error;
     /// a failing task manager may leave external tasks running.
     pub async fn retire_interrupted_turn(&mut self) -> Result<Option<TurnResult>, LoopError> {
+        if self.lifecycle.closing.is_some() || self.lifecycle.closed {
+            return Err(LoopError::InvalidState(
+                "session is closed or closing".into(),
+            ));
+        }
         let Some(turn_id) = self.lifecycle.active_turn.clone() else {
             return Ok(None);
         };
@@ -2968,15 +3818,25 @@ where
         // At AfterToolResult the foreground task round has already completed.
         self.pending_round_resume = None;
         let cleanup = self.cleanup_interrupted_turn().await;
-        let result = TurnResult {
+        let mut result = TurnResult {
             turn_id,
             finish_reason: FinishReason::Cancelled,
             items: Vec::new(),
             usage: None,
             metadata: interrupted_metadata("turn"),
         };
-        self.finish_logical_turn(&result);
+        self.lifecycle.pending_cancel = None;
+        let finish = self
+            .run_turn_finish(&mut result, false, cleanup.as_ref().err(), false)
+            .await;
+        let batch = self.run_ready_tool_batches().await;
+        let end = self
+            .finish_logical_turn(&result, cleanup.as_ref().err())
+            .await;
         cleanup?;
+        finish?;
+        batch?;
+        end?;
         Ok(Some(result))
     }
 
@@ -2985,7 +3845,12 @@ where
         LoopSnapshot {
             session_id: self.session_id.clone(),
             transcript: self.transcript.clone(),
-            pending_input: self.pending_input.clone(),
+            pending_input: self
+                .pending_input
+                .iter()
+                .cloned()
+                .chain(self.pending_admission.iter().flatten().cloned())
+                .collect(),
         }
     }
 
@@ -3031,45 +3896,240 @@ where
     /// Returns [`LoopError::InvalidState`] if called while an unresolved
     /// interrupt is pending, or propagates provider / tool / compaction errors.
     pub async fn next(&mut self) -> Result<LoopStep, LoopError> {
-        if self.lifecycle.active_turn.is_none() {
-            let continuation_turn = self
-                .pending_approval_order
-                .iter()
-                .find_map(|call_id| self.pending_approvals.get(call_id))
-                .map(|pending| pending.presentation_turn_id.clone())
-                .or_else(|| {
-                    self.active_tool_round
-                        .as_ref()
-                        .map(|active| active.presentation_turn_id.clone())
-                })
-                .or_else(|| self.pending_round_resume.clone());
-            if let Some(turn_id) = continuation_turn {
-                self.start_logical_turn_with(turn_id);
-            } else if !self.pending_input.is_empty() {
-                self.start_logical_turn();
-            }
+        if self.lifecycle.closed || self.lifecycle.closing.is_some() {
+            return Err(LoopError::InvalidState(
+                "session is closed or closing".into(),
+            ));
         }
-
-        let result = self.next_inner().await;
-        match &result {
-            Ok(LoopStep::Finished(turn)) => self.finish_logical_turn(turn),
-            Err(_) => {
-                if let Some(turn_id) = self.lifecycle.active_turn.clone() {
-                    if let Err(error) = self.cleanup_interrupted_turn().await {
-                        tracing::debug!(%error, "failed to clean up turn after loop error");
-                    }
-                    self.finish_logical_turn(&TurnResult {
-                        turn_id,
-                        finish_reason: FinishReason::Error,
-                        items: Vec::new(),
-                        usage: None,
-                        metadata: MetadataMap::new(),
-                    });
+        let result = async {
+            if self.lifecycle.terminal.is_some() {
+                return self
+                    .resume_terminal_delivery()
+                    .await
+                    .map(LoopStep::Finished);
+            }
+            if let Some(turn_id) = self.lifecycle.pending_cancel.take() {
+                return self.finish_cancelled(turn_id, Vec::new()).await;
+            }
+            self.admit_queued_input().await?;
+            if self.lifecycle.active_turn.is_none() {
+                let continuation_turn = self
+                    .pending_approval_order
+                    .iter()
+                    .find_map(|call_id| self.pending_approvals.get(call_id))
+                    .map(|pending| pending.presentation_turn_id.clone())
+                    .or_else(|| {
+                        self.active_tool_round
+                            .as_ref()
+                            .map(|active| active.presentation_turn_id.clone())
+                    })
+                    .or_else(|| self.pending_round_resume.clone());
+                if let Some(turn_id) = continuation_turn {
+                    self.start_logical_turn_with(turn_id).await?;
+                } else if !self.pending_input.is_empty() {
+                    self.start_logical_turn().await?;
                 }
             }
-            _ => {}
+            let step = self.next_inner().await?;
+            self.run_ready_tool_batches().await?;
+            Ok(step)
+        }
+        .await;
+        if let Err(error) = &result {
+            let reason = if matches!(error, LoopError::Cancelled) {
+                FinishReason::Cancelled
+            } else {
+                FinishReason::Error
+            };
+            self.abort_active_turn(reason, error).await;
         }
         result
+    }
+
+    async fn abort_active_turn(&mut self, reason: FinishReason, failure: &LoopError) {
+        self.lifecycle.pending_cancel = None;
+        if let Some(turn_id) = self.lifecycle.active_turn.clone() {
+            if let Err(error) = self.cleanup_interrupted_turn().await {
+                tracing::debug!(%error, "failed to clean up turn after loop error");
+            }
+            let mut result = TurnResult {
+                turn_id,
+                finish_reason: reason,
+                items: Vec::new(),
+                usage: None,
+                metadata: MetadataMap::new(),
+            };
+            if let Some(state) = &mut self.lifecycle.terminal {
+                state.result = result.clone();
+                state.output_committed = true;
+                state.editable = false;
+                state.failure = Some(failure.clone());
+            }
+            if !self.lifecycle.finish_attempted {
+                if let Err(error) = self
+                    .run_turn_finish(&mut result, false, Some(failure), false)
+                    .await
+                {
+                    tracing::debug!(%error, "terminal finish callback failed");
+                }
+            }
+            if let Err(error) = self.run_ready_tool_batches().await {
+                tracing::debug!(%error, "terminal batch callback failed");
+            }
+            if let Err(error) = self.finish_logical_turn(&result, Some(failure)).await {
+                tracing::debug!(%error, "terminal end callback failed");
+            }
+        }
+    }
+
+    /// Explicitly close this session, retiring an active turn as cancelled.
+    /// If final delivery already began in `next`, its existing candidate,
+    /// outcome and callback progress are resumed instead of being replaced.
+    /// Admission and `next` are disabled as soon as closing starts. Dropping this
+    /// future leaves resumable progress: a later `close` retries the in-flight
+    /// callback, but never repeats completed callbacks or the terminal event.
+    /// Callbacks must tolerate cancellation/retry of their own unfinished work.
+    /// All cleanup/end callbacks are attempted, with the first error returned.
+    /// After completion (even on error), repeated closes are no-ops. Detached
+    /// background work is not awaited; Drop does not run callbacks.
+    pub async fn close(&mut self) -> Result<(), LoopError> {
+        if self.lifecycle.closed {
+            return Ok(());
+        }
+        if self.lifecycle.closing.is_none() {
+            let mut cleanup_turns = Vec::new();
+            if let Some(active) = &self.active_tool_round {
+                cleanup_turns.push(active.task_turn_id.clone());
+            }
+            if let Some(turn_id) = &self.pending_round_resume {
+                if !cleanup_turns.contains(turn_id) {
+                    cleanup_turns.push(turn_id.clone());
+                }
+            }
+            for pending in self.pending_approvals.values() {
+                if !cleanup_turns.contains(&pending.tool_request.turn_id) {
+                    cleanup_turns.push(pending.tool_request.turn_id.clone());
+                }
+            }
+            if self.lifecycle.terminal.is_none() {
+                if let Some(turn_id) = self.lifecycle.active_turn.clone() {
+                    let result = TurnResult {
+                        turn_id,
+                        finish_reason: FinishReason::Cancelled,
+                        items: Vec::new(),
+                        usage: None,
+                        metadata: interrupted_metadata("turn"),
+                    };
+                    self.begin_terminal(&result, false, None, false);
+                }
+            }
+            self.lifecycle.closing = Some(ClosingState {
+                cleanup_turns,
+                cleanup_index: 0,
+                cleanup_done: false,
+                session_index: 0,
+                error: None,
+            });
+        }
+        loop {
+            let state = self.lifecycle.closing.as_ref().expect("closing state");
+            if state.cleanup_index == state.cleanup_turns.len() {
+                break;
+            }
+            let turn_id = state.cleanup_turns[state.cleanup_index].clone();
+            let outcome = self.task_manager.on_turn_interrupted(&turn_id).await;
+            let state = self.lifecycle.closing.as_mut().expect("closing state");
+            state.cleanup_index += 1;
+            if let Err(error) = outcome {
+                state
+                    .error
+                    .get_or_insert(LoopError::Tool(ToolError::Internal(error.to_string())));
+            }
+        }
+        if !self
+            .lifecycle
+            .closing
+            .as_ref()
+            .expect("closing state")
+            .cleanup_done
+        {
+            self.active_tool_round = None;
+            self.pending_round_resume = None;
+            let pending = self.drain_pending_approval_items();
+            self.reject_drained_approvals(pending);
+            self.close_interrupted_tool_calls();
+            self.pending_input.clear();
+            self.pending_admission.clear();
+            self.lifecycle.pending_cancel = None;
+            self.lifecycle
+                .closing
+                .as_mut()
+                .expect("closing state")
+                .cleanup_done = true;
+        }
+        if self.lifecycle.terminal.is_some() {
+            let cleanup_error = self
+                .lifecycle
+                .closing
+                .as_ref()
+                .expect("closing state")
+                .error
+                .clone();
+            if let Some(error) = cleanup_error {
+                self.lifecycle
+                    .terminal
+                    .as_mut()
+                    .expect("terminal state")
+                    .failure
+                    .get_or_insert(error);
+            }
+            if let Err(error) = self.resume_terminal_delivery().await {
+                self.lifecycle
+                    .closing
+                    .as_mut()
+                    .expect("closing state")
+                    .error
+                    .get_or_insert(error);
+            }
+        } else if let Err(error) = self.run_ready_tool_batches().await {
+            self.lifecycle
+                .closing
+                .as_mut()
+                .expect("closing state")
+                .error
+                .get_or_insert(error);
+        }
+        loop {
+            let state = self.lifecycle.closing.as_ref().expect("closing state");
+            if state.session_index == self.mutators.len() {
+                break;
+            }
+            let outcome = self.mutators[state.session_index]
+                .on_session_end(
+                    SessionEndPayload {
+                        transcript: &self.transcript,
+                    },
+                    LifecycleCtx {
+                        error: state.error.as_ref(),
+                        ..self.lifecycle_ctx(None, None)
+                    },
+                )
+                .await;
+            let state = self.lifecycle.closing.as_mut().expect("closing state");
+            state.session_index += 1;
+            if let Err(error) = outcome {
+                state.error.get_or_insert(error);
+            }
+        }
+        self.session = None;
+        self.pending_tool_batches.clear();
+        self.lifecycle.closed = true;
+        self.lifecycle
+            .closing
+            .take()
+            .expect("closing state")
+            .error
+            .map_or(Ok(()), Err)
     }
 
     async fn cleanup_interrupted_turn(&mut self) -> Result<(), LoopError> {
@@ -3134,11 +4194,14 @@ where
         // before unrelated background completions so a delayed approval cannot
         // bind itself to that turn's TurnStarted event. AfterToolResult resumes
         // remain ordered ahead of fresh input below.
-        if self.pending_round_resume.is_none() && !self.pending_input.is_empty() {
+        if self.pending_round_resume.is_none()
+            && (!self.pending_input.is_empty() || self.lifecycle.started_with_input)
+        {
+            self.lifecycle.started_with_input = false;
             // Take updates now to preserve the driver's once-per-step manager
             // handoff, but defer presenting them until this input turn ends.
             self.collect_pending_loop_updates().await?;
-            let turn_id = self.start_logical_turn();
+            let turn_id = self.start_logical_turn().await?;
             let drained: Vec<Item> = std::mem::take(&mut self.pending_input);
             self.extend_transcript(drained);
             return self
@@ -3172,7 +4235,7 @@ where
             )));
         }
 
-        let turn_id = self.start_logical_turn();
+        let turn_id = self.start_logical_turn().await?;
         let drained: Vec<Item> = std::mem::take(&mut self.pending_input);
         self.extend_transcript(drained);
         self.drive_turn(turn_id, MutationPoint::AfterTurnEnded)
@@ -3187,7 +4250,31 @@ where
     /// registered [`TranscriptObserver`]s. The single mutation point —
     /// every push to `self.transcript` should funnel through here so
     /// observers see exactly what landed in the transcript.
+    fn commit_transcript(&mut self, mut candidate: Vec<Item>) {
+        if candidate.starts_with(&self.transcript) {
+            let suffix = candidate.split_off(self.transcript.len());
+            self.extend_transcript(suffix);
+        } else {
+            let now = Timestamp::now();
+            for item in &mut candidate {
+                item.created_at.get_or_insert(now);
+            }
+            self.transcript = candidate;
+            for observer in &self.transcript_observers {
+                observer.on_transcript_rewrite(TranscriptRewriteEvent {
+                    session_id: &self.session_id,
+                    items: &self.transcript,
+                });
+            }
+        }
+    }
+
     fn append_item(&mut self, mut item: Item) {
+        for part in &item.parts {
+            if let Part::ToolResult(result) = part {
+                self.record_batch_result(result);
+            }
+        }
         if item.created_at.is_none() {
             item.created_at = Some(Timestamp::now());
         }
@@ -3200,10 +4287,13 @@ where
         self.transcript.push(item);
     }
 
-    fn append_detach_placeholder(&mut self, call_id: ToolCallId, tool_name: &str) {
-        self.background_call_ids.insert(call_id.clone());
-        if !self.detached_call_ids.insert(call_id.clone()) {
-            return;
+    async fn append_detach_placeholder(
+        &mut self,
+        call_id: ToolCallId,
+        tool_name: &str,
+    ) -> Result<(), LoopError> {
+        if self.detached_call_ids.contains(&call_id) {
+            return Ok(());
         }
         let detached_result = ToolResultPart {
             call_id: call_id.clone(),
@@ -3213,6 +4303,24 @@ where
             is_error: false,
             metadata: MetadataMap::new(),
         };
+        for mutator in &self.mutators {
+            mutator
+                .on_tool_progress(
+                    &detached_result,
+                    self.lifecycle_ctx(self.lifecycle.active_turn.as_ref(), None),
+                )
+                .await?;
+        }
+        for mutator in &self.mutators {
+            mutator
+                .on_turn_progress(
+                    TurnProgress::ToolDetached(&detached_result),
+                    self.lifecycle_ctx(self.lifecycle.active_turn.as_ref(), None),
+                )
+                .await?;
+        }
+        self.background_call_ids.insert(call_id.clone());
+        self.detached_call_ids.insert(call_id);
         self.emit(AgentEvent::ToolExecutionProgress(detached_result.clone()));
         self.append_item(Item {
             id: None,
@@ -3223,6 +4331,7 @@ where
             finish_reason: None,
             created_at: None,
         });
+        Ok(())
     }
 
     /// Append a tool-result Item: emit one [`AgentEvent::ToolResultReceived`]
@@ -4808,7 +5917,7 @@ fn tool_result_not_started(item: &Item) -> bool {
 }
 
 /// Errors that can occur while driving the agent loop.
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 pub enum LoopError {
     /// Typed, sanitized model failure with retry accounting.
     #[error(transparent)]
@@ -4881,6 +5990,102 @@ fn fan_out_observed_event(
 /// The only invariant currently checked is tool_use ↔ tool_result pairing
 /// — every [`Part::ToolCall`] must be followed (in transcript order) by a
 /// matching [`Part::ToolResult`] with the same `call_id`.
+fn validate_prompt_edits(original: &[Item], candidate: &[Item]) -> Result<(), LoopError> {
+    validate_transcript_invariants(candidate)?;
+    let identified = original.iter().filter(|item| item.id.is_some());
+    for original_item in identified {
+        let matches: Vec<&Item> = candidate
+            .iter()
+            .filter(|item| item.id == original_item.id)
+            .collect();
+        if matches.len() != 1
+            || matches[0].kind != original_item.kind
+            || matches[0].usage != original_item.usage
+            || matches[0].finish_reason != original_item.finish_reason
+            || matches[0].created_at != original_item.created_at
+        {
+            return Err(LoopError::Mutator(
+                "prompt hook changed a message identity or accounting".into(),
+            ));
+        }
+    }
+    for original_item in original.iter().filter(|item| {
+        item.id.is_none()
+            && (item.usage.is_some() || item.finish_reason.is_some() || item.created_at.is_some())
+    }) {
+        let same_facts = |item: &&Item| {
+            item.id.is_none()
+                && item.kind == original_item.kind
+                && item.usage == original_item.usage
+                && item.finish_reason == original_item.finish_reason
+                && item.created_at == original_item.created_at
+        };
+        if candidate.iter().filter(same_facts).count() < original.iter().filter(same_facts).count()
+        {
+            return Err(LoopError::Mutator(
+                "prompt hook removed or changed anonymous item accounting".into(),
+            ));
+        }
+    }
+    let tool_parts = |items: &[Item]| -> Vec<Part> {
+        items
+            .iter()
+            .flat_map(|item| &item.parts)
+            .filter(|part| matches!(part, Part::ToolCall(_) | Part::ToolResult(_)))
+            .cloned()
+            .collect()
+    };
+    if tool_parts(original) != tool_parts(candidate) {
+        return Err(LoopError::Mutator(
+            "prompt hook changed existing tool calls or results".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn output_payload<'a>(
+    original: &'a [Item],
+    candidate: &'a mut [Item],
+) -> Vec<OutputItemPayload<'a>> {
+    original
+        .iter()
+        .zip(candidate)
+        .map(|(original, item)| OutputItemPayload {
+            original,
+            parts: &mut item.parts,
+            metadata: &mut item.metadata,
+        })
+        .collect()
+}
+
+fn validate_output_edits(original: &[Item], candidate: &[Item]) -> Result<(), LoopError> {
+    fn links(item: &Item) -> Vec<(bool, ToolCallId, Option<String>)> {
+        item.parts
+            .iter()
+            .filter_map(|part| match part {
+                Part::ToolCall(call) => Some((true, call.id.clone(), Some(call.name.clone()))),
+                Part::ToolResult(result) => Some((false, result.call_id.clone(), None)),
+                _ => None,
+            })
+            .collect()
+    }
+    if original.len() != candidate.len()
+        || original.iter().zip(candidate).any(|(a, b)| {
+            a.id != b.id
+                || a.kind != b.kind
+                || a.usage != b.usage
+                || a.finish_reason != b.finish_reason
+                || a.created_at != b.created_at
+                || links(a) != links(b)
+        })
+    {
+        return Err(LoopError::Mutator(
+            "output hook changed immutable item identity, accounting, or tool linkage".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_transcript_invariants(transcript: &[Item]) -> Result<(), LoopError> {
     let mut pending: HashSet<ToolCallId> = HashSet::new();
     let mut seen_calls: HashSet<ToolCallId> = HashSet::new();
@@ -8786,6 +9991,7 @@ mod tests {
         ));
         driver
             .finish_cancelled(agentkit_core::TurnId::new("turn-cancelled"), Vec::new())
+            .await
             .unwrap();
 
         assert!(
@@ -10091,3 +11297,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod lifecycle_tests;
