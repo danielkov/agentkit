@@ -261,7 +261,7 @@ This is why caching is configured separately from compaction in agentkit. Compac
 
 ## Loop integration
 
-Compactors register as `LoopMutator`s. The loop runs transcript mutators before inference at `MutationPoint::AfterToolResult` (when continuing after a tool round) or `MutationPoint::AfterTurnEnded` (when dispatching a new logical turn). Despite its name, `AfterTurnEnded` is not a completion notification: newly buffered input has already been appended when it runs. The trigger decides which points are relevant.
+Compactors register as `LoopMutator`s. The loop runs every registered mutator at each `MutationPoint` — `AfterToolResult` (between tool results and the next inference call) and `AfterTurnEnded` (before the first inference call of a new turn, after pending input is appended). The trigger decides which points are relevant.
 
 When a compactor fires:
 

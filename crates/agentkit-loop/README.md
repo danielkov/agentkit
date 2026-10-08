@@ -19,19 +19,15 @@ This crate provides:
 
 Use it as the central coordinator between model providers, tool execution, and application UI or control flow.
 
-## Awaited lifecycle extensions
+## Interception hooks
 
-Register a `LoopMutator` with `AgentBuilder::mutator` to intercept lifecycle boundaries without driving or copying the loop implementation. Its lifecycle methods are asynchronous and default to no-ops, so existing transcript mutators remain compatible. Registered callbacks run in order and later callbacks see earlier payload edits.
+Besides `mutate`, a `LoopMutator` registered with `AgentBuilder::mutator` can intercept values before the loop consumes or commits them:
 
-The extension surface covers session startup and explicit closure, input admission, logical-turn startup and finalization, model requests and complete responses, model errors and stream progress, and resolved top-level tool batches. A logical turn may include multiple model requests and tool continuations; turn callbacks do not run once per inference.
+- `on_session_start` edits session options before the model adapter starts the session.
+- `on_model_request` edits a single inference request (transcript, tools, cache, metadata). These edits are not persisted.
+- `on_model_response` edits complete model output before it is committed, returned, or sent to tools. Content may change. Item identity, accounting and tool-call linkage may not.
 
-Payload types separate editable content from read-only identity and accounting. Complete response edits are applied before transcript commit and tool dispatch. Final-response edits are reflected in both the transcript and returned turn result. Stream-progress callbacks do not retract deltas already delivered to observers.
-
-Use `LoopDriver::submit_input_async` when input must pass awaited callbacks before acceptance. Synchronous submission defers that work until the next driver step. Use `LoopDriver::close().await` to finalize an owned session: a prompt finishing is not session closure, and dropping a driver cannot run asynchronous callbacks.
-
-Lifecycle extensions complement existing boundaries rather than replacing them: decorate a `ToolExecutor` for individual or nested tool interception, and a compaction implementation for an actual compaction operation. Model-selection and application-owned configuration changes remain outside the loop.
-
-The original `mutate` callback still runs at the two pre-inference transcript mutation points. `AfterTurnEnded` names new-turn dispatch, not a completion notification; `AfterToolResult` names a tool-round continuation. Use lifecycle callbacks for actual start/end notifications.
+All hooks default to no-ops and run in registration order. Read-only notifications belong in `LoopObserver`; individual tool interception belongs at `ToolExecutor`.
 
 ## Quick start
 
