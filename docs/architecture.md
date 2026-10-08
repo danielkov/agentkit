@@ -138,7 +138,7 @@ stdio or a custom transport.
 
 ## Mutator path
 
-Transcript edits — compaction, redaction, repair — plug into the loop through one generic seam, `LoopMutator`. Mutators run at well-defined `MutationPoint`s (`AfterToolResult`, `AfterTurnEnded`) and decide for themselves whether to touch the transcript via a `TranscriptCursor`.
+Transcript edits — compaction, redaction, repair — plug into the loop through one generic seam, `LoopMutator`. Mutators run at well-defined `MutationPoint`s (`TurnStarted`, `AfterToolResult`, `AfterTurnEnded`) and decide for themselves whether to touch the transcript via a `TranscriptCursor`.
 
 For each registered mutator the loop:
 
@@ -146,6 +146,6 @@ For each registered mutator the loop:
 2. runs the mutator with read-only context and a mutable cursor over the transcript
 3. emits `AgentEvent::MutationFinished { mutator, dirty, metadata, .. }`
 
-If any mutator in the pass dirtied the cursor, the loop validates transcript invariants (tool_use ↔ tool_result pairing) and hard-fails with `LoopError::Mutator` if a mutator left the transcript protocol-invalid.
+The pass is transactional: the chain edits a candidate copy, and if the final candidate differs from the live transcript the loop validates its invariants (tool_use ↔ tool_result pairing), re-checks cancellation, assigns it in one synchronous step, and delivers one `TranscriptObserver::on_transcript_rewrite` with the complete canonical transcript. A mutator that errors, left the transcript protocol-invalid, cancelled, or whose future was dropped changes nothing and notifies nobody; `LoopError::Mutator` surfaces the protocol violation.
 
 Compaction is the canonical mutator: `agentkit-compaction` provides a `Compactor` trait, `StrategyCompactor`, and trigger helpers (`item_count_trigger`, `context_window_trigger`) that wire into this seam through the `AgentBuilderCompactorExt::compactor` extension. Semantic compaction is provided through an injected `CompactionBackend` (e.g. `AgentCompactor`, which runs a nested sub-agent) rather than a built-in model client.

@@ -160,7 +160,7 @@ For loss-free transcript reconstruction (persistence, replication, audit), regis
 - **`LoopObserver`** sees a stream of `AgentEvent`s. Content arrives as deltas — partial fragments that don't carry their parent-`Item` identity — interleaved with lifecycle and telemetry events. Useful for UIs and logging, but a consumer cannot reassemble the canonical transcript from this stream alone.
 - **`TranscriptObserver`** fires exactly once per `Item` appended, receiving a session-addressed `TranscriptEvent` with the fully-formed `Item` ready to persist. Calls happen synchronously from the driver, in transcript order, at the single mutation point that owns the transcript — so what the observer sees is what the loop will send to the model on the next turn.
 
-Mutator-driven rewrites (compaction, redaction, repair) do not fire `on_transcript_event`; they are signalled separately by `AgentEvent::MutationFinished`, which a persistence layer can use to snapshot the post-mutation state.
+Mutator-driven rewrites (compaction, redaction, repair) replace history rather than appending to it, so they do not fire `on_transcript_event`. They fire the trait's other required method, `on_transcript_rewrite`, with the complete canonical transcript. Between the two, a persistence consumer cannot diverge from the driver.
 
 ## The three-layer model
 

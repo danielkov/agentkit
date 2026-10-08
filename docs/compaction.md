@@ -90,7 +90,9 @@ When a compactor fires, `agentkit-loop` emits:
 - `AgentEvent::MutationStarted { mutator, point, .. }`
 - `AgentEvent::MutationFinished { mutator, dirty, metadata, .. }`
 
-Compactors run at every `MutationPoint` — currently `AfterToolResult` (between tool results and the next inference call) and `AfterTurnEnded`. The trigger closure decides which points are relevant. If a mutator's edit leaves the transcript protocol-invalid (orphaned/duplicate tool_use or tool_result), the loop hard-fails with `LoopError::Mutator` rather than letting the next request blow up at the provider.
+Compactors run at every `MutationPoint` — currently `TurnStarted` (once per logical turn the driver creates, with queued input already appended), `AfterToolResult` (between tool results and the next inference call) and `AfterTurnEnded`. The trigger closure decides which points are relevant; one that ignores `point` now also fires at `TurnStarted`, compacting slightly earlier in the turn. If a mutator's edit leaves the transcript protocol-invalid (orphaned/duplicate tool_use or tool_result), the loop hard-fails with `LoopError::Mutator` rather than letting the next request blow up at the provider.
+
+The chain runs against a candidate copy of the transcript, so a failed, invalid, cancelled or dropped mutation leaves the live transcript unchanged. A committed change is published to every `TranscriptObserver` as one `on_transcript_rewrite` carrying the complete canonical transcript.
 
 ## Scope
 

@@ -269,7 +269,7 @@ impl LoopObserver for AuditLogger {
 | Usage      | `UsageUpdated`                                                                                                   |
 | Diagnostic | `Warning`                                                                                                        |
 
-For loss-free transcript reconstruction, register a `TranscriptObserver` alongside `LoopObserver`. It fires a session-addressed `TranscriptEvent` once per `Item` appended, in transcript order — including the synthetic placeholder and the eventual real result for background-detached tools, correlated by `call_id` through the matching `ToolExecutionProgress` (placeholder) and `ToolResultReceived` (terminal result) events.
+For loss-free transcript reconstruction, register a `TranscriptObserver` alongside `LoopObserver`. It fires a session-addressed `TranscriptEvent` once per `Item` appended, in transcript order — including the synthetic placeholder and the eventual real result for background-detached tools, correlated by `call_id` through the matching `ToolExecutionProgress` (placeholder) and `ToolResultReceived` (terminal result) events. Its other required method, `on_transcript_rewrite`, carries the complete canonical transcript when a mutator rewrote history instead of appending to it.
 
 ### Event timeline for a typical turn
 

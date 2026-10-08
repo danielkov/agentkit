@@ -500,7 +500,7 @@ Recommended execution flow:
 
 1. host submits input items
 2. driver merges input into working transcript
-3. driver runs registered `LoopMutator`s at `MutationPoint::AfterTurnEnded` / `AfterToolResult` (compaction, redaction, repair); the loop validates transcript invariants if any mutator dirtied the cursor
+3. driver runs registered `LoopMutator`s at `MutationPoint::TurnStarted` / `AfterTurnEnded` / `AfterToolResult` (compaction, redaction, repair); the chain runs against a candidate copy, and a committed change is validated and published as one `TranscriptObserver::on_transcript_rewrite`
 4. driver constructs `TurnRequest`
 5. driver starts a provider turn
 6. driver forwards streamed deltas to observers

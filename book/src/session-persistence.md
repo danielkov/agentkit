@@ -6,21 +6,24 @@ The agent loop has no built-in storage backend. Persistence is intentionally a h
 
 | Primitive                                        | Purpose                                                                                                                 |
 | ------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------- |
-| `AgentBuilder::transcript(items)`                | Restore prior transcript before the loop starts.                                                                        |
-| `TranscriptObserver::on_transcript_event(event)` | Mirror every newly-appended item to durable storage as the loop runs (`TranscriptEvent` carries `session_id` + `item`). |
-| `LoopDriver::snapshot() -> LoopSnapshot`         | Read-only point-in-time view of `transcript` and `pending_input` for ad-hoc dumps, audit, or full-state checkpoints.    |
+| `AgentBuilder::transcript(items)`                  | Restore prior transcript before the loop starts.                                                                         |
+| `TranscriptObserver::on_transcript_event(event)`   | Mirror every newly-appended item to durable storage as the loop runs (`TranscriptEvent` carries `session_id` + `item`).   |
+| `TranscriptObserver::on_transcript_rewrite(event)` | Replace the stored transcript when a mutator rewrote history (`TranscriptRewriteEvent` carries `session_id` + `items`).   |
+| `LoopDriver::snapshot() -> LoopSnapshot`           | Read-only point-in-time view of `transcript` and `pending_input` for ad-hoc dumps, audit, or full-state checkpoints.      |
 
 That is the whole protocol. Any storage backend — in-memory map, sqlite, Postgres, S3, Redis — implements the same shape:
 
 1. **On startup**: load the prior `Vec<Item>` for the session id (or empty for a fresh session) and pass it to `AgentBuilder::transcript`.
-2. **During the run**: register a `TranscriptObserver` that appends each `Item` to durable storage.
+2. **During the run**: register a `TranscriptObserver` that appends each `Item` to durable storage and replaces it on rewrite.
 3. **On shutdown** (graceful or not): nothing required — the observer has already persisted every appended item.
 
 ## Two important guarantees
 
 **Append-only ordering.** `on_transcript_event` is called synchronously by the loop, in the exact order items land in the transcript. The observer is the single mutation point — every push to the transcript funnels through it. This means a strictly monotonic `seq` column on a sqlite `items` table reproduces the transcript byte-for-byte on reload.
 
-**Mutators are out-of-band.** Mutator-driven transcript rewrites (compaction, redaction, repair) do **not** fire `on_transcript_event`. They are signalled via `AgentEvent::MutationFinished { dirty: true, .. }`, observable through a `LoopObserver`. A mutation-aware persistor subscribes to both channels and replaces the stored transcript when it sees a dirty mutation finish. An agent without mutators (most coding agents that rely on the provider's prompt cache plus a long context window) can ignore this.
+**Mutator rewrites come through the second method.** Mutator-driven transcript rewrites (compaction, redaction, repair) replace history rather than appending to it, so they do **not** fire `on_transcript_event`. They fire `on_transcript_rewrite` with the complete canonical transcript — once per mutation point whose mutator chain produced a transcript that actually differs from the live one. Both methods are required, so an append-only consumer has to decide explicitly (a one-line no-op body) rather than silently diverging from the driver after a compaction pass.
+
+**Best-effort post-commit observation, not a commit gate.** Both methods are synchronous and infallible, and the loop has already committed by the time they run. A failed write cannot roll the turn back; a host that needs acknowledged durable publication owns that linearization point itself.
 
 ## A complete sqlite implementation
 
@@ -72,6 +75,18 @@ let agent = Agent::builder()
     .build()?;
 ```
 
+```rust,ignore
+impl TranscriptObserver for SqliteTranscriptObserver {
+    fn on_transcript_event(&self, event: TranscriptEvent<'_>) {
+        // append one item
+    }
+
+    fn on_transcript_rewrite(&self, event: TranscriptRewriteEvent<'_>) {
+        // replace the stored rows with event.items
+    }
+}
+```
+
 That is the entire round-trip. Run the example twice with the same `--session` flag and the second run resumes mid-conversation — the first `next()` call returns `AwaitingInput` because the transcript is loaded but no input is queued, and the host supplies the next user message in response.
 
 ## Choosing a backend
@@ -93,10 +108,10 @@ The integration test crate exercises the round-trip pattern internally; see `cra
 
 ## Mutation-aware persistence
 
-If your agent registers any `LoopMutator`s (compaction, redaction, repair), the persistence flow extends:
+If your agent registers any `LoopMutator`s (compaction, redaction, repair), the second observer method carries it:
 
 1. `TranscriptObserver::on_transcript_event` continues to mirror new items as they arrive.
-2. A `LoopObserver` subscribes to `AgentEvent::MutationFinished { dirty: true, .. }` and uses it as a signal to replace the stored transcript.
-3. After a dirty mutation finish, call `LoopDriver::snapshot()` from the host's main task and replace the persisted transcript with `snapshot.transcript`. Subsequent `on_transcript_event` calls resume appending from the new tail.
+2. `TranscriptObserver::on_transcript_rewrite` delivers the complete canonical transcript after a mutator chain committed a change. Replace the stored rows with `event.items`; subsequent `on_transcript_event` calls resume appending from the new tail.
+3. A mutation that errored, produced a protocol-invalid transcript, was cancelled, or whose future was dropped leaves the live transcript untouched and notifies nothing — there is no partial rewrite to reconcile. A mutator that writes the same value back is not a change and notifies nothing either.
 
-The two channels exist precisely so persistence can stay simple in the no-mutator case (one observer) without sacrificing correctness when mutators are wired in (one observer plus one event listener).
+`AgentEvent::MutationStarted` / `MutationFinished` remain the mutator's own telemetry (which mutator ran, why, how much it replaced). They are not the persistence signal: a mutator chooses its own `dirty` label, while `on_transcript_rewrite` fires on the driver's own value comparison.

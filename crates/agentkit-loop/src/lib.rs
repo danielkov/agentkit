@@ -792,9 +792,11 @@ pub struct ObservedEvent {
 /// replication, or audit.
 ///
 /// Observers are called *synchronously* from inside the driver, in the
-/// same order items land in the transcript. Compaction-driven transcript
-/// rewrites do **not** fire `on_transcript_event` — those are signaled by
-/// [`AgentEvent::CompactionFinished`] instead.
+/// same order items land in the transcript. A [`LoopMutator`] that rewrites
+/// the transcript does **not** produce appends; its committed result arrives
+/// through [`TranscriptObserver::on_transcript_rewrite`]. Both methods are
+/// required so a persistence consumer cannot silently diverge from the
+/// driver after a compaction or redaction pass.
 ///
 /// Register via [`AgentBuilder::transcript_observer`]; multiple observers
 /// may be registered and are called in registration order.
@@ -803,7 +805,7 @@ pub struct ObservedEvent {
 ///
 /// ```rust
 /// use agentkit_core::Item;
-/// use agentkit_loop::{TranscriptEvent, TranscriptObserver};
+/// use agentkit_loop::{TranscriptEvent, TranscriptObserver, TranscriptRewriteEvent};
 /// use std::sync::atomic::{AtomicUsize, Ordering};
 ///
 /// struct CountingObserver { items: AtomicUsize }
@@ -811,6 +813,10 @@ pub struct ObservedEvent {
 /// impl TranscriptObserver for CountingObserver {
 ///     fn on_transcript_event(&self, _event: TranscriptEvent<'_>) {
 ///         self.items.fetch_add(1, Ordering::Relaxed);
+///     }
+///
+///     fn on_transcript_rewrite(&self, event: TranscriptRewriteEvent<'_>) {
+///         self.items.store(event.items.len(), Ordering::Relaxed);
 ///     }
 /// }
 /// ```
@@ -820,6 +826,17 @@ pub trait TranscriptObserver: Send + Sync {
     /// state behind interior mutability so the driver can share an
     /// `Arc<dyn TranscriptObserver>`.
     fn on_transcript_event(&self, event: TranscriptEvent<'_>);
+
+    /// Replace the observer's transcript with this complete canonical
+    /// snapshot. Called synchronously once per mutation point whose mutator
+    /// chain committed a transcript that actually differs from the live one,
+    /// after invariant validation and the final cancellation check.
+    ///
+    /// This is post-commit, infallible, best-effort *observation*: it is not
+    /// a commit gate and it is not a durability contract. Hosts that need
+    /// acknowledged durable publication own that linearization point
+    /// themselves. Append-only consumers implement this as a no-op.
+    fn on_transcript_rewrite(&self, event: TranscriptRewriteEvent<'_>);
 }
 
 /// Session-addressed transcript append event delivered to
@@ -832,10 +849,20 @@ pub struct TranscriptEvent<'a> {
     pub item: &'a Item,
 }
 
+/// A complete committed transcript snapshot delivered to
+/// [`TranscriptObserver`]s after a mutator chain rewrote the transcript.
+#[derive(Clone, Debug)]
+pub struct TranscriptRewriteEvent<'a> {
+    /// Session this rewrite belongs to.
+    pub session_id: &'a SessionId,
+    /// The full committed transcript, replacing whatever the observer held.
+    pub items: &'a [Item],
+}
+
 /// Where in the loop a [`LoopMutator`] is given a chance to modify the
-/// transcript. Mutators run synchronously at these points; mid-stream
-/// mutation (e.g. between content deltas) is intentionally not supported
-/// because the assistant item is not yet fully constructed.
+/// transcript. Mutators are awaited at these points; mid-stream mutation
+/// (e.g. between content deltas) is intentionally not supported because the
+/// assistant item is not yet fully constructed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum MutationPoint {
@@ -845,6 +872,21 @@ pub enum MutationPoint {
     /// A new logical turn is about to make its first inference call. Pending
     /// user input has already been appended to the transcript.
     AfterTurnEnded,
+    /// The driver has just created a logical turn, once per turn, before any
+    /// other mutation point and before any inference for it.
+    ///
+    /// This is the only point that also covers turns that never dispatch an
+    /// inference — the synthetic turns the driver opens to carry background
+    /// tool resolutions or a late approval, and turns a mutator empties at
+    /// [`MutationPoint::AfterTurnEnded`]. Re-activating an existing turn (a
+    /// tool round that outlived its [`AgentEvent::TurnFinished`]) does not
+    /// run it again.
+    ///
+    /// Queued user input is already in the transcript, so a mutator can edit
+    /// the prompt the turn will answer. A synthetic turn's tool resolutions
+    /// are appended *after* this point, since the turn is created to carry
+    /// them; [`MutationPoint::AfterTurnEnded`] sees those.
+    TurnStarted,
 }
 
 /// Sink for emitting [`AgentEvent`]s from inside a [`LoopMutator`].
@@ -944,9 +986,29 @@ pub struct OutputItemPayload<'a> {
     pub metadata: &'a mut MetadataMap,
 }
 
+/// What the loop will do with a complete model response once it is committed.
+///
+/// Read-only, and computed from the loop's own branch predicate rather than
+/// from the response content, so a hook does not have to re-derive loop
+/// control flow. Tool-call linkage is immutable across the response hooks
+/// (see [`ModelResponsePayload`]), so no edit can move the branch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ResponseDisposition {
+    /// The loop will dispatch this response's tool calls and the logical turn
+    /// continues.
+    ContinueWithTools,
+    /// This response takes the normal finish branch **if** the remaining hooks,
+    /// output validation and cancellation all succeed. It is a candidate, not
+    /// a committed outcome: an aborted operation commits nothing and finishes
+    /// no turn.
+    FinishTurnCandidate,
+}
+
 /// Complete model output before it is committed to the transcript, returned
 /// in the turn result, or dispatched to tools. Content may be rewritten; item
 /// identity, roles, accounting and tool-call linkage (ids and names) may not.
+/// Tool-call *arguments* may be rewritten and reach the executor.
 /// Deltas already streamed to observers are not retracted.
 #[non_exhaustive]
 pub struct ModelResponsePayload<'a> {
@@ -958,6 +1020,8 @@ pub struct ModelResponsePayload<'a> {
     pub usage: Option<&'a Usage>,
     /// Provider metadata for the call.
     pub metadata: &'a MetadataMap,
+    /// What the loop will do with this response once committed.
+    pub disposition: ResponseDisposition,
 }
 
 /// Async transcript mutator. Registered via [`AgentBuilder::mutator`] and
@@ -1021,6 +1085,184 @@ pub trait LoopMutator: Send + Sync {
         Ok(())
     }
 }
+
+/// Awaited, read-only delivery of facts only the driver can observe.
+///
+/// [`LoopObserver`] stays the synchronous telemetry fan-out. `NativeDelivery`
+/// exists for the one thing a synchronous observer cannot do: let a host
+/// *await* its own asynchronous delivery at the point the fact occurs. The
+/// driver awaits each call at the fact's real emission site, so streaming
+/// progress is delivered as the model produces it rather than buffered until
+/// [`LoopDriver::next`] returns.
+///
+/// Implementations are read-only. They cannot edit the transcript, the model
+/// request, the model output or the turn result, and they cannot drive the
+/// loop. Interception belongs to [`LoopMutator`]; individual tool
+/// interception belongs at [`ToolExecutor`].
+///
+/// Failure is isolated: a [`DeliveryError`] never becomes a [`LoopError`],
+/// never rolls back a commit, never re-runs interception or inference, and
+/// never produces a second terminal event. Failures are recorded and drained
+/// with [`LoopDriver::take_delivery_errors`].
+///
+/// Delivery of a fact that is already in flight cannot survive a hard abort:
+/// dropping the future returned by [`LoopDriver::next`] loses whatever had
+/// not been delivered, and the driver keeps no resumable delivery state. A
+/// host that needs terminal facts delivered must let cooperative cancellation
+/// and [`LoopDriver::retire_interrupted_turn`] run to completion. Every
+/// exactly-once guarantee below is scoped to that: uninterrupted calls, or
+/// cooperative cancellation followed by retirement. A dropped future breaks
+/// it, and the driver does not pretend otherwise.
+///
+/// [`HookCtx::cancellation`] is `None` for the terminal facts: terminal
+/// delivery runs uncancelled so a read-only consumer cannot be starved of the
+/// ending it needs to close its own state. For [`NativeFact::Progress`] it
+/// carries the active turn's handle when the agent was built with
+/// [`AgentBuilder::cancellation`], and is `None` otherwise — so `None` does
+/// not by itself identify a terminal fact. Match on the [`NativeFact`] variant
+/// for that.
+///
+/// Register via [`AgentBuilder::delivery`]; multiple targets are awaited in
+/// registration order.
+#[async_trait]
+pub trait NativeDelivery: Send + Sync {
+    /// Deliver one fact. See [`NativeFact`] for each variant's timing.
+    async fn deliver(&self, fact: NativeFact<'_>, ctx: HookCtx<'_>) -> Result<(), DeliveryError>;
+}
+
+/// A loop fact handed to [`NativeDelivery`]. Payloads borrow the driver's own
+/// values rather than introducing a parallel event taxonomy.
+///
+/// Turn *start* is not here: [`MutationPoint::TurnStarted`] already delivers
+/// it awaited, covers the same turns and can edit the prompt, so a read-only
+/// duplicate would be strictly weaker.
+#[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
+pub enum NativeFact<'a> {
+    /// Non-terminal progress for the active turn, delivered as the driver
+    /// consumes it, before the matching [`AgentEvent`] reaches synchronous
+    /// observers.
+    Progress(NativeProgress<'a>),
+    /// The logical turn is about to finish.
+    ///
+    /// Read-only: the result is already final. Delivered before the turn's own
+    /// terminal items are appended to the transcript, so a consumer sees
+    /// cancellation partials and terminal model output before they commit.
+    /// Exactly once per logical turn, including turns that end through
+    /// cancellation, cleanup failure or [`LoopDriver::retire_interrupted_turn`].
+    ///
+    /// Exactly-once holds for uninterrupted and cooperatively cancelled calls.
+    /// It does **not** survive a hard abort *inside this delivery*: because the
+    /// terminal items commit after it, dropping the [`LoopDriver::next`] future
+    /// while this fact is in flight loses that output candidate — it is never
+    /// committed and never returned — and leaves the turn active, so a later
+    /// [`LoopDriver::retire_interrupted_turn`] delivers a second prefinish for
+    /// the same logical turn, carrying a cancelled result instead. A consumer
+    /// that cannot tolerate that must not drop `next()`; one that chooses to
+    /// must treat prefinish as at-least-once and key on
+    /// [`TurnResult::turn_id`].
+    BeforeFinish(&'a TurnResult),
+    /// The logical turn finished and its items are committed. Exactly once per
+    /// logical turn, paired with [`AgentEvent::TurnFinished`].
+    ///
+    /// Unlike [`NativeFact::BeforeFinish`] this is the last step of the
+    /// transition, so the only way to miss it is to drop the driver future
+    /// before it runs. It is never delivered twice for one logical turn.
+    TurnFinished(&'a TurnResult),
+}
+
+/// Non-terminal progress carried by [`NativeFact::Progress`].
+#[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
+pub enum NativeProgress<'a> {
+    /// An event the model session produced for the active turn: deltas, usage,
+    /// tool calls and response-attempt supersession. [`ModelTurnEvent::Finished`]
+    /// is not progress — it reaches [`LoopMutator::on_model_response`] and then
+    /// [`NativeFact::BeforeFinish`].
+    Model(&'a ModelTurnEvent),
+    /// The synthetic `tool_result` the driver authors when a tool call moves to
+    /// the background, paired with [`AgentEvent::ToolExecutionProgress`]. No
+    /// model produced it, so it does not arrive as a model event.
+    ToolDetached(&'a ToolResultPart),
+}
+
+/// Failure reported by a [`NativeDelivery`] target.
+///
+/// Deliberately not a [`LoopError`] variant: a read-only delivery failure must
+/// never be mistaken for an operation failure.
+#[derive(Clone, Debug, Error)]
+#[error("native delivery failed: {message}")]
+pub struct DeliveryError {
+    /// What went wrong, as reported by the delivery target.
+    pub message: String,
+}
+
+impl DeliveryError {
+    /// Build a delivery failure from any message.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+/// Which [`NativeFact`] a recorded delivery failure belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum NativeFactKind {
+    /// [`NativeFact::Progress`].
+    Progress,
+    /// [`NativeFact::BeforeFinish`].
+    BeforeFinish,
+    /// [`NativeFact::TurnFinished`].
+    TurnFinished,
+}
+
+impl NativeFactKind {
+    fn of(fact: &NativeFact<'_>) -> Self {
+        match fact {
+            NativeFact::Progress(_) => Self::Progress,
+            NativeFact::BeforeFinish(_) => Self::BeforeFinish,
+            NativeFact::TurnFinished(_) => Self::TurnFinished,
+        }
+    }
+}
+
+/// One recorded [`NativeDelivery`] failure.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliveryFailure {
+    /// Session the fact belonged to.
+    pub session_id: SessionId,
+    /// Turn the fact belonged to, when one was active.
+    pub turn_id: Option<agentkit_core::TurnId>,
+    /// Which fact failed to deliver.
+    pub fact: NativeFactKind,
+    /// The target's rendered error.
+    pub error: String,
+}
+
+/// Drained [`NativeDelivery`] diagnostics.
+///
+/// The driver keeps a bounded buffer so a permanently broken delivery target
+/// cannot grow memory for the life of a session; `dropped` counts what the
+/// bound discarded since the last drain.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliveryFailures {
+    /// Recorded failures, oldest first.
+    pub failures: Vec<DeliveryFailure>,
+    /// Failures discarded because the buffer was full.
+    pub dropped: u64,
+}
+
+impl DeliveryFailures {
+    /// Returns `true` when nothing failed since the last drain.
+    pub fn is_empty(&self) -> bool {
+        self.failures.is_empty() && self.dropped == 0
+    }
+}
+
+/// Upper bound on retained [`DeliveryFailure`]s between drains.
+const MAX_DELIVERY_FAILURES: usize = 64;
 
 /// Lifecycle and streaming events emitted by the [`LoopDriver`].
 ///
@@ -1417,9 +1659,23 @@ struct ActiveToolRound {
     foreground_progressed: bool,
 }
 
+/// Outcome of opening a logical turn.
+enum OpenedTurn {
+    /// The turn is active and [`MutationPoint::TurnStarted`] has run.
+    Open(agentkit_core::TurnId),
+    /// A turn-start mutator cancelled, and the turn already finished through
+    /// the terminal funnel as this step.
+    Cancelled(Box<LoopStep>),
+}
+
 #[derive(Default)]
 struct DriverLifecycle {
     active_turn: Option<agentkit_core::TurnId>,
+    /// The active turn admitted queued input at [`MutationPoint::TurnStarted`]
+    /// and has not dispatched an inference for it yet. The input is already in
+    /// the transcript, so `pending_input` alone no longer answers "is there a
+    /// prompt waiting for the model?".
+    admitted_input: bool,
 }
 
 /// A configured agent ready to start a session.
@@ -1477,6 +1733,7 @@ where
     mutators: Vec<Arc<dyn LoopMutator>>,
     observers: Vec<Arc<dyn LoopObserver>>,
     transcript_observers: Vec<Arc<dyn TranscriptObserver>>,
+    deliveries: Vec<Arc<dyn NativeDelivery>>,
     transcript: Vec<Item>,
     input: Vec<Item>,
     telemetry: TelemetryConfig,
@@ -1558,6 +1815,9 @@ where
             mutators: self.mutators.clone(),
             observers: self.observers.clone(),
             transcript_observers: self.transcript_observers.clone(),
+            deliveries: self.deliveries.clone(),
+            delivery_failures: VecDeque::new(),
+            dropped_delivery_failures: 0,
             transcript: self.transcript.clone(),
             pending_input: self.input.clone(),
             pending_approvals: BTreeMap::new(),
@@ -1596,6 +1856,7 @@ where
     mutators: Vec<Arc<dyn LoopMutator>>,
     observers: Vec<Arc<dyn LoopObserver>>,
     transcript_observers: Vec<Arc<dyn TranscriptObserver>>,
+    deliveries: Vec<Arc<dyn NativeDelivery>>,
     transcript: Vec<Item>,
     input: Vec<Item>,
     telemetry: TelemetryConfig,
@@ -1617,6 +1878,7 @@ where
             mutators: Vec::new(),
             observers: Vec::new(),
             transcript_observers: Vec::new(),
+            deliveries: Vec::new(),
             transcript: Vec::new(),
             input: Vec::new(),
             telemetry: TelemetryConfig::default(),
@@ -1723,6 +1985,19 @@ where
         self
     }
 
+    /// Register a [`NativeDelivery`] target that is awaited at the emission
+    /// site of each [`NativeFact`].
+    ///
+    /// Multiple targets may be registered; they are awaited in registration
+    /// order. Use this only for facts a host must deliver *asynchronously* at
+    /// the moment they occur — streaming progress and the terminal
+    /// pre-commit/post-commit pair. Ordinary telemetry belongs in a
+    /// synchronous [`LoopObserver`].
+    pub fn delivery<D: NativeDelivery + 'static>(mut self, delivery: D) -> Self {
+        self.deliveries.push(Arc::new(delivery));
+        self
+    }
+
     /// Preload the driver's transcript with prior conversation state
     /// (defaults to empty).
     ///
@@ -1777,6 +2052,7 @@ where
             mutators: self.mutators,
             observers: self.observers,
             transcript_observers: self.transcript_observers,
+            deliveries: self.deliveries,
             transcript: self.transcript,
             input: self.input,
             telemetry: self.telemetry,
@@ -1833,6 +2109,13 @@ where
     mutators: Vec<Arc<dyn LoopMutator>>,
     observers: Vec<Arc<dyn LoopObserver>>,
     transcript_observers: Vec<Arc<dyn TranscriptObserver>>,
+    deliveries: Vec<Arc<dyn NativeDelivery>>,
+    /// Bounded [`NativeDelivery`] diagnostics, oldest first, drained by
+    /// [`LoopDriver::take_delivery_errors`]. A read-only delivery failure is
+    /// never an operation failure, so it is recorded here instead of returned.
+    delivery_failures: VecDeque<DeliveryFailure>,
+    /// Failures discarded because `delivery_failures` was at capacity.
+    dropped_delivery_failures: u64,
     transcript: Vec<Item>,
     pending_input: Vec<Item>,
     pending_approvals: BTreeMap<ToolCallId, PendingApprovalToolCall>,
@@ -1963,15 +2246,43 @@ where
         !self.pending_approvals.is_empty()
     }
 
-    fn start_logical_turn(&mut self) -> agentkit_core::TurnId {
+    /// Create a logical turn, admit queued input, and run
+    /// [`MutationPoint::TurnStarted`].
+    ///
+    /// A no-op returning the active turn when one is already open, so every
+    /// caller can ask for "the turn this step belongs to" without tracking
+    /// whether it exists yet.
+    ///
+    /// `Err(LoopError::Cancelled)` means a turn-start mutator cancelled; the
+    /// caller must funnel the turn through [`Self::finish_cancelled`] rather
+    /// than leave it open.
+    async fn start_logical_turn(&mut self) -> Result<agentkit_core::TurnId, LoopError> {
         if let Some(turn_id) = &self.lifecycle.active_turn {
-            return turn_id.clone();
+            return Ok(turn_id.clone());
         }
         let turn_id = agentkit_core::TurnId::new(format!("turn-{}", self.next_turn_index));
         self.next_turn_index += 1;
-        self.start_logical_turn_with(turn_id)
+        self.start_logical_turn_with(turn_id.clone());
+        // Admit queued input before the mutation point so a prompt-editing
+        // mutator sees the turn's own input, and so turns that never reach
+        // an inference still get one chance to edit history.
+        let admitted: Vec<Item> = std::mem::take(&mut self.pending_input);
+        self.lifecycle.admitted_input = !admitted.is_empty();
+        self.extend_transcript(admitted);
+        let cancellation = self
+            .cancellation
+            .as_ref()
+            .map(CancellationHandle::checkpoint);
+        self.run_mutators(MutationPoint::TurnStarted, Some(&turn_id), cancellation)
+            .await?;
+        Ok(turn_id)
     }
 
+    /// Activate `turn_id` without running [`MutationPoint::TurnStarted`].
+    ///
+    /// Used to re-activate a turn whose tool round outlived its
+    /// [`AgentEvent::TurnFinished`], which is a continuation of work the
+    /// turn-start point already ran for — not a new turn.
     fn start_logical_turn_with(&mut self, turn_id: agentkit_core::TurnId) -> agentkit_core::TurnId {
         if let Some(active_turn) = &self.lifecycle.active_turn {
             return active_turn.clone();
@@ -1984,14 +2295,121 @@ where
         turn_id
     }
 
-    fn finish_logical_turn(&mut self, result: &TurnResult) {
+    /// [`Self::start_logical_turn`], funnelling a cancelling turn-start
+    /// mutator into the turn's cancelled ending instead of an error.
+    async fn open_logical_turn(&mut self) -> Result<OpenedTurn, LoopError> {
+        match self.start_logical_turn().await {
+            Ok(turn_id) => Ok(OpenedTurn::Open(turn_id)),
+            Err(LoopError::Cancelled) => {
+                let turn_id = self
+                    .lifecycle
+                    .active_turn
+                    .clone()
+                    .ok_or(LoopError::Cancelled)?;
+                self.finish_cancelled(turn_id, Vec::new())
+                    .await
+                    .map(|step| OpenedTurn::Cancelled(Box::new(step)))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The single terminal transition for a logical turn, for a turn whose
+    /// own terminal items are not in the transcript yet.
+    async fn finish_logical_turn(&mut self, result: TurnResult) -> TurnResult {
+        let items = result.items.clone();
+        self.finish_logical_turn_inner(result, items).await
+    }
+
+    /// [`Self::finish_logical_turn`] for a turn whose output was already
+    /// committed earlier in the turn so tools could be dispatched against it.
+    async fn finish_committed_logical_turn(&mut self, result: TurnResult) -> TurnResult {
+        self.finish_logical_turn_inner(result, Vec::new()).await
+    }
+
+    /// Structural funnel every logical-turn ending passes through.
+    ///
+    /// The active-turn guard — not a per-path flag — is what makes the ending
+    /// happen exactly once: a second attempt for a turn that is no longer
+    /// active returns without delivering, emitting or appending anything.
+    ///
+    /// `uncommitted` are the turn's own terminal items that the transcript
+    /// does not hold yet (terminal model output, cancellation partials). They
+    /// are appended *after* [`NativeFact::BeforeFinish`] so a read-only
+    /// consumer observes them before they commit, and the turn never ends
+    /// owing a tool result.
+    ///
+    /// That ordering has one cost, and it is the deliberate trade: the awaited
+    /// prefinish delivery is a suspension point before anything has committed.
+    /// A caller that drops its future there loses `uncommitted` and leaves the
+    /// turn active, so [`Self::retire_interrupted_turn`] will run this
+    /// transition again — a second prefinish for the turn, with a cancelled
+    /// result. Buying exactly-once across that would mean resumable terminal
+    /// state, which this design rejects.
+    async fn finish_logical_turn_inner(
+        &mut self,
+        result: TurnResult,
+        uncommitted: Vec<Item>,
+    ) -> TurnResult {
         if self.pending_round_resume.as_ref() == Some(&result.turn_id) {
             self.pending_round_resume = None;
         }
-        if self.lifecycle.active_turn.as_ref() == Some(&result.turn_id) {
-            self.lifecycle.active_turn = None;
-            self.emit(AgentEvent::TurnFinished(result.clone()));
+        if self.lifecycle.active_turn.as_ref() != Some(&result.turn_id) {
+            return result;
         }
+        self.deliver(NativeFact::BeforeFinish(&result), None).await;
+        self.extend_transcript(uncommitted);
+        self.close_interrupted_tool_calls();
+        self.lifecycle.active_turn = None;
+        self.lifecycle.admitted_input = false;
+        self.emit(AgentEvent::TurnFinished(result.clone()));
+        self.deliver(NativeFact::TurnFinished(&result), None).await;
+        result
+    }
+
+    /// Await every registered [`NativeDelivery`] target for one fact.
+    ///
+    /// Infallible by construction: a target's [`DeliveryError`] is recorded as
+    /// diagnostics and the operation that produced the fact continues
+    /// unchanged — no rollback, no replay, no second terminal event.
+    async fn deliver(&mut self, fact: NativeFact<'_>, cancellation: Option<TurnCancellation>) {
+        if self.deliveries.is_empty() {
+            return;
+        }
+        let kind = NativeFactKind::of(&fact);
+        let session_id = self.session_id.clone();
+        // A terminal fact names its own turn: the active-turn slot is already
+        // cleared by the time `TurnFinished` is delivered.
+        let turn_id = match fact {
+            NativeFact::BeforeFinish(result) | NativeFact::TurnFinished(result) => {
+                Some(result.turn_id.clone())
+            }
+            NativeFact::Progress(_) => self.lifecycle.active_turn.clone(),
+        };
+        let deliveries = self.deliveries.clone();
+        for target in &deliveries {
+            let ctx = HookCtx {
+                session_id: &session_id,
+                turn_id: turn_id.as_ref(),
+                cancellation: cancellation.clone(),
+            };
+            if let Err(error) = target.deliver(fact, ctx).await {
+                self.record_delivery_failure(DeliveryFailure {
+                    session_id: session_id.clone(),
+                    turn_id: turn_id.clone(),
+                    fact: kind,
+                    error: error.to_string(),
+                });
+            }
+        }
+    }
+
+    fn record_delivery_failure(&mut self, failure: DeliveryFailure) {
+        if self.delivery_failures.len() >= MAX_DELIVERY_FAILURES {
+            self.delivery_failures.pop_front();
+            self.dropped_delivery_failures = self.dropped_delivery_failures.saturating_add(1);
+        }
+        self.delivery_failures.push_back(failure);
     }
 
     fn emit_tool_catalog_events(&mut self, events: Vec<ToolCatalogEvent>) {
@@ -2104,8 +2522,13 @@ where
     async fn drain_pending_loop_updates(&mut self) -> Result<(bool, Option<LoopStep>), LoopError> {
         self.collect_pending_loop_updates().await?;
         let mut resolutions = std::mem::take(&mut self.pending_loop_updates);
-        if !resolutions.is_empty() {
-            self.start_logical_turn();
+        if !resolutions.is_empty()
+            && let OpenedTurn::Cancelled(step) = self.open_logical_turn().await?
+        {
+            // The synthetic turn that would have carried these resolutions was
+            // cancelled at its start; requeue them for the next step.
+            self.pending_loop_updates = resolutions;
+            return Ok((false, Some(*step)));
         }
         let mut saw_items = false;
         while let Some(resolution) = resolutions.pop_front() {
@@ -2115,7 +2538,7 @@ where
                     saw_items = true;
                 }
                 TaskResolution::Approval(task) => {
-                    let turn_id = self.start_logical_turn();
+                    let turn_id = self.start_logical_turn().await?;
                     self.enqueue_pending_approval(&turn_id, task, None);
                 }
             }
@@ -2164,8 +2587,14 @@ where
             session_id: &observed_session_id,
             observers: &observers,
         };
+        // The chain runs against a candidate copy, never the live history.
+        // Everything that can fail — a mutator, invariant validation, the
+        // final cancellation check — happens before the single synchronous
+        // assignment below, so a failed, invalid, cancelled or dropped chain
+        // leaves the live transcript exactly as it was and notifies nothing.
+        let mut candidate = self.transcript.clone();
         let mut cursor = TranscriptCursor {
-            items: &mut self.transcript,
+            items: &mut candidate,
             dirty: false,
         };
         for mutator in &mutators {
@@ -2184,8 +2613,32 @@ where
             };
             mutator.mutate(&mut cursor, ctx).await?;
         }
-        if cursor.dirty {
-            validate_transcript_invariants(cursor.items)?;
+        // `dirty` only proves a mutator took `&mut` access; it is a
+        // short-circuit, never evidence of change. A chain that writes the
+        // value back unchanged must commit nothing and notify nobody.
+        let dirty = cursor.dirty;
+        if !dirty || candidate == self.transcript {
+            return Ok(());
+        }
+        validate_transcript_invariants(&candidate)?;
+        if cancellation
+            .as_ref()
+            .is_some_and(TurnCancellation::is_cancelled)
+        {
+            return Err(LoopError::Cancelled);
+        }
+        let now = Timestamp::now();
+        for item in &mut candidate {
+            if item.created_at.is_none() {
+                item.created_at = Some(now);
+            }
+        }
+        self.transcript = candidate;
+        for observer in &self.transcript_observers {
+            observer.on_transcript_rewrite(TranscriptRewriteEvent {
+                session_id: &self.session_id,
+                items: &self.transcript,
+            });
         }
         Ok(())
     }
@@ -2214,6 +2667,7 @@ where
                 self.active_tool_round = None;
                 return self
                     .finish_cancelled(presentation_turn_id, Vec::new())
+                    .await
                     .map(Some);
             }
 
@@ -2264,7 +2718,8 @@ where
                     TaskStartOutcome::Pending { kind, .. } => {
                         self.emit(AgentEvent::ToolExecutionStarted(call.clone()));
                         if kind == agentkit_task_manager::TaskKind::Background {
-                            self.append_detach_placeholder(call.id.clone(), &call.name);
+                            self.append_detach_placeholder(call.id.clone(), &call.name)
+                                .await;
                             if let Some(active) = self.active_tool_round.as_mut() {
                                 active.background_pending = true;
                             }
@@ -2299,7 +2754,8 @@ where
                     }
                 }
                 Some(TurnTaskUpdate::Detached(snapshot)) => {
-                    self.append_detach_placeholder(snapshot.call_id, &snapshot.tool_name);
+                    self.append_detach_placeholder(snapshot.call_id, &snapshot.tool_name)
+                        .await;
                     if let Some(active) = self.active_tool_round.as_mut() {
                         active.background_pending = true;
                         active.foreground_progressed = true;
@@ -2319,6 +2775,7 @@ where
                         self.active_tool_round = None;
                         return self
                             .finish_cancelled(presentation_turn_id, Vec::new())
+                            .await
                             .map(Some);
                     }
                     let active = self.active_tool_round.take().ok_or_else(|| {
@@ -2383,7 +2840,9 @@ where
         {
             Ok(()) => {}
             Err(LoopError::Cancelled) => {
-                return self.finish_cancelled(turn_id, interrupted_assistant_items());
+                return self
+                    .finish_cancelled(turn_id, interrupted_assistant_items())
+                    .await;
             }
             Err(error) => return Err(error),
         }
@@ -2394,14 +2853,15 @@ where
         // for the model to respond to. Finish the turn rather than dispatch an
         // assistant-prefill request, which most providers reject.
         if !transcript_has_pending_input(&self.transcript) {
-            let turn_result = TurnResult {
-                turn_id,
-                finish_reason: FinishReason::Completed,
-                items: Vec::new(),
-                usage: None,
-                metadata: MetadataMap::new(),
-            };
-            self.finish_logical_turn(&turn_result);
+            let turn_result = self
+                .finish_logical_turn(TurnResult {
+                    turn_id,
+                    finish_reason: FinishReason::Completed,
+                    items: Vec::new(),
+                    usage: None,
+                    metadata: MetadataMap::new(),
+                })
+                .await;
             return Ok(LoopStep::Finished(turn_result));
         }
 
@@ -2409,7 +2869,9 @@ where
             .as_ref()
             .is_some_and(TurnCancellation::is_cancelled)
         {
-            return self.finish_cancelled(turn_id, interrupted_assistant_items());
+            return self
+                .finish_cancelled(turn_id, interrupted_assistant_items())
+                .await;
         }
 
         let catalog_events = self.tool_executor.drain_catalog_events();
@@ -2492,7 +2954,9 @@ where
                     .on_turn_interrupted(&turn_id)
                     .await
                     .map_err(|error| LoopError::Tool(ToolError::Internal(error.to_string())))?;
-                return self.finish_cancelled(turn_id, interrupted_assistant_items());
+                return self
+                    .finish_cancelled(turn_id, interrupted_assistant_items())
+                    .await;
             }
             Err(error) => return Err(error),
         }
@@ -2516,7 +2980,9 @@ where
                     .on_turn_interrupted(&turn_id)
                     .await
                     .map_err(|error| LoopError::Tool(ToolError::Internal(error.to_string())))?;
-                return self.finish_cancelled(turn_id, interrupted_assistant_items());
+                return self
+                    .finish_cancelled(turn_id, interrupted_assistant_items())
+                    .await;
             }
             Err(error) => return Err(error),
         };
@@ -2557,20 +3023,31 @@ where
                     .on_turn_interrupted(&turn_id)
                     .await
                     .map_err(|error| LoopError::Tool(ToolError::Internal(error.to_string())))?;
-                return self.finish_cancelled(
-                    turn_id,
-                    interrupted_stream_items(streamed_content.as_ref()),
-                );
+                return self
+                    .finish_cancelled(turn_id, interrupted_stream_items(streamed_content.as_ref()))
+                    .await;
             }
             Err(error) => return Err(error),
         } {
             let attempt_superseded = matches!(event, ModelTurnEvent::ResponseAttemptSuperseded);
             if attempt_superseded {
+                // Drop the superseded attempt's reconstruction state before
+                // the awaited delivery below, so a cancellation observed
+                // during it cannot commit that attempt's partial content.
                 saw_tool_call = false;
                 latest_usage = None;
                 if let Some(content) = &mut streamed_content {
                     content.reset();
                 }
+            }
+            if !matches!(event, ModelTurnEvent::Finished(_)) {
+                self.deliver(
+                    NativeFact::Progress(NativeProgress::Model(&event)),
+                    cancellation.clone(),
+                )
+                .await;
+            }
+            if attempt_superseded {
                 self.emit(AgentEvent::ResponseAttemptSuperseded);
             }
             if cancellation
@@ -2582,10 +3059,9 @@ where
                     .on_turn_interrupted(&turn_id)
                     .await
                     .map_err(|error| LoopError::Tool(ToolError::Internal(error.to_string())))?;
-                return self.finish_cancelled(
-                    turn_id,
-                    interrupted_stream_items(streamed_content.as_ref()),
-                );
+                return self
+                    .finish_cancelled(turn_id, interrupted_stream_items(streamed_content.as_ref()))
+                    .await;
             }
             if attempt_superseded {
                 continue;
@@ -2622,11 +3098,20 @@ where
             LoopError::Provider("model turn ended without a Finished event".into())
         })?;
         result.usage = merge_usage(result.usage, latest_usage);
+        // Taken from the loop's own branch predicate, after every superseded
+        // attempt reset it, so a hook never has to re-derive control flow from
+        // the response content.
+        let disposition = if saw_tool_call {
+            ResponseDisposition::ContinueWithTools
+        } else {
+            ResponseDisposition::FinishTurnCandidate
+        };
         match run_response_hooks(
             &self.mutators,
             &self.session_id,
             &turn_id,
             cancellation.as_ref(),
+            disposition,
             &mut result,
         )
         .instrument(chat_span.clone())
@@ -2638,10 +3123,9 @@ where
                     .on_turn_interrupted(&turn_id)
                     .await
                     .map_err(|error| LoopError::Tool(ToolError::Internal(error.to_string())))?;
-                return self.finish_cancelled(
-                    turn_id,
-                    interrupted_stream_items(streamed_content.as_ref()),
-                );
+                return self
+                    .finish_cancelled(turn_id, interrupted_stream_items(streamed_content.as_ref()))
+                    .await;
             }
             Err(error) => return Err(error),
         }
@@ -2705,9 +3189,11 @@ where
                 item
             })
             .collect();
-        self.extend_transcript(output_items.clone());
-
         if saw_tool_call {
+            // Tool dispatch reads the committed transcript, so this output
+            // commits before the round rather than through the terminal
+            // funnel.
+            self.extend_transcript(output_items.clone());
             let pending_calls = extract_tool_calls(&output_items)
                 .into_iter()
                 .map(|call| {
@@ -2733,13 +3219,14 @@ where
             if let Some(step) = self.continue_active_tool_round().await? {
                 return Ok(step);
             }
-            self.finish_logical_turn(&TurnResult {
+            self.finish_committed_logical_turn(TurnResult {
                 turn_id,
                 finish_reason: result.finish_reason,
                 items: output_items,
                 usage: result.usage,
                 metadata: result.metadata,
-            });
+            })
+            .await;
             return Ok(LoopStep::Interrupt(LoopInterrupt::AwaitingInput(
                 InputRequest {
                     session_id: self.session_id.clone(),
@@ -2748,14 +3235,15 @@ where
             )));
         }
 
-        let turn_result = TurnResult {
-            turn_id,
-            finish_reason: result.finish_reason,
-            items: output_items,
-            usage: result.usage,
-            metadata: result.metadata,
-        };
-        self.finish_logical_turn(&turn_result);
+        let turn_result = self
+            .finish_logical_turn(TurnResult {
+                turn_id,
+                finish_reason: result.finish_reason,
+                items: output_items,
+                usage: result.usage,
+                metadata: result.metadata,
+            })
+            .await;
         Ok(LoopStep::Finished(turn_result))
     }
 
@@ -2844,7 +3332,8 @@ where
                             self.append_detach_placeholder(
                                 pending.call.id.clone(),
                                 &pending.call.name,
-                            );
+                            )
+                            .await;
                         } else {
                             self.active_tool_round = Some(ActiveToolRound {
                                 presentation_turn_id: pending.presentation_turn_id.clone(),
@@ -2890,23 +3379,25 @@ where
         }
     }
 
-    fn finish_cancelled(
+    /// Finish `turn_id` as cancelled, carrying whatever partial output the
+    /// turn produced. The partial is read-only: it reaches the terminal facts
+    /// and the transcript, but no hook may rewrite it.
+    async fn finish_cancelled(
         &mut self,
         turn_id: agentkit_core::TurnId,
         items: Vec<Item>,
     ) -> Result<LoopStep, LoopError> {
         let pending = self.drain_pending_approval_items();
         self.reject_drained_approvals(pending);
-        self.extend_transcript(items.clone());
-        self.close_interrupted_tool_calls();
-        let turn_result = TurnResult {
-            turn_id,
-            finish_reason: FinishReason::Cancelled,
-            items,
-            usage: None,
-            metadata: interrupted_metadata("turn"),
-        };
-        self.finish_logical_turn(&turn_result);
+        let turn_result = self
+            .finish_logical_turn(TurnResult {
+                turn_id,
+                finish_reason: FinishReason::Cancelled,
+                items,
+                usage: None,
+                metadata: interrupted_metadata("turn"),
+            })
+            .await;
         Ok(LoopStep::Finished(turn_result))
     }
 
@@ -3040,7 +3531,10 @@ where
     ///
     /// This clears the blocking approval and appends an error tool result so
     /// the transcript remains provider-valid if the host continues the turn.
-    pub fn cancel_pending_approval_for(&mut self, call_id: ToolCallId) -> Result<(), LoopError> {
+    pub async fn cancel_pending_approval_for(
+        &mut self,
+        call_id: ToolCallId,
+    ) -> Result<(), LoopError> {
         let Some(pending) = self.drain_pending_approval_for(&call_id) else {
             return Err(LoopError::InvalidState(format!(
                 "no approval request is pending for call {}",
@@ -3050,7 +3544,7 @@ where
         let turn_id = pending.presentation_turn_id.clone();
         self.reject_drained_approvals(vec![pending]);
         if self.pending_approvals.is_empty() && self.active_tool_round.is_none() {
-            let _ = self.finish_cancelled(turn_id, Vec::new())?;
+            let _ = self.finish_cancelled(turn_id, Vec::new()).await?;
         }
         Ok(())
     }
@@ -3096,17 +3590,19 @@ where
         }
         self.reject_drained_approvals(pending);
         if let Some(error) = cleanup_error {
-            self.close_interrupted_tool_calls();
-            self.finish_logical_turn(&TurnResult {
+            // Cleanup failed, but the turn still ends exactly once and the
+            // transcript still closes its tool calls — the funnel owns both.
+            self.finish_logical_turn(TurnResult {
                 turn_id,
                 finish_reason: FinishReason::Error,
                 items: Vec::new(),
                 usage: None,
                 metadata: MetadataMap::new(),
-            });
+            })
+            .await;
             return Err(error);
         }
-        self.finish_cancelled(turn_id, Vec::new()).map(Some)
+        self.finish_cancelled(turn_id, Vec::new()).await.map(Some)
     }
 
     /// Retire the active logical turn without resuming model or tool execution.
@@ -3119,6 +3615,13 @@ where
     ///
     /// Returns `None` when no logical turn is active, including on repeated calls.
     /// Otherwise emits exactly one cancelled [`AgentEvent::TurnFinished`].
+    ///
+    /// This is the designated recovery path after a dropped [`Self::next`]
+    /// future, and it is the one case where a turn can see a second
+    /// [`NativeFact::BeforeFinish`]: if the drop happened inside that
+    /// delivery, the turn is still active and its terminal output candidate was
+    /// never committed, so retirement re-runs the transition with a cancelled
+    /// result. See [`NativeFact::BeforeFinish`].
     ///
     /// # Errors
     ///
@@ -3133,16 +3636,32 @@ where
         // At AfterToolResult the foreground task round has already completed.
         self.pending_round_resume = None;
         let cleanup = self.cleanup_interrupted_turn().await;
-        let result = TurnResult {
-            turn_id,
-            finish_reason: FinishReason::Cancelled,
-            items: Vec::new(),
-            usage: None,
-            metadata: interrupted_metadata("turn"),
-        };
-        self.finish_logical_turn(&result);
+        // The terminal facts are delivered before the cleanup error surfaces,
+        // so a failing task manager cannot withhold the turn's ending.
+        let result = self
+            .finish_logical_turn(TurnResult {
+                turn_id,
+                finish_reason: FinishReason::Cancelled,
+                items: Vec::new(),
+                usage: None,
+                metadata: interrupted_metadata("turn"),
+            })
+            .await;
         cleanup?;
         Ok(Some(result))
+    }
+
+    /// Drain the [`NativeDelivery`] failures recorded since the last call.
+    ///
+    /// Delivery failures are diagnostics, never operation failures: the work
+    /// that produced the undelivered fact is already committed and its own
+    /// result was returned unchanged. Hosts that care about delivery drain
+    /// this after each driver call and surface it separately.
+    pub fn take_delivery_errors(&mut self) -> DeliveryFailures {
+        DeliveryFailures {
+            failures: std::mem::take(&mut self.delivery_failures).into(),
+            dropped: std::mem::take(&mut self.dropped_delivery_failures),
+        }
     }
 
     /// Take a read-only snapshot of the driver's current transcript and input queue.
@@ -3196,40 +3715,26 @@ where
     /// Returns [`LoopError::InvalidState`] if called while an unresolved
     /// interrupt is pending, or propagates provider / tool / compaction errors.
     pub async fn next(&mut self) -> Result<LoopStep, LoopError> {
-        if self.lifecycle.active_turn.is_none() {
-            let continuation_turn = self
-                .pending_approval_order
-                .iter()
-                .find_map(|call_id| self.pending_approvals.get(call_id))
-                .map(|pending| pending.presentation_turn_id.clone())
-                .or_else(|| {
-                    self.active_tool_round
-                        .as_ref()
-                        .map(|active| active.presentation_turn_id.clone())
-                })
-                .or_else(|| self.pending_round_resume.clone());
-            if let Some(turn_id) = continuation_turn {
-                self.start_logical_turn_with(turn_id);
-            } else if !self.pending_input.is_empty() {
-                self.start_logical_turn();
-            }
-        }
-
         let result = self.next_inner().await;
         match &result {
-            Ok(LoopStep::Finished(turn)) => self.finish_logical_turn(turn),
+            Ok(LoopStep::Finished(turn)) => {
+                // Already funnelled by whichever path produced it; this is the
+                // guard's no-op for a turn that is no longer active.
+                self.finish_committed_logical_turn(turn.clone()).await;
+            }
             Err(_) => {
                 if let Some(turn_id) = self.lifecycle.active_turn.clone() {
                     if let Err(error) = self.cleanup_interrupted_turn().await {
                         tracing::debug!(%error, "failed to clean up turn after loop error");
                     }
-                    self.finish_logical_turn(&TurnResult {
+                    self.finish_logical_turn(TurnResult {
                         turn_id,
                         finish_reason: FinishReason::Error,
                         items: Vec::new(),
                         usage: None,
                         metadata: MetadataMap::new(),
-                    });
+                    })
+                    .await;
                 }
             }
             _ => {}
@@ -3274,7 +3779,45 @@ where
         }
     }
 
+    /// Open the logical turn the next step belongs to, before any of that
+    /// step's work.
+    ///
+    /// Continuation work re-activates the turn it belongs to; otherwise queued
+    /// input opens a fresh one. Returns the cancelled terminal step when a
+    /// turn-start mutator cancels.
+    async fn open_step_turn(&mut self) -> Result<Option<LoopStep>, LoopError> {
+        if self.lifecycle.active_turn.is_some() {
+            return Ok(None);
+        }
+        let continuation_turn = self
+            .pending_approval_order
+            .iter()
+            .find_map(|call_id| self.pending_approvals.get(call_id))
+            .map(|pending| pending.presentation_turn_id.clone())
+            .or_else(|| {
+                self.active_tool_round
+                    .as_ref()
+                    .map(|active| active.presentation_turn_id.clone())
+            })
+            .or_else(|| self.pending_round_resume.clone());
+        if let Some(turn_id) = continuation_turn {
+            self.start_logical_turn_with(turn_id);
+            return Ok(None);
+        }
+        if self.pending_input.is_empty() {
+            return Ok(None);
+        }
+        match self.open_logical_turn().await? {
+            OpenedTurn::Open(_) => Ok(None),
+            OpenedTurn::Cancelled(step) => Ok(Some(*step)),
+        }
+    }
+
     async fn next_inner(&mut self) -> Result<LoopStep, LoopError> {
+        if let Some(step) = self.open_step_turn().await? {
+            return Ok(step);
+        }
+
         if let Some(pending) = self.take_next_resolved_approval() {
             return self.resume_after_approval(pending).await;
         }
@@ -3299,11 +3842,24 @@ where
         // before unrelated background completions so a delayed approval cannot
         // bind itself to that turn's TurnStarted event. AfterToolResult resumes
         // remain ordered ahead of fresh input below.
-        if self.pending_round_resume.is_none() && !self.pending_input.is_empty() {
+        //
+        // Two queues feed this branch: `admitted_input` for input this step
+        // already folded into the transcript when it opened the turn, and
+        // `pending_input` for input queued against a turn that was already
+        // open. Only `pending_round_resume` defers them, and the branch that
+        // takes it below drains `pending_input` itself — so admitted input is
+        // never left unanswered behind the `AwaitingInput` tail.
+        if self.pending_round_resume.is_none()
+            && (self.lifecycle.admitted_input || !self.pending_input.is_empty())
+        {
             // Take updates now to preserve the driver's once-per-step manager
             // handoff, but defer presenting them until this input turn ends.
             self.collect_pending_loop_updates().await?;
-            let turn_id = self.start_logical_turn();
+            let turn_id = match self.open_logical_turn().await? {
+                OpenedTurn::Open(turn_id) => turn_id,
+                OpenedTurn::Cancelled(step) => return Ok(*step),
+            };
+            self.lifecycle.admitted_input = false;
             let drained: Vec<Item> = std::mem::take(&mut self.pending_input);
             self.extend_transcript(drained);
             return self
@@ -3337,7 +3893,11 @@ where
             )));
         }
 
-        let turn_id = self.start_logical_turn();
+        let turn_id = match self.open_logical_turn().await? {
+            OpenedTurn::Open(turn_id) => turn_id,
+            OpenedTurn::Cancelled(step) => return Ok(*step),
+        };
+        self.lifecycle.admitted_input = false;
         let drained: Vec<Item> = std::mem::take(&mut self.pending_input);
         self.extend_transcript(drained);
         self.drive_turn(turn_id, MutationPoint::AfterTurnEnded)
@@ -3365,7 +3925,7 @@ where
         self.transcript.push(item);
     }
 
-    fn append_detach_placeholder(&mut self, call_id: ToolCallId, tool_name: &str) {
+    async fn append_detach_placeholder(&mut self, call_id: ToolCallId, tool_name: &str) {
         self.background_call_ids.insert(call_id.clone());
         if !self.detached_call_ids.insert(call_id.clone()) {
             return;
@@ -3378,6 +3938,12 @@ where
             is_error: false,
             metadata: MetadataMap::new(),
         };
+        let cancellation = self.tool_cancellation_for(&call_id, None);
+        self.deliver(
+            NativeFact::Progress(NativeProgress::ToolDetached(&detached_result)),
+            cancellation,
+        )
+        .await;
         self.emit(AgentEvent::ToolExecutionProgress(detached_result.clone()));
         self.append_item(Item {
             id: None,
@@ -5149,6 +5715,7 @@ async fn run_response_hooks(
     session_id: &SessionId,
     turn_id: &agentkit_core::TurnId,
     cancellation: Option<&TurnCancellation>,
+    disposition: ResponseDisposition,
     result: &mut ModelTurnResult,
 ) -> Result<(), LoopError> {
     if mutators.is_empty() {
@@ -5170,6 +5737,7 @@ async fn run_response_hooks(
             finish_reason: &result.finish_reason,
             usage: result.usage.as_ref(),
             metadata: &result.metadata,
+            disposition,
         };
         let ctx = HookCtx {
             session_id,
@@ -6466,6 +7034,22 @@ mod tests {
         }
     }
 
+    /// Records the loop-authored detach placeholders delivered as progress.
+    #[derive(Clone, Default)]
+    struct RecordingDelivery {
+        detached: StdArc<StdMutex<Vec<ToolCallId>>>,
+    }
+
+    #[async_trait]
+    impl NativeDelivery for RecordingDelivery {
+        async fn deliver(&self, fact: NativeFact<'_>, _: HookCtx<'_>) -> Result<(), DeliveryError> {
+            if let NativeFact::Progress(NativeProgress::ToolDetached(result)) = fact {
+                self.detached.lock().unwrap().push(result.call_id.clone());
+            }
+            Ok(())
+        }
+    }
+
     #[test]
     fn session_consumer_capabilities_are_typed_and_serde_defaulted() {
         let config = SessionConfig::new("session").with_response_attempt_supersession();
@@ -7165,13 +7749,15 @@ mod tests {
 
         let recorded = points.lock().unwrap().clone();
         assert_eq!(
-            recorded.first(),
-            Some(&MutationPoint::AfterTurnEnded),
-            "first drive of a fresh turn must report AfterTurnEnded, got {recorded:?}"
-        );
-        assert!(
-            recorded.contains(&MutationPoint::AfterToolResult),
-            "post-tool continuation must report AfterToolResult, got {recorded:?}"
+            recorded,
+            [
+                MutationPoint::TurnStarted,
+                MutationPoint::AfterTurnEnded,
+                MutationPoint::AfterToolResult,
+            ],
+            "turn creation reports TurnStarted once, then the fresh turn's \
+             first inference reports AfterTurnEnded and the post-tool \
+             continuation reports AfterToolResult"
         );
     }
 
@@ -7974,6 +8560,7 @@ mod tests {
             release.clone(),
             "detached-done",
         ));
+        let delivery = RecordingDelivery::default();
         let agent = Agent::builder()
             .model(FakeAdapter)
             .add_tool_source(tools)
@@ -7982,6 +8569,7 @@ mod tests {
             .observer(RecordingObserver {
                 events: events.clone(),
             })
+            .delivery(delivery.clone())
             .build()
             .unwrap();
 
@@ -8027,6 +8615,11 @@ mod tests {
             other => panic!("unexpected resumed step: {other:?}"),
         }
 
+        assert_eq!(
+            delivery.detached.lock().unwrap().as_slice(),
+            [ToolCallId::new("call-1")],
+            "the loop-authored detach placeholder is delivered as progress, once"
+        );
         let events = events.lock().unwrap();
         assert!(events.iter().any(|event| matches!(
             event,
@@ -9070,6 +9663,7 @@ mod tests {
         ));
         driver
             .finish_cancelled(agentkit_core::TurnId::new("turn-cancelled"), Vec::new())
+            .await
             .unwrap();
 
         assert!(
@@ -9285,7 +9879,7 @@ mod tests {
             }
             other => panic!("unexpected loop step: {other:?}"),
         };
-        driver.cancel_pending_approval_for(call_id).unwrap();
+        driver.cancel_pending_approval_for(call_id).await.unwrap();
 
         assert!(driver.lifecycle.active_turn.is_none());
         assert!(driver.pending_approvals.is_empty());
@@ -10249,6 +10843,10 @@ mod tests {
     impl TranscriptObserver for RecordingTranscriptObserver {
         fn on_transcript_event(&self, event: TranscriptEvent<'_>) {
             self.items.lock().unwrap().push(event.item.clone());
+        }
+
+        fn on_transcript_rewrite(&self, event: TranscriptRewriteEvent<'_>) {
+            *self.items.lock().unwrap() = event.items.to_vec();
         }
     }
 

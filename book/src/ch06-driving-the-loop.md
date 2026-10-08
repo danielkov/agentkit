@@ -18,6 +18,7 @@ pub struct LoopDriver<S: ModelSession> {
     mutators: Vec<Arc<dyn LoopMutator>>,
     observers: Vec<Arc<dyn LoopObserver>>,
     transcript_observers: Vec<Arc<dyn TranscriptObserver>>,
+    deliveries: Vec<Arc<dyn NativeDelivery>>,
     transcript: Vec<Item>,
     pending_input: Vec<Item>,
     pending_approvals: BTreeMap<ToolCallId, PendingApprovalToolCall>,
@@ -36,6 +37,7 @@ impl<S: ModelSession> LoopDriver<S> {
         -> Result<(), LoopError>;
     pub fn set_next_turn_cache(&mut self, cache: PromptCacheRequest) -> Result<(), LoopError>;
     pub fn snapshot(&self) -> LoopSnapshot;
+    pub fn take_delivery_errors(&mut self) -> DeliveryFailures;
 }
 ```
 
@@ -282,7 +284,9 @@ The full event taxonomy (`AgentEvent` is `#[non_exhaustive]` — keep a wildcard
 
 Observers are called inline, synchronously, in registration order. The loop task blocks briefly for each observer call. This is acceptable because observers should be fast — write to stderr, increment a counter, append to a buffer. Expensive processing should happen asynchronously behind a channel adapter.
 
-For loss-free transcript reconstruction (persistence, replication, audit), the driver also fans out to a separate `TranscriptObserver` channel that fires once per `Item` appended — a session-addressed `TranscriptEvent` carrying the item, in transcript order. `LoopObserver` alone is not sufficient for this — content deltas span partial parts and historically tool results were appended without an event at all. Mutator-driven rewrites do **not** fire `on_transcript_event`; those are signaled by `AgentEvent::MutationFinished`. Register via `AgentBuilder::transcript_observer`.
+For loss-free transcript reconstruction (persistence, replication, audit), the driver also fans out to a separate `TranscriptObserver` channel that fires once per `Item` appended — a session-addressed `TranscriptEvent` carrying the item, in transcript order. `LoopObserver` alone is not sufficient for this — content deltas span partial parts and historically tool results were appended without an event at all. Mutator-driven rewrites do **not** fire `on_transcript_event`; they fire the trait's other required method, `on_transcript_rewrite`, with the complete canonical transcript. Register via `AgentBuilder::transcript_observer`.
+
+Observers are synchronous and infallible, which is the right shape for telemetry but the wrong one for a host that has to *await* its own delivery of a fact at the moment it happens. That is what `AgentBuilder::delivery` is for: a `NativeDelivery` target is awaited at the emission site of each `NativeFact` — streaming progress as the model produces it, the read-only pre-commit `BeforeFinish`, and the post-commit `TurnFinished`. Delivery is read-only and cannot drive the loop, and a `DeliveryError` is diagnostics only: it never fails the operation, never rolls a commit back and never produces a second terminal event. Drain the diagnostics with `LoopDriver::take_delivery_errors`.
 
 ## Building the agent
 
@@ -299,6 +303,7 @@ let agent = Agent::builder()
     .compaction(config)                      // default: none
     .observer(reporter)                      // default: none
     .transcript_observer(persistence)        // default: none
+    .delivery(awaited_target)                // default: none
     .transcript(vec![system_item])           // default: empty
     .input(vec![first_user_turn])            // default: empty (one-shot opener)
     .build()?;
@@ -318,6 +323,7 @@ The builder validates that a model adapter is set. Everything else has sensible 
 | `compaction`           | `None`                | Transcript grows without bounds   |
 | `observers`            | `[]`                  | No event reporting                |
 | `transcript_observers` | `[]`                  | No transcript persistence hook    |
+| `deliveries`           | `[]`                  | No awaited fact delivery          |
 
 `Agent::start()` consumes the agent and returns a `LoopDriver` with the supplied transcript loaded passively. The first call to `next()` yields `AwaitingInput`; the host supplies the first user turn via `InputRequest::submit`, and the driver dispatches the model on the next `next()`. The agent's immutable configuration (adapter, tool sources, permissions) is moved into the driver. Multiple drivers can be created from the same `Agent` type by cloning it first.
 
