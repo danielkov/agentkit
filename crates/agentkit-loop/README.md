@@ -19,6 +19,36 @@ This crate provides:
 
 Use it as the central coordinator between model providers, tool execution, and application UI or control flow.
 
+## Interception hooks
+
+Besides `mutate`, a `LoopMutator` registered with `AgentBuilder::mutator` can intercept values before the loop consumes or commits them:
+
+- `on_session_start` edits session options before the model adapter starts the session.
+- `on_model_request` edits a single inference request (transcript, tools, cache, metadata). These edits are not persisted.
+- `on_model_response` edits complete model output before it is committed, returned, or sent to tools. Content may change — including tool-call arguments, which reach the executor. Item identity, accounting and tool-call linkage may not. `payload.disposition` says whether the loop will dispatch this response's tool calls (`ContinueWithTools`) or take the normal finish branch (`FinishTurnCandidate`), computed from the loop's own branch predicate rather than the response content.
+
+All hooks default to no-ops and run in registration order. Read-only notifications belong in `LoopObserver`; individual tool interception belongs at `ToolExecutor`.
+
+## Transcript mutation
+
+`mutate` runs at every `MutationPoint`: `TurnStarted` (once per logical turn the driver creates, with queued input already appended, and the only point that also runs for turns that never dispatch an inference), `AfterToolResult`, and `AfterTurnEnded`.
+
+The chain is transactional. Mutators edit a candidate copy; the loop validates invariants, re-checks cancellation, then assigns the result to the live transcript in one synchronous step. A mutator that errors, produces a protocol-invalid transcript, cancels, or whose future is dropped leaves the live transcript untouched. A committed change is published to every `TranscriptObserver` as one `on_transcript_rewrite` carrying the complete canonical transcript; writing the same value back is not a change and publishes nothing.
+
+## Awaited delivery
+
+`LoopObserver` is synchronous and infallible. A host that must *await* its own delivery of a fact at the moment it happens registers a `NativeDelivery` with `AgentBuilder::delivery`. The driver awaits each target at the fact's emission site:
+
+- `NativeFact::Progress` — model deltas, usage, tool calls, attempt supersession, and the loop-authored background-detach placeholder, delivered as the driver consumes them rather than buffered until `next()` returns.
+- `NativeFact::BeforeFinish` — the logical turn is about to finish, before its own terminal items are appended, so a consumer sees terminal output and cancellation partials before they commit.
+- `NativeFact::TurnFinished` — the turn finished and its items are committed.
+
+The terminal pair is delivered exactly once per logical turn — including turns that end through cancellation, an error, a failed cleanup, or `retire_interrupted_turn` — for uninterrupted calls and for cooperative cancellation followed by retirement. A hard abort breaks that: `BeforeFinish` is awaited before anything commits, so dropping the `next()` future inside it loses the turn's terminal output candidate and leaves the turn active, and a later `retire_interrupted_turn` delivers a second prefinish for the same turn with a cancelled result. Treat prefinish as at-least-once if you drop driver futures.
+
+`HookCtx::cancellation` is `None` for the terminal facts, and also `None` for `Progress` when the agent was built without `AgentBuilder::cancellation` — match on the `NativeFact` variant rather than on the handle's presence.
+
+Delivery is read-only; a `DeliveryError` is diagnostics only — it never fails the operation, never stops the stream, never rolls a commit back, never replays and never produces a second terminal event, and later facts for the same turn still arrive. Drain it with `LoopDriver::take_delivery_errors`, which resets both the retained failures and the `dropped` count of what the bounded buffer discarded.
+
 ## Quick start
 
 ```rust,no_run

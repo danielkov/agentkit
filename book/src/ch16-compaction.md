@@ -261,7 +261,15 @@ This is why caching is configured separately from compaction in agentkit. Compac
 
 ## Loop integration
 
-Compactors register as `LoopMutator`s. The loop runs every registered mutator at each `MutationPoint` — `AfterToolResult` (between tool results and the next inference call) and `AfterTurnEnded` (after the assistant final, interrupt, or cancellation). The trigger decides which points are relevant.
+Compactors register as `LoopMutator`s. The loop runs every registered mutator at each `MutationPoint`:
+
+- `TurnStarted` — once when the driver creates a logical turn, after queued input is appended and before any other point or inference. This is the only point that also runs for turns that never dispatch an inference.
+- `AfterToolResult` — between tool results and the next inference call.
+- `AfterTurnEnded` — before the first inference call of a new turn.
+
+The trigger decides which points are relevant. A trigger that ignores `point` (such as `item_count_trigger`) now also gets the `TurnStarted` opportunity, so a transcript over the threshold compacts a little earlier in the turn. Filter on `point` if that matters.
+
+The chain is transactional. Mutators edit a candidate copy of the transcript; the loop validates it, re-checks cancellation, and only then assigns it to the live transcript in one synchronous step. A mutator that errors, produces a protocol-invalid transcript, cancels, or whose future is dropped leaves the live transcript exactly as it was.
 
 When a compactor fires:
 
@@ -269,11 +277,15 @@ When a compactor fires:
 2. The strategy pipeline transforms the transcript through the cursor
 3. The loop validates transcript invariants (tool_use ↔ tool_result pairing) and hard-fails with `LoopError::Mutator` on a protocol violation
 4. The compactor emits `AgentEvent::MutationFinished { mutator, dirty, metadata, .. }`
+5. If the committed transcript actually differs from the live one, the loop delivers one `TranscriptObserver::on_transcript_rewrite` with the complete canonical transcript
 
 ```text
 Turn lifecycle with a registered compactor:
 
-  next() → merge pending input
+  next() → open turn, merge pending input
+       │
+       ▼
+  run mutators at TurnStarted
        │
        ▼
   begin model turn

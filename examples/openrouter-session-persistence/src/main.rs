@@ -5,7 +5,8 @@
 //! - **Restore**: load prior `Item`s from sqlite and pass them to
 //!   [`AgentBuilder::transcript`].
 //! - **Incremental write**: register a [`TranscriptObserver`] that writes
-//!   each newly-appended item to sqlite as the loop runs.
+//!   each newly-appended item to sqlite as the loop runs, and replaces the
+//!   stored transcript when a mutator rewrites it.
 //! - **Resume**: the first `next()` call yields `AwaitingInput`, so a fresh
 //!   process can pick up exactly where the previous one stopped — the
 //!   transcript carries the prior turns, and the host supplies the next
@@ -26,7 +27,7 @@ use std::sync::{Arc, Mutex};
 use agentkit_core::{CancellationController, Item, ItemKind, Part};
 use agentkit_loop::{
     Agent, InputRequest, LoopInterrupt, LoopStep, PromptCacheRequest, PromptCacheRetention,
-    SessionConfig, TranscriptEvent, TranscriptObserver,
+    SessionConfig, TranscriptEvent, TranscriptObserver, TranscriptRewriteEvent,
 };
 use agentkit_provider_openrouter::{OpenRouterAdapter, OpenRouterConfig};
 use rusqlite::{Connection, params};
@@ -252,20 +253,42 @@ impl SqliteSessionStore {
         )?;
         Ok(())
     }
+
+    /// Replace the whole stored transcript with a canonical snapshot.
+    ///
+    /// A mutator (compaction, redaction, repair) rewrites history rather than
+    /// appending to it, so there is nothing to append — the stored rows have
+    /// to become the snapshot.
+    fn replace(&self, session_id: &str, items: &[Item]) -> Result<(), Box<dyn std::error::Error>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM items WHERE session_id = ?",
+            params![session_id],
+        )?;
+        for (seq, item) in items.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO items (session_id, seq, json) VALUES (?, ?, ?)",
+                params![session_id, seq as i64, serde_json::to_string(item)?],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
 }
 
-/// `TranscriptObserver` impl that mirrors every appended item into sqlite.
+/// `TranscriptObserver` impl that mirrors the driver's transcript into sqlite.
 ///
-/// `on_transcript_event` is called synchronously by the loop and is the single
-/// mutation point for the transcript -- every push funnels through here. The
-/// observer must NOT block (sqlite writes are fast and local; for remote
-/// stores, use a buffered channel and persist on a background task).
+/// Both methods are called synchronously by the loop, and between them they
+/// cover every way the transcript changes: `on_transcript_event` once per
+/// appended item, `on_transcript_rewrite` with a complete snapshot when a
+/// mutator rewrote history. Neither must block (sqlite writes are fast and
+/// local; for remote stores, use a buffered channel and persist on a
+/// background task).
 ///
-/// Compaction-driven rewrites do **not** fire `on_transcript_event`. A
-/// compaction-aware persistor would also subscribe to
-/// `AgentEvent::CompactionFinished` via a `LoopObserver` and replace the
-/// stored transcript when it sees that event. This example skips
-/// compaction.
+/// Both are best-effort post-commit observation, not a durability gate: the
+/// loop has already committed by the time they run, so a failed write is
+/// reported here and does not roll the turn back.
 struct SqliteTranscriptObserver {
     store: Arc<SqliteSessionStore>,
     session_id: String,
@@ -275,6 +298,12 @@ impl TranscriptObserver for SqliteTranscriptObserver {
     fn on_transcript_event(&self, event: TranscriptEvent<'_>) {
         if let Err(error) = self.store.append(&self.session_id, event.item) {
             eprintln!("[persistence] failed to append item: {error}");
+        }
+    }
+
+    fn on_transcript_rewrite(&self, event: TranscriptRewriteEvent<'_>) {
+        if let Err(error) = self.store.replace(&self.session_id, event.items) {
+            eprintln!("[persistence] failed to replace transcript: {error}");
         }
     }
 }
