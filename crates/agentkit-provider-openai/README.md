@@ -122,15 +122,18 @@ WebSocket retries are intentionally more conservative than HTTP retries:
   may reconnect and retry only on a fresh socket. On reused sockets, errors lack
   reliable request correlation and may belong to a previous turn, so generic
   errors never trigger automatic replay or authentication refresh. The narrowly
-  scoped missing-continuation recovery is described below. An accepted response
-  is never automatically replayed.
+  scoped missing-continuation recovery is described below.
 - A send failure, socket close, receive failure, stall, or timeout after sending
   reconnects and resends the full request (no `previous_response_id`) within the
   retry budget, when the request policy sends `store: false`. The server keeps no
   response state for such a request, so a lost or unfinished delivery cannot
   create a duplicate stored response or corrupt a continuation. With any other
   `store` setting these failures are not replayed.
-- After visible output, that resend happens only when the consumer opts into
+- A transient `response.failed` with an explicit ID matching the active response
+  also retries on a fresh socket with the full request when `store: false`.
+  Lifecycle and sequence validation must succeed; missing or mismatched IDs,
+  permanent failures, and uncorrelated wrapped errors do not authorize this replay.
+- After visible output, these resends happen only when the consumer opts into
   response-attempt supersession, exactly as for HTTP: the adapter emits
   `ModelTurnEvent::ResponseAttemptSuperseded` before the replacement attempt.
   Otherwise visible WebSocket output is never replayed. Wrapped error statuses and

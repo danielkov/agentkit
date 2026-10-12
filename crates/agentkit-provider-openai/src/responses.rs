@@ -888,18 +888,18 @@ impl OpenAIResponsesTurn {
                 if missing_previous {
                     failure.retryable = true;
                 }
-                // A stalled, timed-out or lost socket is resent in full on a fresh
-                // socket before visible output, or after it when the session accepts
-                // superseded attempts. With store:false the server keeps no response
-                // state, so an unfinished delivery cannot become a duplicate stored
-                // response or poison a continuation.
+                // A lost socket or correlated transient terminal failure is resent
+                // in full on a fresh socket before visible output, or after it when
+                // the session accepts superseded attempts. Require store:false and
+                // discard the failed socket's continuation checkpoint. Uncorrelated
+                // wrapped errors retain the rejection-only recovery policy.
                 let resendable = websocket
                     && (!self.attempt_output_emitted || self.supersession_enabled)
                     && self.context.config.request_policy.store == Some(false)
-                    && self
-                        .attempt
-                        .as_ref()
-                        .is_some_and(|attempt| attempt.connection_lost);
+                    && self.attempt.as_ref().is_some_and(|attempt| {
+                        attempt.connection_lost
+                            || failure.retryable && attempt.decoder.correlated_terminal_failure
+                    });
                 if resendable {
                     failure.retryable = true;
                 }
@@ -2326,6 +2326,7 @@ struct ResponsesSseDecoder {
     buffer_start: usize,
     received: usize,
     request_rejected: bool,
+    correlated_terminal_failure: bool,
     previous_response_missing: Option<String>,
     max_attempt_bytes: usize,
     state: ResponsesState,
@@ -2359,6 +2360,7 @@ impl ResponsesSseDecoder {
             buffer_start: 0,
             received: 0,
             request_rejected: false,
+            correlated_terminal_failure: false,
             previous_response_missing: None,
             max_attempt_bytes: limits.max_attempt_bytes,
             state: ResponsesState::new(
@@ -2520,6 +2522,19 @@ impl ResponsesSseDecoder {
         }
         self.previous_response_missing = None;
         let mut result = self.state.consume(&kind, &value);
+        // Only a validated terminal event with an explicit matching response ID
+        // authorizes replay on a reused socket. Protocol failures and ID-less
+        // events must not be mistaken for a failure of the active response.
+        self.correlated_terminal_failure = kind == "response.failed"
+            && value.pointer("/response/id").and_then(Value::as_str)
+                == self.state.response_id.as_deref()
+            && self.state.response_id.is_some()
+            && result.as_ref().is_err_and(|failure| {
+                failure
+                    .error
+                    .provider_failure()
+                    .is_some_and(|failure| failure.reason == ProviderFailureReason::ResponseFailed)
+            });
         if kind == "error"
             && let Err(failure) = &mut result
             && failure
@@ -2697,7 +2712,10 @@ impl ResponsesState {
         {
             self.progress = self.progress.saturating_add(1);
         }
-        if let Some(sequence) = value.get("sequence_number").and_then(Value::as_u64) {
+        if let Some(sequence) = value.get("sequence_number") {
+            let sequence = sequence.as_u64().ok_or_else(|| {
+                protocol_failure("Responses SSE sequence is not an unsigned integer")
+            })?;
             let expected = self
                 .sequence
                 .map_or(sequence, |last| last.saturating_add(1));
