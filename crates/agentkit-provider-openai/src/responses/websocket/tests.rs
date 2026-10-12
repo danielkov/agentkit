@@ -441,19 +441,14 @@ async fn attempt_and_logical_deadlines_bound_silent_socket() {
 
 #[tokio::test]
 async fn wrapped_retryable_error_reconnects_before_acceptance_but_not_after() {
-    for mode in 0..3 {
-        let accepted = mode != 0;
+    for accepted in [false, true] {
         let (endpoint, peer) = server(move |listener| {
             let mut ws = socket(&listener);
             let original = receive(&mut ws);
             if accepted {
                 ws.send(Message::Text(r#"{"type":"response.created","sequence_number":1,"response":{"id":"accepted","model":"gpt-test"}}"#.into())).unwrap();
             }
-            if mode == 2 {
-                ws.send(Message::Text(r#"{"type":"response.failed","sequence_number":2,"response":{"id":"accepted","error":{"code":"server_error","type":"server_error"}}}"#.into())).unwrap();
-            } else {
-                ws.send(Message::Text(r#"{"type":"error","status":429,"error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"retry later"}}"#.into())).unwrap();
-            }
+            ws.send(Message::Text(r#"{"type":"error","status":429,"error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"retry later"}}"#.into())).unwrap();
             if !accepted {
                 let mut retry = socket(&listener);
                 assert_eq!(original, receive(&mut retry));
@@ -475,6 +470,222 @@ async fn wrapped_retryable_error_reconnects_before_acceptance_but_not_after() {
         } else {
             finished(&result.unwrap());
         }
+        peer.join().unwrap();
+    }
+}
+
+// Deliver an accepted attempt, optionally including a user-visible text delta.
+fn accepted_failed(ws: &mut Socket, visible: bool, failure: Value) {
+    for line in SUCCESS
+        .replace("resp-1", "accepted")
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .take(if visible { 4 } else { 1 })
+    {
+        ws.send(Message::Text(line.into())).unwrap();
+    }
+    ws.send(Message::Text(failure.to_string().into())).unwrap();
+}
+
+fn transient_response_failed(visible: bool) -> Value {
+    json!({
+        "type": "response.failed", "sequence_number": if visible { 5 } else { 2 },
+        "response": {"id": "accepted", "error": {"code": "server_error"}}
+    })
+}
+
+#[tokio::test]
+async fn correlated_transient_response_failed_retries_on_fresh_socket() {
+    for visible in [false, true] {
+        // Exercise both the provider error code and the HTTP status classifier.
+        for status_only in [false, true] {
+            let (endpoint, peer) = server(move |listener| {
+                let mut first = socket(&listener);
+                let original = receive(&mut first);
+                assert_eq!(original["store"], false);
+                let mut failure = transient_response_failed(visible);
+                if status_only {
+                    failure["response"]["error"] = json!({"message":"temporarily unavailable"});
+                    failure["response"]["status_code"] = json!(503);
+                }
+                accepted_failed(&mut first, visible, failure);
+                let mut retry = socket(&listener);
+                assert_eq!(receive(&mut retry), original);
+                success(&mut retry);
+            });
+            let mut cfg = config(&endpoint, OpenAIResponsesTransport::WebSocket);
+            if status_only {
+                // ChatGPT uses status-based retries; the public API retains its
+                // existing transient error-code allowlist.
+                cfg.profile = OpenAIResponsesProfile::ChatGptPrivate;
+            }
+            cfg.resilience.as_mut().unwrap().max_retries = 1;
+            let adapter = OpenAIResponsesAdapter::new(cfg).unwrap();
+            let session_cfg = if visible {
+                SessionConfig::new("session").with_response_attempt_supersession()
+            } else {
+                SessionConfig::new("session")
+            };
+            let mut session = adapter.start_session(session_cfg).await.unwrap();
+            let mut turn = session.begin_turn(request(), None).await.unwrap();
+            let events = drain(&mut turn).await.unwrap();
+            finished(&events);
+            let superseded: Vec<_> = events
+                .iter()
+                .enumerate()
+                .filter_map(|(index, event)| {
+                    matches!(event, ModelTurnEvent::ResponseAttemptSuperseded).then_some(index)
+                })
+                .collect();
+            assert_eq!(superseded.len(), usize::from(visible));
+            if visible {
+                let boundary = superseded[0];
+                assert!(events[..boundary].iter().any(|event| matches!(event,
+                    ModelTurnEvent::Delta(Delta::AppendText {chunk, ..}) if chunk == "hello")));
+                finished(&events[boundary + 1..]);
+            }
+            peer.join().unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn correlated_response_failed_continuation_resends_authoritative_history() {
+    let (endpoint, peer) = server(|listener| {
+        let mut first = socket(&listener);
+        receive(&mut first);
+        success(&mut first);
+        let continuation = receive_continuation(&mut first);
+        assert_eq!(continuation["previous_response_id"], "resp-1");
+        assert_eq!(continuation["input"].as_array().unwrap().len(), 1);
+        accepted_failed(&mut first, false, transient_response_failed(false));
+        let mut retry = socket(&listener);
+        let full = receive(&mut retry);
+        assert_eq!(full["store"], false);
+        assert_eq!(full["input"].as_array().unwrap().len(), 5);
+        assert_eq!(full["input"][0]["role"], "user");
+        assert_canonical_output(&full, "opaque", json!({"q":1}));
+        assert_eq!(full["input"][4], continuation["input"][0]);
+        success_id(&mut retry, "recovered");
+    });
+    let mut cfg = config(&endpoint, OpenAIResponsesTransport::WebSocket);
+    cfg.resilience.as_mut().unwrap().max_retries = 1;
+    let adapter = OpenAIResponsesAdapter::new(cfg).unwrap();
+    let mut session = adapter
+        .start_session(SessionConfig::new("session"))
+        .await
+        .unwrap();
+    let mut request = request();
+    let mut turn = session.begin_turn(request.clone(), None).await.unwrap();
+    append_completed(&mut turn, &mut request).await;
+    append_tool_result(&mut request);
+    let mut turn = session.begin_turn(request, None).await.unwrap();
+    finished(&drain(&mut turn).await.unwrap());
+    peer.join().unwrap();
+}
+
+#[tokio::test]
+async fn response_failed_unsafe_or_uncorrelated_attempts_are_not_replayed() {
+    for case in [
+        "missing_id",
+        "mismatched_id",
+        "regressed_sequence",
+        "malformed_sequence",
+        "permanent",
+        "stored",
+        "visible",
+    ] {
+        let visible = case == "visible";
+        let (endpoint, peer) = server(move |listener| {
+            let mut ws = socket(&listener);
+            receive(&mut ws);
+            let mut failure = transient_response_failed(visible);
+            match case {
+                "missing_id" => {
+                    failure["response"].as_object_mut().unwrap().remove("id");
+                }
+                "mismatched_id" => failure["response"]["id"] = json!("another-response"),
+                "regressed_sequence" => failure["sequence_number"] = json!(1),
+                "malformed_sequence" => failure["sequence_number"] = json!("invalid"),
+                "permanent" => {
+                    failure["response"]["error"] = json!({"code":"invalid_request_error", "type":"invalid_request_error", "status":400})
+                }
+                _ => {}
+            }
+            accepted_failed(&mut ws, visible, failure);
+            no_connection_within(&listener, Duration::from_millis(300));
+        });
+        let mut cfg = config(&endpoint, OpenAIResponsesTransport::WebSocket);
+        cfg.resilience.as_mut().unwrap().max_retries = 2;
+        if case == "stored" {
+            cfg.request_policy.store = Some(true);
+        }
+        let adapter = OpenAIResponsesAdapter::new(cfg).unwrap();
+        let mut session = adapter
+            .start_session(SessionConfig::new("session"))
+            .await
+            .unwrap();
+        let mut turn = session.begin_turn(request(), None).await.unwrap();
+        let error = drain(&mut turn).await.expect_err(case);
+        assert_eq!(
+            error.provider_failure().unwrap().accounting.attempts,
+            1,
+            "{case}"
+        );
+        peer.join().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn correlated_response_failed_exhausts_retry_limit_and_supersedes_each_visible_attempt() {
+    for visible in [false, true] {
+        let (endpoint, peer) = server(move |listener| {
+            let mut original = None;
+            for _ in 0..3 {
+                let mut ws = socket(&listener);
+                let wire = receive(&mut ws);
+                if let Some(original) = &original {
+                    assert_eq!(&wire, original);
+                } else {
+                    original = Some(wire);
+                }
+                accepted_failed(&mut ws, visible, transient_response_failed(visible));
+            }
+            no_connection_within(&listener, Duration::from_millis(300));
+        });
+        let mut cfg = config(&endpoint, OpenAIResponsesTransport::WebSocket);
+        cfg.resilience.as_mut().unwrap().max_retries = 2;
+        let adapter = OpenAIResponsesAdapter::new(cfg).unwrap();
+        let mut session = adapter
+            .start_session(SessionConfig::new("session").with_response_attempt_supersession())
+            .await
+            .unwrap();
+        let mut turn = session.begin_turn(request(), None).await.unwrap();
+        let (events, error) = tokio::time::timeout(WAIT, async {
+            let mut events = vec![];
+            loop {
+                match turn.next_event(None).await {
+                    Ok(Some(event)) => events.push(event),
+                    Ok(None) => panic!("failed attempt unexpectedly finished"),
+                    Err(error) => break (events, error),
+                }
+            }
+        })
+        .await
+        .expect("turn hung");
+        assert_eq!(error.provider_failure().unwrap().accounting.attempts, 3);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, ModelTurnEvent::ResponseAttemptSuperseded))
+                .count(),
+            if visible { 2 } else { 0 }
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ModelTurnEvent::Finished(_)))
+        );
         peer.join().unwrap();
     }
 }
