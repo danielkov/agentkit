@@ -63,7 +63,31 @@ impl SubscriptionController {
         base_filter: SubscriptionFilter,
         sink: McpNotificationSink,
     ) -> Result<Self, McpError> {
-        let subscription = establish(&peer, base_filter.clone()).await?;
+        let subscription = match establish(&peer, base_filter.clone()).await {
+            Ok(subscription) => subscription,
+            Err(error @ McpError::Invocation(crate::McpInvocationError::MethodNotFound { .. }))
+                if resource_set(&base_filter).is_empty() =>
+            {
+                // Catalog subscriptions are optional for ordinary RPC access.
+                // Keep an explicit closed status and a closed command receiver:
+                // resource subscription requests must still fail, not succeed silently.
+                let (_, status) = watch::channel(McpSubscriptionStatus::Closed {
+                    graceful: false,
+                    error: Some(error.to_string()),
+                });
+                let (_, requested) = watch::channel(BTreeSet::new());
+                let (commands, _) = mpsc::channel(32);
+                let (stop, _) = watch::channel(false);
+                return Ok(Self {
+                    commands,
+                    status,
+                    requested,
+                    stop,
+                    worker: None,
+                });
+            }
+            Err(error) => return Err(error),
+        };
         verify_resources(&base_filter, subscription.acknowledged())?;
         let initial = active_status(&base_filter, &subscription);
         let (status_tx, status) = watch::channel(initial);
@@ -186,7 +210,7 @@ async fn establish(
             operation: "subscriptions/listen acknowledgment",
             duration: ESTABLISHMENT_TIMEOUT,
         })?
-        .map_err(|error| McpError::Transport(error.to_string()))
+        .map_err(crate::rmcp_service_error)
 }
 
 fn verify_resources(

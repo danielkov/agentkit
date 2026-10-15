@@ -577,3 +577,42 @@ async fn recovered_http_listen_redirties_catalog_after_refresh_during_gap() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn unsupported_listen_preserves_rpc_but_other_errors_fail_connection() {
+    bounded(async {
+        for code in [-32601, -32603, -32001] {
+            let mut fixture = Fixture::start().await;
+            fixture.hold_ack.store(true, Ordering::SeqCst);
+            let config = fixture.config.clone();
+            let connecting = tokio::spawn(async move { McpConnection::connect(&config).await });
+            let listen = fixture.listen().await;
+            listen
+                .frames
+                .send(frame(json!({"jsonrpc":"2.0","id":listen.id,
+                "error":{"code":code,"message":"subscription rejected"}})))
+                .unwrap();
+            let result = connecting.await.unwrap();
+            if code == -32601 {
+                let connection = result.unwrap();
+                assert!(matches!(
+                    connection.subscription_status().await,
+                    Some(McpSubscriptionStatus::Closed {
+                        graceful: false,
+                        error: Some(_)
+                    })
+                ));
+                connection.discover().await.unwrap();
+                assert!(
+                    connection
+                        .subscribe_resource("memo:unsupported")
+                        .await
+                        .is_err()
+                );
+            } else {
+                assert!(result.is_err(), "unrelated subscription failure was hidden");
+            }
+        }
+    })
+    .await;
+}
