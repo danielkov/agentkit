@@ -14,7 +14,7 @@ doctest = false
 [dependencies]
 agentkit-core = { version = "0.10.5", path = "../agentkit-core" }
 agentkit-loop = { version = "0.10.5", path = "../agentkit-loop" }
-agentkit-mcp = { version = "0.10.5", path = "../agentkit-mcp" }
+agentkit-mcp = { version = "0.11.0", path = "../agentkit-mcp" }
 agentkit-task-manager = { version = "0.10.5", path = "../agentkit-task-manager" }
 agentkit-tool-compose = { version = "0.10.5", path = "../agentkit-tool-compose" }
 agentkit-tools-core = { version = "0.10.5", path = "../agentkit-tools-core", features = ["schemars"] }
@@ -23,7 +23,7 @@ async-trait.workspace = true
 schemars = { workspace = true, features = ["derive"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 pretty_assertions = "1.4"
-rmcp = { version = "3.1.2", default-features = false, features = ["client", "server", "transport-async-rw", "transport-streamable-http-server", "macros"] }
+rmcp = { version = "=3.5.1", default-features = false, features = ["client", "server", "transport-async-rw", "transport-streamable-http-server", "macros"] }
 ron = "0.8"
 serde.workspace = true
 serde_json.workspace = true

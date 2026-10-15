@@ -20,7 +20,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit"
-version = "0.10.12"
+version = "0.11.0"
 dependencies = [
  "agentkit-acp",
  "agentkit-adapter-completions",
@@ -233,7 +233,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-mcp"
-version = "0.10.7"
+version = "0.11.0"
 dependencies = [
  "agentkit-capabilities",
  "agentkit-core",
@@ -2703,9 +2703,9 @@ dependencies = [
 
 [[package]]
 name = "process-wrap"
-version = "9.1.0"
+version = "10.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e842efad9119158434d193c6682e2ebee4b44d6ad801d7b349623b3f57cdf55"
+checksum = "1f21b97672d2dc848e7b25701ab4535618b92f4861c13cc3f7f7bed52ad3c8da"
 dependencies = [
  "futures",
  "indexmap 2.14.0",
@@ -3006,9 +3006,9 @@ dependencies = [
 
 [[package]]
 name = "rmcp"
-version = "3.1.2"
+version = "3.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c8dddc5b1924b9a59fba420166160ca2c4663a4e01803e52eda33070f56d63c8"
+checksum = "ab5023804cbe0304cbe06197ac16e645a0a0d0ffa2953bf735c15c2fa0213350"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -3018,6 +3018,7 @@ dependencies = [
  "http",
  "http-body",
  "http-body-util",
+ "indexmap 2.14.0",
  "oauth2",
  "pastey",
  "pin-project-lite",
@@ -3041,9 +3042,9 @@ dependencies = [
 
 [[package]]
 name = "rmcp-macros"
-version = "3.1.2"
+version = "3.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6898e24cd16342b59bfa8a53c2c04b9cf62fc8a2cfea57b9c038b09984bfc521"
+checksum = "a1da498700030856ba63114bceefa30ba21f5e278cb975e5b9de3529fe842b40"
 dependencies = [
  "darling 0.24.0",
  "proc-macro2",

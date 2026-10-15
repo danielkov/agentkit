@@ -19,9 +19,10 @@ use rmcp::{
         wrapper::Parameters,
     },
     model::{
-        GetPromptResult, Implementation, ListResourcesResult, PaginatedRequestParams,
-        PromptMessage, ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult,
-        Resource, ResourceContents, Role, ServerCapabilities, ServerInfo,
+        DiscoverResult, GetPromptResult, Implementation, ListResourcesResult,
+        PaginatedRequestParams, PromptMessage, ProtocolVersion, ReadResourceRequestParams,
+        ReadResourceResponse, ReadResourceResult, Resource, ResourceContents, Role,
+        ServerCapabilities, ServerConfig,
     },
     prompt, prompt_handler, prompt_router, tool, tool_handler, tool_router,
     transport::streamable_http_server::{
@@ -41,11 +42,13 @@ struct AppState {
 enum ServerMode {
     Stateful,
     StatelessJson,
+    Modern,
 }
 
 impl ServerMode {
     fn parse(value: &str) -> Option<Self> {
         match value {
+            "modern" => Some(Self::Modern),
             "stateful" => Some(Self::Stateful),
             "stateless-json" => Some(Self::StatelessJson),
             _ => None,
@@ -55,6 +58,7 @@ impl ServerMode {
     fn tool_prefix(&self) -> &'static str {
         match self {
             Self::Stateful => "rmcp-stateful",
+            Self::Modern => "rmcp-modern",
             Self::StatelessJson => "rmcp-stateless",
         }
     }
@@ -62,6 +66,7 @@ impl ServerMode {
     fn resource_text(&self) -> &'static str {
         match self {
             Self::Stateful => "rust sdk stateful fixture resource",
+            Self::Modern => "rust sdk modern fixture resource",
             Self::StatelessJson => "rust sdk stateless fixture resource",
         }
     }
@@ -69,6 +74,7 @@ impl ServerMode {
     fn prompt_text(&self, name: &str) -> String {
         match self {
             Self::Stateful => format!("rust sdk stateful prompt for {name}"),
+            Self::Modern => format!("rust sdk modern prompt for {name}"),
             Self::StatelessJson => format!("rust sdk stateless prompt for {name}"),
         }
     }
@@ -76,6 +82,7 @@ impl ServerMode {
     fn server_name(&self) -> &'static str {
         match self {
             Self::Stateful => "agentkit-rmcp-stateful",
+            Self::Modern => "agentkit-rmcp-modern",
             Self::StatelessJson => "agentkit-rmcp-stateless-json",
         }
     }
@@ -84,6 +91,7 @@ impl ServerMode {
         let config = StreamableHttpServerConfig::default();
         match self {
             Self::Stateful => config,
+            Self::Modern => config.with_legacy_session_mode(false),
             Self::StatelessJson => config
                 .with_legacy_session_mode(false)
                 .with_json_response(true)
@@ -144,15 +152,59 @@ impl ReferenceServer {
 #[tool_handler(router = self.tool_router)]
 #[prompt_handler(router = self.prompt_router)]
 impl ServerHandler for ReferenceServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
-            ServerCapabilities::builder()
-                .enable_tools()
-                .enable_prompts()
-                .enable_resources()
-                .build(),
-        )
-        .with_server_info(Implementation::new(self.mode.server_name(), "1.0.0"))
+    fn get_info(&self) -> ServerConfig {
+        let mut capabilities = ServerCapabilities::builder()
+            .enable_tools()
+            .enable_prompts()
+            .enable_resources();
+        if self.mode == ServerMode::Modern {
+            capabilities = capabilities
+                .enable_tool_list_changed()
+                .enable_prompts_list_changed()
+                .enable_resources_list_changed();
+        }
+        ServerConfig::new(capabilities.build())
+            .with_server_info(Implementation::new(self.mode.server_name(), "1.0.0"))
+            .with_protocol_version(if self.mode == ServerMode::Modern {
+                ProtocolVersion::V_2026_07_28
+            } else {
+                ProtocolVersion::V_2025_11_25
+            })
+    }
+
+    async fn discover(
+        &self,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<DiscoverResult, ErrorData> {
+        if self.mode != ServerMode::Modern {
+            // Session and resumption modes deliberately implement the legacy era.
+            return Err(ErrorData::method_not_found::<
+                rmcp::model::DiscoverRequestMethod,
+            >());
+        }
+        Ok(DiscoverResult::from_server_info(
+            vec![ProtocolVersion::V_2026_07_28],
+            self.get_info(),
+        ))
+    }
+
+    fn accepted_subscription_filter(
+        &self,
+        requested: &rmcp::model::SubscriptionFilter,
+    ) -> Option<rmcp::model::SubscriptionFilter> {
+        (self.mode == ServerMode::Modern).then(|| requested.clone())
+    }
+
+    async fn listen(&self, context: rmcp::service::SubscriptionContext) -> Result<(), ErrorData> {
+        if self.mode != ServerMode::Modern {
+            return Err(ErrorData::method_not_found::<
+                rmcp::model::SubscriptionsListenRequestMethod,
+            >());
+        }
+        // RMCP acknowledges the accepted subset before invoking this handler.
+        // Keep the POST stream alive until this client's subscription ends.
+        context.cancelled().await;
+        Ok(())
     }
 
     async fn list_resources(

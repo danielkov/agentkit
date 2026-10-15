@@ -32,6 +32,26 @@ The MCP specification moves quickly. Because agentkit-mcp re-exports [`rmcp::mod
 
 The same logic applies to transports: stdio and Streamable HTTP are rmcp implementations driven declaratively here; future rmcp transports are reachable through `McpConnection::from_running_service_with_events` without touching `McpTransportBinding`.
 
+## Modern subscriptions and catalog refresh
+
+Discovery gives a harness a snapshot of a server's tools, resources, and prompts.
+A subscription does not replace that snapshot: its notifications are
+invalidations, telling the harness that its view may be stale.
+
+The host owns reconciliation. It decides when to fetch and publish a fresh
+snapshot, coalescing repeated invalidations instead of refreshing once per event.
+After a notification stream is restored, reconcile again to cover changes missed
+during the gap. If a refresh fails, keep the last usable snapshot and leave the
+refresh pending.
+
+Bind refresh results to the connection that produced them. Authentication changes
+or server replacement can make in-flight work obsolete; a result from an old
+connection must never overwrite the catalog for its replacement.
+
+Subscription lifecycle belongs to the connection, not to an individual agent
+turn. Close subscriptions with their connection and rebuild them when it is
+replaced, so background streams cannot outlive the server they describe.
+
 ## MCP in the capability model
 
 MCP servers expose three capability types, which map directly to agentkit's capability layer:
@@ -132,7 +152,7 @@ while let Ok(event) = events.recv().await {
 
 `set_logging_level(LoggingLevel::Info)` negotiates the minimum severity the server emits. `subscribe_resource` / `unsubscribe_resource` toggle per-URI watch on resources that support it.
 
-List-changed events are _also_ delivered through the legacy `McpServerNotification` mpsc receiver that `McpServerManager::refresh_changed_catalogs` drains to re-run discovery — the two channels coexist: events for live UI/observability, mpsc for catalog re-sync.
+List-changed events also advance the coalescing catalog revision watch used by `McpServerManager::refresh_changed_catalogs`. The compatibility `McpServerNotification` receiver remains available; catalog reconciliation does not require draining the event broadcast.
 
 ## Auth handled outside the loop
 
@@ -163,11 +183,11 @@ The manager owns server lifecycle:
 | `connect_server(id)` / `connect_all()` | Open a connection and run discovery                                                                                                     |
 | `connect_all_settled()`                | Attempt all registered servers concurrently, install successes, and return per-server failures                                          |
 | `refresh_server(id)`                   | Re-run discovery and emit per-tool/resource/prompt diff events                                                                          |
-| `refresh_changed_catalogs()`           | Drain pending `*list_changed` notifications and refresh affected catalogs                                                               |
+| `refresh_changed_catalogs()`           | Reconcile catalogs marked dirty by coalesced invalidations                                                                              |
 | `disconnect_server(id)`                | Close the connection, drop tools from the federated catalog, emit `ServerDisconnected`                                                  |
 | `subscribe_catalog_events()`           | Broadcast receiver for `McpCatalogEvent` (server connect / disconnect / tool added / removed / changed / refresh failed / auth changed) |
 
-Register a server with `with_server_options(config, McpServerOptions::new().with_timeout(duration))` to bound connecting to that server. The timeout covers connection establishment — transport setup and the MCP initialize handshake — plus initial discovery, and applies to refresh discovery on its own; failures surface as `McpError::Timeout`.
+Register a server with `with_server_options(config, McpServerOptions::new().with_timeout(duration))` to bound connecting to that server. The timeout covers connection establishment — transport setup and MCP lifecycle negotiation — plus initial discovery, and applies to refresh discovery on its own; failures surface as `McpError::Timeout`.
 
 ## Federating MCP into the agent
 

@@ -69,6 +69,51 @@ Use `connect_all_settled().await` when startup should be best effort: it attempt
 
 For slow or unresponsive servers, register with `with_server_options(config, McpServerOptions::new().with_timeout(duration))`. The timeout bounds connection establishment — transport setup and the MCP initialize handshake — together with initial discovery, and bounds refresh discovery on its own; exceeding it returns `McpError::Timeout`.
 
+## Negotiation and notification subscriptions
+
+Built-in stdio and Streamable HTTP connections use RMCP's `Auto` lifecycle: probe
+`server/discover`, then fall back to legacy initialization when needed. Inspect
+`connection.protocol_version()` and the cloned `connection.capabilities()` for
+the negotiated peer, rather than assuming a protocol from the transport.
+
+For modern peers, discovery establishes a connection-owned `subscriptions/listen`
+stream and waits for its acknowledgment. The requested filter covers advertised
+tool, resource, and prompt catalogs. `subscription_status().await` exposes both
+the requested and acknowledged filters: a server may accept only part of the
+catalog filter. `subscription_changes().await` returns a watch receiver once a
+modern stream exists; legacy peers return `None`. Adopting an existing RMCP
+service with `from_running_service_with_events` is synchronous: call
+`discover().await` to establish its modern subscription lazily.
+
+`subscribe_resource(uri)` and `unsubscribe_resource(uri)` replace the modern
+stream's complete filter. A resource update is committed only after the server
+acknowledges the requested URI set; rejection preserves the previous active
+filter and stream. Legacy peers retain `resources/subscribe` and
+`resources/unsubscribe`. Streamed notifications feed the same
+`subscribe_events()` broadcast used by legacy notifications.
+
+Catalog invalidations also advance `catalog_revision()` and wake
+`catalog_changes()`, a coalescing watch channel that does not require draining
+broadcast events. Watch wakeups are invalidations, not newly published catalogs.
+Hosts should call `McpServerManager::refresh_changed_catalogs()` to reconcile
+snapshots, or use `prepare_changed_catalogs()`, fetch work outside their manager
+lock, and `publish_catalog_refresh(...)` to publish it. Revision and connection
+epoch checks fence obsolete results; canceled or failed fetches remain dirty.
+A host must schedule this refresh work itself; event delivery does not silently
+refresh the host's tool registry.
+
+On transport failure, the modern subscription worker retries with bounded
+backoff and marks catalogs dirty for reconciliation. Graceful server completion
+is observable as `Closed { graceful: true, .. }` and is not retried. Authentication
+reconnect replaces the subscription on the new peer, retaining committed resource
+URIs. `connection_epoch()` changes when the transport is replaced or closed.
+Call `close().await` to stop owned streams before transport cleanup; dropping the
+connection also cancels its workers.
+
+**Migration (agentkit-mcp 0.11.0):** `capabilities()` now returns an owned snapshot,
+not a borrowed reference. Call it again after authentication reconnect to obtain
+the current peer capabilities; no capability lock guard needs to span an await.
+
 ## Tool response timeouts
 
 `McpConnection::call_tool_with_timeout(name, arguments, Duration)` is an opt-in,

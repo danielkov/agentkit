@@ -14,8 +14,9 @@ use rmcp::{
     RoleServer, ServerHandler,
     model::{
         CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock as Content,
-        ErrorData as RmcpError, InitializeRequestParams, InitializeResult, ListToolsResult,
-        PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
+        DiscoverResult, ErrorData as RmcpError, InitializeRequestParams, InitializeResult,
+        ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerConfig,
+        Tool,
     },
     service::{NotificationContext, Peer, RequestContext},
     transport::streamable_http_server::{
@@ -49,13 +50,24 @@ impl MutableMcpServer {
 }
 
 impl ServerHandler for MutableMcpServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_tool_list_changed()
                 .build(),
         )
+        .with_protocol_version(ProtocolVersion::V_2025_11_25)
+    }
+
+    async fn discover(
+        &self,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<DiscoverResult, RmcpError> {
+        // This fixture deliberately exercises the initialize-era protocol.
+        Err(RmcpError::method_not_found::<
+            rmcp::model::DiscoverRequestMethod,
+        >())
     }
 
     async fn initialize(
