@@ -34,37 +34,23 @@ The same logic applies to transports: stdio and Streamable HTTP are rmcp impleme
 
 ## Modern subscriptions and catalog refresh
 
-Built-in transports negotiate with RMCP's `Auto` lifecycle (`server/discover`
-with legacy initialization fallback). Check `protocol_version()` and
-`capabilities()` on the connection instead of inferring support from HTTP or
-stdio. Adopting an existing service with
-`McpConnection::from_running_service_with_events` does not perform asynchronous
-setup: call `discover().await` to establish its modern notification stream.
+Discovery gives a harness a snapshot of a server's tools, resources, and prompts.
+A subscription does not replace that snapshot: its notifications are
+invalidations, telling the harness that its view may be stale.
 
-Modern discovery waits for a `subscriptions/listen` acknowledgment.
-`subscription_status().await` reports the requested and accepted filters, and
-`subscription_changes().await` watches their lifecycle. Partial catalog
-acknowledgments are visible rather than treated as full acceptance. Resource
-subscribe/unsubscribe operations replace the complete filter; a rejected URI
-set leaves the previous active stream in place. Legacy peers keep the separate
-`resources/subscribe` and `resources/unsubscribe` methods.
+The host owns reconciliation. It decides when to fetch and publish a fresh
+snapshot, coalescing repeated invalidations instead of refreshing once per event.
+After a notification stream is restored, reconcile again to cover changes missed
+during the gap. If a refresh fails, keep the last usable snapshot and leave the
+refresh pending.
 
-Stream notifications use the existing `subscribe_events()` broadcast. For catalog
-reconciliation, use `catalog_changes()` and `catalog_revision()`; watch updates
-coalesce and survive slow broadcast consumers. The host must schedule
-`refresh_changed_catalogs()`, or prepare/fetch/publish refresh work outside its
-manager lock. Invalidated, failed, or canceled work must not publish a stale
-snapshot.
+Bind refresh results to the connection that produced them. Authentication changes
+or server replacement can make in-flight work obsolete; a result from an old
+connection must never overwrite the catalog for its replacement.
 
-A transport failure triggers bounded subscription recovery and dirties the
-catalog. Graceful completion yields `Closed { graceful: true, .. }` without
-retry. Authentication reconnect rebuilds subscriptions on the new peer and
-retains committed resource URIs; `connection_epoch()` fences old work. Await
-`close()` to shut down streams before transport cleanup.
-
-**Migration (agentkit-mcp 0.11.0):** `capabilities()` returns an owned snapshot
-instead of a borrowed reference. Read it again after authentication reconnect
-for the current peer capabilities; do not retain a lock guard across awaits.
+Subscription lifecycle belongs to the connection, not to an individual agent
+turn. Close subscriptions with their connection and rebuild them when it is
+replaced, so background streams cannot outlive the server they describe.
 
 ## MCP in the capability model
 
@@ -197,7 +183,7 @@ The manager owns server lifecycle:
 | `connect_server(id)` / `connect_all()` | Open a connection and run discovery                                                                                                     |
 | `connect_all_settled()`                | Attempt all registered servers concurrently, install successes, and return per-server failures                                          |
 | `refresh_server(id)`                   | Re-run discovery and emit per-tool/resource/prompt diff events                                                                          |
-| `refresh_changed_catalogs()`           | Reconcile catalogs marked dirty by coalesced invalidations                                                               |
+| `refresh_changed_catalogs()`           | Reconcile catalogs marked dirty by coalesced invalidations                                                                              |
 | `disconnect_server(id)`                | Close the connection, drop tools from the federated catalog, emit `ServerDisconnected`                                                  |
 | `subscribe_catalog_events()`           | Broadcast receiver for `McpCatalogEvent` (server connect / disconnect / tool added / removed / changed / refresh failed / auth changed) |
 

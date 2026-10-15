@@ -243,10 +243,6 @@ URIs. `connection_epoch()` changes when the transport is replaced or closed.
 Call `close().await` to stop owned streams before transport cleanup; dropping the
 connection also cancels its workers.
 
-**Migration (agentkit-mcp 0.11.0):** `capabilities()` now returns an owned snapshot,
-not a borrowed reference. Call it again after authentication reconnect to obtain
-the current peer capabilities; no capability lock guard needs to span an await.
-
 ### 8. Errors
 
 `McpError` covers transport failure, protocol errors, auth challenges (`AuthRequired(Box<AuthRequest>)`), invocation errors, and unknown-server lookup misses. It implements `From<McpError> for rmcp::model::ErrorData` so responders can return agentkit errors and have them surface to the server as JSON-RPC errors.
