@@ -19,6 +19,57 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
+async fn rust_sdk_modern_subscription_streamable_http_interop() {
+    let result = probe_reference_implementation_with_binary(
+        ReferenceImplementation::RustSdkModern,
+        env!("CARGO_BIN_EXE_mcp-reference-server"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.tool_output, "rmcp-modern:streamable-http-ok");
+    assert_eq!(result.resource_text, "rust sdk modern fixture resource");
+    assert_eq!(result.prompt_text, "rust sdk modern prompt for Ada");
+    let requests = capture_transport_exchange_with_binary(
+        ReferenceImplementation::RustSdkModern,
+        env!("CARGO_BIN_EXE_mcp-reference-server"),
+    )
+    .await
+    .unwrap();
+    find_jsonrpc_request(&requests, "server/discover");
+    let listen = find_jsonrpc_request(&requests, "subscriptions/listen");
+    assert_eq!(
+        listen
+            .headers
+            .get("mcp-protocol-version")
+            .map(String::as_str),
+        Some("2026-07-28")
+    );
+    assert_eq!(
+        listen.headers.get("mcp-method").map(String::as_str),
+        Some("subscriptions/listen")
+    );
+    let body: Value = serde_json::from_str(&listen.body).unwrap();
+    assert_eq!(body["params"]["notifications"]["toolsListChanged"], true);
+    assert_eq!(
+        body["params"]["notifications"]["resourcesListChanged"],
+        true
+    );
+    assert_eq!(body["params"]["notifications"]["promptsListChanged"], true);
+    assert_eq!(
+        body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"],
+        "2026-07-28"
+    );
+    assert!(
+        requests.iter().all(|request| {
+            !request.headers.contains_key("mcp-session-id")
+                && !matches!(request.method.as_str(), "GET" | "DELETE")
+                && request.jsonrpc_method.as_deref() != Some("initialize")
+        }),
+        "modern exchange must not establish or resume a legacy session: {requests:#?}"
+    );
+}
+
+#[tokio::test]
 async fn rust_sdk_stateful_streamable_http_interop() {
     let result = probe_reference_implementation_with_binary(
         ReferenceImplementation::RustSdkStatefulSse,
@@ -83,6 +134,8 @@ async fn rust_sdk_stateful_transport_propagates_session_protocol_and_delete() {
     .await
     .unwrap();
 
+    let discover = find_jsonrpc_request(&requests, "server/discover");
+    assert!(!discover.headers.contains_key("mcp-session-id"));
     let initialize = find_jsonrpc_request(&requests, "initialize");
     assert!(!initialize.headers.contains_key("mcp-session-id"));
 
@@ -97,13 +150,21 @@ async fn rust_sdk_stateful_transport_propagates_session_protocol_and_delete() {
 
     let negotiated_protocol = post_requests
         .iter()
-        .find(|request| request.jsonrpc_method.as_deref() != Some("initialize"))
+        .find(|request| {
+            !matches!(
+                request.jsonrpc_method.as_deref(),
+                Some("initialize" | "server/discover")
+            )
+        })
         .and_then(|request| request.headers.get("mcp-protocol-version"))
         .cloned()
         .expect("stateful exchange should advertise a negotiated protocol version");
 
     for request in post_requests {
-        if request.jsonrpc_method.as_deref() == Some("initialize") {
+        if matches!(
+            request.jsonrpc_method.as_deref(),
+            Some("initialize" | "server/discover")
+        ) {
             continue;
         }
 
@@ -155,7 +216,12 @@ async fn rust_sdk_stateless_transport_skips_session_and_delete() {
     let negotiated_protocol = requests
         .iter()
         .filter(|request| request.method == "POST")
-        .filter(|request| request.jsonrpc_method.as_deref() != Some("initialize"))
+        .filter(|request| {
+            !matches!(
+                request.jsonrpc_method.as_deref(),
+                Some("initialize" | "server/discover")
+            )
+        })
         .find_map(|request| request.headers.get("mcp-protocol-version"))
         .cloned()
         .expect("stateless exchange should advertise a negotiated protocol version");
@@ -163,7 +229,12 @@ async fn rust_sdk_stateless_transport_skips_session_and_delete() {
     for request in requests
         .iter()
         .filter(|request| request.method == "POST")
-        .filter(|request| request.jsonrpc_method.as_deref() != Some("initialize"))
+        .filter(|request| {
+            !matches!(
+                request.jsonrpc_method.as_deref(),
+                Some("initialize" | "server/discover")
+            )
+        })
     {
         assert_eq!(
             request
@@ -293,6 +364,12 @@ async fn resume_post(
 
     let request = serde_json::from_str::<Value>(&body).unwrap();
     match request.get("method").and_then(Value::as_str) {
+        Some("server/discover") => response_with_headers(
+            StatusCode::BAD_REQUEST,
+            &[("content-type", "application/json")],
+            json!({"jsonrpc":"2.0", "id":request["id"], "error":{"code":-32601,"message":"legacy fixture"}})
+                .to_string(),
+        ),
         Some("initialize") => response_with_headers(
             StatusCode::OK,
             &[

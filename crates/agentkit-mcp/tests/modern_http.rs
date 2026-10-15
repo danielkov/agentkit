@@ -1,9 +1,18 @@
 //! Built-in Auto lifecycle through an actual HTTP JSON-RPC and POST SSE boundary.
-use std::{convert::Infallible, future::Future, sync::Arc, time::Duration};
+use std::{
+    convert::Infallible,
+    future::Future,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use agentkit_mcp::{
     AuthOperation, AuthRequest, AuthResolution, McpConnection, McpServerConfig, McpServerEvent,
-    McpSubscriptionStatus, McpTransportBinding, StreamableHttpTransportConfig,
+    McpServerId, McpServerManager, McpSubscriptionStatus, McpTransportBinding,
+    StreamableHttpTransportConfig,
 };
 use axum::{
     Json, Router,
@@ -30,6 +39,20 @@ struct Listen {
     frames: mpsc::UnboundedSender<Bytes>,
 }
 impl Listen {
+    fn acknowledge(&self, filter: Value) {
+        self.notify(
+            "notifications/subscriptions/acknowledged",
+            json!({"notifications":filter}),
+        );
+    }
+
+    fn fail(&self) {
+        self.frames
+            .send(frame(json!({"jsonrpc":"2.0", "id":self.id,
+            "error":{"code":-32603,"message":"listen failed; ordinary RPC remains healthy"}})))
+            .unwrap();
+    }
+
     fn notify(&self, method: &str, params: Value) {
         let mut params = params;
         params["_meta"] = json!({"io.modelcontextprotocol/subscriptionId":self.id});
@@ -46,6 +69,8 @@ fn frame(message: Value) -> Bytes {
 
 #[derive(Clone)]
 struct Endpoint {
+    hold_ack: Arc<AtomicBool>,
+    tool_version: Arc<AtomicU64>,
     listens: mpsc::UnboundedSender<Listen>,
     requests: Arc<Mutex<Vec<(HeaderMap, Value)>>>,
 }
@@ -101,7 +126,7 @@ async fn rpc(
         "subscriptions/listen" => {
             let (frames, receiver) = mpsc::unbounded_channel();
             let filter = message["params"]["notifications"].clone();
-            if token != "Bearer hold" {
+            if token != "Bearer hold" && !state.hold_ack.load(Ordering::SeqCst) {
                 frames.send(frame(json!({"jsonrpc":"2.0", "method":"notifications/subscriptions/acknowledged",
                     "params":{"notifications":filter,"_meta":{"io.modelcontextprotocol/subscriptionId":id}}}))).unwrap();
             }
@@ -149,7 +174,9 @@ async fn rpc(
             json!({})
         }
         "resources/unsubscribe" => json!({}),
-        "tools/list" => json!({"tools":[]}),
+        "tools/list" => {
+            json!({"tools":[{"name":format!("tool{}", state.tool_version.load(Ordering::SeqCst)),"inputSchema":{"type":"object"}}]})
+        }
         "resources/list" => json!({"resources":[]}),
         "prompts/list" => json!({"prompts":[]}),
         _ => return Json(
@@ -161,6 +188,8 @@ async fn rpc(
 }
 
 struct Fixture {
+    hold_ack: Arc<AtomicBool>,
+    tool_version: Arc<AtomicU64>,
     config: McpServerConfig,
     listens: mpsc::UnboundedReceiver<Listen>,
     requests: Arc<Mutex<Vec<(HeaderMap, Value)>>>,
@@ -174,10 +203,14 @@ impl Drop for Fixture {
 impl Fixture {
     async fn start() -> Self {
         let (tx, listens) = mpsc::unbounded_channel();
+        let hold_ack = Arc::new(AtomicBool::new(false));
+        let tool_version = Arc::new(AtomicU64::new(0));
         let requests = Arc::new(Mutex::new(Vec::new()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/mcp", listener.local_addr().unwrap());
         let app = Router::new().route("/mcp", post(rpc)).with_state(Endpoint {
+            hold_ack: hold_ack.clone(),
+            tool_version: tool_version.clone(),
             listens: tx,
             requests: requests.clone(),
         });
@@ -191,6 +224,8 @@ impl Fixture {
             ),
         );
         Self {
+            hold_ack,
+            tool_version,
             config,
             listens,
             requests,
@@ -428,6 +463,117 @@ async fn cancelling_initiated_close_terminates_http_stream_with_connection_retai
         bounded(active.frames.closed()).await;
         // Keep the connection alive throughout: stream disposal cannot be attributed to Drop.
         assert!(connection.discover().await.is_err());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn auth_reconnect_partial_ack_preserves_committed_http_subscription() {
+    bounded(async {
+        let mut fixture = Fixture::start().await;
+        let connection = Arc::new(McpConnection::connect(&fixture.config).await.unwrap());
+        let initial = fixture.listen().await;
+        connection.subscribe_resource("memo:first").await.unwrap();
+        let first = fixture.listen().await;
+        bounded(initial.frames.closed()).await;
+        connection.subscribe_resource("memo:second").await.unwrap();
+        let active = fixture.listen().await;
+        bounded(first.frames.closed()).await;
+        let epoch = connection.connection_epoch();
+        let capabilities = connection.capabilities();
+        let status = connection.subscription_status().await;
+        let mut events = connection.subscribe_events();
+
+        // Gate only the candidate's actual POST SSE acknowledgement. Discovery
+        // advertises different capabilities, so neither discovery nor a partial
+        // acknowledgement may commit any part of this authentication change.
+        fixture.hold_ack.store(true, Ordering::SeqCst);
+        let reconnect = {
+            let connection = connection.clone();
+            tokio::spawn(async move { connection.resolve_auth(auth("replacement")).await })
+        };
+        let candidate = fixture.listen().await;
+        assert_eq!(candidate.headers.get("authorization").unwrap(), "Bearer replacement");
+        assert_eq!(candidate.filter["resourceSubscriptions"], json!(["memo:first", "memo:second"]));
+        let mut partial = candidate.filter.clone();
+        partial["resourceSubscriptions"] = json!(["memo:first"]);
+        candidate.acknowledge(partial);
+        assert!(bounded(reconnect).await.unwrap().is_err());
+        bounded(candidate.frames.closed()).await;
+        assert_eq!(connection.connection_epoch(), epoch);
+        assert_eq!(connection.capabilities(), capabilities);
+        assert_eq!(connection.subscription_status().await, status);
+        assert!(!active.frames.is_closed());
+        for uri in ["memo:first", "memo:second"] {
+            active.notify("notifications/resources/updated", json!({"uri":uri}));
+            assert!(matches!(events.recv().await.unwrap(), McpServerEvent::ResourceUpdated(params) if params.uri == uri));
+        }
+        connection.list_resources().await.unwrap();
+        let requests = fixture.requests.lock().await;
+        let (headers, request) = requests.last().unwrap();
+        assert_eq!(request["method"], "resources/list");
+        assert_eq!(headers.get("authorization").unwrap(), "Bearer initial");
+        drop(requests);
+        connection.close().await.unwrap();
+        bounded(active.frames.closed()).await;
+    }).await;
+}
+
+#[tokio::test]
+async fn recovered_http_listen_redirties_catalog_after_refresh_during_gap() {
+    bounded(async {
+        let mut fixture = Fixture::start().await;
+        let id = McpServerId::new("http-modern");
+        let mut manager = McpServerManager::new().with_server(fixture.config.clone());
+        manager.connect_server(&id).await.unwrap();
+        let active = fixture.listen().await;
+        let connection = manager.connected_server(&id).unwrap().connection();
+        manager.refresh_changed_catalogs().await.unwrap();
+        assert!(manager.prepare_changed_catalogs().is_empty());
+        assert_eq!(
+            manager.connected_server(&id).unwrap().snapshot().tools[0].name,
+            "tool0"
+        );
+
+        // A JSON-RPC error terminates the listen, not the HTTP endpoint. Hold
+        // recovery at the next POST SSE ACK while ordinary catalog RPCs work.
+        fixture.hold_ack.store(true, Ordering::SeqCst);
+        active.fail();
+        let recovery = fixture.listen().await;
+        assert_eq!(
+            connection.subscription_status().await,
+            Some(McpSubscriptionStatus::Pending)
+        );
+        manager.refresh_changed_catalogs().await.unwrap();
+        assert!(manager.prepare_changed_catalogs().is_empty());
+        assert_eq!(
+            manager.connected_server(&id).unwrap().snapshot().tools[0].name,
+            "tool0"
+        );
+        assert_eq!(
+            connection.subscription_status().await,
+            Some(McpSubscriptionStatus::Pending)
+        );
+
+        // Change the remote catalog after the host has consumed the first dirty
+        // mark. Send no list-changed notification, only the recovery ACK.
+        fixture.tool_version.store(1, Ordering::SeqCst);
+        recovery.acknowledge(recovery.filter.clone());
+        while !matches!(
+            connection.subscription_status().await,
+            Some(McpSubscriptionStatus::Active { .. })
+        ) {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(manager.prepare_changed_catalogs().len(), 1);
+        manager.refresh_changed_catalogs().await.unwrap();
+        assert_eq!(
+            manager.connected_server(&id).unwrap().snapshot().tools[0].name,
+            "tool1"
+        );
+        assert!(manager.prepare_changed_catalogs().is_empty());
+        manager.disconnect_server(&id).await.unwrap();
+        bounded(recovery.frames.closed()).await;
     })
     .await;
 }

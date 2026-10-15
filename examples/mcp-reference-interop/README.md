@@ -3,21 +3,23 @@
 Live Streamable HTTP interop checks for `agentkit-mcp` against the official Rust
 MCP SDK, `rmcp`.
 
-This example does not mock the transport layer. It launches two `rmcp`-backed
+This example does not mock the transport layer. It launches three `rmcp`-backed
 reference servers and probes them through the real `agentkit-mcp` client:
 
-- stateful Streamable HTTP with SSE responses
-- stateless Streamable HTTP with JSON responses
+- legacy (2025-11-25) stateful Streamable HTTP with SSE responses
+- legacy (2025-11-25) stateless Streamable HTTP with JSON responses
+- modern (2026-07-28) sessionless Streamable HTTP with acknowledged subscriptions
 
 Each probe verifies:
 
-- `initialize` and capability discovery
+- modern `server/discover` or legacy `initialize` and capability discovery
 - tool listing and `tools/call`
 - resource listing and `resources/read`
 - prompt listing and `prompts/get`
 - negotiated protocol header propagation
 - stateful session header reuse and `DELETE` on close
-- interrupted SSE response resume via `Last-Event-ID`
+- legacy interrupted SSE response resume via `Last-Event-ID`
+- modern `subscriptions/listen` without initialization, GET streams, or session cleanup
 
 ## Run
 
@@ -31,6 +33,12 @@ Probe the stateless JSON-response server:
 
 ```bash
 cargo run -p mcp-reference-interop -- stateless
+```
+
+Probe the modern subscription server:
+
+```bash
+cargo run -p mcp-reference-interop -- modern
 ```
 
 ## Live Tests
@@ -57,5 +65,5 @@ cargo test -p mcp-reference-interop -- --nocapture
 
 ## Upstream Targets
 
-- Rust SDK crate: `rmcp = 3.1.2`
+- Rust SDK crate: `rmcp = 3.5.1` (resolved by the workspace lockfile)
 - Upstream repository: <https://github.com/modelcontextprotocol/rust-sdk>

@@ -32,11 +32,13 @@ pub struct RecordedRequest {
 pub enum ReferenceImplementation {
     RustSdkStatefulSse,
     RustSdkStatelessJson,
+    RustSdkModern,
 }
 
 impl ReferenceImplementation {
     pub fn parse(value: &str) -> Option<Self> {
         match value {
+            "rust-modern" | "modern" => Some(Self::RustSdkModern),
             "rust-stateful" | "stateful" => Some(Self::RustSdkStatefulSse),
             "rust-stateless" | "stateless" | "json" => Some(Self::RustSdkStatelessJson),
             _ => None,
@@ -45,6 +47,7 @@ impl ReferenceImplementation {
 
     pub fn as_str(&self) -> &'static str {
         match self {
+            Self::RustSdkModern => "rust-modern",
             Self::RustSdkStatefulSse => "rust-stateful",
             Self::RustSdkStatelessJson => "rust-stateless",
         }
@@ -52,6 +55,7 @@ impl ReferenceImplementation {
 
     fn server_mode_arg(&self) -> &'static str {
         match self {
+            Self::RustSdkModern => "modern",
             Self::RustSdkStatefulSse => "stateful",
             Self::RustSdkStatelessJson => "stateless-json",
         }

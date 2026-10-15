@@ -64,6 +64,7 @@ impl SubscriptionController {
         sink: McpNotificationSink,
     ) -> Result<Self, McpError> {
         let subscription = establish(&peer, base_filter.clone()).await?;
+        verify_resources(&base_filter, subscription.acknowledged())?;
         let initial = active_status(&base_filter, &subscription);
         let (status_tx, status) = watch::channel(initial);
         let (requested_tx, requested) = watch::channel(resource_set(&base_filter));
@@ -326,6 +327,9 @@ async fn run(
                             return McpSubscriptionStatus::Closed { graceful: false, error: Some(last_error) };
                         };
                         active = stream;
+                        // A host may have refreshed during backoff. Reconcile the
+                        // entire notification gap after this stream is active.
+                        sink.mark_catalog_dirty();
                         status.send_replace(active_status(&filter, &active));
                     }
                 }
