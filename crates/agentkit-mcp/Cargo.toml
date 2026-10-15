@@ -4,7 +4,7 @@ homepage.workspace = true
 name = "agentkit-mcp"
 readme = "README.md"
 repository.workspace = true
-version = "0.10.7"
+version = "0.11.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -20,7 +20,7 @@ async-trait.workspace = true
 futures-util.workspace = true
 http = "1"
 reqwest.workspace = true
-rmcp = { version = "3.1.2", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest", "auth"] }
+rmcp = { version = "=3.5.1", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest", "auth"] }
 serde.workspace = true
 serde_json.workspace = true
 sse-stream = "0.2"
@@ -30,5 +30,5 @@ tokio = { workspace = true, features = ["sync", "time"] }
 
 [dev-dependencies]
 axum = "0.8"
-rmcp = { version = "3.1.2", default-features = false, features = ["client", "server", "transport-async-rw", "macros", "elicitation"] }
+rmcp = { version = "=3.5.1", default-features = false, features = ["client", "server", "transport-async-rw", "macros", "elicitation"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util", "time", "net"] }

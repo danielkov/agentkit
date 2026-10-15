@@ -32,6 +32,40 @@ The MCP specification moves quickly. Because agentkit-mcp re-exports [`rmcp::mod
 
 The same logic applies to transports: stdio and Streamable HTTP are rmcp implementations driven declaratively here; future rmcp transports are reachable through `McpConnection::from_running_service_with_events` without touching `McpTransportBinding`.
 
+## Modern subscriptions and catalog refresh
+
+Built-in transports negotiate with RMCP's `Auto` lifecycle (`server/discover`
+with legacy initialization fallback). Check `protocol_version()` and
+`capabilities()` on the connection instead of inferring support from HTTP or
+stdio. Adopting an existing service with
+`McpConnection::from_running_service_with_events` does not perform asynchronous
+setup: call `discover().await` to establish its modern notification stream.
+
+Modern discovery waits for a `subscriptions/listen` acknowledgment.
+`subscription_status().await` reports the requested and accepted filters, and
+`subscription_changes().await` watches their lifecycle. Partial catalog
+acknowledgments are visible rather than treated as full acceptance. Resource
+subscribe/unsubscribe operations replace the complete filter; a rejected URI
+set leaves the previous active stream in place. Legacy peers keep the separate
+`resources/subscribe` and `resources/unsubscribe` methods.
+
+Stream notifications use the existing `subscribe_events()` broadcast. For catalog
+reconciliation, use `catalog_changes()` and `catalog_revision()`; watch updates
+coalesce and survive slow broadcast consumers. The host must schedule
+`refresh_changed_catalogs()`, or prepare/fetch/publish refresh work outside its
+manager lock. Invalidated, failed, or canceled work must not publish a stale
+snapshot.
+
+A transport failure triggers bounded subscription recovery and dirties the
+catalog. Graceful completion yields `Closed { graceful: true, .. }` without
+retry. Authentication reconnect rebuilds subscriptions on the new peer and
+retains committed resource URIs; `connection_epoch()` fences old work. Await
+`close()` to shut down streams before transport cleanup.
+
+**Migration (agentkit-mcp 0.11.0):** `capabilities()` returns an owned snapshot
+instead of a borrowed reference. Read it again after authentication reconnect
+for the current peer capabilities; do not retain a lock guard across awaits.
+
 ## MCP in the capability model
 
 MCP servers expose three capability types, which map directly to agentkit's capability layer:
@@ -132,7 +166,7 @@ while let Ok(event) = events.recv().await {
 
 `set_logging_level(LoggingLevel::Info)` negotiates the minimum severity the server emits. `subscribe_resource` / `unsubscribe_resource` toggle per-URI watch on resources that support it.
 
-List-changed events are _also_ delivered through the legacy `McpServerNotification` mpsc receiver that `McpServerManager::refresh_changed_catalogs` drains to re-run discovery — the two channels coexist: events for live UI/observability, mpsc for catalog re-sync.
+List-changed events also advance the coalescing catalog revision watch used by `McpServerManager::refresh_changed_catalogs`. The compatibility `McpServerNotification` receiver remains available; catalog reconciliation does not require draining the event broadcast.
 
 ## Auth handled outside the loop
 
@@ -163,11 +197,11 @@ The manager owns server lifecycle:
 | `connect_server(id)` / `connect_all()` | Open a connection and run discovery                                                                                                     |
 | `connect_all_settled()`                | Attempt all registered servers concurrently, install successes, and return per-server failures                                          |
 | `refresh_server(id)`                   | Re-run discovery and emit per-tool/resource/prompt diff events                                                                          |
-| `refresh_changed_catalogs()`           | Drain pending `*list_changed` notifications and refresh affected catalogs                                                               |
+| `refresh_changed_catalogs()`           | Reconcile catalogs marked dirty by coalesced invalidations                                                               |
 | `disconnect_server(id)`                | Close the connection, drop tools from the federated catalog, emit `ServerDisconnected`                                                  |
 | `subscribe_catalog_events()`           | Broadcast receiver for `McpCatalogEvent` (server connect / disconnect / tool added / removed / changed / refresh failed / auth changed) |
 
-Register a server with `with_server_options(config, McpServerOptions::new().with_timeout(duration))` to bound connecting to that server. The timeout covers connection establishment — transport setup and the MCP initialize handshake — plus initial discovery, and applies to refresh discovery on its own; failures surface as `McpError::Timeout`.
+Register a server with `with_server_options(config, McpServerOptions::new().with_timeout(duration))` to bound connecting to that server. The timeout covers connection establishment — transport setup and MCP lifecycle negotiation — plus initial discovery, and applies to refresh discovery on its own; failures surface as `McpError::Timeout`.
 
 ## Federating MCP into the agent
 

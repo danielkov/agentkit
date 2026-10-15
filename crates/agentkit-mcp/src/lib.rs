@@ -21,6 +21,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -42,12 +43,12 @@ use async_trait::async_trait;
 use futures_util::future::{join_all, try_join_all};
 use futures_util::stream::BoxStream;
 use http::{HeaderName, HeaderValue};
-use rmcp::ServiceExt;
 use rmcp::handler::client::ClientHandler;
 use rmcp::model as rmcp_model;
 use rmcp::service::{
     ClientInitializeError, Peer, PeerRequestOptions, RoleClient, RunningService, ServiceError,
 };
+use rmcp::service::{ClientLifecycleMode, ClientServiceExt};
 use rmcp::transport::streamable_http_client::{
     AuthRequiredError, InsufficientScopeError, StreamableHttpClient as RmcpStreamableHttpClient,
     StreamableHttpClientTransportConfig as RmcpStreamableHttpClientTransportConfig,
@@ -60,7 +61,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sse_stream::{Error as SseError, Sse};
 use thiserror::Error;
-use tokio::sync::{Mutex, broadcast, mpsc};
+use tokio::sync::{Mutex, broadcast, mpsc, watch};
+
+mod subscriptions;
+pub use subscriptions::McpSubscriptionStatus;
 
 /// Re-exports of the rmcp wire-protocol types this crate now surfaces directly
 /// instead of wrapping. Pull these in to pattern-match on tool annotations,
@@ -78,13 +82,13 @@ pub use rmcp::model::{
     FormElicitationCapability as McpFormElicitationCapability, GetPromptResult, ImageContent,
     ImageContent as RawImageContent, Implementation as McpImplementation,
     ProgressNotificationParam as McpProgressNotificationParam, Prompt as McpPrompt, PromptArgument,
-    PromptMessage, ReadResourceResult, Resource as McpRawResource, Resource as McpResource,
-    ResourceContents as McpResourceContents,
+    PromptMessage, ProtocolVersion as McpProtocolVersion, ReadResourceResult,
+    Resource as McpRawResource, Resource as McpResource, ResourceContents as McpResourceContents,
     ResourceUpdatedNotificationParam as McpResourceUpdatedNotificationParam, Role,
     Role as PromptMessageRole, RootsCapabilities as McpRootsCapabilities,
-    SamplingCapability as McpSamplingCapability, TextContent as RawTextContent, TextContent,
-    Tool as McpTool, ToolAnnotations as McpToolAnnotations,
-    UrlElicitationCapability as McpUrlElicitationCapability,
+    SamplingCapability as McpSamplingCapability, SubscriptionFilter as McpSubscriptionFilter,
+    TextContent as RawTextContent, TextContent, Tool as McpTool,
+    ToolAnnotations as McpToolAnnotations, UrlElicitationCapability as McpUrlElicitationCapability,
 };
 
 // RMCP 3 still supports these legacy MCP surfaces. Keep exposing them for API
@@ -946,8 +950,8 @@ pub struct LoggingCapability {}
 
 /// Server-originated catalog notifications observed by [`McpClientHandler`].
 ///
-/// Drained by [`McpConnection`] inside
-/// [`McpServerManager::refresh_changed_catalogs`] to trigger re-discovery of
+/// Consumed by [`McpConnection`] to advance its coalesced catalog revision.
+/// Hosts use [`McpServerManager::refresh_changed_catalogs`] to reconcile
 /// the affected capability lists. For richer push-style consumption (progress,
 /// logging, resource updates, cancellation), subscribe via
 /// [`McpConnection::subscribe_events`] and pattern-match on
@@ -1038,9 +1042,9 @@ const DEFAULT_EVENTS_CAPACITY: usize = 128;
 /// Channels paired with an [`McpClientHandler`] returned by
 /// [`McpHandlerConfig::build`].
 ///
-/// `notifications` is the legacy mpsc receiver consumed by the catalog refresh
-/// path inside [`McpServerManager::refresh_changed_catalogs`]. `events` is the
-/// broadcast sender that surfaces every [`McpServerEvent`] — clone it once and
+/// `notifications` preserves the compatibility mpsc stream for standalone
+/// handler consumers. Connections track coalesced revisions directly and release
+/// this receiver on adoption. `events` is the broadcast sender that surfaces every [`McpServerEvent`] — clone it once and
 /// pass it into [`McpConnection::from_running_service_with_events`] when
 /// adopting an externally constructed [`rmcp::service::RunningService`]. If the
 /// adopted connection also needs adapter-time hooks from the same
@@ -1064,7 +1068,9 @@ pub struct McpClientChannels {
 /// the connection must preserve adapter-time hooks from the config.
 #[derive(Clone)]
 pub struct McpClientHandler {
-    info: rmcp_model::ClientInfo,
+    info: rmcp_model::ClientConfig,
+    revision: watch::Sender<u64>,
+    active: Arc<AtomicBool>,
     notifications: mpsc::UnboundedSender<McpServerNotification>,
     events: broadcast::Sender<McpServerEvent>,
     sampling: Option<Arc<dyn McpSamplingResponder>>,
@@ -1138,6 +1144,9 @@ impl ClientHandler for McpClientHandler {
         params: rmcp_model::ProgressNotificationParam,
         _context: rmcp::service::NotificationContext<RoleClient>,
     ) -> impl Future<Output = ()> + rmcp::service::MaybeSendFuture + '_ {
+        if !self.active.load(Ordering::Acquire) {
+            return std::future::ready(());
+        }
         let _ = self.events.send(McpServerEvent::Progress(params));
         std::future::ready(())
     }
@@ -1148,6 +1157,9 @@ impl ClientHandler for McpClientHandler {
         params: rmcp_model::LoggingMessageNotificationParam,
         _context: rmcp::service::NotificationContext<RoleClient>,
     ) -> impl Future<Output = ()> + rmcp::service::MaybeSendFuture + '_ {
+        if !self.active.load(Ordering::Acquire) {
+            return std::future::ready(());
+        }
         let _ = self.events.send(McpServerEvent::Logging(params));
         std::future::ready(())
     }
@@ -1157,6 +1169,9 @@ impl ClientHandler for McpClientHandler {
         params: rmcp_model::ResourceUpdatedNotificationParam,
         _context: rmcp::service::NotificationContext<RoleClient>,
     ) -> impl Future<Output = ()> + rmcp::service::MaybeSendFuture + '_ {
+        if !self.active.load(Ordering::Acquire) {
+            return std::future::ready(());
+        }
         let _ = self.events.send(McpServerEvent::ResourceUpdated(params));
         std::future::ready(())
     }
@@ -1166,6 +1181,9 @@ impl ClientHandler for McpClientHandler {
         params: rmcp_model::CancelledNotificationParam,
         _context: rmcp::service::NotificationContext<RoleClient>,
     ) -> impl Future<Output = ()> + rmcp::service::MaybeSendFuture + '_ {
+        if !self.active.load(Ordering::Acquire) {
+            return std::future::ready(());
+        }
         let _ = self.events.send(McpServerEvent::Cancelled(params));
         std::future::ready(())
     }
@@ -1174,6 +1192,11 @@ impl ClientHandler for McpClientHandler {
         &self,
         _context: rmcp::service::NotificationContext<RoleClient>,
     ) -> impl Future<Output = ()> + rmcp::service::MaybeSendFuture + '_ {
+        if !self.active.load(Ordering::Acquire) {
+            return std::future::ready(());
+        }
+        self.revision
+            .send_modify(|revision| *revision = revision.saturating_add(1));
         let _ = self.notifications.send(McpServerNotification::ToolsChanged);
         let _ = self.events.send(McpServerEvent::ToolListChanged);
         std::future::ready(())
@@ -1183,6 +1206,11 @@ impl ClientHandler for McpClientHandler {
         &self,
         _context: rmcp::service::NotificationContext<RoleClient>,
     ) -> impl Future<Output = ()> + rmcp::service::MaybeSendFuture + '_ {
+        if !self.active.load(Ordering::Acquire) {
+            return std::future::ready(());
+        }
+        self.revision
+            .send_modify(|revision| *revision = revision.saturating_add(1));
         let _ = self
             .notifications
             .send(McpServerNotification::ResourcesChanged);
@@ -1194,6 +1222,11 @@ impl ClientHandler for McpClientHandler {
         &self,
         _context: rmcp::service::NotificationContext<RoleClient>,
     ) -> impl Future<Output = ()> + rmcp::service::MaybeSendFuture + '_ {
+        if !self.active.load(Ordering::Acquire) {
+            return std::future::ready(());
+        }
+        self.revision
+            .send_modify(|revision| *revision = revision.saturating_add(1));
         let _ = self
             .notifications
             .send(McpServerNotification::PromptsChanged);
@@ -1201,7 +1234,7 @@ impl ClientHandler for McpClientHandler {
         std::future::ready(())
     }
 
-    fn get_info(&self) -> rmcp_model::ClientInfo {
+    fn get_info(&self) -> rmcp_model::ClientConfig {
         self.info.clone()
     }
 }
@@ -1335,7 +1368,9 @@ impl McpHandlerConfig {
         }
 
         let handler = McpClientHandler {
-            info: rmcp_model::ClientInfo::new(
+            revision: watch::channel(1).0,
+            active: Arc::new(AtomicBool::new(true)),
+            info: rmcp_model::ClientConfig::new(
                 capabilities,
                 rmcp_model::Implementation::new("agentkit-mcp", env!("CARGO_PKG_VERSION"))
                     .with_title("agentkit MCP client"),
@@ -1358,6 +1393,43 @@ impl McpHandlerConfig {
     }
 }
 
+/// Notification state is scoped to a connection. Each invalidation advances a
+/// watch revision; catalog publishers acknowledge only the revision they fetched.
+#[derive(Clone)]
+struct McpNotificationSink {
+    revision: watch::Sender<u64>,
+    active: Arc<AtomicBool>,
+    events: broadcast::Sender<McpServerEvent>,
+}
+
+impl McpNotificationSink {
+    fn mark_catalog_dirty(&self) {
+        self.revision
+            .send_modify(|revision| *revision = revision.saturating_add(1));
+    }
+
+    fn dispatch(&self, notification: rmcp_model::ServerNotification) {
+        if !self.active.load(Ordering::Acquire) {
+            return;
+        }
+        use rmcp_model::ServerNotification as N;
+        let event = match notification {
+            N::ToolListChangedNotification(_) => McpServerEvent::ToolListChanged,
+            N::ResourceListChangedNotification(_) => McpServerEvent::ResourceListChanged,
+            N::PromptListChangedNotification(_) => McpServerEvent::PromptListChanged,
+            N::ResourceUpdatedNotification(update) => {
+                let _ = self
+                    .events
+                    .send(McpServerEvent::ResourceUpdated(update.params));
+                return;
+            }
+            _ => return,
+        };
+        self.mark_catalog_dirty();
+        let _ = self.events.send(event);
+    }
+}
+
 /// A live connection to a single MCP server, wrapping an
 /// [`rmcp::service::RunningService`].
 pub struct McpConnection {
@@ -1366,10 +1438,15 @@ pub struct McpConnection {
     inner: Mutex<RmcpClientService>,
     peer: RwLock<Peer<RoleClient>>,
     auth: Mutex<Option<MetadataMap>>,
-    notifications: Mutex<mpsc::UnboundedReceiver<McpServerNotification>>,
+    sink: McpNotificationSink,
+    subscriptions: Mutex<Option<subscriptions::SubscriptionController>>,
+    lifecycle: Mutex<()>,
+    epoch: AtomicU64,
+    closed: AtomicBool,
+    desired_resources: Mutex<BTreeSet<String>>,
     events: broadcast::Sender<McpServerEvent>,
     handler_config: McpHandlerConfig,
-    capabilities: McpServerCapabilities,
+    capabilities: RwLock<McpServerCapabilities>,
 }
 
 /// The result of replaying an MCP operation after auth resolution.
@@ -1386,7 +1463,7 @@ pub enum McpOperationResult {
 }
 
 impl McpConnection {
-    /// Connects to an MCP server, performs the rmcp `initialize` handshake,
+    /// Connects to an MCP server with modern discovery or legacy initialization,
     /// and returns a ready-to-use connection. No sampling / elicitation /
     /// roots responders are wired; use [`Self::connect_with_handler`] when
     /// the server may issue those requests.
@@ -1422,17 +1499,31 @@ impl McpConnection {
         };
 
         let peer = service.peer().clone();
-        Ok(Self {
+        let revision = service.service().revision.clone();
+        let sink = McpNotificationSink {
+            revision,
+            active: service.service().active.clone(),
+            events: events_tx.clone(),
+        };
+        drop(notification_rx);
+        let connection = Self {
             server_id: config.id.clone(),
             config: Some(config.clone()),
             inner: Mutex::new(service),
             peer: RwLock::new(peer),
             auth: Mutex::new(auth.cloned()),
-            notifications: Mutex::new(notification_rx),
+            sink,
+            subscriptions: Mutex::new(None),
+            lifecycle: Mutex::new(()),
+            epoch: AtomicU64::new(1),
+            closed: AtomicBool::new(false),
+            desired_resources: Mutex::new(BTreeSet::new()),
             events: events_tx,
             handler_config,
-            capabilities,
-        })
+            capabilities: RwLock::new(capabilities),
+        };
+        connection.ensure_subscriptions().await?;
+        Ok(connection)
     }
 
     /// Adopts an externally constructed [`rmcp::service::RunningService`] as
@@ -1440,9 +1531,9 @@ impl McpConnection {
     ///
     /// Use this when you need a transport rmcp supports but
     /// [`McpTransportBinding`] does not (in-memory pipes for tests, websockets,
-    /// custom IO). Pair the service with the notification receiver returned by
-    /// [`McpHandlerConfig::build`] so list-change notifications stay
-    /// observable.
+    /// custom IO). Pass the notification receiver returned by
+    /// [`McpHandlerConfig::build`]; the handler tracks catalog revisions directly
+    /// and the compatibility receiver is released on adoption.
     ///
     /// The connection has no [`McpServerConfig`] attached, so reconnect-on-auth
     /// is unavailable; [`resolve_auth`](Self::resolve_auth) only updates stored
@@ -1498,29 +1589,45 @@ impl McpConnection {
             .map(|info| rmcp_server_capabilities_to_agentkit(&info.capabilities))
             .unwrap_or_default();
         let peer = service.peer().clone();
+        let revision = service.service().revision.clone();
+        let sink = McpNotificationSink {
+            revision,
+            active: service.service().active.clone(),
+            events: events.clone(),
+        };
+        drop(notifications);
         Self {
             server_id: server_id.into(),
             config: None,
             inner: Mutex::new(service),
             peer: RwLock::new(peer),
             auth: Mutex::new(None),
-            notifications: Mutex::new(notifications),
+            sink,
+            subscriptions: Mutex::new(None),
+            lifecycle: Mutex::new(()),
+            epoch: AtomicU64::new(1),
+            closed: AtomicBool::new(false),
+            desired_resources: Mutex::new(BTreeSet::new()),
             events,
             handler_config,
-            capabilities,
+            capabilities: RwLock::new(capabilities),
         }
     }
 
     async fn reconnect_inner(&self, auth: Option<&MetadataMap>) -> Result<(), McpError> {
+        let _lifecycle = self.lifecycle.lock().await;
+        if self.closed.load(Ordering::Acquire) {
+            return Err(McpError::Transport("MCP connection is closed".into()));
+        }
         let Some(config) = self.config.clone() else {
             return Ok(());
         };
-        let (handler, channels) = self.handler_config.build_with(self.events.clone());
-        let McpClientChannels {
-            notifications: notification_rx,
-            ..
-        } = channels;
-        let (service, _capabilities) = match &config.transport {
+        let (mut handler, channels) = self.handler_config.build_with(self.events.clone());
+        handler.revision = self.sink.revision.clone();
+        handler.active = Arc::new(AtomicBool::new(false));
+        let mut candidate_sink = self.sink.clone();
+        candidate_sink.active = handler.active.clone();
+        let (service, capabilities) = match &config.transport {
             McpTransportBinding::Stdio(binding) => {
                 connect_rmcp_stdio(&config, binding, handler).await?
             }
@@ -1529,9 +1636,73 @@ impl McpConnection {
             }
         };
         let new_peer = service.peer().clone();
-        *self.notifications.lock().await = notification_rx;
-        *self.inner.lock().await = service;
-        *self.peer.write().expect("MCP peer lock poisoned") = new_peer;
+        let modern = new_peer
+            .peer_info()
+            .is_some_and(|info| !info.protocol_version.has_initialize());
+        let resources = match self.subscriptions.lock().await.as_ref() {
+            Some(controller) => controller.settled_resources().await,
+            None => self.desired_resources.lock().await.clone(),
+        };
+        let controller = if modern {
+            let mut filter = filter_for_capabilities(&capabilities);
+            if !resources.is_empty() {
+                filter.resource_subscriptions = Some(resources.iter().cloned().collect());
+            }
+            Some(
+                subscriptions::SubscriptionController::start(
+                    new_peer.clone(),
+                    filter,
+                    candidate_sink.clone(),
+                )
+                .await?,
+            )
+        } else {
+            // Legacy subscriptions are session-scoped and must be replayed on
+            // the candidate before retiring the authoritative old transport.
+            for uri in &resources {
+                #[allow(deprecated)]
+                new_peer
+                    .subscribe(rmcp_model::SubscribeRequestParams::new(uri.clone()))
+                    .await
+                    .map_err(rmcp_service_error)?;
+            }
+            None
+        };
+        drop(channels.notifications);
+        // Acquire every async publication guard before changing state. Cancellation
+        // during preparation leaves the old connection and controller untouched.
+        let mut inner = self.inner.lock().await;
+        let mut active = self.subscriptions.lock().await;
+        let mut desired_resources = self.desired_resources.lock().await;
+        let next_epoch = self
+            .epoch
+            .load(Ordering::Acquire)
+            .checked_add(1)
+            .filter(|epoch| *epoch < u64::MAX)
+            .ok_or_else(|| McpError::Transport("MCP connection generation exhausted".into()))?;
+        let (mut previous, old_controller) = {
+            let mut peer = self.peer.write().expect("MCP peer lock poisoned");
+            let mut current_capabilities = self
+                .capabilities
+                .write()
+                .expect("MCP capabilities lock poisoned");
+            self.epoch.store(next_epoch, Ordering::Release);
+            inner.service().active.store(false, Ordering::Release);
+            let previous = std::mem::replace(&mut *inner, service);
+            candidate_sink.active.store(true, Ordering::Release);
+            *peer = new_peer;
+            *current_capabilities = capabilities;
+            *desired_resources = resources;
+            (previous, std::mem::replace(&mut *active, controller))
+        };
+        drop(desired_resources);
+        drop(active);
+        drop(inner);
+        self.mark_catalog_dirty();
+        if let Some(mut controller) = old_controller {
+            controller.shutdown().await;
+        }
+        let _ = previous.close().await;
         Ok(())
     }
 
@@ -1544,9 +1715,71 @@ impl McpConnection {
         &self.server_id
     }
 
-    /// Returns the capabilities advertised by the server during `initialize`.
-    pub fn capabilities(&self) -> &McpServerCapabilities {
-        &self.capabilities
+    /// Returns the capabilities from the current connection, including auth reconnects.
+    pub fn capabilities(&self) -> McpServerCapabilities {
+        self.capabilities
+            .read()
+            .expect("MCP capabilities lock poisoned")
+            .clone()
+    }
+
+    /// Protocol selected by discovery or the legacy initialization handshake.
+    pub fn protocol_version(&self) -> Option<McpProtocolVersion> {
+        self.peer()
+            .peer_info()
+            .map(|info| info.protocol_version.clone())
+    }
+
+    /// Receives coalesced catalog invalidations; revision one denotes initial discovery.
+    pub fn catalog_changes(&self) -> watch::Receiver<u64> {
+        self.sink.revision.subscribe()
+    }
+
+    /// Changes whenever authentication replaces the transport or the connection closes.
+    pub fn connection_epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
+    }
+
+    /// Current catalog invalidation revision. A successful fetch acknowledges only its captured revision.
+    pub fn catalog_revision(&self) -> u64 {
+        *self.sink.revision.borrow()
+    }
+
+    fn mark_catalog_dirty(&self) {
+        self.sink.mark_catalog_dirty();
+    }
+
+    fn modern(&self) -> bool {
+        self.protocol_version()
+            .is_some_and(|version| !version.has_initialize())
+    }
+
+    fn subscription_filter(&self) -> McpSubscriptionFilter {
+        let capabilities = self.capabilities();
+        filter_for_capabilities(&capabilities)
+    }
+
+    async fn ensure_subscriptions(&self) -> Result<(), McpError> {
+        let _lifecycle = self.lifecycle.lock().await;
+        if self.closed.load(Ordering::Acquire) {
+            return Err(McpError::Transport("MCP connection is closed".into()));
+        }
+        let mut subscriptions = self.subscriptions.lock().await;
+        if self.modern() && subscriptions.is_none() {
+            let mut filter = self.subscription_filter();
+            let resources = self.desired_resources.lock().await;
+            if !resources.is_empty() {
+                filter.resource_subscriptions = Some(resources.iter().cloned().collect());
+            }
+            let controller = subscriptions::SubscriptionController::start(
+                self.peer(),
+                filter,
+                self.sink.clone(),
+            )
+            .await?;
+            *subscriptions = Some(controller);
+        }
+        Ok(())
     }
 
     /// Returns the [`McpHandlerConfig`] this connection was built with.
@@ -1562,8 +1795,8 @@ impl McpConnection {
     /// [`McpHandlerConfig::with_events_capacity`], defaults to
     /// `DEFAULT_EVENTS_CAPACITY`) before slow consumers are signalled with
     /// [`broadcast::error::RecvError::Lagged`]. Catalog `*ListChanged` events
-    /// are also delivered through the legacy [`McpServerNotification`]
-    /// receiver consumed by [`McpServerManager::refresh_changed_catalogs`].
+    /// also advance [`Self::catalog_revision`] independently of broadcast lag.
+    /// Hosts reconcile them with [`McpServerManager::refresh_changed_catalogs`].
     pub fn subscribe_events(&self) -> broadcast::Receiver<McpServerEvent> {
         self.events.subscribe()
     }
@@ -1575,32 +1808,46 @@ impl McpConnection {
     #[allow(deprecated)]
     pub async fn subscribe_resource(&self, uri: impl Into<String>) -> Result<(), McpError> {
         let uri = uri.into();
+        self.ensure_subscriptions().await?;
+        let _lifecycle = self.lifecycle.lock().await;
+        if let Some(controller) = self.subscriptions.lock().await.as_ref() {
+            return controller.subscribe_resource(uri).await;
+        }
         self.peer()
             .subscribe(rmcp_model::SubscribeRequestParams::new(uri.clone()))
             .await
             .map_err(|error| {
                 rmcp_operation_error(
                     &self.server_id,
-                    McpMethod::ResourcesSubscribe { uri },
+                    McpMethod::ResourcesSubscribe { uri: uri.clone() },
                     error,
                 )
-            })
+            })?;
+        self.desired_resources.lock().await.insert(uri);
+        Ok(())
     }
 
     /// Cancels a previous [`Self::subscribe_resource`] subscription.
     #[allow(deprecated)]
     pub async fn unsubscribe_resource(&self, uri: impl Into<String>) -> Result<(), McpError> {
         let uri = uri.into();
+        self.ensure_subscriptions().await?;
+        let _lifecycle = self.lifecycle.lock().await;
+        if let Some(controller) = self.subscriptions.lock().await.as_ref() {
+            return controller.unsubscribe_resource(uri).await;
+        }
         self.peer()
             .unsubscribe(rmcp_model::UnsubscribeRequestParams::new(uri.clone()))
             .await
             .map_err(|error| {
                 rmcp_operation_error(
                     &self.server_id,
-                    McpMethod::ResourcesUnsubscribe { uri },
+                    McpMethod::ResourcesUnsubscribe { uri: uri.clone() },
                     error,
                 )
-            })
+            })?;
+        self.desired_resources.lock().await.remove(&uri);
+        Ok(())
     }
 
     /// Negotiates the minimum severity the server should emit through
@@ -1642,12 +1889,43 @@ impl McpConnection {
             .map_err(rmcp_service_error)
     }
 
-    /// Gracefully closes the underlying rmcp service.
-    ///
-    /// For Streamable HTTP this drives the rmcp transport to issue a `DELETE`
-    /// against the negotiated session, releasing server-side state.
+    /// Current acknowledged modern subscription, or `None` for legacy peers.
+    pub async fn subscription_status(&self) -> Option<McpSubscriptionStatus> {
+        self.subscriptions
+            .lock()
+            .await
+            .as_ref()
+            .map(|controller| controller.status())
+    }
+
+    /// Watches establishment, accepted filters, disconnects, and recovery.
+    pub async fn subscription_changes(&self) -> Option<watch::Receiver<McpSubscriptionStatus>> {
+        self.subscriptions
+            .lock()
+            .await
+            .as_ref()
+            .map(|controller| controller.subscribe_status())
+    }
+
+    /// Closes owned subscriptions before shutting down the underlying transport.
+    /// Legacy HTTP sessions retain their protocol-specific DELETE cleanup.
     pub async fn close(&self) -> Result<(), McpError> {
+        let _lifecycle = self.lifecycle.lock().await;
+        // Acquire every guard before initiating shutdown. Once closed becomes
+        // visible, transport cancellation and worker stop need no more awaits.
         let mut inner = self.inner.lock().await;
+        let mut subscriptions = self.subscriptions.lock().await;
+        self.closed.store(true, Ordering::Release);
+        inner.service().active.store(false, Ordering::Release);
+        self.epoch
+            .store(self.connection_epoch().saturating_add(1), Ordering::Release);
+        let controller = subscriptions.take();
+        inner.cancellation_token().cancel();
+        drop(subscriptions);
+        self.mark_catalog_dirty();
+        if let Some(mut controller) = controller {
+            controller.shutdown().await;
+        }
         inner
             .close()
             .await
@@ -1668,32 +1946,36 @@ impl McpConnection {
             }
         }
         let snapshot = auth_slot.clone();
-        drop(auth_slot);
+        // Keep auth ordering through reconnect: later resolutions cannot publish
+        // an older transport after a newer credential selection.
         // Only reconnect if we have a config to reconnect with. Without one
         // (e.g. constructed via [`from_running_service`]) the auth is stored
         // but not pushed to the live transport.
         if self.config.is_some() {
             self.reconnect_inner(snapshot.as_ref()).await?;
         }
+        drop(auth_slot);
         Ok(())
     }
 
     /// Discovers tools, resources, and prompts that the server advertised.
     pub async fn discover(&self) -> Result<McpDiscoverySnapshot, McpError> {
+        self.ensure_subscriptions().await?;
+        let capabilities = self.capabilities();
         let tools = async {
-            match self.capabilities.tools {
+            match capabilities.tools {
                 Some(_) => self.list_tools().await,
                 None => Ok(Vec::new()),
             }
         };
         let resources = async {
-            match self.capabilities.resources {
+            match capabilities.resources {
                 Some(_) => self.list_resources().await,
                 None => Ok(Vec::new()),
             }
         };
         let prompts = async {
-            match self.capabilities.prompts {
+            match capabilities.prompts {
                 Some(_) => self.list_prompts().await,
                 None => Ok(Vec::new()),
             }
@@ -1706,15 +1988,6 @@ impl McpConnection {
             prompts,
             metadata: MetadataMap::new(),
         })
-    }
-
-    async fn drain_notifications(&self) -> Vec<McpServerNotification> {
-        let mut notifications = self.notifications.lock().await;
-        let mut drained = Vec::new();
-        while let Ok(notification) = notifications.try_recv() {
-            drained.push(notification);
-        }
-        drained
     }
 
     /// Lists all tools advertised by the connected MCP server.
@@ -1910,6 +2183,21 @@ impl McpConnection {
     }
 }
 
+fn filter_for_capabilities(capabilities: &McpServerCapabilities) -> McpSubscriptionFilter {
+    let mut filter = McpSubscriptionFilter::default();
+    filter.tools_list_changed = capabilities.tools.as_ref().map(|_| true);
+    filter.resources_list_changed = capabilities.resources.as_ref().map(|_| true);
+    filter.prompts_list_changed = capabilities.prompts.as_ref().map(|_| true);
+    filter
+}
+
+fn client_lifecycle() -> ClientLifecycleMode {
+    ClientLifecycleMode::Auto {
+        preferred_versions: vec![rmcp_model::ProtocolVersion::V_2026_07_28],
+        legacy_version: Some(rmcp_model::ProtocolVersion::V_2025_11_25),
+    }
+}
+
 async fn connect_rmcp_stdio(
     config: &McpServerConfig,
     binding: &StdioTransportConfig,
@@ -1929,7 +2217,7 @@ async fn connect_rmcp_stdio(
     .map_err(McpError::Io)?;
 
     let service = handler
-        .serve(transport)
+        .serve_with_lifecycle(transport, client_lifecycle())
         .await
         .map_err(|error| rmcp_initialize_error(config, error))?;
     let capabilities = service
@@ -1961,11 +2249,15 @@ async fn connect_rmcp_streamable_http(
                 DynHttpClient(client.clone()),
                 rmcp_config,
             );
-            handler.serve(transport).await
+            handler
+                .serve_with_lifecycle(transport, client_lifecycle())
+                .await
         }
         None => {
             let transport = StreamableHttpClientTransport::from_config(rmcp_config);
-            handler.serve(transport).await
+            handler
+                .serve_with_lifecycle(transport, client_lifecycle())
+                .await
         }
     };
     let service = result.map_err(|error| rmcp_initialize_error(config, error))?;
@@ -2325,6 +2617,64 @@ impl McpServerOptions {
     }
 }
 
+/// Prepared catalog discovery. Fetch outside the manager lock, then publish
+/// under the lock. Dropping this value never acknowledges pending changes.
+pub struct McpCatalogRefresh {
+    server_id: McpServerId,
+    connection: Arc<McpConnection>,
+    revision: u64,
+    epoch: u64,
+    publication: u64,
+    options: McpServerOptions,
+}
+
+impl McpCatalogRefresh {
+    /// Returns the target server.
+    pub fn server_id(&self) -> &McpServerId {
+        &self.server_id
+    }
+
+    /// Performs discovery without borrowing the manager.
+    pub async fn fetch(self) -> McpCatalogRefreshResult {
+        let snapshot =
+            McpServerManager::discover_with_options(&self.connection, &self.options).await;
+        McpCatalogRefreshResult {
+            request: self,
+            snapshot,
+        }
+    }
+}
+
+/// Completed discovery with its identity and generation publication fences.
+pub struct McpCatalogRefreshResult {
+    request: McpCatalogRefresh,
+    snapshot: Result<McpDiscoverySnapshot, McpError>,
+}
+
+/// Wake sources captured under the manager lock. Rebuild after each wake to
+/// include newly connected servers. Waiting does not borrow the manager.
+pub struct McpCatalogRefreshWake {
+    receivers: Vec<tokio::sync::watch::Receiver<u64>>,
+}
+
+impl McpCatalogRefreshWake {
+    /// Waits for a pending change or a connection lifecycle change.
+    pub async fn changed(&mut self) {
+        let waits = self.receivers.iter_mut().map(|receiver| {
+            Box::pin(async move {
+                let _ = receiver.changed().await;
+            })
+        });
+        let _ = futures_util::future::select_all(waits).await;
+    }
+}
+
+#[derive(Default)]
+struct McpCatalogPublication {
+    revision: u64,
+    publication: u64,
+}
+
 /// Manages the lifecycle of one or more MCP servers.
 pub struct McpServerManager {
     configs: BTreeMap<McpServerId, McpServerConfig>,
@@ -2340,6 +2690,8 @@ pub struct McpServerManager {
     /// [`CatalogWriter`] on connect/disconnect/refresh without rebuilding
     /// the whole catalog.
     server_tools: BTreeMap<McpServerId, BTreeSet<ToolName>>,
+    catalog_publications: BTreeMap<McpServerId, McpCatalogPublication>,
+    catalog_wake_tx: tokio::sync::watch::Sender<u64>,
 }
 
 impl Default for McpServerManager {
@@ -2356,6 +2708,8 @@ impl Default for McpServerManager {
             handler_config: McpHandlerConfig::default(),
             catalog_writer,
             server_tools: BTreeMap::new(),
+            catalog_publications: BTreeMap::new(),
+            catalog_wake_tx: tokio::sync::watch::channel(0).0,
         }
     }
 }
@@ -2522,23 +2876,28 @@ impl McpServerManager {
             snapshot,
             namespace: self.namespace.clone(),
         };
-        self.install_connection(server_id.clone(), handle.clone())
-            .await;
-        self.register_server_tools(server_id, &handle.snapshot);
-        self.emit_catalog_event(McpCatalogEvent::ServerConnected {
-            server_id: server_id.clone(),
-        });
+        let previous = self.install_connection(server_id.clone(), handle.clone());
+        if let Some(previous) = previous {
+            let _ = previous.connection.close().await;
+        }
         Ok(handle)
     }
 
-    /// Installs a freshly connected handle, gracefully closing any previous
-    /// connection it replaces so transports (and, for Streamable HTTP,
-    /// server-side sessions) are not leaked. Close failures on the replaced
-    /// connection are ignored — it is being discarded either way.
-    async fn install_connection(&mut self, server_id: McpServerId, handle: McpServerHandle) {
-        if let Some(previous) = self.connections.insert(server_id, handle) {
-            let _ = previous.connection.close().await;
-        }
+    /// Commits a connection and its complete catalog without suspension. The
+    /// caller closes the returned old handle only after this state is consistent.
+    fn install_connection(
+        &mut self,
+        server_id: McpServerId,
+        handle: McpServerHandle,
+    ) -> Option<McpServerHandle> {
+        self.catalog_publications.remove(&server_id);
+        let snapshot = handle.snapshot.clone();
+        let previous = self.connections.insert(server_id.clone(), handle);
+        self.register_server_tools(&server_id, &snapshot);
+        self.catalog_wake_tx
+            .send_modify(|revision| *revision = revision.saturating_add(1));
+        self.emit_catalog_event(McpCatalogEvent::ServerConnected { server_id });
+        previous
     }
 
     /// Connects all registered servers concurrently.
@@ -2584,18 +2943,16 @@ impl McpServerManager {
 
         let results = try_join_all(futures).await?;
         let mut handles = Vec::with_capacity(results.len());
-        let mut connected: Vec<(McpServerId, McpDiscoverySnapshot)> =
-            Vec::with_capacity(results.len());
+        let mut replaced = Vec::new();
         for (server_id, handle) in results {
-            connected.push((server_id.clone(), handle.snapshot.clone()));
-            self.install_connection(server_id, handle.clone()).await;
+            if let Some(previous) = self.install_connection(server_id, handle.clone()) {
+                replaced.push(previous);
+            }
             handles.push(handle);
         }
-        for (server_id, snapshot) in &connected {
-            self.register_server_tools(server_id, snapshot);
-        }
-        for (server_id, _) in connected {
-            self.emit_catalog_event(McpCatalogEvent::ServerConnected { server_id });
+        // Every successful installation is consistent before any cleanup await.
+        for previous in replaced {
+            let _ = previous.connection.close().await;
         }
         Ok(handles)
     }
@@ -2697,13 +3054,14 @@ impl McpServerManager {
         });
 
         let results = join_all(futures).await;
-        let mut connected_snapshots = Vec::new();
+        let mut replaced = Vec::new();
 
         for (server_id, result) in results {
             match result {
                 Ok(handle) => {
-                    connected_snapshots.push((server_id.clone(), handle.snapshot.clone()));
-                    self.install_connection(server_id, handle.clone()).await;
+                    if let Some(previous) = self.install_connection(server_id, handle.clone()) {
+                        replaced.push(previous);
+                    }
                     connected.push(handle);
                 }
                 Err(error) => {
@@ -2712,11 +3070,8 @@ impl McpServerManager {
             }
         }
 
-        for (server_id, snapshot) in &connected_snapshots {
-            self.register_server_tools(server_id, snapshot);
-        }
-        for (server_id, _) in connected_snapshots {
-            self.emit_catalog_event(McpCatalogEvent::ServerConnected { server_id });
+        for previous in replaced {
+            let _ = previous.connection.close().await;
         }
 
         McpConnectAllSettled {
@@ -2725,86 +3080,165 @@ impl McpServerManager {
         }
     }
 
-    /// Re-discovers capabilities for a connected server.
-    pub async fn refresh_server(
-        &mut self,
+    /// Prepares explicit refresh without network I/O. Marks the server dirty
+    /// so failed or cancelled work can be retried by the changed-catalog path.
+    pub fn prepare_catalog_refresh(
+        &self,
         server_id: &McpServerId,
-    ) -> Result<McpDiscoverySnapshot, McpError> {
+    ) -> Result<McpCatalogRefresh, McpError> {
         let handle = self
             .connections
-            .get_mut(server_id)
+            .get(server_id)
             .ok_or_else(|| McpError::UnknownServer(server_id.to_string()))?;
-        let options = self.options.get(server_id).cloned().unwrap_or_default();
-        let previous = handle.snapshot.clone();
-        let snapshot = match Self::discover_with_options(&handle.connection, &options).await {
+        handle.connection.mark_catalog_dirty();
+        Ok(self.catalog_refresh_request(server_id, handle))
+    }
+
+    fn catalog_refresh_request(
+        &self,
+        server_id: &McpServerId,
+        handle: &McpServerHandle,
+    ) -> McpCatalogRefresh {
+        McpCatalogRefresh {
+            server_id: server_id.clone(),
+            connection: handle.connection.clone(),
+            revision: handle.connection.catalog_revision(),
+            epoch: handle.connection.connection_epoch(),
+            publication: self
+                .catalog_publications
+                .get(server_id)
+                .map_or(0, |state| state.publication),
+            options: self.options.get(server_id).cloned().unwrap_or_default(),
+        }
+    }
+
+    /// Coalesces notifications into one request per dirty server. Preparation
+    /// never acknowledges changes, so dropping a request leaves it retryable.
+    pub fn prepare_changed_catalogs(&self) -> Vec<McpCatalogRefresh> {
+        self.connections
+            .iter()
+            .filter_map(|(server_id, handle)| {
+                let published = self
+                    .catalog_publications
+                    .get(server_id)
+                    .map_or(0, |state| state.revision);
+                let revision = handle.connection.catalog_revision();
+                (revision == u64::MAX || revision != published)
+                    .then(|| self.catalog_refresh_request(server_id, handle))
+            })
+            .collect()
+    }
+
+    /// Captures wake sources while locked. Await outside the lock and rebuild
+    /// after each wake. Already-dirty servers wake immediately.
+    pub fn catalog_refresh_wake(&self) -> McpCatalogRefreshWake {
+        let mut receivers = vec![self.catalog_wake_tx.subscribe()];
+        for (server_id, handle) in &self.connections {
+            let mut receiver = handle.connection.catalog_changes();
+            let published = self
+                .catalog_publications
+                .get(server_id)
+                .map_or(0, |state| state.revision);
+            let revision = *receiver.borrow();
+            if revision == u64::MAX || revision != published {
+                receiver.mark_changed();
+            }
+            receivers.push(receiver);
+        }
+        McpCatalogRefreshWake { receivers }
+    }
+
+    /// Publishes only while connection identity, connection epoch, notification
+    /// revision and prior publication still match. Superseded results are ignored.
+    /// Failure retains the previous catalog and dirty revision for retry.
+    pub fn publish_catalog_refresh(
+        &mut self,
+        result: McpCatalogRefreshResult,
+    ) -> Result<Vec<McpCatalogEvent>, McpError> {
+        let McpCatalogRefreshResult { request, snapshot } = result;
+        let Some(handle) = self.connections.get(&request.server_id) else {
+            return Ok(Vec::new());
+        };
+        let publication = self
+            .catalog_publications
+            .get(&request.server_id)
+            .map_or(0, |state| state.publication);
+        if !Arc::ptr_eq(&handle.connection, &request.connection)
+            || handle.connection.connection_epoch() != request.epoch
+            || handle.connection.catalog_revision() != request.revision
+            || publication != request.publication
+        {
+            return Ok(Vec::new());
+        }
+        let snapshot = match snapshot {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 self.emit_catalog_event(McpCatalogEvent::RefreshFailed {
-                    server_id: server_id.clone(),
+                    server_id: request.server_id,
                     message: error.to_string(),
                 });
                 return Err(error);
             }
         };
-        handle.snapshot = snapshot.clone();
-        let events = diff_discovery_snapshots(server_id, &previous, &snapshot);
-        if !events.is_empty() {
-            self.apply_catalog_events(server_id, &snapshot, &events);
-            for event in events {
-                self.emit_catalog_event(event);
-            }
+        let events = diff_discovery_snapshots(&request.server_id, &handle.snapshot, &snapshot);
+        self.apply_catalog_events(&request.server_id, &snapshot, &events);
+        self.connections
+            .get_mut(&request.server_id)
+            .expect("identity checked above")
+            .snapshot = snapshot;
+        self.catalog_publications.insert(
+            request.server_id,
+            McpCatalogPublication {
+                revision: request.revision,
+                publication: publication.saturating_add(1),
+            },
+        );
+        for event in &events {
+            self.emit_catalog_event(event.clone());
         }
-        Ok(snapshot)
+        Ok(events)
     }
 
-    /// Processes pending server list-change notifications.
+    /// Re-discovers capabilities. Prefer prepare/fetch/publish for shared managers.
+    pub async fn refresh_server(
+        &mut self,
+        server_id: &McpServerId,
+    ) -> Result<McpDiscoverySnapshot, McpError> {
+        let request = self.prepare_catalog_refresh(server_id)?;
+        self.publish_catalog_refresh(request.fetch().await)?;
+        Ok(self
+            .connections
+            .get(server_id)
+            .expect("server remains connected")
+            .snapshot
+            .clone())
+    }
+
+    /// Refreshes dirty servers concurrently, isolating failures. All completed
+    /// results are processed before the first error is returned.
     pub async fn refresh_changed_catalogs(&mut self) -> Result<Vec<McpCatalogEvent>, McpError> {
-        let server_ids = self.connections.keys().cloned().collect::<Vec<_>>();
+        let results = join_all(
+            self.prepare_changed_catalogs()
+                .into_iter()
+                .map(McpCatalogRefresh::fetch),
+        )
+        .await;
         let mut emitted = Vec::new();
-
-        for server_id in server_ids {
-            let Some(connection) = self
-                .connections
-                .get(&server_id)
-                .map(McpServerHandle::connection)
-            else {
-                continue;
-            };
-            let notifications = connection.drain_notifications().await;
-            if notifications.is_empty() {
-                continue;
-            }
-
-            let handle = self
-                .connections
-                .get_mut(&server_id)
-                .ok_or_else(|| McpError::UnknownServer(server_id.to_string()))?;
-            let options = self.options.get(&server_id).cloned().unwrap_or_default();
-            let previous = handle.snapshot.clone();
-            let snapshot = match Self::discover_with_options(&handle.connection, &options).await {
-                Ok(snapshot) => snapshot,
+        let mut first_error = None;
+        for result in results {
+            match self.publish_catalog_refresh(result) {
+                Ok(events) => emitted.extend(events),
                 Err(error) => {
-                    let event = McpCatalogEvent::RefreshFailed {
-                        server_id: server_id.clone(),
-                        message: error.to_string(),
-                    };
-                    self.emit_catalog_event(event.clone());
-                    emitted.push(event);
-                    return Err(error);
-                }
-            };
-            handle.snapshot = snapshot.clone();
-            let events = diff_discovery_snapshots(&server_id, &previous, &snapshot);
-            if !events.is_empty() {
-                self.apply_catalog_events(&server_id, &snapshot, &events);
-                for event in events {
-                    self.emit_catalog_event(event.clone());
-                    emitted.push(event);
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
                 }
             }
         }
-
-        Ok(emitted)
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(emitted),
+        }
     }
 
     /// Disconnects a server and removes it from active connections.
@@ -2819,12 +3253,14 @@ impl McpServerManager {
         let Some(handle) = self.connections.remove(server_id) else {
             return Err(McpError::UnknownServer(server_id.to_string()));
         };
-        let close_result = handle.connection.close().await;
+        self.catalog_publications.remove(server_id);
+        self.catalog_wake_tx
+            .send_modify(|revision| *revision = revision.saturating_add(1));
         self.unregister_server_tools(server_id);
         self.emit_catalog_event(McpCatalogEvent::ServerDisconnected {
             server_id: server_id.clone(),
         });
-        close_result
+        handle.connection.close().await
     }
 
     /// Removes a server's registration entirely: its config, options, and
