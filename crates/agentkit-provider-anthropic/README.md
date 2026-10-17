@@ -58,6 +58,13 @@ Resilience is opt-in: `resilience` is an `Option<ResilienceConfig>` that
 defaults to `None`. Calling `.with_resilience(...)` enables retries and
 timeouts; leaving it as `None` preserves the existing single-attempt behavior.
 
+## Token usage
+
+`TokenUsage.input_tokens` includes all prompt tokens: uncached input, cache reads,
+and cache writes. `cached_input_tokens` and `cache_write_input_tokens` are
+breakdowns of that total, not additional tokens. Streaming usage events report
+the latest cumulative snapshot; do not sum them across events within a turn.
+
 ## Server tools
 
 Known server tools (`WebSearchTool`, `WebFetchTool`, `CodeExecutionTool`, etc.)
