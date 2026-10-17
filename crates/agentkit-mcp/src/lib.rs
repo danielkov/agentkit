@@ -2193,7 +2193,15 @@ fn filter_for_capabilities(capabilities: &McpServerCapabilities) -> McpSubscript
 
 fn client_lifecycle() -> ClientLifecycleMode {
     ClientLifecycleMode::Auto {
-        preferred_versions: vec![rmcp_model::ProtocolVersion::V_2026_07_28],
+        // Auto must retry discovery at a mutually supported version before an
+        // unknown method response can trigger the legacy initialize handshake.
+        preferred_versions: vec![
+            rmcp_model::ProtocolVersion::V_2026_07_28,
+            rmcp_model::ProtocolVersion::V_2025_11_25,
+            rmcp_model::ProtocolVersion::V_2025_06_18,
+            rmcp_model::ProtocolVersion::V_2025_03_26,
+            rmcp_model::ProtocolVersion::V_2024_11_05,
+        ],
         legacy_version: Some(rmcp_model::ProtocolVersion::V_2025_11_25),
     }
 }
