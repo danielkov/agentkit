@@ -92,6 +92,37 @@ async fn rpc(
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
+    // Validate the version before dispatch, as legacy endpoints can do even
+    // for methods they do not recognize.
+    let supported = if token == "Bearer no-common" {
+        vec!["2099-01-01"]
+    } else if let Some(version) = token.strip_prefix("Bearer legacy-negotiate-") {
+        vec![version]
+    } else if token == "Bearer legacy-negotiate" {
+        // Deliberately ascending: the client's preference, not server order,
+        // must choose the newest mutual version.
+        vec!["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"]
+    } else {
+        vec![]
+    };
+    if !supported.is_empty()
+        && message["method"] == "server/discover"
+        && !headers
+            .get("mcp-protocol-version")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|version| supported.contains(&version))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "jsonrpc":"2.0", "id":id, "error":{
+                    "code":-32022, "message":"Unsupported protocol version",
+                    "data":{"supported":supported}
+                }
+            })),
+        )
+            .into_response();
+    }
     let result = match message["method"].as_str().unwrap_or_default() {
         "server/discover" => {
             if token.starts_with("Bearer legacy") {
@@ -613,6 +644,95 @@ async fn unsupported_listen_preserves_rpc_but_other_errors_fail_connection() {
                 assert!(result.is_err(), "unrelated subscription failure was hidden");
             }
         }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn auto_http_version_rejection_retries_before_legacy_initialization() {
+    bounded(async {
+        for (token, expected_discovery_versions) in [
+            ("legacy-negotiate", vec!["2026-07-28", "2025-11-25"]),
+            (
+                "legacy-negotiate-2025-11-25",
+                vec!["2026-07-28", "2025-11-25"],
+            ),
+            (
+                "legacy-negotiate-2025-06-18",
+                vec!["2026-07-28", "2025-06-18"],
+            ),
+            (
+                "legacy-negotiate-2025-03-26",
+                vec!["2026-07-28", "2025-03-26"],
+            ),
+            (
+                "legacy-negotiate-2024-11-05",
+                vec!["2026-07-28", "2024-11-05"],
+            ),
+            ("legacy-direct", vec!["2026-07-28"]),
+        ] {
+            let mut fixture = Fixture::start().await;
+            if let McpTransportBinding::StreamableHttp(binding) = &mut fixture.config.transport {
+                *binding = binding.clone().with_bearer_token(token);
+            }
+            let connection = McpConnection::connect(&fixture.config).await.unwrap();
+            // The initialize result, not the retry candidate, determines the
+            // version. Legacy connections must not open modern streams.
+            assert_eq!(
+                connection.protocol_version(),
+                Some(ProtocolVersion::V_2024_11_05)
+            );
+            connection.discover().await.unwrap();
+            let requests = fixture.requests.lock().await;
+            let discoveries: Vec<_> = requests
+                .iter()
+                .filter(|(_, m)| m["method"] == "server/discover")
+                .collect();
+            assert_eq!(discoveries.len(), expected_discovery_versions.len());
+            for ((headers, message), version) in discoveries.iter().zip(expected_discovery_versions)
+            {
+                assert_eq!(headers.get("mcp-protocol-version").unwrap(), version);
+                assert_eq!(
+                    message["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"],
+                    version
+                );
+            }
+            let methods: Vec<_> = requests
+                .iter()
+                .map(|(_, m)| m["method"].as_str().unwrap())
+                .collect();
+            let initialize = methods.iter().position(|m| *m == "initialize").unwrap();
+            assert_eq!(initialize, discoveries.len());
+            assert_eq!(
+                requests[initialize].1["params"]["protocolVersion"],
+                "2025-11-25"
+            );
+            assert_eq!(methods[initialize + 1], "notifications/initialized");
+            assert!(methods.contains(&"tools/list"));
+            assert!(!methods.contains(&"subscriptions/listen"));
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn auto_http_no_common_version_does_not_initialize() {
+    bounded(async {
+        let mut fixture = Fixture::start().await;
+        if let McpTransportBinding::StreamableHttp(binding) = &mut fixture.config.transport {
+            *binding = binding.clone().with_bearer_token("no-common");
+        }
+        let error = McpConnection::connect(&fixture.config)
+            .await
+            .err()
+            .expect("must reject incompatible server");
+        assert!(
+            error.to_string().contains("no compatible protocol version"),
+            "{error}"
+        );
+        let requests = fixture.requests.lock().await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].1["method"], "server/discover");
     })
     .await;
 }
