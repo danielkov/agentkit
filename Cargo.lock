@@ -266,7 +266,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-provider-anthropic"
-version = "0.10.10"
+version = "0.10.11"
 dependencies = [
  "agentkit-core",
  "agentkit-http",

@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 
 use agentkit_core::{
     CustomPart, Delta, FinishReason, Item, ItemKind, MetadataMap, Part, PartId, PartKind,
-    ReasoningPart, TextPart, TokenUsage, ToolCallPart, Usage,
+    ReasoningPart, TextPart, ToolCallPart,
 };
 use agentkit_loop::{LoopError, ModelTurnEvent, ModelTurnResult, set_provider_finish_reasons};
 use serde_json::{Value, json};
@@ -59,7 +59,7 @@ pub(crate) struct EventTranslator {
     committed_parts: Vec<(usize, Part)>,
     /// Accumulated usage. Anthropic sends `input_tokens` in `message_start`
     /// and progressively updates `output_tokens` in `message_delta`.
-    usage: Option<Usage>,
+    usage: Option<crate::usage::UsageSnapshot>,
     /// Message-level metadata harvested from `message_start` / `message_delta`.
     metadata: MetadataMap,
     /// Message id from `message_start`.
@@ -137,11 +137,11 @@ impl EventTranslator {
             self.metadata
                 .insert("anthropic.container".into(), container.clone());
         }
-        let usage = parse_usage(message.get("usage"));
+        let usage = crate::usage::UsageSnapshot::parse(message.get("usage"));
         self.usage = usage.clone();
         let mut events = Vec::new();
         if let Some(usage) = usage {
-            events.push(ModelTurnEvent::Usage(usage));
+            events.push(ModelTurnEvent::Usage(usage.to_usage()));
         }
         Ok(events)
     }
@@ -405,10 +405,10 @@ impl EventTranslator {
                     .insert("anthropic.stop_sequence".into(), Value::String(seq.into()));
             }
         }
-        if let Some(usage) = parse_usage(value.get("usage")) {
-            let merged = merge_usage(self.usage.take(), usage);
-            self.usage = Some(merged.clone());
-            return Ok(vec![ModelTurnEvent::Usage(merged)]);
+        if let Some(usage) = crate::usage::UsageSnapshot::parse(value.get("usage")) {
+            let accumulated = self.usage.get_or_insert_with(Default::default);
+            accumulated.merge(usage);
+            return Ok(vec![ModelTurnEvent::Usage(accumulated.to_usage())]);
         }
         Ok(Vec::new())
     }
@@ -443,7 +443,7 @@ impl EventTranslator {
         Ok(vec![ModelTurnEvent::Finished(ModelTurnResult {
             finish_reason,
             output_items,
-            usage: self.usage.clone(),
+            usage: self.usage.as_ref().map(|usage| usage.to_usage()),
             metadata: turn_metadata,
             model: self.model.take(),
             response_id,
@@ -479,82 +479,6 @@ fn merge_unknown_delta(raw: &mut Value, delta_type: &str, delta: &Value) {
     }
 }
 
-fn parse_usage(value: Option<&Value>) -> Option<Usage> {
-    let value = value?;
-    let input = value
-        .get("input_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let output = value
-        .get("output_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let cached = value.get("cache_read_input_tokens").and_then(Value::as_u64);
-    let cache_write = value
-        .get("cache_creation_input_tokens")
-        .and_then(Value::as_u64);
-
-    let mut metadata = MetadataMap::new();
-    if let Some(creation) = value.get("cache_creation") {
-        metadata.insert("anthropic.cache_creation".into(), creation.clone());
-    }
-    if let Some(tier) = value.get("service_tier") {
-        metadata.insert("anthropic.service_tier".into(), tier.clone());
-    }
-    if let Some(server_tool_use) = value.get("server_tool_use") {
-        metadata.insert("anthropic.server_tool_use".into(), server_tool_use.clone());
-    }
-
-    Some(Usage {
-        tokens: Some(TokenUsage {
-            input_tokens: input,
-            output_tokens: output,
-            reasoning_tokens: None,
-            cached_input_tokens: cached,
-            cache_write_input_tokens: cache_write,
-        }),
-        cost: None,
-        metadata,
-    })
-}
-
-/// Merges a later usage report into an earlier one. Anthropic reports
-/// `input_tokens` on `message_start` and updates `output_tokens` on
-/// `message_delta`; the merged record should reflect the newest numbers for
-/// each direction while retaining whichever fields weren't re-sent.
-fn merge_usage(prev: Option<Usage>, next: Usage) -> Usage {
-    let Some(prev) = prev else {
-        return next;
-    };
-    let tokens = match (prev.tokens, next.tokens) {
-        (Some(a), Some(b)) => Some(TokenUsage {
-            input_tokens: if b.input_tokens > 0 {
-                b.input_tokens
-            } else {
-                a.input_tokens
-            },
-            output_tokens: if b.output_tokens > 0 {
-                b.output_tokens
-            } else {
-                a.output_tokens
-            },
-            reasoning_tokens: b.reasoning_tokens.or(a.reasoning_tokens),
-            cached_input_tokens: b.cached_input_tokens.or(a.cached_input_tokens),
-            cache_write_input_tokens: b.cache_write_input_tokens.or(a.cache_write_input_tokens),
-        }),
-        (a, b) => b.or(a),
-    };
-    let mut metadata = prev.metadata;
-    for (k, v) in next.metadata {
-        metadata.insert(k, v);
-    }
-    Usage {
-        tokens,
-        cost: next.cost.or(prev.cost),
-        metadata,
-    }
-}
-
 fn map_stop_reason(reason: Option<&str>) -> FinishReason {
     match reason {
         Some("end_turn") => FinishReason::Completed,
@@ -584,6 +508,67 @@ mod tests {
             out.extend(translator.handle(&event).expect("translation failed"));
         }
         out
+    }
+
+    #[test]
+    fn cached_usage_merges_raw_snapshots_before_normalizing() {
+        let snapshots = [
+            json!({"input_tokens": 10, "output_tokens": 0, "cache_read_input_tokens": 900,
+                "cache_creation_input_tokens": 90, "cache_creation": {"ephemeral_5m_input_tokens": 90},
+                "service_tier": "standard"}),
+            json!({"output_tokens": 5}),
+            json!({"output_tokens": 5}), // repeated cumulative report, not another increment
+            json!({"cache_read_input_tokens": 910}),
+            json!({"input_tokens": 0, "cache_read_input_tokens": 0, "output_tokens": 0}),
+            json!({"cache_creation_input_tokens": 0}),
+        ];
+        let mut stream = String::new();
+        for (index, usage) in snapshots.into_iter().enumerate() {
+            let (kind, data) = if index == 0 {
+                (
+                    "message_start",
+                    json!({"message": {"id": "msg_cache", "usage": usage}}),
+                )
+            } else {
+                ("message_delta", json!({"usage": usage}))
+            };
+            stream.push_str(&format!("event: {kind}\ndata: {data}\n\n"));
+        }
+        stream.push_str("event: message_stop\ndata: {}\n\n");
+        let events = translate(&stream);
+        let usages: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                ModelTurnEvent::Usage(usage) => Some(usage),
+                _ => None,
+            })
+            .collect();
+        let counts: Vec<_> = usages
+            .iter()
+            .map(|usage| {
+                let tokens = usage.tokens.as_ref().unwrap();
+                (tokens.input_tokens, tokens.output_tokens)
+            })
+            .collect();
+        assert_eq!(
+            counts,
+            [(1000, 0), (1000, 5), (1000, 5), (1010, 5), (90, 0), (0, 0)]
+        );
+        for usage in &usages {
+            assert_eq!(
+                usage.metadata["anthropic.cache_creation"],
+                json!({"ephemeral_5m_input_tokens": 90})
+            );
+            assert_eq!(usage.metadata["anthropic.service_tier"], "standard");
+        }
+        let last = usages.last().unwrap();
+        let tokens = last.tokens.as_ref().unwrap();
+        assert_eq!(tokens.cached_input_tokens, Some(0));
+        assert_eq!(tokens.cache_write_input_tokens, Some(0));
+        let ModelTurnEvent::Finished(result) = events.last().unwrap() else {
+            panic!("expected finished")
+        };
+        assert_eq!(result.usage.as_ref(), Some(*last));
     }
 
     #[test]

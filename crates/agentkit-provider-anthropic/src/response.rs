@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 
 use agentkit_core::{
     CustomPart, Delta, FinishReason, Item, ItemKind, MetadataMap, Part, ReasoningPart, TextPart,
-    TokenUsage, ToolCallPart, Usage,
+    ToolCallPart,
 };
 use agentkit_loop::{ModelTurnEvent, ModelTurnResult, set_provider_finish_reasons};
 use serde_json::Value;
@@ -45,7 +45,7 @@ pub(crate) fn build_turn_from_response(
         metadata.insert("anthropic.container".into(), container.clone());
     }
 
-    let usage = parse_usage(raw.get("usage"));
+    let usage = crate::usage::UsageSnapshot::parse(raw.get("usage")).map(|usage| usage.to_usage());
 
     let mut parts: Vec<Part> = Vec::new();
     for block in content {
@@ -184,45 +184,6 @@ fn block_to_part(block: &Value) -> Result<Option<Part>, ResponseError> {
     }
 }
 
-fn parse_usage(value: Option<&Value>) -> Option<Usage> {
-    let value = value?;
-    let input = value
-        .get("input_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let output = value
-        .get("output_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let cached = value.get("cache_read_input_tokens").and_then(Value::as_u64);
-    let cache_write = value
-        .get("cache_creation_input_tokens")
-        .and_then(Value::as_u64);
-
-    let mut metadata = MetadataMap::new();
-    if let Some(creation) = value.get("cache_creation") {
-        metadata.insert("anthropic.cache_creation".into(), creation.clone());
-    }
-    if let Some(tier) = value.get("service_tier") {
-        metadata.insert("anthropic.service_tier".into(), tier.clone());
-    }
-    if let Some(server_tool_use) = value.get("server_tool_use") {
-        metadata.insert("anthropic.server_tool_use".into(), server_tool_use.clone());
-    }
-
-    Some(Usage {
-        tokens: Some(TokenUsage {
-            input_tokens: input,
-            output_tokens: output,
-            reasoning_tokens: None,
-            cached_input_tokens: cached,
-            cache_write_input_tokens: cache_write,
-        }),
-        cost: None,
-        metadata,
-    })
-}
-
 fn map_stop_reason(reason: Option<&str>) -> FinishReason {
     match reason {
         Some("end_turn") => FinishReason::Completed,
@@ -242,6 +203,68 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn normalizes_all_input_buckets_in_usage_and_finished_events() {
+        for (raw, expected_input, expected_read, expected_write) in [
+            (json!({"input_tokens": 10}), 10, None, None),
+            (
+                json!({"input_tokens": 10, "cache_read_input_tokens": 900}),
+                910,
+                Some(900),
+                None,
+            ),
+            (
+                json!({"input_tokens": 10, "cache_creation_input_tokens": 90}),
+                100,
+                None,
+                Some(90),
+            ),
+            (
+                json!({"input_tokens": 10, "cache_read_input_tokens": 900, "cache_creation_input_tokens": 90}),
+                1000,
+                Some(900),
+                Some(90),
+            ),
+            (
+                json!({"input_tokens": 0, "cache_read_input_tokens": 900}),
+                900,
+                Some(900),
+                None,
+            ),
+            (
+                json!({"cache_creation_input_tokens": 90}),
+                90,
+                None,
+                Some(90),
+            ),
+            (
+                json!({"input_tokens": u64::MAX, "cache_read_input_tokens": 1, "cache_creation_input_tokens": 1}),
+                u64::MAX,
+                Some(1),
+                Some(1),
+            ),
+        ] {
+            let body = json!({
+                "id": "msg_cache", "type": "message", "role": "assistant",
+                "content": [{"type": "text", "text": "ok"}], "stop_reason": "end_turn",
+                "usage": raw,
+            })
+            .to_string();
+            let events = build_turn_from_response(&body).unwrap();
+            let ModelTurnEvent::Usage(usage) = &events[0] else {
+                panic!("expected usage")
+            };
+            let tokens = usage.tokens.as_ref().unwrap();
+            assert_eq!(tokens.input_tokens, expected_input);
+            assert_eq!(tokens.cached_input_tokens, expected_read);
+            assert_eq!(tokens.cache_write_input_tokens, expected_write);
+            let ModelTurnEvent::Finished(result) = events.back().unwrap() else {
+                panic!("expected finished")
+            };
+            assert_eq!(result.usage.as_ref(), Some(usage));
+        }
+    }
 
     #[test]
     fn parses_text_and_usage() {
@@ -265,7 +288,7 @@ mod tests {
         let mut events: Vec<_> = events.into_iter().collect();
         assert!(
             matches!(events.remove(0), ModelTurnEvent::Usage(u) if u.tokens == Some(TokenUsage {
-                input_tokens: 10,
+                input_tokens: 15,
                 output_tokens: 5,
                 reasoning_tokens: None,
                 cached_input_tokens: Some(3),
