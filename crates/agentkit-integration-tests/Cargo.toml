@@ -13,8 +13,8 @@ doctest = false
 
 [dependencies]
 agentkit-core = { version = "0.10.5", path = "../agentkit-core" }
-agentkit-loop = { version = "0.10.5", path = "../agentkit-loop" }
-agentkit-mcp = { version = "0.11.0", path = "../agentkit-mcp" }
+agentkit-loop = { version = "0.11.0", path = "../agentkit-loop" }
+agentkit-mcp = { version = "0.11.3", path = "../agentkit-mcp" }
 agentkit-task-manager = { version = "0.10.5", path = "../agentkit-task-manager" }
 agentkit-tool-compose = { version = "0.10.5", path = "../agentkit-tool-compose" }
 agentkit-tools-core = { version = "0.10.5", path = "../agentkit-tools-core", features = ["schemars"] }
