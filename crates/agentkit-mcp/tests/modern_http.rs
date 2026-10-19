@@ -827,12 +827,18 @@ async fn resource_only_server_starts_modern_stream_lazily_and_replays_on_reconne
                 .iter()
                 .any(|(_, r)| r["method"] == "subscriptions/listen")
         );
+        // Reconnect before the first stream exists: lazy startup must use the
+        // replacement transport's active notification sink.
+        connection.resolve_auth(auth("caps-resource")).await.unwrap();
+        let mut events = connection.subscribe_events();
         connection.subscribe_resource("memo:one").await.unwrap();
         let initial = fixture.listen().await;
         assert_eq!(
             initial.filter,
             json!({"resourceSubscriptions":["memo:one"]})
         );
+        initial.notify("notifications/resources/updated", json!({"uri":"memo:one"}));
+        assert!(matches!(events.recv().await.unwrap(), McpServerEvent::ResourceUpdated(params) if params.uri == "memo:one"));
         connection
             .resolve_auth(auth("caps-resource"))
             .await

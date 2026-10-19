@@ -1778,12 +1778,10 @@ impl McpConnection {
             if subscription_filter_is_empty(&filter) {
                 return Ok(());
             }
-            let controller = subscriptions::SubscriptionController::start(
-                self.peer(),
-                filter,
-                self.sink.clone(),
-            )
-            .await?;
+            let mut sink = self.sink.clone();
+            sink.active = self.inner.lock().await.service().active.clone();
+            let controller =
+                subscriptions::SubscriptionController::start(self.peer(), filter, sink).await?;
             *subscriptions = Some(controller);
         }
         Ok(())
@@ -1825,12 +1823,10 @@ impl McpConnection {
             // modern stream with the explicit URI, never a legacy subscribe RPC.
             let mut filter = self.subscription_filter();
             filter.resource_subscriptions = Some(vec![uri]);
-            let controller = subscriptions::SubscriptionController::start(
-                self.peer(),
-                filter,
-                self.sink.clone(),
-            )
-            .await?;
+            let mut sink = self.sink.clone();
+            sink.active = self.inner.lock().await.service().active.clone();
+            let controller =
+                subscriptions::SubscriptionController::start(self.peer(), filter, sink).await?;
             *self.subscriptions.lock().await = Some(controller);
             return Ok(());
         }
