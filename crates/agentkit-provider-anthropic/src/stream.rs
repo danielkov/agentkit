@@ -103,10 +103,11 @@ impl EventTranslator {
             "content_block_stop" => self.on_block_stop(&event.data),
             "message_delta" => self.on_message_delta(&event.data),
             "message_stop" => self.on_message_stop(),
-            "error" => Err(LoopError::Provider(format!(
-                "Anthropic stream error: {}",
-                event.data
-            ))),
+            "error" => Err(
+                crate::context_length_error(&event.data, None).unwrap_or_else(|| {
+                    LoopError::Provider(format!("Anthropic stream error: {}", event.data))
+                }),
+            ),
             "ping" | "" => Ok(Vec::new()),
             _ => Ok(Vec::new()),
         }
@@ -750,6 +751,19 @@ mod tests {
             Part::Custom(c) => assert_eq!(c.kind, "anthropic.server_tool_use"),
             other => panic!("expected custom, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn prompt_size_stream_error_is_typed_and_payload_free() {
+        let mut decoder = SseDecoder::new();
+        let mut translator = EventTranslator::new();
+        let events = decoder.feed("event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"prompt is too long: SECRET-PROMPT\"}}\n\n");
+        let error = translator.handle(&events[0]).unwrap_err();
+        assert_eq!(
+            error.provider_failure().unwrap().upstream.code,
+            agentkit_loop::UpstreamErrorKind::ContextLengthExceeded
+        );
+        assert!(!format!("{error:?} {error}").contains("SECRET-PROMPT"));
     }
 
     #[test]

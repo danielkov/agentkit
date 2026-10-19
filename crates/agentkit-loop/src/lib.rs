@@ -820,10 +820,15 @@ pub trait TranscriptObserver: Send + Sync {
     /// state behind interior mutability so the driver can share an
     /// `Arc<dyn TranscriptObserver>`.
     fn on_transcript_event(&self, event: TranscriptEvent<'_>);
+
+    /// A validated recovery transaction replaced the canonical transcript.
+    /// Consumers retaining transcript state should replace it with `items`.
+    fn on_transcript_replaced(&self, _session_id: &SessionId, _items: &[Item]) {}
 }
 
 /// Session-addressed transcript append event delivered to
-/// [`TranscriptObserver`]s.
+/// [`TranscriptObserver`]s. Replacement transactions use
+/// [`TranscriptObserver::on_transcript_replaced`] instead.
 #[derive(Clone, Debug)]
 pub struct TranscriptEvent<'a> {
     /// Session this transcript append belongs to.
@@ -845,6 +850,28 @@ pub enum MutationPoint {
     /// A turn has fully ended (assistant final, interrupt, or cancellation)
     /// and any new user input has not yet been dispatched.
     AfterTurnEnded,
+    /// A confirmed context-length rejection before any assistant output.
+    ContextLengthRejected,
+}
+
+/// Opt-in limits for transcript recovery after confirmed context rejection.
+/// Zero attempts or a zero budget disables recovery. The budget begins at the
+/// first rejection, not at the start of an ordinary model request.
+#[derive(Clone, Copy, Debug)]
+pub struct ContextRecoveryPolicy {
+    /// Maximum mutation/retry attempts per inference boundary.
+    pub max_attempts: u32,
+    /// Total time allowed for mutation and replacement model generation.
+    pub budget: std::time::Duration,
+}
+
+/// Bounds for the current context-rejection mutation pass.
+#[derive(Clone, Copy, Debug)]
+pub struct ContextRecoveryInfo {
+    /// One-based recovery attempt.
+    pub attempt: u32,
+    /// Absolute deadline shared by all recovery attempts.
+    pub deadline: std::time::Instant,
 }
 
 /// Sink for emitting [`AgentEvent`]s from inside a [`LoopMutator`].
@@ -863,6 +890,8 @@ pub struct LoopCtx<'a> {
     pub turn_id: Option<&'a agentkit_core::TurnId>,
     /// Where in the loop the mutator is running.
     pub point: MutationPoint,
+    /// Present only during context-rejection recovery.
+    pub recovery: Option<ContextRecoveryInfo>,
     /// Cancellation handle for the active turn, if any.
     pub cancellation: Option<TurnCancellation>,
     /// Sink for emitting events from the mutator (telemetry, progress).
@@ -905,6 +934,11 @@ impl<'a> std::ops::DerefMut for TranscriptCursor<'a> {
 #[async_trait]
 pub trait LoopMutator: Send + Sync {
     /// Run this mutator. Returning without writing to `cursor` is a no-op.
+    /// At [`MutationPoint::ContextLengthRejected`], edits are staged and only
+    /// committed after the entire pass succeeds and validates. The future may
+    /// be dropped on cancellation or deadline. Events emitted through `ctx`
+    /// are progress notifications, not evidence that edits were committed;
+    /// transcript observers receive replacement only after successful commit.
     /// Errors abort the loop; protocol-violating mutations (orphaned tool
     /// uses or results) are detected by validation and turned into
     /// [`LoopError::Mutator`].
@@ -1371,6 +1405,7 @@ where
     resources: Arc<dyn ToolResources>,
     cancellation: Option<CancellationHandle>,
     mutators: Vec<Arc<dyn LoopMutator>>,
+    context_recovery: Option<ContextRecoveryPolicy>,
     observers: Vec<Arc<dyn LoopObserver>>,
     transcript_observers: Vec<Arc<dyn TranscriptObserver>>,
     transcript: Vec<Item>,
@@ -1436,6 +1471,7 @@ where
             resources: self.resources.clone(),
             cancellation: self.cancellation.clone(),
             mutators: self.mutators.clone(),
+            context_recovery: self.context_recovery,
             observers: self.observers.clone(),
             transcript_observers: self.transcript_observers.clone(),
             transcript: self.transcript.clone(),
@@ -1474,6 +1510,7 @@ where
     resources: Arc<dyn ToolResources>,
     cancellation: Option<CancellationHandle>,
     mutators: Vec<Arc<dyn LoopMutator>>,
+    context_recovery: Option<ContextRecoveryPolicy>,
     observers: Vec<Arc<dyn LoopObserver>>,
     transcript_observers: Vec<Arc<dyn TranscriptObserver>>,
     transcript: Vec<Item>,
@@ -1495,6 +1532,7 @@ where
             resources: Arc::new(()),
             cancellation: None,
             mutators: Vec::new(),
+            context_recovery: None,
             observers: Vec::new(),
             transcript_observers: Vec::new(),
             transcript: Vec::new(),
@@ -1567,6 +1605,13 @@ where
     /// Attach a [`CancellationHandle`] for cooperative cancellation of turns.
     pub fn cancellation(mut self, handle: CancellationHandle) -> Self {
         self.cancellation = Some(handle);
+        self
+    }
+
+    /// Enable bounded recovery of confirmed context-length rejections.
+    /// Only model generation is retried; tool execution is never replayed.
+    pub fn context_recovery(mut self, policy: ContextRecoveryPolicy) -> Self {
+        self.context_recovery = Some(policy);
         self
     }
 
@@ -1655,6 +1700,7 @@ where
             resources: self.resources,
             cancellation: self.cancellation,
             mutators: self.mutators,
+            context_recovery: self.context_recovery,
             observers: self.observers,
             transcript_observers: self.transcript_observers,
             transcript: self.transcript,
@@ -1711,6 +1757,7 @@ where
     resources: Arc<dyn ToolResources>,
     cancellation: Option<CancellationHandle>,
     mutators: Vec<Arc<dyn LoopMutator>>,
+    context_recovery: Option<ContextRecoveryPolicy>,
     observers: Vec<Arc<dyn LoopObserver>>,
     transcript_observers: Vec<Arc<dyn TranscriptObserver>>,
     transcript: Vec<Item>,
@@ -2059,6 +2106,7 @@ where
                 session_id: &session_id,
                 turn_id,
                 point,
+                recovery: None,
                 cancellation: cancellation.clone(),
                 emitter: &emitter,
             };
@@ -2068,6 +2116,89 @@ where
             validate_transcript_invariants(cursor.items)?;
         }
         Ok(())
+    }
+
+    /// Stage recovery edits separately: a failed, cancelled, or timed-out
+    /// mutator must never leave an unvalidated canonical transcript behind.
+    async fn recover_context(
+        &mut self,
+        error: &LoopError,
+        turn_id: &agentkit_core::TurnId,
+        cancellation: Option<TurnCancellation>,
+        recovery: &mut Option<ContextRecoveryInfo>,
+    ) -> Result<bool, LoopError> {
+        let Some(policy) = self.context_recovery else {
+            return Ok(false);
+        };
+        if !error.is_context_length_exceeded()
+            || policy.max_attempts == 0
+            || policy.budget.is_zero()
+            || self.mutators.is_empty()
+        {
+            return Ok(false);
+        }
+        let previous_attempt = recovery.map_or(0, |info| info.attempt);
+        if previous_attempt >= policy.max_attempts {
+            return Ok(false);
+        }
+        let deadline = match *recovery {
+            Some(info) => info.deadline,
+            None => std::time::Instant::now()
+                .checked_add(policy.budget)
+                .ok_or_else(|| {
+                    LoopError::InvalidState("context recovery budget is too large".into())
+                })?,
+        };
+        let info = ContextRecoveryInfo {
+            attempt: previous_attempt + 1,
+            deadline,
+        };
+        *recovery = Some(info);
+        let mut candidate = self.transcript.clone();
+        let emitter = DriverEmitter {
+            session_id: &self.observed_session_id,
+            observers: &self.observers,
+        };
+        let mutation = async {
+            let mut cursor = TranscriptCursor {
+                items: &mut candidate,
+                dirty: false,
+            };
+            for mutator in &self.mutators {
+                mutator
+                    .mutate(
+                        &mut cursor,
+                        LoopCtx {
+                            session_id: &self.session_id,
+                            turn_id: Some(turn_id),
+                            point: MutationPoint::ContextLengthRejected,
+                            recovery: Some(info),
+                            cancellation: cancellation.clone(),
+                            emitter: &emitter,
+                        },
+                    )
+                    .await?;
+            }
+            validate_transcript_invariants(cursor.items)
+        };
+        recovery_bound(mutation, Some(info), cancellation.clone()).await?;
+        if cancellation
+            .as_ref()
+            .is_some_and(TurnCancellation::is_cancelled)
+        {
+            return Err(LoopError::Cancelled);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(LoopError::ContextRecoveryDeadlineExceeded);
+        }
+        if candidate == self.transcript {
+            return Ok(false);
+        }
+        self.transcript = candidate;
+        for observer in &self.transcript_observers {
+            observer.on_transcript_replaced(&self.session_id, &self.transcript);
+        }
+        Ok(true)
     }
 
     async fn continue_active_tool_round(&mut self) -> Result<Option<LoopStep>, LoopError> {
@@ -2363,122 +2494,187 @@ where
         }
 
         use tracing::Instrument;
-        let mut turn = match session
-            .begin_turn(request, cancellation.clone())
-            .instrument(chat_span.clone())
+        let mut recovery = None;
+        let (mut result, saw_tool_call, latest_usage) = 'generation: loop {
+            let mut request = request.clone();
+            request.transcript = self.transcript.clone();
+            let mut turn = match recovery_bound(
+                self.session
+                    .as_mut()
+                    .expect("session checked above")
+                    .begin_turn(request, cancellation.clone())
+                    .instrument(chat_span.clone()),
+                recovery,
+                cancellation.clone(),
+            )
             .await
-        {
-            Ok(turn) => turn,
-            Err(LoopError::Cancelled) => {
-                self.task_manager
-                    .on_turn_interrupted(&turn_id)
-                    .await
-                    .map_err(|error| LoopError::Tool(ToolError::Internal(error.to_string())))?;
-                return self.finish_cancelled(turn_id, interrupted_assistant_items());
-            }
-            Err(error) => return Err(error),
-        };
-
-        // begin_turn may apply per-turn routing. Sample the effective selection
-        // only after that work, while the chat span still wraps begin_turn.
-        let provider_name =
-            effective_provider_name(session.provider_name(), self.provider_name.as_deref());
-        if let Some(provider) = &provider_name {
-            chat_span.record("gen_ai.provider.name", provider.as_str());
-            tracing::Span::current().record("gen_ai.provider.name", provider.as_str());
-        }
-        match session.model_name() {
-            Some(model) => {
-                chat_span.record("gen_ai.request.model", model);
-                chat_span.record("otel.name", format!("chat {model}").as_str());
-            }
-            None => {
-                chat_span.record("otel.name", "chat");
-            }
-        }
-
-        let mut saw_tool_call = false;
-        let mut finished_result = None;
-        let mut latest_usage = None;
-        let mut streamed_content = cancellation
-            .is_some()
-            .then(StreamedAssistantContent::default);
-
-        while let Some(event) = match turn
-            .next_event(cancellation.clone())
-            .instrument(chat_span.clone())
-            .await
-        {
-            Ok(event) => event,
-            Err(LoopError::Cancelled) => {
-                self.task_manager
-                    .on_turn_interrupted(&turn_id)
-                    .await
-                    .map_err(|error| LoopError::Tool(ToolError::Internal(error.to_string())))?;
-                return self.finish_cancelled(
-                    turn_id,
-                    interrupted_stream_items(streamed_content.as_ref()),
-                );
-            }
-            Err(error) => return Err(error),
-        } {
-            let attempt_superseded = matches!(event, ModelTurnEvent::ResponseAttemptSuperseded);
-            if attempt_superseded {
-                saw_tool_call = false;
-                latest_usage = None;
-                if let Some(content) = &mut streamed_content {
-                    content.reset();
-                }
-                self.emit(AgentEvent::ResponseAttemptSuperseded);
-            }
-            if cancellation
-                .as_ref()
-                .is_some_and(TurnCancellation::is_cancelled)
             {
-                turn.on_cancelled();
-                self.task_manager
-                    .on_turn_interrupted(&turn_id)
-                    .await
-                    .map_err(|error| LoopError::Tool(ToolError::Internal(error.to_string())))?;
-                return self.finish_cancelled(
-                    turn_id,
-                    interrupted_stream_items(streamed_content.as_ref()),
-                );
-            }
-            if attempt_superseded {
-                continue;
-            }
-            match event {
-                ModelTurnEvent::Delta(delta) => {
-                    if let Some(content) = &mut streamed_content {
-                        content.apply_delta(&delta);
+                Ok(turn) => turn,
+                Err(LoopError::Cancelled) => {
+                    self.task_manager
+                        .on_turn_interrupted(&turn_id)
+                        .await
+                        .map_err(|error| LoopError::Tool(ToolError::Internal(error.to_string())))?;
+                    return self.finish_cancelled(turn_id, interrupted_assistant_items());
+                }
+                Err(error) => {
+                    match self
+                        .recover_context(&error, &turn_id, cancellation.clone(), &mut recovery)
+                        .await
+                    {
+                        Ok(true) => continue 'generation,
+                        Ok(false) => return Err(error),
+                        Err(LoopError::Cancelled) => {
+                            self.task_manager
+                                .on_turn_interrupted(&turn_id)
+                                .await
+                                .map_err(|error| {
+                                    LoopError::Tool(ToolError::Internal(error.to_string()))
+                                })?;
+                            return self.finish_cancelled(turn_id, interrupted_assistant_items());
+                        }
+                        Err(error) => return Err(error),
                     }
-                    self.emit(AgentEvent::ContentDelta(delta));
                 }
-                ModelTurnEvent::Usage(usage) => {
-                    latest_usage = Some(usage.clone());
-                    self.emit(AgentEvent::UsageUpdated(usage));
-                }
-                ModelTurnEvent::ToolCall(call) => {
-                    saw_tool_call = true;
-                    if let Some(content) = &mut streamed_content {
-                        content.commit_tool_call(&call);
-                    }
-                    self.emit(AgentEvent::ToolCallRequested(call));
-                }
-                ModelTurnEvent::ResponseAttemptSuperseded => {
-                    unreachable!("response-attempt supersession is handled before cancellation")
-                }
-                ModelTurnEvent::Finished(result) => {
-                    finished_result = Some(result);
-                    break;
-                }
-            }
-        }
+            };
 
-        let mut result = finished_result.ok_or_else(|| {
-            LoopError::Provider("model turn ended without a Finished event".into())
-        })?;
+            // begin_turn may apply per-turn routing. Sample the effective selection
+            // only after that work, while the chat span still wraps begin_turn.
+            let session = self.session.as_ref().expect("session checked above");
+            let provider_name =
+                effective_provider_name(session.provider_name(), self.provider_name.as_deref());
+            if let Some(provider) = &provider_name {
+                chat_span.record("gen_ai.provider.name", provider.as_str());
+                tracing::Span::current().record("gen_ai.provider.name", provider.as_str());
+            }
+            match session.model_name() {
+                Some(model) => {
+                    chat_span.record("gen_ai.request.model", model);
+                    chat_span.record("otel.name", format!("chat {model}").as_str());
+                }
+                None => {
+                    chat_span.record("otel.name", "chat");
+                }
+            }
+
+            let mut emitted_output = false;
+            let mut saw_tool_call = false;
+            let mut finished_result = None;
+            let mut latest_usage = None;
+            let mut streamed_content = cancellation
+                .is_some()
+                .then(StreamedAssistantContent::default);
+
+            while let Some(event) = match recovery_bound(
+                turn.next_event(cancellation.clone())
+                    .instrument(chat_span.clone()),
+                recovery,
+                cancellation.clone(),
+            )
+            .await
+            {
+                Ok(event) => event,
+                Err(LoopError::Cancelled) => {
+                    self.task_manager
+                        .on_turn_interrupted(&turn_id)
+                        .await
+                        .map_err(|error| LoopError::Tool(ToolError::Internal(error.to_string())))?;
+                    return self.finish_cancelled(
+                        turn_id,
+                        interrupted_stream_items(streamed_content.as_ref()),
+                    );
+                }
+                Err(error) => {
+                    drop(turn);
+                    if emitted_output {
+                        return Err(error);
+                    }
+                    match self
+                        .recover_context(&error, &turn_id, cancellation.clone(), &mut recovery)
+                        .await
+                    {
+                        Ok(true) => continue 'generation,
+                        Ok(false) => return Err(error),
+                        Err(LoopError::Cancelled) => {
+                            self.task_manager
+                                .on_turn_interrupted(&turn_id)
+                                .await
+                                .map_err(|error| {
+                                    LoopError::Tool(ToolError::Internal(error.to_string()))
+                                })?;
+                            return self.finish_cancelled(turn_id, interrupted_assistant_items());
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+            } {
+                // Every delta and tool-call event is output, including empty deltas.
+                // Supersession never resets this guard.
+                emitted_output |= matches!(
+                    event,
+                    ModelTurnEvent::Delta(_)
+                        | ModelTurnEvent::ToolCall(_)
+                        | ModelTurnEvent::Finished(_)
+                );
+                let attempt_superseded = matches!(event, ModelTurnEvent::ResponseAttemptSuperseded);
+                if attempt_superseded {
+                    saw_tool_call = false;
+                    latest_usage = None;
+                    if let Some(content) = &mut streamed_content {
+                        content.reset();
+                    }
+                    self.emit(AgentEvent::ResponseAttemptSuperseded);
+                }
+                if cancellation
+                    .as_ref()
+                    .is_some_and(TurnCancellation::is_cancelled)
+                {
+                    turn.on_cancelled();
+                    self.task_manager
+                        .on_turn_interrupted(&turn_id)
+                        .await
+                        .map_err(|error| LoopError::Tool(ToolError::Internal(error.to_string())))?;
+                    return self.finish_cancelled(
+                        turn_id,
+                        interrupted_stream_items(streamed_content.as_ref()),
+                    );
+                }
+                if attempt_superseded {
+                    continue;
+                }
+                match event {
+                    ModelTurnEvent::Delta(delta) => {
+                        if let Some(content) = &mut streamed_content {
+                            content.apply_delta(&delta);
+                        }
+                        self.emit(AgentEvent::ContentDelta(delta));
+                    }
+                    ModelTurnEvent::Usage(usage) => {
+                        latest_usage = Some(usage.clone());
+                        self.emit(AgentEvent::UsageUpdated(usage));
+                    }
+                    ModelTurnEvent::ToolCall(call) => {
+                        saw_tool_call = true;
+                        if let Some(content) = &mut streamed_content {
+                            content.commit_tool_call(&call);
+                        }
+                        self.emit(AgentEvent::ToolCallRequested(call));
+                    }
+                    ModelTurnEvent::ResponseAttemptSuperseded => {
+                        unreachable!("response-attempt supersession is handled before cancellation")
+                    }
+                    ModelTurnEvent::Finished(result) => {
+                        finished_result = Some(result);
+                        break;
+                    }
+                }
+            }
+
+            let result = finished_result.ok_or_else(|| {
+                LoopError::Provider("model turn ended without a Finished event".into())
+            })?;
+            break 'generation (result, saw_tool_call, latest_usage);
+        };
         result.usage = merge_usage(result.usage, latest_usage);
         if let Some(model) = &result.model {
             chat_span.record("gen_ai.response.model", model.as_str());
@@ -4819,6 +5015,9 @@ pub enum LoopError {
     /// The current turn was cancelled via the [`CancellationHandle`].
     #[error("turn cancelled")]
     Cancelled,
+    /// The absolute context-recovery budget expired.
+    #[error("context recovery deadline exceeded")]
+    ContextRecoveryDeadlineExceeded,
     /// An error originating from the model provider.
     #[error("provider error: {0}")]
     Provider(String),
@@ -4833,7 +5032,63 @@ pub enum LoopError {
     Unsupported(String),
 }
 
+/// Ordinary inference remains unbounded; only recovery has an absolute budget.
+async fn recovery_bound<T>(
+    future: impl std::future::Future<Output = Result<T, LoopError>>,
+    recovery: Option<ContextRecoveryInfo>,
+    cancellation: Option<TurnCancellation>,
+) -> Result<T, LoopError> {
+    let Some(info) = recovery else {
+        return future.await;
+    };
+    let cancelled = async {
+        match cancellation {
+            Some(cancellation) => cancellation.cancelled().await,
+            None => std::future::pending::<()>().await,
+        }
+    };
+    use std::future::Future;
+    use std::task::Poll;
+
+    let mut cancelled = std::pin::pin!(cancelled);
+    let mut deadline = std::pin::pin!(futures_timer::Delay::new(
+        info.deadline
+            .saturating_duration_since(std::time::Instant::now()),
+    ));
+    let mut future = std::pin::pin!(future);
+    std::future::poll_fn(|cx| {
+        // Cancellation wins over timeout, and both win over model/mutator
+        // completion. Check the clock as well as the timer so an expired
+        // deadline never depends on the timer thread having woken us yet.
+        if cancelled.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Err(LoopError::Cancelled));
+        }
+        if std::time::Instant::now() >= info.deadline || deadline.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Err(LoopError::ContextRecoveryDeadlineExceeded));
+        }
+        future.as_mut().poll(cx)
+    })
+    .await
+}
+
 impl LoopError {
+    /// True only for structured, confirmed upstream context-length rejection.
+    /// Only the exact typed code is accepted; error types, messages, generic
+    /// client errors, cancellation, and replay-unsafe failures are ignored.
+    pub fn is_context_length_exceeded(&self) -> bool {
+        self.provider_failure().is_some_and(|failure| {
+            failure.upstream.code == UpstreamErrorKind::ContextLengthExceeded
+                && !matches!(
+                    failure.reason,
+                    ProviderFailureReason::Cancelled | ProviderFailureReason::ReplayUnsafe
+                )
+                && !matches!(
+                    failure.last_attempt_reason,
+                    Some(ProviderFailureReason::Cancelled | ProviderFailureReason::ReplayUnsafe)
+                )
+        })
+    }
+
     /// Returns structured provider metadata without parsing a rendered error.
     pub fn provider_failure(&self) -> Option<&ProviderFailure> {
         match self {
@@ -4927,6 +5182,7 @@ fn validate_transcript_invariants(transcript: &[Item]) -> Result<(), LoopError> 
 
 #[cfg(test)]
 mod tests {
+    include!("context_recovery_tests.rs");
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc as StdArc, Mutex as StdMutex};

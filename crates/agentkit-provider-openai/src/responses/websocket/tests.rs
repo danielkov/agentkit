@@ -2398,3 +2398,51 @@ async fn slow_progressing_stream_outlives_progress_gap() {
     assert!(start.elapsed() > STALL * 2);
     peer.join().unwrap();
 }
+
+#[tokio::test]
+async fn websocket_context_length_rejection_is_typed_and_payload_free() {
+    for private in [false, true] {
+        let (endpoint, peer) = server(|listener| {
+            let mut ws = socket(&listener);
+            receive(&mut ws);
+            ws.send(Message::Text(r#"{"type":"error","error":{"code":"context_length_exceeded","message":"SECRET-PROMPT"}}"#.into())).unwrap();
+            assert!(
+                matches!(ws.read(), Err(_) | Ok(Message::Close(_))),
+                "context rejection must not resend on the socket"
+            );
+            no_connection_within(&listener, Duration::from_millis(100));
+        });
+        let mut cfg = if private {
+            private_config(&endpoint)
+        } else {
+            config(&endpoint, OpenAIResponsesTransport::WebSocket)
+        };
+        cfg.resilience.as_mut().unwrap().max_retries = 2;
+        let adapter = OpenAIResponsesAdapter::new(cfg).unwrap();
+        let mut session = adapter
+            .start_session(SessionConfig::new("session"))
+            .await
+            .unwrap();
+        let mut turn = session.begin_turn(request(), None).await.unwrap();
+        let error = drain(&mut turn).await.unwrap_err();
+        let failure = error.provider_failure().unwrap();
+        assert_eq!(failure.accounting.attempts, 1);
+        assert_eq!(failure.reason, ProviderFailureReason::ResponseFailed);
+        assert_eq!(
+            failure.upstream.code,
+            UpstreamErrorKind::ContextLengthExceeded
+        );
+        assert_eq!(
+            failure.route,
+            if private {
+                ProviderRoute::OpenAiChatGptResponses
+            } else {
+                ProviderRoute::OpenAiResponses
+            }
+        );
+        assert!(!format!("{error:?} {error}").contains("SECRET-PROMPT"));
+        drop(turn);
+        drop(session);
+        peer.join().unwrap();
+    }
+}

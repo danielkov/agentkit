@@ -178,28 +178,113 @@ pub(super) fn upstream_kind(value: Option<&Value>) -> UpstreamErrorKind {
     }
 }
 
+// Context overflow is an allowlisted code, not a free-form type or message.
+fn upstream_code(value: Option<&Value>) -> UpstreamErrorKind {
+    if value.and_then(Value::as_str) == Some("context_length_exceeded") {
+        UpstreamErrorKind::ContextLengthExceeded
+    } else {
+        upstream_kind(value)
+    }
+}
+
+// Conflicting authentication/throttling/status signals do not authorize recovery.
+fn context_consistent(mut classification: ProviderClassification) -> ProviderClassification {
+    if classification.code == UpstreamErrorKind::ContextLengthExceeded
+        && (classification
+            .http_status
+            .is_some_and(|status| status != 400)
+            || matches!(
+                classification.error_type,
+                UpstreamErrorKind::AuthenticationError
+                    | UpstreamErrorKind::InvalidApiKey
+                    | UpstreamErrorKind::InvalidAuthentication
+                    | UpstreamErrorKind::Unauthorized
+                    | UpstreamErrorKind::PermissionDenied
+                    | UpstreamErrorKind::RateLimitError
+                    | UpstreamErrorKind::RateLimitExceeded
+                    | UpstreamErrorKind::InsufficientQuota
+            ))
+    {
+        classification.code = UpstreamErrorKind::Unknown;
+    }
+    classification
+}
+
+pub(super) fn http_classification(value: &Value, status: u16) -> ProviderClassification {
+    let error = value.get("error").unwrap_or(&Value::Null);
+    context_consistent(ProviderClassification {
+        error_type: upstream_kind(error.get("type")),
+        code: upstream_code(error.get("code")),
+        http_status: Some(status),
+    })
+}
+
 pub(super) fn stream_classification(value: &Value, kind: &str) -> ProviderClassification {
     let error = if kind == "response.failed" {
         value.pointer("/response/error").unwrap_or(&Value::Null)
     } else {
         value.get("error").unwrap_or(value)
     };
-    ProviderClassification {
+    context_consistent(ProviderClassification {
         error_type: upstream_kind(error.get("type")),
-        code: upstream_kind(error.get("code").or_else(|| value.get("code"))),
+        code: upstream_code(error.get("code").or_else(|| value.get("code"))),
         http_status: error
             .get("status")
             .or_else(|| value.get("status"))
+            .or_else(|| value.get("status_code"))
             .or_else(|| value.pointer("/response/status_code"))
             .and_then(Value::as_u64)
             .filter(|status| (100..=599).contains(status))
             .map(|status| status as u16),
-    }
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contradictory_context_signals_do_not_authorize_recovery() {
+        for value in [
+            json!({"status":401,"error":{"code":"context_length_exceeded"}}),
+            json!({"status":429,"error":{"code":"context_length_exceeded"}}),
+            json!({"status_code":401,"error":{"code":"context_length_exceeded"}}),
+            json!({"error":{"type":"authentication_error","code":"context_length_exceeded"}}),
+            json!({"error":{"type":"rate_limit_error","code":"context_length_exceeded"}}),
+            json!({"error":{"type":"context_length_exceeded","message":"context_length_exceeded"}}),
+        ] {
+            assert_ne!(
+                stream_classification(&value, "error").code,
+                UpstreamErrorKind::ContextLengthExceeded
+            );
+        }
+    }
+
+    #[test]
+    fn structured_stream_errors_require_exact_context_code() {
+        for kind in ["response.failed", "error"] {
+            for (code, expected) in [
+                ("context_length_exceeded", true),
+                ("invalid_request_error", false),
+                ("rate_limit_exceeded", false),
+                ("invalid_api_key", false),
+                ("CONTEXT_LENGTH_EXCEEDED", false),
+            ] {
+                let error = json!({"type":"invalid_request_error", "code":code, "message":"SECRET-PROMPT context_length_exceeded"});
+                let value = if kind == "response.failed" {
+                    json!({"response":{"error":error}})
+                } else {
+                    json!({"error":error})
+                };
+                let classification = stream_classification(&value, kind);
+                assert_eq!(
+                    classification.code == UpstreamErrorKind::ContextLengthExceeded,
+                    expected
+                );
+                assert!(!format!("{classification:?}").contains("SECRET-PROMPT"));
+            }
+        }
+    }
 
     #[test]
     fn throttling_keeps_exact_accounting_and_never_suppresses_terminal() {

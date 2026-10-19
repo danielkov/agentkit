@@ -874,3 +874,97 @@ async fn invalid_local_headers_preflight_have_zero_attempts_and_no_retry() {
         assert!(!format!("{error:?} {error}").contains("SECRET"));
     }
 }
+
+#[tokio::test]
+async fn http_context_length_rejection_is_typed_and_payload_free() {
+    for (status, body, expected) in [
+        (
+            StatusCode::BAD_REQUEST,
+            r#"{"error":{"type":"invalid_request_error","code":"context_length_exceeded","message":"SECRET-PROMPT"}}"#,
+            true,
+        ),
+        (
+            StatusCode::BAD_REQUEST,
+            r#"{"error":{"type":"invalid_request_error","message":"context_length_exceeded SECRET-PROMPT"}}"#,
+            false,
+        ),
+        (
+            StatusCode::BAD_REQUEST,
+            r#"{"code":"context_length_exceeded"}"#,
+            false,
+        ),
+        (
+            StatusCode::BAD_REQUEST,
+            "context_length_exceeded SECRET-PROMPT",
+            false,
+        ),
+        (
+            StatusCode::UNAUTHORIZED,
+            r#"{"error":{"code":"invalid_api_key"}}"#,
+            false,
+        ),
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            r#"{"error":{"code":"rate_limit_exceeded"}}"#,
+            false,
+        ),
+    ] {
+        let (mut session, events, _) = observed(
+            OpenAIResponsesConfig::new("key", "model").with_resilience(policy(0)),
+            // Authentication refresh may resend once even with max_retries = 0.
+            vec![wire(status, body), wire(status, body)],
+        )
+        .await;
+        let error = match session.begin_turn(request(), None).await {
+            Err(error) => error,
+            Ok(_) => panic!("expected rejection"),
+        };
+        assert_eq!(
+            error.provider_failure().unwrap().upstream.code
+                == UpstreamErrorKind::ContextLengthExceeded,
+            expected
+        );
+        assert!(
+            !format!("{error:?} {error} {:?}", events.lock().unwrap()).contains("SECRET-PROMPT")
+        );
+    }
+}
+
+#[tokio::test]
+async fn code_only_context_rejection_never_retries_private_or_public_sse() {
+    const BODY: &str = r#"event: response.created
+data: {"type":"response.created","sequence_number":1,"response":{"id":"private-id","model":"private-model"}}
+
+event: response.failed
+data: {"type":"response.failed","sequence_number":2,"response":{"error":{"code":"context_length_exceeded","message":"SECRET-PROMPT"}}}
+
+"#;
+    for private in [false, true] {
+        let config = if private {
+            OpenAIResponsesConfig::chatgpt_private("model", Authentication::bearer("key"))
+        } else {
+            OpenAIResponsesConfig::new("key", "model")
+        }
+        .with_resilience(policy(2));
+        let (mut session, events, client) =
+            observed(config, vec![wire(StatusCode::OK, BODY)]).await;
+        let mut turn = session.begin_turn(request(), None).await.unwrap();
+        let error = finish(&mut turn).await.unwrap_err();
+        let failure = error.provider_failure().unwrap();
+        assert_eq!(
+            failure.upstream.code,
+            UpstreamErrorKind::ContextLengthExceeded
+        );
+        assert_eq!(failure.reason, ProviderFailureReason::ResponseFailed);
+        assert_eq!(failure.accounting.attempts, 1);
+        assert_eq!(client.requests.lock().unwrap().len(), 1);
+        assert!(
+            !events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event, ProviderRetryEvent::Scheduled(_)))
+        );
+        assert!(!format!("{error:?} {error}").contains("SECRET-PROMPT"));
+    }
+}

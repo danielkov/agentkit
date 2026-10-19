@@ -492,6 +492,9 @@ impl ModelSession for AnthropicSession {
                 };
 
                 if !status.is_success() {
+                    if let Some(error) = context_length_error(&body_text, Some(status.as_u16())) {
+                        return Err(error);
+                    }
                     return Err(LoopError::Provider(format!(
                         "Anthropic request failed with status {status}: {body_text}"
                     )));
@@ -702,6 +705,54 @@ mod tests {
     use futures_util::stream;
 
     use super::*;
+
+    struct ContextRejection;
+
+    #[async_trait]
+    impl HttpClient for ContextRejection {
+        async fn execute(&self, request: HttpRequest) -> Result<HttpResponse, HttpError> {
+            Ok(HttpResponse::new(
+                StatusCode::BAD_REQUEST,
+                HeaderMap::new(),
+                request.url,
+                Box::pin(stream::once(async {
+                    Ok(Bytes::from_static(br#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: SECRET-PROMPT"}}"#))
+                })),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn http_context_rejection_is_typed_for_streaming_and_buffered_requests() {
+        for streaming in [false, true] {
+            let config = AnthropicConfig::new("key", "model", 1024)
+                .unwrap()
+                .with_streaming(streaming);
+            let adapter =
+                AnthropicAdapter::with_client(config, Http::from_arc(Arc::new(ContextRejection)));
+            let mut session = adapter
+                .start_session(SessionConfig::new("session"))
+                .await
+                .unwrap();
+            let request = TurnRequest {
+                session_id: agentkit_core::SessionId::new("session"),
+                turn_id: agentkit_core::TurnId::new("turn"),
+                transcript: vec![],
+                available_tools: vec![],
+                cache: None,
+                metadata: agentkit_core::MetadataMap::new(),
+            };
+            let error = match session.begin_turn(request, None).await {
+                Err(error) => error,
+                Ok(_) => panic!("expected rejection"),
+            };
+            assert_eq!(
+                error.provider_failure().unwrap().upstream.code,
+                agentkit_loop::UpstreamErrorKind::ContextLengthExceeded
+            );
+            assert!(!format!("{error:?} {error}").contains("SECRET-PROMPT"));
+        }
+    }
 
     struct AlwaysUnauthorized {
         authorizations: std::sync::Mutex<Vec<String>>,
@@ -1079,5 +1130,71 @@ mod tests {
 
         let err = turn.next_event(Some(checkpoint)).await.unwrap_err();
         assert!(matches!(err, LoopError::Cancelled));
+    }
+}
+
+/// Recognize only Anthropic's structured invalid-request prompt-size rejection.
+/// Message text is inspected here but never retained in the typed failure.
+fn context_length_error(body: &str, status: Option<u16>) -> Option<LoopError> {
+    use agentkit_loop::{
+        ProviderClassification, ProviderFailure, ProviderFailureReason, ProviderRoute,
+        RetryAccounting, UpstreamErrorKind,
+    };
+    if status.is_some_and(|status| status != 400) {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    if value.get("type")?.as_str()? != "error"
+        || value.pointer("/error/type")?.as_str()? != "invalid_request_error"
+        || !value
+            .pointer("/error/message")?
+            .as_str()?
+            .starts_with("prompt is too long: ")
+    {
+        return None;
+    }
+    Some(LoopError::ProviderFailure(Box::new(ProviderFailure {
+        route: ProviderRoute::Unknown,
+        reason: ProviderFailureReason::InvalidRequest,
+        last_attempt_reason: Some(ProviderFailureReason::InvalidRequest),
+        upstream: ProviderClassification {
+            error_type: UpstreamErrorKind::InvalidRequestError,
+            code: UpstreamErrorKind::ContextLengthExceeded,
+            http_status: status,
+        },
+        accounting: RetryAccounting::default(),
+    })))
+}
+
+#[cfg(test)]
+mod context_length_tests {
+    use super::*;
+
+    #[test]
+    fn only_structured_prompt_too_long_is_classified_without_payload() {
+        let body = r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: SECRET"}}"#;
+        let error = context_length_error(body, Some(400)).unwrap();
+        assert_eq!(
+            error.provider_failure().unwrap().upstream.code,
+            agentkit_loop::UpstreamErrorKind::ContextLengthExceeded
+        );
+        assert_eq!(
+            error.provider_failure().unwrap().route,
+            agentkit_loop::ProviderRoute::Unknown
+        );
+        assert!(!format!("{error:?} {error}").contains("SECRET"));
+        assert!(context_length_error(body, None).is_some());
+        for status in [401, 403, 429, 500] {
+            assert!(context_length_error(body, Some(status)).is_none());
+        }
+        for body in [
+            "prompt is too long: SECRET",
+            "{}",
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"too many tokens"}}"#,
+            r#"{"type":"error","error":{"type":"authentication_error","message":"prompt is too long: SECRET"}}"#,
+            r#"{"type":"message","error":{"type":"invalid_request_error","message":"prompt is too long: SECRET"}}"#,
+        ] {
+            assert!(context_length_error(body, Some(400)).is_none());
+        }
     }
 }

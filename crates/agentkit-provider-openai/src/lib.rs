@@ -356,6 +356,35 @@ impl CompletionsProvider for OpenAIProvider {
         Ok(())
     }
 
+    fn preprocess_response(
+        &self,
+        status: agentkit_http::StatusCode,
+        body: &str,
+    ) -> Result<(), LoopError> {
+        use agentkit_loop::{
+            ProviderClassification, ProviderFailure, ProviderFailureReason, ProviderRoute,
+            RetryAccounting, UpstreamErrorKind,
+        };
+        if status == agentkit_http::StatusCode::BAD_REQUEST
+            && let Ok(value) = serde_json::from_str::<Value>(body)
+            && value.pointer("/error/code").and_then(Value::as_str)
+                == Some("context_length_exceeded")
+        {
+            return Err(LoopError::ProviderFailure(Box::new(ProviderFailure {
+                route: ProviderRoute::Unknown,
+                reason: ProviderFailureReason::InvalidRequest,
+                last_attempt_reason: Some(ProviderFailureReason::InvalidRequest),
+                upstream: ProviderClassification {
+                    code: UpstreamErrorKind::ContextLengthExceeded,
+                    http_status: Some(status.as_u16()),
+                    ..ProviderClassification::default()
+                },
+                accounting: RetryAccounting::default(),
+            })));
+        }
+        Ok(())
+    }
+
     fn postprocess_response(
         &self,
         _usage: &mut Option<Usage>,
@@ -456,6 +485,41 @@ pub enum OpenAIError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn completions_context_rejection_requires_exact_structured_code() {
+        use agentkit_http::StatusCode;
+        use agentkit_loop::UpstreamErrorKind;
+        let provider = OpenAIProvider::from(OpenAIConfig::new("key", "model"));
+        let body = r#"{"error":{"code":"context_length_exceeded","message":"SECRET-PROMPT"}}"#;
+        let error = provider
+            .preprocess_response(StatusCode::BAD_REQUEST, body)
+            .unwrap_err();
+        assert_eq!(
+            error.provider_failure().unwrap().upstream.code,
+            UpstreamErrorKind::ContextLengthExceeded
+        );
+        assert!(!format!("{error:?} {error}").contains("SECRET-PROMPT"));
+        for status in [
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+            StatusCode::TOO_MANY_REQUESTS,
+        ] {
+            assert!(provider.preprocess_response(status, body).is_ok());
+        }
+        for body in [
+            "context_length_exceeded",
+            r#"{"error":{"type":"invalid_request_error","message":"too many tokens"}}"#,
+            r#"{"error":{"code":"CONTEXT_LENGTH_EXCEEDED"}}"#,
+            r#"{"code":"context_length_exceeded"}"#,
+        ] {
+            assert!(
+                provider
+                    .preprocess_response(StatusCode::BAD_REQUEST, body)
+                    .is_ok()
+            );
+        }
+    }
+
     use agentkit_core::{MetadataMap, SessionId, TurnId};
 
     use super::*;
