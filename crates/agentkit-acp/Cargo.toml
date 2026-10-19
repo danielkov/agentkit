@@ -4,7 +4,7 @@ homepage.workspace = true
 name = "agentkit-acp"
 readme = "README.md"
 repository.workspace = true
-version = "0.10.12"
+version = "0.11.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -22,7 +22,7 @@ unstable-inject = [
 [dependencies]
 agent-client-protocol = { package = "agentkit-acp-sdk", version = "=2.2.0" }
 agentkit-core = { version = "0.10.5", path = "../agentkit-core" }
-agentkit-loop = { version = "0.10.13", path = "../agentkit-loop" }
+agentkit-loop = { version = "0.11.0", path = "../agentkit-loop" }
 agentkit-tools-core = { version = "0.10.5", path = "../agentkit-tools-core" }
 async-trait.workspace = true
 base64.workspace = true

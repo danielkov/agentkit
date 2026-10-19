@@ -20,7 +20,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "agentkit-acp",
  "agentkit-adapter-completions",
@@ -51,7 +51,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-acp"
-version = "0.10.12"
+version = "0.11.0"
 dependencies = [
  "agentkit-acp-sdk",
  "agentkit-core",
@@ -110,7 +110,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-adapter-completions"
-version = "0.10.9"
+version = "0.11.0"
 dependencies = [
  "agentkit-core",
  "agentkit-http",
@@ -138,7 +138,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-compaction"
-version = "0.10.5"
+version = "0.11.0"
 dependencies = [
  "agentkit-core",
  "agentkit-loop",
@@ -215,7 +215,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-loop"
-version = "0.10.13"
+version = "0.11.0"
 dependencies = [
  "agentkit-core",
  "agentkit-task-manager",
@@ -234,7 +234,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-mcp"
-version = "0.11.2"
+version = "0.11.3"
 dependencies = [
  "agentkit-capabilities",
  "agentkit-core",
@@ -267,7 +267,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-provider-anthropic"
-version = "0.10.11"
+version = "0.11.0"
 dependencies = [
  "agentkit-core",
  "agentkit-http",
@@ -285,7 +285,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-provider-baseten"
-version = "0.10.6"
+version = "0.11.0"
 dependencies = [
  "agentkit-adapter-completions",
  "agentkit-http",
@@ -297,7 +297,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-provider-cerebras"
-version = "0.10.8"
+version = "0.11.0"
 dependencies = [
  "agentkit-core",
  "agentkit-http",
@@ -318,7 +318,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-provider-groq"
-version = "0.10.7"
+version = "0.11.0"
 dependencies = [
  "agentkit-adapter-completions",
  "agentkit-http",
@@ -330,7 +330,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-provider-mistral"
-version = "0.10.7"
+version = "0.11.0"
 dependencies = [
  "agentkit-adapter-completions",
  "agentkit-http",
@@ -342,7 +342,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-provider-ollama"
-version = "0.10.7"
+version = "0.11.0"
 dependencies = [
  "agentkit-adapter-completions",
  "agentkit-http",
@@ -354,7 +354,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-provider-openai"
-version = "0.10.14"
+version = "0.11.0"
 dependencies = [
  "agentkit-adapter-completions",
  "agentkit-core",
@@ -374,7 +374,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-provider-openrouter"
-version = "0.10.8"
+version = "0.11.0"
 dependencies = [
  "agentkit-adapter-completions",
  "agentkit-core",
@@ -388,7 +388,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-provider-vllm"
-version = "0.10.7"
+version = "0.11.0"
 dependencies = [
  "agentkit-adapter-completions",
  "agentkit-http",
@@ -400,7 +400,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-reporting"
-version = "0.10.5"
+version = "0.11.0"
 dependencies = [
  "agentkit-core",
  "agentkit-loop",
@@ -1652,7 +1652,7 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "how-cli"
-version = "0.10.6"
+version = "0.10.7"
 dependencies = [
  "agentkit-core",
  "agentkit-loop",
