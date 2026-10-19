@@ -2435,56 +2435,60 @@ where
             .take()
             .or_else(|| self.default_cache.clone());
 
-        let session = self
-            .session
-            .as_mut()
-            .ok_or_else(|| LoopError::InvalidState("model session is not available".into()))?;
-
-        // Inference span per the OTel GenAI semantic conventions. It wraps the
-        // model request and the full event drain rather than just `begin_turn`,
-        // so attributes that streaming adapters only learn mid-stream (usage,
-        // stop reason, response identity) still land before the span closes.
-        // `otel.name` carries the dynamic `chat {model}` span name for
-        // OpenTelemetry bridges since tracing span names are static.
-        let chat_span = tracing::info_span!(
-            "chat",
-            "otel.name" = tracing::field::Empty,
-            "otel.kind" = "client",
-            "gen_ai.operation.name" = "chat",
-            "gen_ai.provider.name" = tracing::field::Empty,
-            "gen_ai.conversation.id" = %self.session_id,
-            "gen_ai.request.model" = tracing::field::Empty,
-            "gen_ai.response.model" = tracing::field::Empty,
-            "gen_ai.response.id" = tracing::field::Empty,
-            "gen_ai.response.finish_reasons" = tracing::field::Empty,
-            "gen_ai.input.messages" = tracing::field::Empty,
-            "gen_ai.output.messages" = tracing::field::Empty,
-            "gen_ai.usage.input_tokens" = tracing::field::Empty,
-            "gen_ai.usage.output_tokens" = tracing::field::Empty,
-            "gen_ai.usage.cost" = tracing::field::Empty,
-        );
-        // Seed known identity before begin_turn so request setup failures and
-        // cancellation remain attributable. Successful per-turn routing below
-        // overwrites these values with the effective selection.
-        let initial_provider_name =
-            effective_provider_name(session.provider_name(), self.provider_name.as_deref());
-        if let Some(provider) = &initial_provider_name {
-            chat_span.record("gen_ai.provider.name", provider.as_str());
-            tracing::Span::current().record("gen_ai.provider.name", provider.as_str());
-        }
-        match session.model_name() {
-            Some(model) => {
-                chat_span.record("gen_ai.request.model", model);
-                chat_span.record("otel.name", format!("chat {model}").as_str());
-            }
-            None => {
-                chat_span.record("otel.name", "chat");
-            }
-        }
-
         use tracing::Instrument;
         let mut recovery = None;
-        let (mut result, saw_tool_call, latest_usage) = 'generation: loop {
+        let (mut result, saw_tool_call, latest_usage, chat_span) = 'generation: loop {
+            let session = self
+                .session
+                .as_mut()
+                .ok_or_else(|| LoopError::InvalidState("model session is not available".into()))?;
+
+            // One inference span per dispatched generation attempt. In particular,
+            // OTel array attributes append rather than replace, so recovery must
+            // not reuse a rejected attempt's span. This span wraps the
+            // model request and the full event drain rather than just `begin_turn`,
+            // so attributes that streaming adapters only learn mid-stream (usage,
+            // stop reason, response identity) still land before the span closes.
+            // `otel.name` carries the dynamic `chat {model}` span name for
+            // OpenTelemetry bridges since tracing span names are static.
+            let chat_span = tracing::info_span!(
+                "chat",
+                "otel.name" = tracing::field::Empty,
+                "otel.kind" = "client",
+                "otel.status_code" = tracing::field::Empty,
+                "error.type" = tracing::field::Empty,
+                "gen_ai.operation.name" = "chat",
+                "gen_ai.provider.name" = tracing::field::Empty,
+                "gen_ai.conversation.id" = %self.session_id,
+                "gen_ai.request.model" = tracing::field::Empty,
+                "gen_ai.response.model" = tracing::field::Empty,
+                "gen_ai.response.id" = tracing::field::Empty,
+                "gen_ai.response.finish_reasons" = tracing::field::Empty,
+                "gen_ai.input.messages" = tracing::field::Empty,
+                "gen_ai.output.messages" = tracing::field::Empty,
+                "gen_ai.usage.input_tokens" = tracing::field::Empty,
+                "gen_ai.usage.output_tokens" = tracing::field::Empty,
+                "gen_ai.usage.cost" = tracing::field::Empty,
+            );
+            // Seed known identity before begin_turn so request setup failures and
+            // cancellation remain attributable. Successful per-turn routing below
+            // overwrites these values with the effective selection.
+            let initial_provider_name =
+                effective_provider_name(session.provider_name(), self.provider_name.as_deref());
+            if let Some(provider) = &initial_provider_name {
+                chat_span.record("gen_ai.provider.name", provider.as_str());
+                tracing::Span::current().record("gen_ai.provider.name", provider.as_str());
+            }
+            match session.model_name() {
+                Some(model) => {
+                    chat_span.record("gen_ai.request.model", model);
+                    chat_span.record("otel.name", format!("chat {model}").as_str());
+                }
+                None => {
+                    chat_span.record("otel.name", "chat");
+                }
+            }
+
             let request = TurnRequest {
                 session_id: self.session_id.clone(),
                 turn_id: turn_id.clone(),
@@ -2520,6 +2524,7 @@ where
             {
                 Ok(turn) => turn,
                 Err(LoopError::Cancelled) => {
+                    record_inference_error(&chat_span, &LoopError::Cancelled);
                     self.task_manager
                         .on_turn_interrupted(&turn_id)
                         .await
@@ -2527,6 +2532,8 @@ where
                     return self.finish_cancelled(turn_id, interrupted_assistant_items());
                 }
                 Err(error) => {
+                    record_inference_error(&chat_span, &error);
+                    drop(chat_span);
                     match self
                         .recover_context(&error, &turn_id, cancellation.clone(), &mut recovery)
                         .await
@@ -2584,6 +2591,7 @@ where
             {
                 Ok(event) => event,
                 Err(LoopError::Cancelled) => {
+                    record_inference_error(&chat_span, &LoopError::Cancelled);
                     turn.on_cancelled();
                     self.task_manager
                         .on_turn_interrupted(&turn_id)
@@ -2595,6 +2603,8 @@ where
                     );
                 }
                 Err(error) => {
+                    record_inference_error(&chat_span, &error);
+                    drop(chat_span);
                     drop(turn);
                     if emitted_output || (latest_usage.is_some() && !self.allow_supersession) {
                         return Err(error);
@@ -2644,6 +2654,7 @@ where
                     .as_ref()
                     .is_some_and(TurnCancellation::is_cancelled)
                 {
+                    record_inference_error(&chat_span, &LoopError::Cancelled);
                     turn.on_cancelled();
                     self.task_manager
                         .on_turn_interrupted(&turn_id)
@@ -2686,9 +2697,11 @@ where
             }
 
             let result = finished_result.ok_or_else(|| {
-                LoopError::Provider("model turn ended without a Finished event".into())
+                let error = LoopError::Provider("model turn ended without a Finished event".into());
+                record_inference_error(&chat_span, &error);
+                error
             })?;
-            break 'generation (result, saw_tool_call, latest_usage);
+            break 'generation (result, saw_tool_call, latest_usage, chat_span);
         };
         result.usage = merge_usage(result.usage, latest_usage);
         if let Some(model) = &result.model {
@@ -4232,7 +4245,8 @@ tracing-subscriber = "={tracing_subscriber_version}"
         assert_eq!(encoded, r#""C:\\Users\\name\\quoted\\\"dir""#);
     }
 
-    const TRUE_OTEL_HARNESS: &str = r#"
+    const TRUE_OTEL_HARNESS: &str = concat!(
+        r#"
 use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -4245,14 +4259,15 @@ use opentelemetry::{Array, Context, KeyValue, Value};
 use tracing_subscriber::layer::SubscriberExt;
 
 #[derive(Clone, Debug)]
-struct Exported { name: String, attributes: Vec<KeyValue> }
+struct Exported { name: String, attributes: Vec<KeyValue>, capture_id: usize, status: Status }
 #[derive(Clone, Default)]
 struct MemoryTracer { exported: Arc<Mutex<Vec<Exported>>> }
-struct MemorySpan { name: String, attributes: Vec<KeyValue>, exported: Arc<Mutex<Vec<Exported>>>, ended: bool }
+struct MemorySpan { name: String, attributes: Vec<KeyValue>, exported: Arc<Mutex<Vec<Exported>>>, ended: bool, capture_id: usize, status: Status }
 impl Tracer for MemoryTracer {
     type Span = MemorySpan;
     fn build_with_context(&self, builder: SpanBuilder, _: &Context) -> MemorySpan {
-        MemorySpan { name: builder.name.into_owned(), attributes: builder.attributes.unwrap_or_default(), exported: self.exported.clone(), ended: false }
+        static NEXT_CAPTURE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        MemorySpan { name: builder.name.into_owned(), attributes: builder.attributes.unwrap_or_default(), exported: self.exported.clone(), ended: false, capture_id: NEXT_CAPTURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed), status: Status::Unset }
     }
 }
 impl Span for MemorySpan {
@@ -4260,13 +4275,13 @@ impl Span for MemorySpan {
     fn span_context(&self) -> &SpanContext { &SpanContext::NONE }
     fn is_recording(&self) -> bool { !self.ended }
     fn set_attribute(&mut self, attribute: KeyValue) { self.attributes.push(attribute); }
-    fn set_status(&mut self, _: Status) {}
+    fn set_status(&mut self, status: Status) { self.status = status; }
     fn update_name<T>(&mut self, name: T) where T: Into<Cow<'static, str>> { self.name = name.into().into_owned(); }
     fn add_link(&mut self, _: SpanContext, _: Vec<KeyValue>) {}
     fn end_with_timestamp(&mut self, _: SystemTime) {
         if !self.ended {
             self.ended = true;
-            self.exported.lock().unwrap().push(Exported { name: self.name.clone(), attributes: self.attributes.clone() });
+            self.exported.lock().unwrap().push(Exported { name: self.name.clone(), attributes: self.attributes.clone(), capture_id: self.capture_id, status: self.status.clone() });
         }
     }
 }
@@ -4370,6 +4385,7 @@ fn run(adapter: ScriptedAdapter) -> (Vec<Exported>, agentkit_loop::TurnResult) {
 }
 
 fn main() {
+    recovery_attempts_have_distinct_otel_spans();
     let (spans, result) = run(ScriptedAdapter { adapter_provider: "adapter", final_usage: true, overflow: true, begin_mode: BeginMode::Success });
     let chat = spans.iter().find(|s| operation(s) == Some("chat")).unwrap();
     let agent = spans.iter().find(|s| operation(s) == Some("invoke_agent")).unwrap();
@@ -4418,12 +4434,18 @@ fn main() {
         }
         let chat = spans.iter().find(|s| operation(s) == Some("chat")).unwrap();
         let agent = spans.iter().find(|s| operation(s) == Some("invoke_agent")).unwrap();
+        assert_eq!(spans.iter().filter(|s| operation(s) == Some("chat")).count(), 1);
+        assert!(matches!(chat.status, Status::Error { .. }));
+        let expected_error = match begin_mode { BeginMode::Cancelled => "cancelled", _ => "model_error" };
+        assert_eq!(attr(chat, "error.type"), Some(&Value::String(expected_error.into())));
         assert_eq!(attr(chat, "gen_ai.provider.name"), Some(&Value::String("before-begin".into())));
         assert_eq!(attr(chat, "gen_ai.request.model"), Some(&Value::String("before-model".into())));
         assert_eq!(attr(agent, "gen_ai.provider.name"), Some(&Value::String("before-begin".into())));
     }
 }
-"#;
+"#,
+        include_str!("context_recovery_otel_harness.rs")
+    );
 }
 
 #[derive(Default)]
@@ -5045,6 +5067,21 @@ pub enum LoopError {
     /// The requested operation is not supported.
     #[error("unsupported operation: {0}")]
     Unsupported(String),
+}
+
+/// Attribute only sanitized, bounded failure categories to an inference attempt.
+fn record_inference_error(span: &tracing::Span, error: &LoopError) {
+    let kind = if error.is_context_length_exceeded() {
+        "context_length_exceeded"
+    } else {
+        match error {
+            LoopError::Cancelled => "cancelled",
+            LoopError::ContextRecoveryDeadlineExceeded => "context_recovery_deadline_exceeded",
+            _ => "model_error",
+        }
+    };
+    span.record("error.type", kind);
+    span.record("otel.status_code", "ERROR");
 }
 
 /// Ordinary inference remains unbounded; only recovery has an absolute budget.

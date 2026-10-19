@@ -644,7 +644,33 @@ mod context_recovery {
     #[cfg(not(feature = "otel"))]
     #[tokio::test]
     async fn input_capture_tracks_each_dispatched_transcript() {
-        use tracing::instrument::WithSubscriber;
+        // Tracing callsite interest and max-level caches are process-global.
+        // Keep this subscriber assertion isolated from concurrently running
+        // tests that register/drop dispatchers for the same inference callsite.
+        const CHILD: &str = "AGENTKIT_TEST_RECOVERY_INPUT_CAPTURE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::context_recovery::input_capture_tracks_each_dispatched_transcript",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .expect("launch isolated input capture regression");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "isolated regression failed:\n{stdout}\n{stderr}"
+            );
+            assert!(
+                stdout.contains("1 passed"),
+                "child did not execute the regression:\n{stdout}"
+            );
+            return;
+        }
         use tracing_subscriber::prelude::*;
         struct InputRecords(StdArc<StdMutex<Vec<String>>>);
         impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for InputRecords {
@@ -671,6 +697,9 @@ mod context_recovery {
         }
         let records = StdArc::new(StdMutex::new(Vec::new()));
         let subscriber = tracing_subscriber::registry().with(InputRecords(records.clone()));
+        // This process runs only this exact test. Install the subscriber before
+        // any driver work and keep it registered for the child's whole lifetime.
+        tracing::subscriber::set_global_default(subscriber).unwrap();
         async {
             let (mut driver, requests, _, _, _) =
                 driver(FailureSite::Begin, Edit::Change, 2, Duration::from_secs(1)).await;
@@ -695,7 +724,6 @@ mod context_recovery {
             }
             assert_ne!(records[0], records[1]);
         }
-        .with_subscriber(subscriber)
         .await;
     }
 }
