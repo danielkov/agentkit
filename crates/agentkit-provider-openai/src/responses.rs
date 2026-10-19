@@ -874,9 +874,9 @@ impl OpenAIResponsesTurn {
                     .attempt
                     .as_ref()
                     .is_some_and(|attempt| matches!(attempt.body, LiveBody::WebSocket(_)));
-                // A sent WebSocket request has no idempotency guarantee. Explicit
-                // provider rejections before visible output can be retried only on a
-                // fresh socket; reused sockets can deliver uncorrelated stale errors.
+                // A sent WebSocket request has no idempotency guarantee. Recovery
+                // must discard the socket and any continuation checkpoint; reused
+                // sockets can deliver uncorrelated stale errors.
                 let missing_previous = self.attempt.as_ref().is_some_and(|attempt| {
                     matches!(&attempt.body, LiveBody::WebSocket(connection)
                         if connection.missing_previous(&attempt.decoder))
@@ -888,18 +888,18 @@ impl OpenAIResponsesTurn {
                 if missing_previous {
                     failure.retryable = true;
                 }
-                // A lost socket or correlated transient terminal failure is resent
-                // in full on a fresh socket before visible output, or after it when
-                // the session accepts superseded attempts. Require store:false and
-                // discard the failed socket's continuation checkpoint. Uncorrelated
-                // wrapped errors retain the rejection-only recovery policy.
+                // Retry transient failures on a fresh socket with the authoritative
+                // full request, even when the error cannot be correlated. Correlation
+                // is not an idempotency guarantee: require store:false and either
+                // no visible output or explicit supersession support. Protocol and
+                // permanent provider failures retain their nonretryable classification.
                 let resendable = websocket
                     && (!self.attempt_output_emitted || self.supersession_enabled)
                     && self.context.config.request_policy.store == Some(false)
-                    && self.attempt.as_ref().is_some_and(|attempt| {
-                        attempt.connection_lost
-                            || failure.retryable && attempt.decoder.correlated_terminal_failure
-                    });
+                    && self
+                        .attempt
+                        .as_ref()
+                        .is_some_and(|attempt| attempt.connection_lost || failure.retryable);
                 if resendable {
                     failure.retryable = true;
                 }
@@ -2326,7 +2326,6 @@ struct ResponsesSseDecoder {
     buffer_start: usize,
     received: usize,
     request_rejected: bool,
-    correlated_terminal_failure: bool,
     previous_response_missing: Option<String>,
     max_attempt_bytes: usize,
     state: ResponsesState,
@@ -2360,7 +2359,6 @@ impl ResponsesSseDecoder {
             buffer_start: 0,
             received: 0,
             request_rejected: false,
-            correlated_terminal_failure: false,
             previous_response_missing: None,
             max_attempt_bytes: limits.max_attempt_bytes,
             state: ResponsesState::new(
@@ -2522,19 +2520,6 @@ impl ResponsesSseDecoder {
         }
         self.previous_response_missing = None;
         let mut result = self.state.consume(&kind, &value);
-        // Only a validated terminal event with an explicit matching response ID
-        // authorizes replay on a reused socket. Protocol failures and ID-less
-        // events must not be mistaken for a failure of the active response.
-        self.correlated_terminal_failure = kind == "response.failed"
-            && value.pointer("/response/id").and_then(Value::as_str)
-                == self.state.response_id.as_deref()
-            && self.state.response_id.is_some()
-            && result.as_ref().is_err_and(|failure| {
-                failure
-                    .error
-                    .provider_failure()
-                    .is_some_and(|failure| failure.reason == ProviderFailureReason::ResponseFailed)
-            });
         if kind == "error"
             && let Err(failure) = &mut result
             && failure
