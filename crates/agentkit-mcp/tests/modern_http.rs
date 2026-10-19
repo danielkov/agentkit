@@ -348,7 +348,7 @@ async fn auto_http_discovery_stream_metadata_and_auth_replacement_restore_resour
         let mut events = connection.subscribe_events();
         replacement.notify("notifications/resources/updated", json!({"uri":"memo:keep"}));
         assert!(matches!(events.recv().await.unwrap(), McpServerEvent::ResourceUpdated(params) if params.uri == "memo:keep"));
-        connection.close().await;
+        connection.close().await.unwrap();
         bounded(replacement.frames.closed()).await;
     }).await;
 }
@@ -384,7 +384,7 @@ async fn failed_and_cancelled_auth_reconnect_leave_old_http_stream_usable() {
             McpServerEvent::ToolListChanged
         ));
         connection.discover().await.unwrap();
-        connection.close().await;
+        connection.close().await.unwrap();
         bounded(active.frames.closed()).await;
     })
     .await;
@@ -461,7 +461,7 @@ async fn modern_to_legacy_and_legacy_to_legacy_replay_committed_resource_uris() 
         connection.resolve_auth(auth("replacement")).await.unwrap();
         let modern = fixture.listen().await;
         assert_eq!(modern.filter["resourceSubscriptions"], json!(["memo:keep"]));
-        connection.close().await;
+        connection.close().await.unwrap();
         bounded(modern.frames.closed()).await;
     })
     .await;
@@ -495,7 +495,7 @@ async fn rejected_legacy_resource_replay_keeps_authoritative_modern_connection()
         active.notify("notifications/resources/updated", json!({"uri":"memo:keep"}));
         assert!(matches!(events.recv().await.unwrap(), McpServerEvent::ResourceUpdated(params) if params.uri == "memo:keep"));
         connection.discover().await.unwrap();
-        connection.close().await;
+        connection.close().await.unwrap();
         bounded(active.frames.closed()).await;
     }).await;
 }
@@ -570,7 +570,7 @@ async fn auth_reconnect_partial_ack_preserves_committed_http_subscription() {
         assert_eq!(request["method"], "resources/list");
         assert_eq!(headers.get("authorization").unwrap(), "Bearer initial");
         drop(requests);
-        connection.close().await;
+        connection.close().await.unwrap();
         bounded(active.frames.closed()).await;
     }).await;
 }
@@ -777,22 +777,30 @@ async fn advertised_catalog_flags_gate_listen_on_connect_discover_and_reconnect(
                 "true" => Some(json!({"toolsListChanged":true,"resourcesListChanged":true,"promptsListChanged":true})),
                 _ => None,
             };
-            if let Some(filter) = &expected {
-                assert_eq!(&fixture.listen().await.filter, filter);
+            let initial = if let Some(filter) = &expected {
+                let stream = fixture.listen().await;
+                assert_eq!(&stream.filter, filter);
+                Some(stream)
             } else {
                 assert!(connection.subscription_status().await.is_none());
-            }
+                None
+            };
             connection.discover().await.unwrap();
             connection.discover().await.unwrap();
             connection.resolve_auth(auth(&token)).await.unwrap();
             connection.discover().await.unwrap();
-            if let Some(filter) = &expected {
-                assert_eq!(&fixture.listen().await.filter, filter);
-            }
+            let replacement = if let Some(filter) = &expected {
+                let stream = fixture.listen().await;
+                assert_eq!(&stream.filter, filter);
+                Some(stream)
+            } else {
+                None
+            };
             let requests = fixture.requests.lock().await;
             assert_eq!(requests.iter().filter(|(_, r)| r["method"] == "subscriptions/listen").count(), if expected.is_some() { 2 } else { 0 }, "{profile}");
             drop(requests);
-            connection.close().await;
+            connection.close().await.unwrap();
+            drop((initial, replacement));
         }
     }).await;
 }
@@ -820,16 +828,18 @@ async fn resource_only_server_starts_modern_stream_lazily_and_replays_on_reconne
                 .any(|(_, r)| r["method"] == "subscriptions/listen")
         );
         connection.subscribe_resource("memo:one").await.unwrap();
+        let initial = fixture.listen().await;
         assert_eq!(
-            fixture.listen().await.filter,
+            initial.filter,
             json!({"resourceSubscriptions":["memo:one"]})
         );
         connection
             .resolve_auth(auth("caps-resource"))
             .await
             .unwrap();
+        let replacement = fixture.listen().await;
         assert_eq!(
-            fixture.listen().await.filter,
+            replacement.filter,
             json!({"resourceSubscriptions":["memo:one"]})
         );
         connection.unsubscribe_resource("memo:one").await.unwrap();
@@ -837,7 +847,8 @@ async fn resource_only_server_starts_modern_stream_lazily_and_replays_on_reconne
             r["method"].as_str(),
             Some("resources/subscribe" | "resources/unsubscribe")
         )));
-        connection.close().await;
+        connection.close().await.unwrap();
+        drop((initial, replacement));
     })
     .await;
 }
