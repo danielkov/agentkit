@@ -148,6 +148,22 @@ async fn rpc(
             } else {
                 capabilities.build()
             };
+            let capabilities = match token {
+                "Bearer caps-missing" => json!({}),
+                "Bearer caps-empty" => json!({"tools":{},"resources":{},"prompts":{}}),
+                "Bearer caps-false" => {
+                    json!({"tools":{"listChanged":false},"resources":{"listChanged":false},"prompts":{"listChanged":false}})
+                }
+                "Bearer caps-resource" => json!({"resources":{"subscribe":true}}),
+                "Bearer caps-mixed" => {
+                    json!({"tools":{"listChanged":true},"resources":{"listChanged":false},"prompts":{}})
+                }
+                "Bearer caps-true" => {
+                    json!({"tools":{"listChanged":true},"resources":{"listChanged":true},"prompts":{"listChanged":true}})
+                }
+                _ => serde_json::to_value(capabilities).unwrap(),
+            };
+            let capabilities = serde_json::from_value(capabilities).unwrap();
             serde_json::to_value(DiscoverResult::new(
                 vec![ProtocolVersion::V_2026_07_28],
                 capabilities,
@@ -155,6 +171,15 @@ async fn rpc(
             .unwrap()
         }
         "subscriptions/listen" => {
+            if matches!(
+                token,
+                "Bearer caps-missing" | "Bearer caps-empty" | "Bearer caps-false"
+            ) {
+                return Json(json!({"jsonrpc":"2.0", "id":id, "error":{
+                    "code":-32601, "message":"subscriptions not supported"
+                }}))
+                .into_response();
+            }
             let (frames, receiver) = mpsc::unbounded_channel();
             let filter = message["params"]["notifications"].clone();
             if token != "Bearer hold" && !state.hold_ack.load(Ordering::SeqCst) {
@@ -323,7 +348,7 @@ async fn auto_http_discovery_stream_metadata_and_auth_replacement_restore_resour
         let mut events = connection.subscribe_events();
         replacement.notify("notifications/resources/updated", json!({"uri":"memo:keep"}));
         assert!(matches!(events.recv().await.unwrap(), McpServerEvent::ResourceUpdated(params) if params.uri == "memo:keep"));
-        connection.close().await.unwrap();
+        connection.close().await;
         bounded(replacement.frames.closed()).await;
     }).await;
 }
@@ -359,7 +384,7 @@ async fn failed_and_cancelled_auth_reconnect_leave_old_http_stream_usable() {
             McpServerEvent::ToolListChanged
         ));
         connection.discover().await.unwrap();
-        connection.close().await.unwrap();
+        connection.close().await;
         bounded(active.frames.closed()).await;
     })
     .await;
@@ -436,7 +461,7 @@ async fn modern_to_legacy_and_legacy_to_legacy_replay_committed_resource_uris() 
         connection.resolve_auth(auth("replacement")).await.unwrap();
         let modern = fixture.listen().await;
         assert_eq!(modern.filter["resourceSubscriptions"], json!(["memo:keep"]));
-        connection.close().await.unwrap();
+        connection.close().await;
         bounded(modern.frames.closed()).await;
     })
     .await;
@@ -470,7 +495,7 @@ async fn rejected_legacy_resource_replay_keeps_authoritative_modern_connection()
         active.notify("notifications/resources/updated", json!({"uri":"memo:keep"}));
         assert!(matches!(events.recv().await.unwrap(), McpServerEvent::ResourceUpdated(params) if params.uri == "memo:keep"));
         connection.discover().await.unwrap();
-        connection.close().await.unwrap();
+        connection.close().await;
         bounded(active.frames.closed()).await;
     }).await;
 }
@@ -545,7 +570,7 @@ async fn auth_reconnect_partial_ack_preserves_committed_http_subscription() {
         assert_eq!(request["method"], "resources/list");
         assert_eq!(headers.get("authorization").unwrap(), "Bearer initial");
         drop(requests);
-        connection.close().await.unwrap();
+        connection.close().await;
         bounded(active.frames.closed()).await;
     }).await;
 }
@@ -733,6 +758,86 @@ async fn auto_http_no_common_version_does_not_initialize() {
         let requests = fixture.requests.lock().await;
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].1["method"], "server/discover");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn advertised_catalog_flags_gate_listen_on_connect_discover_and_reconnect() {
+    bounded(async {
+        for profile in ["missing", "empty", "false", "mixed", "true"] {
+            let mut fixture = Fixture::start().await;
+            let token = format!("caps-{profile}");
+            if let McpTransportBinding::StreamableHttp(binding) = &mut fixture.config.transport {
+                *binding = binding.clone().with_bearer_token(&token);
+            }
+            let connection = McpConnection::connect(&fixture.config).await.unwrap();
+            let expected = match profile {
+                "mixed" => Some(json!({"toolsListChanged":true})),
+                "true" => Some(json!({"toolsListChanged":true,"resourcesListChanged":true,"promptsListChanged":true})),
+                _ => None,
+            };
+            if let Some(filter) = &expected {
+                assert_eq!(&fixture.listen().await.filter, filter);
+            } else {
+                assert!(connection.subscription_status().await.is_none());
+            }
+            connection.discover().await.unwrap();
+            connection.discover().await.unwrap();
+            connection.resolve_auth(auth(&token)).await.unwrap();
+            connection.discover().await.unwrap();
+            if let Some(filter) = &expected {
+                assert_eq!(&fixture.listen().await.filter, filter);
+            }
+            let requests = fixture.requests.lock().await;
+            assert_eq!(requests.iter().filter(|(_, r)| r["method"] == "subscriptions/listen").count(), if expected.is_some() { 2 } else { 0 }, "{profile}");
+            drop(requests);
+            connection.close().await;
+        }
+    }).await;
+}
+
+#[tokio::test]
+async fn resource_only_server_starts_modern_stream_lazily_and_replays_on_reconnect() {
+    bounded(async {
+        let mut fixture = Fixture::start().await;
+        if let McpTransportBinding::StreamableHttp(binding) = &mut fixture.config.transport {
+            *binding = binding.clone().with_bearer_token("caps-resource");
+        }
+        let connection = McpConnection::connect(&fixture.config).await.unwrap();
+        connection.discover().await.unwrap();
+        connection
+            .unsubscribe_resource("memo:absent")
+            .await
+            .unwrap();
+        assert!(connection.subscription_status().await.is_none());
+        assert!(
+            !fixture
+                .requests
+                .lock()
+                .await
+                .iter()
+                .any(|(_, r)| r["method"] == "subscriptions/listen")
+        );
+        connection.subscribe_resource("memo:one").await.unwrap();
+        assert_eq!(
+            fixture.listen().await.filter,
+            json!({"resourceSubscriptions":["memo:one"]})
+        );
+        connection
+            .resolve_auth(auth("caps-resource"))
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture.listen().await.filter,
+            json!({"resourceSubscriptions":["memo:one"]})
+        );
+        connection.unsubscribe_resource("memo:one").await.unwrap();
+        assert!(!fixture.requests.lock().await.iter().any(|(_, r)| matches!(
+            r["method"].as_str(),
+            Some("resources/subscribe" | "resources/unsubscribe")
+        )));
+        connection.close().await;
     })
     .await;
 }
