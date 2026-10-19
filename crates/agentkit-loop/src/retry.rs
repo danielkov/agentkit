@@ -34,6 +34,8 @@ pub enum UpstreamErrorKind {
     PermissionDenied,
     InsufficientQuota,
     ContentPolicyViolation,
+    /// Explicit provider rejection because the input exceeds the context window.
+    ContextLengthExceeded,
     #[default]
     #[serde(other)]
     Unknown,
@@ -145,6 +147,19 @@ impl<F: Fn(ProviderRetryEvent) + Send + Sync> RetryObserver for F {
 mod tests {
     use super::*;
     use crate::AgentEvent;
+
+    #[test]
+    fn context_length_kind_uses_stable_wire_name() {
+        let kind = UpstreamErrorKind::ContextLengthExceeded;
+        assert_eq!(
+            serde_json::to_string(&kind).unwrap(),
+            "\"context_length_exceeded\""
+        );
+        assert_eq!(
+            serde_json::from_str::<UpstreamErrorKind>("\"context_length_exceeded\"").unwrap(),
+            kind
+        );
+    }
 
     #[test]
     fn event_roundtrip_and_legacy_shape_remain_compatible() {

@@ -301,6 +301,44 @@ impl ReplayRequest {
         .await
     }
 
+    /// Inspect only a complete, bounded HTTP 400 envelope. Failure to inspect is
+    /// not evidence of context overflow; never expose the rejection body.
+    async fn rejection_error(&self, response: HttpResponse) -> LoopError {
+        let status = response.status();
+        if status == StatusCode::BAD_REQUEST {
+            let timeout = self
+                .resilience
+                .as_ref()
+                .and_then(|config| config.attempt_timeout)
+                .unwrap_or(Duration::from_secs(2))
+                .min(Duration::from_secs(2));
+            let inspect = async {
+                let mut body = response.bytes_stream();
+                let mut bytes = Vec::new();
+                while let Some(chunk) = next_body_chunk_bounded(&mut body, None, None).await? {
+                    if bytes.len().saturating_add(chunk.len()) > 64 * 1024 {
+                        return Ok(None);
+                    }
+                    bytes.extend_from_slice(&chunk);
+                }
+                Ok(std::str::from_utf8(&bytes)
+                    .ok()
+                    .and_then(|body| context_length_error(body, Some(400))))
+            };
+            if let Ok(Some(error)) = run_bounded(
+                inspect,
+                Some(timeout),
+                self.deadline.as_ref(),
+                "HTTP rejection body",
+            )
+            .await
+            {
+                return error;
+            }
+        }
+        LoopError::Provider(format!("Anthropic request failed with status {status}"))
+    }
+
     async fn open_response(&self) -> Result<HttpResponse, LoopError> {
         loop {
             let authentication = self.authentication_attempt().await?;
@@ -375,10 +413,7 @@ impl ReplayRequest {
         self.wait_before_retry(retry_number, None).await?;
         let response = self.open_response().await?;
         if !response.status().is_success() {
-            return Err(LoopError::Provider(format!(
-                "Anthropic stream replay failed with status {}",
-                response.status()
-            )));
+            return Err(self.rejection_error(response).await);
         }
         let integrity = TruncatedStreamDetector::from_headers(response.headers());
         Ok((response.bytes_stream(), integrity))
@@ -440,6 +475,9 @@ impl ModelSession for AnthropicSession {
             loop {
                 let response = replay_request.open_response().await?;
                 let status = response.status();
+                if status == StatusCode::BAD_REQUEST {
+                    return Err(replay_request.rejection_error(response).await);
+                }
                 if config.streaming && status.is_success() {
                     let integrity = TruncatedStreamDetector::from_headers(response.headers());
                     let idle_timeout = self
@@ -492,6 +530,9 @@ impl ModelSession for AnthropicSession {
                 };
 
                 if !status.is_success() {
+                    if let Some(error) = context_length_error(&body_text, Some(status.as_u16())) {
+                        return Err(error);
+                    }
                     return Err(LoopError::Provider(format!(
                         "Anthropic request failed with status {status}: {body_text}"
                     )));
@@ -702,6 +743,177 @@ mod tests {
     use futures_util::stream;
 
     use super::*;
+
+    struct ContextRejection;
+
+    #[async_trait]
+    impl HttpClient for ContextRejection {
+        async fn execute(&self, request: HttpRequest) -> Result<HttpResponse, HttpError> {
+            Ok(HttpResponse::new(
+                StatusCode::BAD_REQUEST,
+                HeaderMap::new(),
+                request.url,
+                Box::pin(stream::once(async {
+                    Ok(Bytes::from_static(br#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: SECRET-PROMPT"}}"#))
+                })),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn http_context_rejection_is_typed_for_streaming_and_buffered_requests() {
+        for streaming in [false, true] {
+            let config = AnthropicConfig::new("key", "model", 1024)
+                .unwrap()
+                .with_streaming(streaming);
+            let adapter =
+                AnthropicAdapter::with_client(config, Http::from_arc(Arc::new(ContextRejection)));
+            let mut session = adapter
+                .start_session(SessionConfig::new("session"))
+                .await
+                .unwrap();
+            let request = TurnRequest {
+                session_id: agentkit_core::SessionId::new("session"),
+                turn_id: agentkit_core::TurnId::new("turn"),
+                transcript: vec![],
+                available_tools: vec![],
+                cache: None,
+                metadata: agentkit_core::MetadataMap::new(),
+            };
+            let error = match session.begin_turn(request, None).await {
+                Err(error) => error,
+                Ok(_) => panic!("expected rejection"),
+            };
+            assert_eq!(
+                error.provider_failure().unwrap().upstream.code,
+                agentkit_loop::UpstreamErrorKind::ContextLengthExceeded
+            );
+            assert!(!format!("{error:?} {error}").contains("SECRET-PROMPT"));
+        }
+    }
+
+    struct ReplayRejection {
+        calls: AtomicUsize,
+        body: Vec<u8>,
+        pending: bool,
+    }
+
+    #[async_trait]
+    impl HttpClient for ReplayRejection {
+        async fn execute(&self, request: HttpRequest) -> Result<HttpResponse, HttpError> {
+            let first = self.calls.fetch_add(1, Ordering::SeqCst) == 0;
+            let body: BodyStream = if first {
+                Box::pin(stream::once(async {
+                    Err(HttpError::body(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionReset,
+                        "stream reset",
+                    )))
+                }))
+            } else if self.pending {
+                Box::pin(stream::pending())
+            } else {
+                let bytes = Bytes::copy_from_slice(&self.body);
+                Box::pin(stream::once(async move { Ok(bytes) }))
+            };
+            Ok(HttpResponse::new(
+                if first {
+                    StatusCode::OK
+                } else {
+                    StatusCode::BAD_REQUEST
+                },
+                HeaderMap::new(),
+                request.url,
+                body,
+            ))
+        }
+    }
+
+    async fn replay_rejection_turn(
+        body: Vec<u8>,
+        pending: bool,
+        budget: Duration,
+    ) -> (AnthropicTurn, Arc<ReplayRejection>) {
+        let client = Arc::new(ReplayRejection {
+            calls: AtomicUsize::new(0),
+            body,
+            pending,
+        });
+        let adapter = AnthropicAdapter::with_client(
+            AnthropicConfig::new("key", "model", 1024).unwrap(),
+            Http::from_arc(client.clone()),
+        )
+        .with_resilience(ResilienceConfig {
+            max_retries: 2,
+            retry_budget: budget,
+            attempt_timeout: None,
+            stream_idle_timeout: None,
+            initial_backoff: Duration::ZERO,
+            max_backoff: Duration::ZERO,
+        });
+        let mut session = adapter
+            .start_session(SessionConfig::new("session"))
+            .await
+            .unwrap();
+        let request = TurnRequest {
+            session_id: agentkit_core::SessionId::new("session"),
+            turn_id: agentkit_core::TurnId::new("turn"),
+            transcript: vec![],
+            available_tools: vec![],
+            cache: None,
+            metadata: agentkit_core::MetadataMap::new(),
+        };
+        (session.begin_turn(request, None).await.unwrap(), client)
+    }
+
+    #[tokio::test]
+    async fn replay_http_context_rejection_is_typed_bounded_and_payload_free() {
+        let valid = br#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: SECRET-PROMPT"}}"#;
+        let oversized = format!(
+            r#"{{"type":"error","error":{{"type":"invalid_request_error","message":"prompt is too long: {}"}}}}"#,
+            "x".repeat(64 * 1024)
+        );
+        for (body, expected) in [
+            (valid.to_vec(), true),
+            (br#"{"type":"error","error":{"type":"invalid_request_error","message":"SECRET-PROMPT too many tokens"}}"#.to_vec(), false),
+            (b"prompt is too long: SECRET-PROMPT".to_vec(), false),
+            (oversized.into_bytes(), false),
+        ] {
+            let (mut turn, client) = replay_rejection_turn(body, false, Duration::from_secs(10)).await;
+            let error = turn.next_event(None).await.unwrap_err();
+            assert_eq!(error.is_context_length_exceeded(), expected);
+            assert!(!format!("{error:?} {error}").contains("SECRET-PROMPT"));
+            assert_eq!(client.calls.load(Ordering::SeqCst), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn replay_rejection_body_respects_logical_deadline() {
+        let (mut turn, client) =
+            replay_rejection_turn(vec![], true, Duration::from_millis(50)).await;
+        let start = std::time::Instant::now();
+        let error = turn.next_event(None).await.unwrap_err();
+        assert!(!error.is_context_length_exceeded());
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert_eq!(client.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn replay_rejection_body_is_cancellable() {
+        let (mut turn, client) = replay_rejection_turn(vec![], true, Duration::from_secs(10)).await;
+        let controller = CancellationController::new();
+        let future = turn.next_event(Some(TurnCancellation::new(controller.handle())));
+        futures_util::pin_mut!(future);
+        for _ in 0..100 {
+            assert!(futures_util::poll!(future.as_mut()).is_pending());
+            if client.calls.load(Ordering::SeqCst) == 2 {
+                break;
+            }
+            resilience_sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(client.calls.load(Ordering::SeqCst), 2);
+        controller.interrupt();
+        assert!(matches!(future.await, Err(LoopError::Cancelled)));
+    }
 
     struct AlwaysUnauthorized {
         authorizations: std::sync::Mutex<Vec<String>>,
@@ -1079,5 +1291,71 @@ mod tests {
 
         let err = turn.next_event(Some(checkpoint)).await.unwrap_err();
         assert!(matches!(err, LoopError::Cancelled));
+    }
+}
+
+/// Recognize only Anthropic's structured invalid-request prompt-size rejection.
+/// Message text is inspected here but never retained in the typed failure.
+fn context_length_error(body: &str, status: Option<u16>) -> Option<LoopError> {
+    use agentkit_loop::{
+        ProviderClassification, ProviderFailure, ProviderFailureReason, ProviderRoute,
+        RetryAccounting, UpstreamErrorKind,
+    };
+    if status.is_some_and(|status| status != 400) {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    if value.get("type")?.as_str()? != "error"
+        || value.pointer("/error/type")?.as_str()? != "invalid_request_error"
+        || !value
+            .pointer("/error/message")?
+            .as_str()?
+            .starts_with("prompt is too long: ")
+    {
+        return None;
+    }
+    Some(LoopError::ProviderFailure(Box::new(ProviderFailure {
+        route: ProviderRoute::Unknown,
+        reason: ProviderFailureReason::InvalidRequest,
+        last_attempt_reason: Some(ProviderFailureReason::InvalidRequest),
+        upstream: ProviderClassification {
+            error_type: UpstreamErrorKind::InvalidRequestError,
+            code: UpstreamErrorKind::ContextLengthExceeded,
+            http_status: status,
+        },
+        accounting: RetryAccounting::default(),
+    })))
+}
+
+#[cfg(test)]
+mod context_length_tests {
+    use super::*;
+
+    #[test]
+    fn only_structured_prompt_too_long_is_classified_without_payload() {
+        let body = r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: SECRET"}}"#;
+        let error = context_length_error(body, Some(400)).unwrap();
+        assert_eq!(
+            error.provider_failure().unwrap().upstream.code,
+            agentkit_loop::UpstreamErrorKind::ContextLengthExceeded
+        );
+        assert_eq!(
+            error.provider_failure().unwrap().route,
+            agentkit_loop::ProviderRoute::Unknown
+        );
+        assert!(!format!("{error:?} {error}").contains("SECRET"));
+        assert!(context_length_error(body, None).is_some());
+        for status in [401, 403, 429, 500] {
+            assert!(context_length_error(body, Some(status)).is_none());
+        }
+        for body in [
+            "prompt is too long: SECRET",
+            "{}",
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"too many tokens"}}"#,
+            r#"{"type":"error","error":{"type":"authentication_error","message":"prompt is too long: SECRET"}}"#,
+            r#"{"type":"message","error":{"type":"invalid_request_error","message":"prompt is too long: SECRET"}}"#,
+        ] {
+            assert!(context_length_error(body, Some(400)).is_none());
+        }
     }
 }

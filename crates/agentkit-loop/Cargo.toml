@@ -18,6 +18,7 @@ agentkit-core = { version = "0.10.5", path = "../agentkit-core" }
 agentkit-task-manager = { version = "0.10.7", path = "../agentkit-task-manager" }
 agentkit-tools-core = { version = "0.10.5", path = "../agentkit-tools-core" }
 async-trait.workspace = true
+futures-timer.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

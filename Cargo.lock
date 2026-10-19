@@ -221,6 +221,7 @@ dependencies = [
  "agentkit-task-manager",
  "agentkit-tools-core",
  "async-trait",
+ "futures-timer",
  "opentelemetry",
  "serde",
  "serde_json",

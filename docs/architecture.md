@@ -149,3 +149,28 @@ For each registered mutator the loop:
 If any mutator in the pass dirtied the cursor, the loop validates transcript invariants (tool_use ↔ tool_result pairing) and hard-fails with `LoopError::Mutator` if a mutator left the transcript protocol-invalid.
 
 Compaction is the canonical mutator: `agentkit-compaction` provides a `Compactor` trait, `StrategyCompactor`, and trigger helpers (`item_count_trigger`, `context_window_trigger`) that wire into this seam through the `AgentBuilderCompactorExt::compactor` extension. Semantic compaction is provided through an injected `CompactionBackend` (e.g. `AgentCompactor`, which runs a nested sub-agent) rather than a built-in model client.
+
+## Recovering from context-length rejection
+
+Enable context recovery when your host can compact or otherwise reduce conversation history after a provider rejects an oversized request:
+
+```rust,ignore
+use agentkit_loop::ContextRecoveryPolicy;
+use std::time::Duration;
+
+let builder = Agent::builder()
+    .context_recovery(ContextRecoveryPolicy {
+        max_attempts: 3,
+        budget: Duration::from_secs(60),
+    });
+```
+
+Register a `LoopMutator` that handles `MutationPoint::ContextLengthRejected`. At that point, `LoopCtx::recovery` provides the one-based attempt and an absolute deadline. The mutator chooses what history to summarize or shorten; AgentKit does not estimate token counts or implement a degradation policy. Preserve applicable instructions, the current user request, and complete tool-call/result relationships.
+
+Recovery is disabled unless configured. It starts only on a typed context-length rejection, never a generic HTTP 400, authentication error, or rate limit. The provider adapter must preserve that classification; `LoopError::is_context_length_exceeded()` exposes it without parsing rendered error messages. Supported classification includes OpenAI Responses HTTP/SSE/WebSocket errors, OpenAI chat-completions HTTP errors, and Anthropic HTTP/SSE prompt-length errors. Other compatible-provider routes may still return an unclassified error.
+
+Recovery mutators edit a staged transcript. AgentKit validates and commits the candidate only after the mutation pass succeeds within its cancellation and deadline bounds. An unchanged candidate stops recovery. Failed, cancelled, invalid, or timed-out mutation passes do not replace canonical history. Mutators must not persist staged candidates themselves: implement `TranscriptObserver::on_transcript_replaced` to update a persisted or mirrored transcript after commitment.
+
+The driver retries only model generation, preserving the logical turn and avoiding repeated tool execution. Recovery is refused after model response content has been exposed. If a rejected attempt emitted usage, recovery also requires `SessionConfig::with_response_attempt_supersession()`: the host must discard that attempt's usage when it receives `ResponseAttemptSuperseded`, before handling replacement output. Without that capability, the rejection terminates without a recovery mutation. All recovery attempts and replacement generation share the configured budget, starting at the first rejection; zero attempts or a zero budget disables recovery. The deadline is cooperative and cannot preempt blocking synchronous code.
+
+If the retry limit is reached or protected context cannot be reduced, surface the failure rather than discarding instructions or repeatedly submitting the same request. A successful summary does not guarantee the resumed request fits: instructions, tools, attachments, or the current request can themselves exceed the provider's limit.

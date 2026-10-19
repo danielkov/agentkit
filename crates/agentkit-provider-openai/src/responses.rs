@@ -2212,16 +2212,50 @@ async fn send_live_attempt(
         });
     }
     if !status.is_success() {
+        let headers = retry_headers(response.headers());
+        let mut upstream = ProviderClassification {
+            http_status: Some(status.as_u16()),
+            ..ProviderClassification::default()
+        };
+        // Only inspect a bounded structured rejection body, never retain its text.
+        // Other status paths preserve their existing retry/authentication behavior.
+        if status == StatusCode::BAD_REQUEST {
+            let mut body = response.bytes_stream();
+            let mut bytes = Zeroizing::new(Vec::new());
+            let started = Instant::now();
+            loop {
+                let Some(remaining) = Duration::from_secs(2).checked_sub(started.elapsed()) else {
+                    break;
+                };
+                let chunk = cancellable(
+                    run_bounded_http(
+                        async { futures_util::StreamExt::next(&mut body).await.transpose() },
+                        Some(remaining),
+                        context.deadline.as_ref(),
+                        "context rejection body",
+                    ),
+                    cancellation,
+                )
+                .await
+                .map_err(nonretryable)?;
+                match chunk {
+                    Ok(Some(chunk)) if bytes.len().saturating_add(chunk.len()) <= 64 * 1024 => {
+                        bytes.extend_from_slice(&chunk);
+                    }
+                    Ok(None) => {
+                        if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
+                            upstream = retry::http_classification(&value, status.as_u16());
+                        }
+                        break;
+                    }
+                    _ => break,
+                }
+            }
+        }
         return Err(AttemptFailure {
-            error: Box::new(provider_error(
-                ProviderFailureReason::HttpStatus,
-                ProviderClassification {
-                    http_status: Some(status.as_u16()),
-                    ..ProviderClassification::default()
-                },
-            )),
+            error: Box::new(provider_error(ProviderFailureReason::HttpStatus, upstream)),
             retryable: retryable_response_status(status, context.config.profile),
-            headers: retry_headers(response.headers()),
+            headers,
         });
     }
     if response
@@ -2572,7 +2606,8 @@ impl ResponsesSseDecoder {
                 classification.http_status = Some(status.as_u16());
                 *failure.error =
                     provider_error(ProviderFailureReason::ResponseFailed, classification);
-                failure.retryable = retryable_response_status(status, self.state.profile);
+                failure.retryable = classification.code != UpstreamErrorKind::ContextLengthExceeded
+                    && retryable_response_status(status, self.state.profile);
             }
             if let Some(headers) = value.get("headers").and_then(Value::as_object) {
                 let mut parsed = HeaderMap::new();
@@ -3841,6 +3876,11 @@ fn protocol_failure(message: &str) -> AttemptFailure {
 }
 
 fn stream_failure_retryable(profile: OpenAIResponsesProfile, value: &Value, kind: &str) -> bool {
+    // A confirmed context rejection cannot succeed by resending the same input,
+    // including private code-only envelopes with no HTTP status or error type.
+    if stream_classification(value, kind).code == UpstreamErrorKind::ContextLengthExceeded {
+        return false;
+    }
     let error = if kind == "response.failed" {
         value.pointer("/response/error").unwrap_or(&Value::Null)
     } else {
