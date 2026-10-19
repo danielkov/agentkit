@@ -22,11 +22,15 @@ mod context_recovery {
         requests: StdArc<StdMutex<Vec<TurnRequest>>>,
     }
     struct RecoverySession {
+        cancellations: StdArc<AtomicUsize>,
+        polls: StdArc<AtomicUsize>,
         executions: StdArc<AtomicUsize>,
         site: FailureSite,
         requests: StdArc<StdMutex<Vec<TurnRequest>>>,
     }
     struct RecoveryTurn {
+        cancellations: StdArc<AtomicUsize>,
+        polls: StdArc<AtomicUsize>,
         hold_when_empty: bool,
         events: VecDeque<Result<ModelTurnEvent, LoopError>>,
     }
@@ -58,6 +62,8 @@ mod context_recovery {
         type Session = RecoverySession;
         async fn start_session(&self, _: SessionConfig) -> Result<Self::Session, LoopError> {
             Ok(RecoverySession {
+                cancellations: StdArc::new(AtomicUsize::new(0)),
+                polls: StdArc::new(AtomicUsize::new(0)),
                 executions: self.executions.clone(),
                 site: self.site,
                 requests: self.requests.clone(),
@@ -87,6 +93,8 @@ mod context_recovery {
                     events.push_back(Ok(event));
                 }
                 return Ok(RecoveryTurn {
+                    cancellations: self.cancellations.clone(),
+                    polls: self.polls.clone(),
                     events,
                     hold_when_empty: false,
                 });
@@ -96,6 +104,8 @@ mod context_recovery {
                     std::future::pending::<()>().await;
                 }
                 return Ok(RecoveryTurn {
+                    cancellations: self.cancellations.clone(),
+                    polls: self.polls.clone(),
                     hold_when_empty: matches!(self.site, FailureSite::SlowStream),
                     events: if matches!(self.site, FailureSite::SlowStream) {
                         VecDeque::from([Ok(ModelTurnEvent::Usage(Usage::default()))])
@@ -149,6 +159,8 @@ mod context_recovery {
                 FailureSite::AfterTools => unreachable!(),
             };
             Ok(RecoveryTurn {
+                cancellations: self.cancellations.clone(),
+                polls: self.polls.clone(),
                 events,
                 hold_when_empty: false,
             })
@@ -156,10 +168,14 @@ mod context_recovery {
     }
     #[async_trait]
     impl ModelTurn for RecoveryTurn {
+        fn on_cancelled(&mut self) {
+            self.cancellations.fetch_add(1, Ordering::SeqCst);
+        }
         async fn next_event(
             &mut self,
             _: Option<TurnCancellation>,
         ) -> Result<Option<ModelTurnEvent>, LoopError> {
+            self.polls.fetch_add(1, Ordering::SeqCst);
             if self.hold_when_empty && self.events.is_empty() {
                 std::future::pending::<()>().await;
             }
@@ -171,6 +187,8 @@ mod context_recovery {
     enum Edit {
         Change,
         Noop,
+        Empty,
+        AssistantTail,
         Hang,
         Invalid,
         Fail,
@@ -214,6 +232,8 @@ mod context_recovery {
                 Item::text(ItemKind::System, format!("recovered {attempt}")),
             );
             match self.edit {
+                Edit::Empty => cursor.clear(),
+                Edit::AssistantTail => **cursor = vec![Item::text(ItemKind::Assistant, "summary")],
                 Edit::Hang => std::future::pending::<()>().await,
                 Edit::Fail => return Err(LoopError::Mutator("failed".into())),
                 Edit::Invalid => cursor.push(Item {
@@ -300,7 +320,11 @@ mod context_recovery {
             .unwrap();
         (
             agent
-                .start(SessionConfig::new("recovery").with_cache(PromptCacheRequest::automatic()))
+                .start(
+                    SessionConfig::new("recovery")
+                        .with_cache(PromptCacheRequest::automatic())
+                        .with_response_attempt_supersession(),
+                )
                 .await
                 .unwrap(),
             requests,
@@ -517,5 +541,161 @@ mod context_recovery {
             serde_json::to_string(&MutationPoint::ContextLengthRejected).unwrap(),
             "\"ContextLengthRejected\""
         );
+    }
+    #[tokio::test]
+    async fn recovery_without_pending_input_rolls_back() {
+        for edit in [Edit::Empty, Edit::AssistantTail] {
+            let (mut driver, requests, calls, replacements, _) =
+                driver(FailureSite::Begin, edit, 2, Duration::from_secs(1)).await;
+            assert!(
+                driver
+                    .next()
+                    .await
+                    .unwrap_err()
+                    .is_context_length_exceeded()
+            );
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(driver.transcript, requests[0].transcript);
+            assert!(replacements.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_finalizes_held_provider_turn() {
+        let (mut driver, _, _, _, controller) = driver(
+            FailureSite::SlowStream,
+            Edit::Change,
+            2,
+            Duration::from_secs(5),
+        )
+        .await;
+        let session = driver.session.as_ref().unwrap();
+        let cancellations = session.cancellations.clone();
+        let polls = session.polls.clone();
+        let cancel = async {
+            while polls.load(Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
+            controller.interrupt();
+        };
+        let (result, _) = timeout(Duration::from_secs(2), async {
+            tokio::join!(driver.next(), cancel)
+        })
+        .await
+        .unwrap();
+        assert!(matches!(result, Ok(LoopStep::Finished(_))));
+        assert_eq!(cancellations.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn usage_recovery_requires_supersession_and_invalidates_only_on_commit() {
+        for (allow_supersession, edit, succeeds) in [
+            (false, Edit::Change, false),
+            (true, Edit::Noop, false),
+            (true, Edit::Fail, false),
+            (true, Edit::Change, true),
+        ] {
+            let (mut driver, requests, calls, _, _) =
+                driver(FailureSite::EarlyStream, edit, 2, Duration::from_secs(1)).await;
+            driver.allow_supersession = allow_supersession;
+            let events = StdArc::new(StdMutex::new(Vec::new()));
+            driver.observers.push(StdArc::new(RecordingObserver {
+                events: events.clone(),
+            }));
+            let result = driver.next().await;
+            if succeeds {
+                let LoopStep::Finished(result) = result.unwrap() else {
+                    panic!("expected finished")
+                };
+                assert!(
+                    result.usage.is_none(),
+                    "rejected attempt usage must not leak into result"
+                );
+            } else {
+                assert!(result.is_err());
+            }
+            assert_eq!(requests.lock().unwrap().len(), if succeeds { 2 } else { 1 });
+            if !allow_supersession {
+                assert_eq!(calls.load(Ordering::SeqCst), 0);
+            }
+            let sequence: Vec<_> = events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|event| match event {
+                    AgentEvent::UsageUpdated(_) => Some("usage"),
+                    AgentEvent::ResponseAttemptSuperseded => Some("superseded"),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                sequence,
+                if succeeds {
+                    vec!["usage", "superseded"]
+                } else {
+                    vec!["usage"]
+                }
+            );
+        }
+    }
+
+    #[cfg(not(feature = "otel"))]
+    #[tokio::test]
+    async fn input_capture_tracks_each_dispatched_transcript() {
+        use tracing::instrument::WithSubscriber;
+        use tracing_subscriber::prelude::*;
+        struct InputRecords(StdArc<StdMutex<Vec<String>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for InputRecords {
+            fn on_record(
+                &self,
+                _: &tracing::span::Id,
+                values: &tracing::span::Record<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct Visitor<'a>(&'a StdMutex<Vec<String>>);
+                impl tracing::field::Visit for Visitor<'_> {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        if field.name() == "gen_ai.input.messages" {
+                            self.0.lock().unwrap().push(format!("{value:?}"));
+                        }
+                    }
+                }
+                values.record(&mut Visitor(&self.0));
+            }
+        }
+        let records = StdArc::new(StdMutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(InputRecords(records.clone()));
+        async {
+            let (mut driver, requests, _, _, _) =
+                driver(FailureSite::Begin, Edit::Change, 2, Duration::from_secs(1)).await;
+            driver.telemetry = TelemetryConfig::default()
+                .with_input_messages(MessageCapture::new(10, 10000).unwrap());
+            driver.next().await.unwrap();
+            let records = records.lock().unwrap();
+            let requests = requests.lock().unwrap();
+            assert_eq!(records.len(), requests.len());
+            for (record, request) in records.iter().zip(requests.iter()) {
+                assert_eq!(
+                    *record,
+                    format!(
+                        "{:?}",
+                        capture_messages(
+                            &request.transcript,
+                            driver.telemetry.input_messages.unwrap(),
+                            CaptureOrder::NewestTail
+                        )
+                    )
+                );
+            }
+            assert_ne!(records[0], records[1]);
+        }
+        .with_subscriber(subscriber)
+        .await;
     }
 }

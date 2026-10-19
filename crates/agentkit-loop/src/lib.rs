@@ -1439,6 +1439,7 @@ where
     /// Returns [`LoopError`] if the model adapter fails to create a session.
     pub async fn start(&self, config: SessionConfig) -> Result<LoopDriver<M::Session>, LoopError> {
         let session_id = config.session_id.clone();
+        let allow_supersession = config.consumer_capabilities.response_attempt_supersession;
         let default_cache = config.cache.clone();
         let mut session = self.model.start_session(config).await?;
         if !self.observers.is_empty() {
@@ -1464,6 +1465,7 @@ where
             telemetry: self.telemetry,
             default_cache,
             next_turn_cache: None,
+            allow_supersession,
             session: Some(session),
             tool_executor,
             task_manager: self.task_manager.clone(),
@@ -1744,6 +1746,7 @@ pub struct LoopDriver<S>
 where
     S: ModelSession,
 {
+    allow_supersession: bool,
     session_id: SessionId,
     observed_session_id: Arc<SessionId>,
     provider_name: Option<String>,
@@ -2191,7 +2194,7 @@ where
         if std::time::Instant::now() >= deadline {
             return Err(LoopError::ContextRecoveryDeadlineExceeded);
         }
-        if candidate == self.transcript {
+        if candidate == self.transcript || !transcript_has_pending_input(&candidate) {
             return Ok(false);
         }
         self.transcript = candidate;
@@ -2426,17 +2429,11 @@ where
         let catalog_events = self.tool_executor.drain_catalog_events();
         self.emit_tool_catalog_events(catalog_events);
 
-        let request = TurnRequest {
-            session_id: self.session_id.clone(),
-            turn_id: turn_id.clone(),
-            transcript: self.transcript.clone(),
-            available_tools: self.tool_executor.specs(),
-            cache: self
-                .next_turn_cache
-                .take()
-                .or_else(|| self.default_cache.clone()),
-            metadata: MetadataMap::new(),
-        };
+        let available_tools = self.tool_executor.specs();
+        let cache = self
+            .next_turn_cache
+            .take()
+            .or_else(|| self.default_cache.clone());
 
         let session = self
             .session
@@ -2466,14 +2463,6 @@ where
             "gen_ai.usage.output_tokens" = tracing::field::Empty,
             "gen_ai.usage.cost" = tracing::field::Empty,
         );
-        if let Some(capture) = self.telemetry.input_messages {
-            record_string_array_attribute(
-                &chat_span,
-                "gen_ai.input.messages",
-                capture_messages(&request.transcript, capture, CaptureOrder::NewestTail),
-            );
-        }
-
         // Seed known identity before begin_turn so request setup failures and
         // cancellation remain attributable. Successful per-turn routing below
         // overwrites these values with the effective selection.
@@ -2496,14 +2485,34 @@ where
         use tracing::Instrument;
         let mut recovery = None;
         let (mut result, saw_tool_call, latest_usage) = 'generation: loop {
-            let mut request = request.clone();
-            request.transcript = self.transcript.clone();
+            let request = TurnRequest {
+                session_id: self.session_id.clone(),
+                turn_id: turn_id.clone(),
+                transcript: self.transcript.clone(),
+                available_tools: available_tools.clone(),
+                cache: cache.clone(),
+                metadata: MetadataMap::new(),
+            };
             let mut turn = match recovery_bound(
-                self.session
-                    .as_mut()
-                    .expect("session checked above")
-                    .begin_turn(request, cancellation.clone())
-                    .instrument(chat_span.clone()),
+                async {
+                    if let Some(capture) = self.telemetry.input_messages {
+                        record_string_array_attribute(
+                            &chat_span,
+                            "gen_ai.input.messages",
+                            capture_messages(
+                                &request.transcript,
+                                capture,
+                                CaptureOrder::NewestTail,
+                            ),
+                        );
+                    }
+                    self.session
+                        .as_mut()
+                        .expect("session checked above")
+                        .begin_turn(request, cancellation.clone())
+                        .await
+                }
+                .instrument(chat_span.clone()),
                 recovery,
                 cancellation.clone(),
             )
@@ -2575,6 +2584,7 @@ where
             {
                 Ok(event) => event,
                 Err(LoopError::Cancelled) => {
+                    turn.on_cancelled();
                     self.task_manager
                         .on_turn_interrupted(&turn_id)
                         .await
@@ -2586,14 +2596,19 @@ where
                 }
                 Err(error) => {
                     drop(turn);
-                    if emitted_output {
+                    if emitted_output || (latest_usage.is_some() && !self.allow_supersession) {
                         return Err(error);
                     }
                     match self
                         .recover_context(&error, &turn_id, cancellation.clone(), &mut recovery)
                         .await
                     {
-                        Ok(true) => continue 'generation,
+                        Ok(true) => {
+                            if latest_usage.is_some() {
+                                self.emit(AgentEvent::ResponseAttemptSuperseded);
+                            }
+                            continue 'generation;
+                        }
                         Ok(false) => return Err(error),
                         Err(LoopError::Cancelled) => {
                             self.task_manager
