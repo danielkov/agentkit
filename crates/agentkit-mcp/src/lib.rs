@@ -1648,14 +1648,18 @@ impl McpConnection {
             if !resources.is_empty() {
                 filter.resource_subscriptions = Some(resources.iter().cloned().collect());
             }
-            Some(
-                subscriptions::SubscriptionController::start(
-                    new_peer.clone(),
-                    filter,
-                    candidate_sink.clone(),
+            if subscription_filter_is_empty(&filter) {
+                None
+            } else {
+                Some(
+                    subscriptions::SubscriptionController::start(
+                        new_peer.clone(),
+                        filter,
+                        candidate_sink.clone(),
+                    )
+                    .await?,
                 )
-                .await?,
-            )
+            }
         } else {
             // Legacy subscriptions are session-scoped and must be replayed on
             // the candidate before retiring the authoritative old transport.
@@ -1771,12 +1775,13 @@ impl McpConnection {
             if !resources.is_empty() {
                 filter.resource_subscriptions = Some(resources.iter().cloned().collect());
             }
-            let controller = subscriptions::SubscriptionController::start(
-                self.peer(),
-                filter,
-                self.sink.clone(),
-            )
-            .await?;
+            if subscription_filter_is_empty(&filter) {
+                return Ok(());
+            }
+            let mut sink = self.sink.clone();
+            sink.active = self.inner.lock().await.service().active.clone();
+            let controller =
+                subscriptions::SubscriptionController::start(self.peer(), filter, sink).await?;
             *subscriptions = Some(controller);
         }
         Ok(())
@@ -1813,6 +1818,18 @@ impl McpConnection {
         if let Some(controller) = self.subscriptions.lock().await.as_ref() {
             return controller.subscribe_resource(uri).await;
         }
+        if self.modern() {
+            // Resource-only servers have no catalog stream to extend. Start a
+            // modern stream with the explicit URI, never a legacy subscribe RPC.
+            let mut filter = self.subscription_filter();
+            filter.resource_subscriptions = Some(vec![uri]);
+            let mut sink = self.sink.clone();
+            sink.active = self.inner.lock().await.service().active.clone();
+            let controller =
+                subscriptions::SubscriptionController::start(self.peer(), filter, sink).await?;
+            *self.subscriptions.lock().await = Some(controller);
+            return Ok(());
+        }
         self.peer()
             .subscribe(rmcp_model::SubscribeRequestParams::new(uri.clone()))
             .await
@@ -1835,6 +1852,10 @@ impl McpConnection {
         let _lifecycle = self.lifecycle.lock().await;
         if let Some(controller) = self.subscriptions.lock().await.as_ref() {
             return controller.unsubscribe_resource(uri).await;
+        }
+        if self.modern() {
+            // No modern controller means no resource subscription exists.
+            return Ok(());
         }
         self.peer()
             .unsubscribe(rmcp_model::UnsubscribeRequestParams::new(uri.clone()))
@@ -2185,10 +2206,32 @@ impl McpConnection {
 
 fn filter_for_capabilities(capabilities: &McpServerCapabilities) -> McpSubscriptionFilter {
     let mut filter = McpSubscriptionFilter::default();
-    filter.tools_list_changed = capabilities.tools.as_ref().map(|_| true);
-    filter.resources_list_changed = capabilities.resources.as_ref().map(|_| true);
-    filter.prompts_list_changed = capabilities.prompts.as_ref().map(|_| true);
+    filter.tools_list_changed = capabilities
+        .tools
+        .as_ref()
+        .and_then(|c| c.list_changed)
+        .filter(|enabled| *enabled);
+    filter.resources_list_changed = capabilities
+        .resources
+        .as_ref()
+        .and_then(|c| c.list_changed)
+        .filter(|enabled| *enabled);
+    filter.prompts_list_changed = capabilities
+        .prompts
+        .as_ref()
+        .and_then(|c| c.list_changed)
+        .filter(|enabled| *enabled);
     filter
+}
+
+fn subscription_filter_is_empty(filter: &McpSubscriptionFilter) -> bool {
+    filter.tools_list_changed != Some(true)
+        && filter.resources_list_changed != Some(true)
+        && filter.prompts_list_changed != Some(true)
+        && filter
+            .resource_subscriptions
+            .as_ref()
+            .is_none_or(Vec::is_empty)
 }
 
 fn client_lifecycle() -> ClientLifecycleMode {
