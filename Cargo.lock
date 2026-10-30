@@ -11,8 +11,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 [[package]]
 name = "agent-client-protocol-derive"
 version = "2.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f4893bfb11e0e193aa5a64611a126ee87567acb1879556519c902722899229de"
+source = "git+https://github.com/danielkov/rust-sdk?rev=05d219b5cebc6980fec81ee64f62a4a655a47b84#05d219b5cebc6980fec81ee64f62a4a655a47b84"
 dependencies = [
  "quote",
  "syn 3.0.3",
@@ -71,8 +70,7 @@ dependencies = [
 [[package]]
 name = "agentkit-acp-schema"
 version = "1.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dfcb839ccca8f4f43bfc9aa26473396f16afbd32071efd00d36801daed62f9d7"
+source = "git+https://github.com/danielkov/agent-client-protocol?rev=66d51e46f0835a0d0848e9e2746ef8672c75e343#66d51e46f0835a0d0848e9e2746ef8672c75e343"
 dependencies = [
  "anyhow",
  "derive_more",
@@ -87,8 +85,7 @@ dependencies = [
 [[package]]
 name = "agentkit-acp-sdk"
 version = "2.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6b93c10bb458dd1c2c822275a7e1c390b46846a6bcd3cbc84aafa312563e36ad"
+source = "git+https://github.com/danielkov/rust-sdk?rev=05d219b5cebc6980fec81ee64f62a4a655a47b84#05d219b5cebc6980fec81ee64f62a4a655a47b84"
 dependencies = [
  "agent-client-protocol-derive",
  "agentkit-acp-schema",
@@ -1353,7 +1350,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2301,7 +2298,7 @@ version = "5.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "51e219e79014df21a225b1860a479e2dcd7cbd9130f4defd4bd0e191ea31d67d"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.21.7",
  "chrono",
  "getrandom 0.2.17",
  "http",
@@ -2770,7 +2767,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3140,7 +3137,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3197,7 +3194,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3350,7 +3347,7 @@ checksum = "f83ad47c2f14654528a89495f8d0dbc64173176f8512c7c72386cbe81009f661"
 dependencies = [
  "ahash",
  "annotate-snippets",
- "base64 0.22.1",
+ "base64 0.21.7",
  "encoding_rs_io",
  "getrandom 0.3.4",
  "nohash-hasher",
@@ -4275,7 +4272,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
