@@ -2389,13 +2389,23 @@ mod tests {
             async move |cx| {
                 let cwd = std::env::current_dir()
                     .map_err(agent_client_protocol::Error::into_internal_error)?;
+                cx.send_request(acp::InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
                 let error = cx
                     .send_request(acp::NewSessionRequest::new(cwd))
                     .block_task()
                     .await
                     .err()
                     .expect("session creation should fail");
-                assert!(error.to_string().contains("factory failed"));
+                assert!(
+                    error
+                        .data
+                        .as_ref()
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|message| message.contains("factory failed")),
+                    "unexpected error: {error:?}"
+                );
                 Ok(())
             },
         );

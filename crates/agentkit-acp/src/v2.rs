@@ -37,7 +37,7 @@ fn sdk_v2_error(error: wire::Error) -> agent_client_protocol::Error {
 
 #[cfg(feature = "unstable-inject")]
 fn session_not_found_error(session_id: &wire::SessionId) -> agent_client_protocol::Error {
-    sdk_v2_error(wire::Error::resource_not_found(None)).data(serde_json::json!({
+    sdk_v2_error(wire::Error::resource_not_found()).data(serde_json::json!({
         "sessionId": session_id,
     }))
 }
@@ -3111,7 +3111,7 @@ fn data_ref_to_resource_content(
 }
 
 fn error_stop_reason() -> wire::StopReason {
-    wire::StopReason::Other("_error".into())
+    wire::StopReason::Error(wire::ErrorStopReason::new())
 }
 
 fn finish_reason_to_stop_reason(reason: &FinishReason) -> wire::StopReason {
@@ -4909,7 +4909,7 @@ mod tests {
         for reason in [FinishReason::Blocked, FinishReason::Error] {
             assert_eq!(
                 finish_reason_to_stop_reason(&reason),
-                wire::StopReason::Other("_error".into())
+                wire::StopReason::Error(wire::ErrorStopReason::new())
             );
         }
     }
@@ -4970,7 +4970,7 @@ mod tests {
                     &notification.update,
                     wire::SessionUpdate::StateUpdate(wire::StateUpdate::Idle(idle))
                         if idle.stop_reason.as_ref()
-                            == Some(&wire::StopReason::Other("_error".into()))
+                            == Some(&wire::StopReason::Error(wire::ErrorStopReason::new()))
                 )
         ));
         assert!(messages.try_recv().is_err());

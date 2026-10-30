@@ -4,14 +4,14 @@ homepage.workspace = true
 name = "agentkit"
 readme = "README.md"
 repository.workspace = true
-version = "0.12.0"
+version = "0.13.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
 agentkit-capabilities = { version = "0.10.5", path = "../agentkit-capabilities", optional = true }
-agentkit-acp = { version = "0.11.0", path = "../agentkit-acp", optional = true }
+agentkit-acp = { version = "0.12.0", path = "../agentkit-acp", optional = true }
 agentkit-compaction = { version = "0.11.0", path = "../agentkit-compaction", optional = true }
 agentkit-context = { version = "0.10.5", path = "../agentkit-context", optional = true }
 agentkit-core = { version = "0.10.5", path = "../agentkit-core", optional = true }

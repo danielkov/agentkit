@@ -620,7 +620,8 @@ async fn uncorrelated_overload_stops_on_budget_or_cancellation() {
         cfg.profile = OpenAIResponsesProfile::ChatGptPrivate;
         let resilience = cfg.resilience.as_mut().unwrap();
         resilience.max_retries = usize::MAX;
-        resilience.retry_budget = Duration::from_millis(100);
+        let retry_budget = Duration::from_secs(2);
+        resilience.retry_budget = retry_budget;
         resilience.initial_backoff = Duration::from_secs(1);
         resilience.max_backoff = Duration::from_secs(1);
         let adapter = OpenAIResponsesAdapter::new(cfg).unwrap();
@@ -631,8 +632,14 @@ async fn uncorrelated_overload_stops_on_budget_or_cancellation() {
         let controller = Arc::new(CancellationController::new());
         let interrupt = controller.clone();
         session.set_retry_observer(Some(Arc::new(move |event| {
-            if cancel && matches!(event, ProviderRetryEvent::Scheduled(_)) {
-                interrupt.interrupt();
+            if matches!(event, ProviderRetryEvent::Scheduled(_)) {
+                if cancel {
+                    interrupt.interrupt();
+                } else {
+                    // Exhaust the wall-clock budget only after the overload is
+                    // classified, independent of handshake timing and jitter.
+                    std::thread::sleep(retry_budget);
+                }
             }
         })));
         let cancellation = controller.handle().checkpoint();
