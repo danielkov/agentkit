@@ -37,7 +37,7 @@ fn sdk_v2_error(error: wire::Error) -> agent_client_protocol::Error {
 
 #[cfg(feature = "unstable-inject")]
 fn session_not_found_error(session_id: &wire::SessionId) -> agent_client_protocol::Error {
-    sdk_v2_error(wire::Error::resource_not_found(None)).data(serde_json::json!({
+    sdk_v2_error(wire::Error::resource_not_found()).data(serde_json::json!({
         "sessionId": session_id,
     }))
 }
