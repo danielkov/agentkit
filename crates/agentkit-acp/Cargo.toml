@@ -20,7 +20,7 @@ unstable-inject = [
 ]
 
 [dependencies]
-agent-client-protocol = { package = "agentkit-acp-sdk", version = "=2.2.0" }
+agent-client-protocol = { package = "agentkit-acp-sdk", version = "=2.2.0", git = "https://github.com/danielkov/rust-sdk", rev = "05d219b5cebc6980fec81ee64f62a4a655a47b84" }
 agentkit-core = { version = "0.10.5", path = "../agentkit-core" }
 agentkit-loop = { version = "0.11.0", path = "../agentkit-loop" }
 agentkit-tools-core = { version = "0.10.5", path = "../agentkit-tools-core" }
