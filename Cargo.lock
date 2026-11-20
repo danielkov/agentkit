@@ -10,9 +10,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "agent-client-protocol-derive"
-version = "3.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d2d255cb5d3afa4760084fbcaf87c7d214d316328546cd777d8736a8af6e368"
+version = "5.4.0"
 dependencies = [
  "quote",
  "syn 3.0.3",
@@ -51,7 +49,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-acp"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "agentkit-acp-sdk",
  "agentkit-core",
@@ -70,36 +68,33 @@ dependencies = [
 
 [[package]]
 name = "agentkit-acp-schema"
-version = "1.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "11fceebccf753866b268d7375a9ef4904ea358019fefb16438b0146c8a56d0f6"
+version = "1.19.0"
 dependencies = [
  "anyhow",
  "derive_more",
+ "indexmap 2.14.0",
  "serde",
  "serde_json",
  "serde_with",
  "strum",
+ "uuid",
 ]
 
 [[package]]
 name = "agentkit-acp-sdk"
-version = "3.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34a98bcf96dbdcae3eec8a1a9f44b1c1862f1739f7f6a0e2a23fa515f2af84d3"
+version = "5.4.0"
 dependencies = [
  "agent-client-protocol-derive",
  "agentkit-acp-schema",
+ "anyhow",
  "blocking",
  "futures",
  "futures-concurrency",
- "libc",
  "rustc-hash",
  "serde",
  "serde_json",
  "tracing",
  "uuid",
- "wasm-bindgen",
 ]
 
 [[package]]
@@ -209,7 +204,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-loop"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "agentkit-core",
  "agentkit-task-manager",
@@ -2235,7 +2230,7 @@ version = "5.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "51e219e79014df21a225b1860a479e2dcd7cbd9130f4defd4bd0e191ea31d67d"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.21.7",
  "chrono",
  "getrandom 0.2.17",
  "http",
@@ -3270,7 +3265,7 @@ checksum = "f83ad47c2f14654528a89495f8d0dbc64173176f8512c7c72386cbe81009f661"
 dependencies = [
  "ahash",
  "annotate-snippets",
- "base64 0.22.1",
+ "base64 0.21.7",
  "encoding_rs_io",
  "getrandom 0.3.4",
  "nohash-hasher",
