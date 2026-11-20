@@ -11,6 +11,8 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 [[package]]
 name = "agent-client-protocol-derive"
 version = "5.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a2ff29b1cc0de7ea56df8971f559741872119ddf8d2245bce264a9fb2f577aaf"
 dependencies = [
  "quote",
  "syn 3.0.3",
@@ -69,6 +71,8 @@ dependencies = [
 [[package]]
 name = "agentkit-acp-schema"
 version = "1.19.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a65281699b3b868acddfe880ffd65c2b7e414554413dbb308fe6791cd12d1b23"
 dependencies = [
  "anyhow",
  "derive_more",
@@ -83,6 +87,8 @@ dependencies = [
 [[package]]
 name = "agentkit-acp-sdk"
 version = "5.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7268cd8c58fe3896f7d113c0e20e25ffe0d712e02c65384bad58cae7c7a2415e"
 dependencies = [
  "agent-client-protocol-derive",
  "agentkit-acp-schema",
@@ -2230,7 +2236,7 @@ version = "5.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "51e219e79014df21a225b1860a479e2dcd7cbd9130f4defd4bd0e191ea31d67d"
 dependencies = [
- "base64 0.21.7",
+ "base64 0.22.1",
  "chrono",
  "getrandom 0.2.17",
  "http",
@@ -3265,7 +3271,7 @@ checksum = "f83ad47c2f14654528a89495f8d0dbc64173176f8512c7c72386cbe81009f661"
 dependencies = [
  "ahash",
  "annotate-snippets",
- "base64 0.21.7",
+ "base64 0.22.1",
  "encoding_rs_io",
  "getrandom 0.3.4",
  "nohash-hasher",
