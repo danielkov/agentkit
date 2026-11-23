@@ -1,9 +1,10 @@
 //! Sandboxed Lua execution backend (the default).
 
+use std::collections::HashSet;
 use std::error::Error;
 use std::fmt;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use agentkit_core::TurnCancellation;
 use agentkit_tools_core::{ToolError, ToolInterruption, ToolName, ToolSpec};
@@ -87,10 +88,16 @@ impl ComposeBackend for LuaBackend {
             )
             .map_err(lua_error_to_outcome)?;
 
+        // An interrupt raised by `tool()` must reach the host even when the
+        // script catches it with `pcall`, so it is also recorded here and
+        // checked once the script returns.
+        let interrupted: Arc<Mutex<Option<ToolInterruption>>> = Arc::new(Mutex::new(None));
         let dispatcher = run.dispatcher.clone();
+        let interrupted_slot = interrupted.clone();
         let tool_fn = lua
             .create_async_function(move |lua, (name, lua_input): (String, LuaValue)| {
                 let dispatcher = dispatcher.clone();
+                let interrupted_slot = interrupted_slot.clone();
                 async move {
                     let child_input: Value = lua.from_value(lua_input)?;
                     match dispatcher
@@ -99,6 +106,10 @@ impl ComposeBackend for LuaBackend {
                     {
                         Ok(output) => lua.to_value(&output),
                         Err(DispatchError::Interrupted(interruption)) => {
+                            interrupted_slot
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .get_or_insert_with(|| interruption.clone());
                             Err(mlua::Error::external(ComposeInterrupt(interruption)))
                         }
                         Err(DispatchError::Failed(error)) => {
@@ -119,7 +130,73 @@ impl ComposeBackend for LuaBackend {
             Ok(value) => value,
             Err(error) => return Err(lua_error_to_outcome(error)),
         };
+        if let Some(interruption) = interrupted
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            return Err(ComposeOutcome::Interrupted(interruption));
+        }
+        let result =
+            replace_caught_errors(&lua, result, &mut HashSet::new()).map_err(|outcome| *outcome)?;
         lua.from_value(result).map_err(lua_error_to_outcome)
+    }
+}
+
+/// Replaces error values a script caught with `pcall` and returned (directly
+/// or inside tables) with their message, so the result serializes instead of
+/// failing with "unsupported value type `error`". A caught cancellation or
+/// interrupt is re-raised rather than turned into data.
+fn replace_caught_errors(
+    lua: &Lua,
+    value: LuaValue,
+    seen: &mut HashSet<usize>,
+) -> Result<LuaValue, Box<ComposeOutcome>> {
+    match value {
+        LuaValue::Error(error) => {
+            let message = caught_error_message(*error)?;
+            lua.create_string(message)
+                .map(LuaValue::String)
+                .map_err(|error| Box::new(lua_error_to_outcome(error)))
+        }
+        LuaValue::Table(table) => {
+            // Tables can be shared or cyclic; each is rewritten once, in place.
+            if !seen.insert(table.to_pointer() as usize) {
+                return Ok(LuaValue::Table(table));
+            }
+            let mut replacements = Vec::new();
+            for pair in table.pairs::<LuaValue, LuaValue>() {
+                let (key, entry) = pair.map_err(|error| Box::new(lua_error_to_outcome(error)))?;
+                match entry {
+                    LuaValue::Error(_) => {
+                        replacements.push((key, replace_caught_errors(lua, entry, seen)?));
+                    }
+                    LuaValue::Table(_) => {
+                        replace_caught_errors(lua, entry, seen)?;
+                    }
+                    _ => {}
+                }
+            }
+            for (key, replaced) in replacements {
+                table
+                    .raw_set(key, replaced)
+                    .map_err(|error| Box::new(lua_error_to_outcome(error)))?;
+            }
+            Ok(LuaValue::Table(table))
+        }
+        other => Ok(other),
+    }
+}
+
+fn caught_error_message(error: mlua::Error) -> Result<String, Box<ComposeOutcome>> {
+    match lua_error_to_outcome(error) {
+        ComposeOutcome::Failed(ToolError::Cancelled) => {
+            Err(Box::new(ComposeOutcome::Failed(ToolError::Cancelled)))
+        }
+        ComposeOutcome::Interrupted(interruption) => {
+            Err(Box::new(ComposeOutcome::Interrupted(interruption)))
+        }
+        ComposeOutcome::Failed(error) => Ok(error.to_string()),
     }
 }
 

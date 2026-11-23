@@ -660,3 +660,150 @@ fn type_notation_renders_json_schema_compactly() {
 
 #[cfg(feature = "runlet")]
 mod runlet;
+
+#[derive(Clone)]
+struct FailingTool {
+    spec: ToolSpec,
+}
+
+impl FailingTool {
+    fn new() -> Self {
+        Self {
+            spec: ToolSpec::new("fail", "always fails", json!({"type": "object"})),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for FailingTool {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    async fn invoke(
+        &self,
+        _request: ToolRequest,
+        _ctx: &mut ToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
+        Err(ToolError::ExecutionFailed("permission denied".into()))
+    }
+}
+
+#[tokio::test]
+async fn pcall_caught_error_is_returned_as_its_message() {
+    let outcome = execute_compose(
+        ComposeConfig::default(),
+        FailingTool::new(),
+        request(
+            "local ok, err = pcall(tool, 'fail', {}); return { ok = ok, err = err }",
+            Value::Null,
+        ),
+    )
+    .await;
+
+    match outcome {
+        ToolExecutionOutcome::Completed(result) => {
+            let ToolOutput::Structured(value) = result.result.output else {
+                panic!("expected structured output");
+            };
+            assert_eq!(value["ok"], json!(false));
+            let err = value["err"].as_str().expect("err is a string");
+            assert!(err.contains("permission denied"), "unexpected err: {err}");
+        }
+        other => panic!("unexpected outcome: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn pcall_caught_error_returned_directly_and_nested() {
+    let outcome = execute_compose(
+        ComposeConfig::default(),
+        FailingTool::new(),
+        request(
+            "local out = {} \
+             for _, name in ipairs({ 'a', 'b' }) do \
+               local ok, res = pcall(tool, 'fail', {}) \
+               out[name] = ok and res or { error = res } \
+             end \
+             return out",
+            Value::Null,
+        ),
+    )
+    .await;
+
+    match outcome {
+        ToolExecutionOutcome::Completed(result) => {
+            let ToolOutput::Structured(value) = result.result.output else {
+                panic!("expected structured output");
+            };
+            for name in ["a", "b"] {
+                let err = value[name]["error"]
+                    .as_str()
+                    .expect("nested error is a string");
+                assert!(err.contains("permission denied"), "unexpected err: {err}");
+            }
+        }
+        other => panic!("unexpected outcome: {other:?}"),
+    }
+
+    let outcome = execute_compose(
+        ComposeConfig::default(),
+        FailingTool::new(),
+        request(
+            "local _, err = pcall(tool, 'fail', {}); return err",
+            Value::Null,
+        ),
+    )
+    .await;
+    match outcome {
+        ToolExecutionOutcome::Completed(result) => {
+            let ToolOutput::Structured(value) = result.result.output else {
+                panic!("expected structured output");
+            };
+            assert!(
+                value
+                    .as_str()
+                    .is_some_and(|s| s.contains("permission denied"))
+            );
+        }
+        other => panic!("unexpected outcome: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn uncaught_child_failure_still_fails_compose() {
+    let outcome = execute_compose(
+        ComposeConfig::default(),
+        FailingTool::new(),
+        request("return tool('fail', {})", Value::Null),
+    )
+    .await;
+
+    match outcome {
+        ToolExecutionOutcome::Failed(ToolError::ExecutionFailed(message)) => {
+            assert!(message.contains("permission denied"));
+        }
+        other => panic!("unexpected outcome: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn pcall_does_not_swallow_approval_interrupt() {
+    let compose = ComposeTool::new(ComposeConfig::default());
+    let gated = ApprovalEchoTool::new();
+    let executor: Arc<dyn ToolExecutor> = Arc::new(BasicToolExecutor::from_registry(
+        ToolRegistry::new().with(compose).with(gated),
+    ));
+    let permissions: Arc<dyn PermissionChecker> = Arc::new(RequireApproval);
+    let req = request(
+        "local ok = pcall(tool, 'approval_echo', { value = 1 }); return { ok = ok }",
+        Value::Null,
+    );
+
+    let owned = owned_context(executor.clone(), permissions);
+    let mut ctx = owned.borrowed();
+    match executor.execute(req, &mut ctx).await {
+        ToolExecutionOutcome::Interrupted(ToolInterruption::ApprovalRequired(_)) => {}
+        other => panic!("approval must reach the host, got: {other:?}"),
+    }
+}
