@@ -12,9 +12,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use agentkit_mcp::{
-    ClientJsonRpcMessage, McpCallToolRequest, McpConnection, McpHandlerConfig, McpHttpClient,
-    McpServerConfig, McpSseStream, McpStreamableHttpError, McpStreamableHttpPostResponse,
-    McpTransportBinding, StreamableHttpTransportConfig,
+    ClientJsonRpcMessage, McpCallToolRequestParams, McpConnection, McpExtensions, McpHttpClient,
+    McpRequestDecorator, McpServerConfig, McpServerId, McpServerManager, McpSseStream,
+    McpStreamableHttpError, McpStreamableHttpPostResponse, McpTransportBinding,
+    StreamableHttpTransportConfig,
 };
 use async_trait::async_trait;
 use axum::Router;
@@ -181,50 +182,35 @@ impl McpHttpClient for MarkerHeaderClient {
     }
 }
 
-#[tokio::test]
-async fn decorated_extensions_reach_the_transport_per_call() {
-    // A registry subscriber so span metadata is available to the decorator.
-    let _subscriber = tracing::subscriber::set_default(tracing_subscriber::registry());
-
-    let mock = MockState::default();
-    let addr = spawn_mock(mock.clone()).await;
-
-    let counter = Arc::new(AtomicU64::new(0));
-    let decorator_counter = counter.clone();
-    let decorator = move |request: &mut McpCallToolRequest| {
-        let span = tracing::Span::current()
-            .metadata()
-            .map(|metadata| metadata.name())
-            .unwrap_or("none");
-        let n = decorator_counter.fetch_add(1, Ordering::SeqCst);
-        request
-            .extensions
-            .insert(CallMarker(format!("{span}:{}:{n}", request.params.name)));
-    };
-
-    let connection = McpConnection::connect_with_handler(
-        &McpServerConfig::new(
-            "decorated",
-            McpTransportBinding::StreamableHttp(
-                StreamableHttpTransportConfig::new(format!("http://{addr}/mcp")).with_http_client(
-                    Arc::new(MarkerHeaderClient {
-                        inner: reqwest::Client::new(),
-                    }),
-                ),
+fn server_config(addr: SocketAddr) -> McpServerConfig {
+    McpServerConfig::new(
+        "decorated",
+        McpTransportBinding::StreamableHttp(
+            StreamableHttpTransportConfig::new(format!("http://{addr}/mcp")).with_http_client(
+                Arc::new(MarkerHeaderClient {
+                    inner: reqwest::Client::new(),
+                }),
             ),
         ),
-        McpHandlerConfig::new().with_request_decorator(Arc::new(decorator)),
     )
-    .await
-    .expect("connect succeeds");
+}
 
-    for _ in 0..3 {
-        connection
-            .call_tool("ping", json!({}))
-            .await
-            .expect("tool call succeeds");
-    }
+/// Records the current span name, the tool name and a per-call counter.
+fn marker_decorator() -> Arc<dyn McpRequestDecorator> {
+    let counter = Arc::new(AtomicU64::new(0));
+    Arc::new(
+        move |params: &McpCallToolRequestParams, extensions: &mut McpExtensions| {
+            let span = tracing::Span::current()
+                .metadata()
+                .map(|metadata| metadata.name())
+                .unwrap_or("none");
+            let n = counter.fetch_add(1, Ordering::SeqCst);
+            extensions.insert(CallMarker(format!("{span}:{}:{n}", params.name)));
+        },
+    )
+}
 
+async fn assert_markers(mock: &MockState) {
     let seen = mock.seen.lock().await.clone();
     let markers: Vec<Option<String>> = seen
         .iter()
@@ -247,4 +233,49 @@ async fn decorated_extensions_reach_the_transport_per_call() {
             .all(|(_, marker)| marker.is_none()),
         "unexpected marker on a non-call request: {seen:?}"
     );
+}
+
+#[tokio::test]
+async fn decorated_extensions_reach_the_transport_per_call() {
+    // A registry subscriber so span metadata is available to the decorator.
+    let _subscriber = tracing::subscriber::set_default(tracing_subscriber::registry());
+    let mock = MockState::default();
+    let addr = spawn_mock(mock.clone()).await;
+
+    let connection = McpConnection::connect(&server_config(addr))
+        .await
+        .expect("connect succeeds")
+        .with_request_decorator(marker_decorator());
+    for _ in 0..3 {
+        connection
+            .call_tool("ping", json!({}))
+            .await
+            .expect("tool call succeeds");
+    }
+
+    assert_markers(&mock).await;
+}
+
+#[tokio::test]
+async fn manager_installs_the_decorator_on_its_connections() {
+    let _subscriber = tracing::subscriber::set_default(tracing_subscriber::registry());
+    let mock = MockState::default();
+    let addr = spawn_mock(mock.clone()).await;
+
+    let mut manager = McpServerManager::new()
+        .with_request_decorator(marker_decorator())
+        .with_server(server_config(addr));
+    let handle = manager
+        .connect_server(&McpServerId::new("decorated"))
+        .await
+        .expect("connect succeeds");
+    for _ in 0..3 {
+        handle
+            .connection()
+            .call_tool("ping", json!({}))
+            .await
+            .expect("tool call succeeds");
+    }
+
+    assert_markers(&mock).await;
 }
