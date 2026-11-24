@@ -917,33 +917,92 @@ async fn caught_instruction_budget_stop_still_fails_compose() {
     }
 }
 
-#[tokio::test]
-async fn approval_reaches_host_without_waiting_for_the_script() {
-    let compose = ComposeTool::new(ComposeConfig::default().with_max_instruction_count(0));
-    let executor: Arc<dyn ToolExecutor> = Arc::new(BasicToolExecutor::from_registry(
-        ToolRegistry::new()
-            .with(compose)
-            .with(ApprovalEchoTool::new()),
-    ));
-    let permissions: Arc<dyn PermissionChecker> = Arc::new(RequireApproval);
-    // With no instruction budget, this script never ends once it resumes.
-    let req = request(
-        "pcall(tool, 'approval_echo', { value = 1 }); while true do end",
-        Value::Null,
-    );
+#[test]
+fn approval_reaches_host_without_waiting_for_the_script() {
+    // With no instruction budget, this script never yields again once it
+    // resumes, so a regression would block the runtime thread forever. Run it
+    // on its own thread so the deadline below still fails the test.
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let outcome = runtime.block_on(async {
+            let compose = ComposeTool::new(ComposeConfig::default().with_max_instruction_count(0));
+            let executor: Arc<dyn ToolExecutor> = Arc::new(BasicToolExecutor::from_registry(
+                ToolRegistry::new()
+                    .with(compose)
+                    .with(ApprovalEchoTool::new()),
+            ));
+            let permissions: Arc<dyn PermissionChecker> = Arc::new(RequireApproval);
+            let req = request(
+                "pcall(tool, 'approval_echo', { value = 1 }); while true do end",
+                Value::Null,
+            );
+            let owned = owned_context(executor.clone(), permissions);
+            let mut ctx = owned.borrowed();
+            executor.execute(req, &mut ctx).await
+        });
+        let _ = sender.send(outcome);
+    });
 
-    let owned = owned_context(executor.clone(), permissions);
-    let mut ctx = owned.borrowed();
-    let outcome = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        executor.execute(req, &mut ctx),
-    )
-    .await
-    .expect("approval must not wait for the script to finish");
+    let outcome = receiver
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("approval must not wait for the script to finish");
     assert!(matches!(
         outcome,
         ToolExecutionOutcome::Interrupted(ToolInterruption::ApprovalRequired(_))
     ));
+}
+
+#[derive(Clone)]
+struct CancelledTool {
+    spec: ToolSpec,
+}
+
+#[async_trait]
+impl Tool for CancelledTool {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    async fn invoke(
+        &self,
+        _request: ToolRequest,
+        _ctx: &mut ToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
+        Err(ToolError::Cancelled)
+    }
+}
+
+#[tokio::test]
+async fn child_cancellation_ends_the_attempt() {
+    let compose = ComposeTool::new(ComposeConfig::default());
+    let echo = EchoTool::new();
+    let echo_calls = echo.calls.clone();
+    let executor: Arc<dyn ToolExecutor> = Arc::new(BasicToolExecutor::from_registry(
+        ToolRegistry::new()
+            .with(compose)
+            .with(CancelledTool {
+                spec: ToolSpec::new("cancelled", "always cancelled", json!({"type": "object"})),
+            })
+            .with(echo),
+    ));
+    let owned = owned_context(executor.clone(), Arc::new(AllowAllPermissions));
+    let mut ctx = owned.borrowed();
+    let req = request(
+        "local _, err = pcall(tool, 'cancelled', {}) \
+         return { err = err, value = tool('echo', { value = 2 }) }",
+        Value::Null,
+    );
+
+    let outcome = executor.execute(req, &mut ctx).await;
+    assert!(
+        matches!(outcome, ToolExecutionOutcome::Failed(ToolError::Cancelled)),
+        "unexpected outcome: {outcome:?}"
+    );
+    assert_eq!(echo_calls.load(Ordering::SeqCst), 0);
 }
 
 /// Requires approval for every call, but first cancels the turn, as if the
@@ -986,4 +1045,39 @@ async fn cancellation_wins_over_a_recorded_approval() {
         "unexpected outcome: {outcome:?}"
     );
     assert!(states.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn approval_raised_in_a_coroutine_survives_the_script_finishing() {
+    let compose = ComposeTool::new(ComposeConfig::default());
+    let echo = EchoTool::new();
+    let echo_calls = echo.calls.clone();
+    let executor: Arc<dyn ToolExecutor> = Arc::new(BasicToolExecutor::from_registry(
+        ToolRegistry::new()
+            .with(compose)
+            .with(echo)
+            .with(ApprovalEchoTool::new()),
+    ));
+    let permissions: Arc<dyn PermissionChecker> = Arc::new(RequireApproval);
+    // The coroutine parks at the gated call, but the root script keeps going:
+    // it tries another child and then finishes.
+    let req = request(
+        "local co = coroutine.wrap(function() return tool('approval_echo', { value = 1 }) end) \
+         pcall(co) \
+         pcall(tool, 'echo', { value = 2 }) \
+         return 'done'",
+        Value::Null,
+    );
+
+    let owned = owned_context(executor.clone(), permissions);
+    let mut ctx = owned.borrowed();
+    let outcome = executor.execute(req, &mut ctx).await;
+    assert!(
+        matches!(
+            outcome,
+            ToolExecutionOutcome::Interrupted(ToolInterruption::ApprovalRequired(_))
+        ),
+        "unexpected outcome: {outcome:?}"
+    );
+    assert_eq!(echo_calls.load(Ordering::SeqCst), 0);
 }

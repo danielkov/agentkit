@@ -90,33 +90,42 @@ impl ComposeBackend for LuaBackend {
             )
             .map_err(lua_error_to_outcome)?;
 
-        // An approval interrupt ends the Lua attempt at the `tool()` call that
-        // raised it: the call records it here and never resumes the script, so
-        // `pcall` cannot catch it and no later script code or child call runs
-        // before the host answers it.
-        let interrupted: Arc<OnceLock<ToolInterruption>> = Arc::new(OnceLock::new());
+        // An approval interrupt or a child's own cancellation ends the Lua
+        // attempt at the `tool()` call that hit it: the call records it here and
+        // never resumes the script, so `pcall` cannot catch it. The latch also
+        // refuses any later dispatch (from a coroutine or during teardown)
+        // before it reaches the dispatcher, so no child side effect runs while
+        // an approval is pending.
+        let stopped: Arc<OnceLock<AttemptStop>> = Arc::new(OnceLock::new());
         let dispatcher = run.dispatcher.clone();
-        let interrupted_slot = interrupted.clone();
+        let stopped_slot = stopped.clone();
         let tool_fn = lua
             .create_async_function(move |lua, (name, lua_input): (String, LuaValue)| {
                 let dispatcher = dispatcher.clone();
-                let interrupted_slot = interrupted_slot.clone();
+                let stopped_slot = stopped_slot.clone();
                 async move {
+                    if stopped_slot.get().is_some() {
+                        return Err(mlua::Error::external(ComposeStop(ToolError::Internal(
+                            "compose attempt already stopped".into(),
+                        ))));
+                    }
                     let child_input: Value = lua.from_value(lua_input)?;
-                    match dispatcher
+                    let stop = match dispatcher
                         .call(CallKey::Sequential, ToolName::new(name), child_input)
                         .await
                     {
-                        Ok(output) => lua.to_value(&output),
+                        Ok(output) => return lua.to_value(&output),
                         Err(DispatchError::Interrupted(interruption)) => {
-                            let _ = interrupted_slot.set(interruption);
-                            std::future::pending::<()>().await;
-                            unreachable!("a pending future never resolves")
+                            AttemptStop::Interrupted(interruption)
                         }
+                        Err(DispatchError::Failed(ToolError::Cancelled)) => AttemptStop::Cancelled,
                         Err(DispatchError::Failed(error)) => {
-                            Err(mlua::Error::external(ComposeFailure(error)))
+                            return Err(mlua::Error::external(ComposeFailure(error)));
                         }
-                    }
+                    };
+                    let _ = stopped_slot.set(stop);
+                    std::future::pending::<()>().await;
+                    unreachable!("a pending future never resolves")
                 }
             })
             .map_err(lua_error_to_outcome)?;
@@ -127,11 +136,14 @@ impl ComposeBackend for LuaBackend {
                 .set_name("compose")
                 .eval_async::<LuaValue>()
         );
-        // Stop polling the script as soon as a child call records an approval.
-        let evaluated = std::future::poll_fn(|cx| match evaluation.as_mut().poll(cx) {
-            Poll::Ready(result) => Poll::Ready(Some(result)),
-            Poll::Pending if interrupted.get().is_some() => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
+        // A recorded stop wins over whatever the poll returned, including a
+        // finished script.
+        let evaluated = std::future::poll_fn(|cx| {
+            let polled = evaluation.as_mut().poll(cx);
+            if stopped.get().is_some() {
+                return Poll::Ready(None);
+            }
+            polled.map(Some)
         })
         .await;
         let Some(evaluated) = evaluated else {
@@ -139,12 +151,15 @@ impl ComposeBackend for LuaBackend {
             if run.dispatcher.is_cancelled() {
                 return Err(ComposeOutcome::Failed(ToolError::Cancelled));
             }
-            let interruption = interrupted.get().cloned().ok_or_else(|| {
-                ComposeOutcome::Failed(ToolError::Internal(
-                    "compose approval interrupt was not recorded".into(),
-                ))
-            })?;
-            return Err(ComposeOutcome::Interrupted(interruption));
+            return Err(match stopped.get().cloned() {
+                Some(AttemptStop::Interrupted(interruption)) => {
+                    ComposeOutcome::Interrupted(interruption)
+                }
+                Some(AttemptStop::Cancelled) => ComposeOutcome::Failed(ToolError::Cancelled),
+                None => ComposeOutcome::Failed(ToolError::Internal(
+                    "compose attempt stop was not recorded".into(),
+                )),
+            });
         };
         let result = evaluated.map_err(lua_error_to_outcome)?;
         match lua.from_value(result.clone()) {
@@ -252,6 +267,13 @@ fn compose_error(error: &mlua::Error) -> Option<ComposeError<'_>> {
         }
         _ => None,
     }
+}
+
+/// Why a Lua attempt ended at a `tool()` call.
+#[derive(Clone, Debug)]
+enum AttemptStop {
+    Interrupted(ToolInterruption),
+    Cancelled,
 }
 
 /// A child tool call failed. A script may catch and return it as data.
