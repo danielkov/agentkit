@@ -164,7 +164,7 @@ async fn rpc(
         }
         "skills/get" if token == "Bearer skills" => {
             assert_eq!(message["params"]["uri"], "skill://unlisted/SKILL.md");
-            json!({"resultType":"complete","ttlMs":0,"cacheScope":"private","skill":skill("unlisted")})
+            json!({"resultType":"complete","skill":skill("unlisted")})
         }
         "server/discover" => {
             if token.starts_with("Bearer legacy") {

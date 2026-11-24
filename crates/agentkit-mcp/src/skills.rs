@@ -57,11 +57,6 @@ pub enum McpSkillDynamic {
 #[serde(rename_all = "camelCase")]
 struct Complete<T> {
     result_type: CompleteResultType,
-    // Require and decode the cache contract even though this adapter does not cache.
-    #[serde(rename = "ttlMs")]
-    _ttl_ms: i64,
-    #[serde(rename = "cacheScope")]
-    _cache_scope: CacheScope,
     #[serde(flatten)]
     payload: T,
 }
@@ -75,6 +70,11 @@ enum CompleteResultType {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ListPage {
+    // Require and decode the cache contract even though this adapter does not cache.
+    #[serde(rename = "ttlMs")]
+    _ttl_ms: i64,
+    #[serde(rename = "cacheScope")]
+    _cache_scope: CacheScope,
     skills: Vec<McpSkill>,
     next_cursor: Option<String>,
 }
