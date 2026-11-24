@@ -54,9 +54,7 @@ use rmcp::transport::streamable_http_client::{
     StreamableHttpClientTransportConfig as RmcpStreamableHttpClientTransportConfig,
     StreamableHttpError, StreamableHttpPostResponse,
 };
-use rmcp::transport::{
-    ConfigureCommandExt, DynamicTransportError, StreamableHttpClientTransport, TokioChildProcess,
-};
+use rmcp::transport::{DynamicTransportError, StreamableHttpClientTransport};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sse_stream::{Error as SseError, Sse};
@@ -67,6 +65,7 @@ mod skills;
 pub use skills::{
     MCP_SKILLS_EXTENSION_ID, McpSkill, McpSkillFile, McpSkillFrontmatter, McpSkillResources,
 };
+mod stdio;
 mod subscriptions;
 pub use subscriptions::McpSubscriptionStatus;
 
@@ -493,6 +492,10 @@ pub struct StdioTransportConfig {
     pub env: Vec<(String, String)>,
     /// Optional working directory for the child process.
     pub cwd: Option<std::path::PathBuf>,
+    /// Maximum bytes in an incoming JSON-RPC line, including the newline (default: 16 MiB).
+    ///
+    /// An oversized line closes the connection and fails pending requests.
+    pub max_line_length: usize,
 }
 
 impl StdioTransportConfig {
@@ -503,7 +506,16 @@ impl StdioTransportConfig {
             args: Vec::new(),
             env: Vec::new(),
             cwd: None,
+            max_line_length: rmcp::transport::async_rw::DEFAULT_MAX_LINE_LENGTH,
         }
+    }
+
+    /// Sets a finite maximum byte length for incoming lines, including the newline.
+    ///
+    /// Zero and `usize::MAX` are rejected when connecting.
+    pub fn with_max_line_length(mut self, max_line_length: usize) -> Self {
+        self.max_line_length = max_line_length;
+        self
     }
 
     /// Appends a command-line argument. Returns `self` for chaining.
@@ -2322,18 +2334,7 @@ async fn connect_rmcp_stdio(
     binding: &StdioTransportConfig,
     handler: McpClientHandler,
 ) -> Result<(RmcpClientService, McpServerCapabilities), McpError> {
-    let transport = TokioChildProcess::new(
-        tokio::process::Command::new(&binding.command).configure(|command| {
-            command.args(&binding.args);
-            if let Some(cwd) = &binding.cwd {
-                command.current_dir(cwd);
-            }
-            for (key, value) in &binding.env {
-                command.env(key, value);
-            }
-        }),
-    )
-    .map_err(McpError::Io)?;
+    let transport = stdio::StdioTransport::spawn(binding).map_err(McpError::Io)?;
 
     let service = handler
         .serve_with_lifecycle(transport, client_lifecycle())

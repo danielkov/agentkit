@@ -16,7 +16,7 @@ agentkit-compaction = { version = "0.11.0", path = "../agentkit-compaction", opt
 agentkit-context = { version = "0.10.5", path = "../agentkit-context", optional = true }
 agentkit-core = { version = "0.10.5", path = "../agentkit-core", optional = true }
 agentkit-loop = { version = "0.11.0", path = "../agentkit-loop", optional = true }
-agentkit-mcp = { version = "0.11.3", path = "../agentkit-mcp", optional = true }
+agentkit-mcp = { version = "0.12.0", path = "../agentkit-mcp", optional = true }
 agentkit-plugins = { version = "0.10.6", path = "../agentkit-plugins", optional = true }
 agentkit-adapter-completions = { version = "0.11.0", path = "../agentkit-adapter-completions", optional = true }
 agentkit-provider-anthropic = { version = "0.11.0", path = "../agentkit-provider-anthropic", optional = true }

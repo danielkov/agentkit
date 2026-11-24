@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use rmcp::model::{GetSkillRequestParams, PaginatedRequestParams};
+use rmcp::model::{GetSkillRequestParams, PaginatedRequestParams, ResultType};
 use rmcp::service::{Peer, RoleClient, ServiceError};
 use serde_json::{Value, json};
 
@@ -38,6 +38,7 @@ impl McpConnection {
                             .map_or_else(|| json!({}), |cursor| json!({"cursor":cursor}))
                     })
                 })?;
+            require_complete("skills/list", page.result_type.as_ref())?;
             skills.extend(page.skills);
             let Some(next) = page.next_cursor else {
                 return Ok(skills);
@@ -62,6 +63,7 @@ impl McpConnection {
             .map_err(|error| {
                 skill_error(self.server_id(), "skills/get", error, || json!({"uri":uri}))
             })?;
+        require_complete("skills/get", result.result_type.as_ref())?;
         if result.skill.uri != uri {
             return Err(McpError::Protocol(
                 "skills/get returned a different URI".into(),
@@ -69,6 +71,15 @@ impl McpConnection {
         }
         Ok(result.skill)
     }
+}
+
+fn require_complete(method: &str, result_type: Option<&ResultType>) -> Result<(), McpError> {
+    if let Some(result_type) = result_type.filter(|kind| !kind.is_complete()) {
+        return Err(McpError::Protocol(format!(
+            "{method} returned unsupported resultType {result_type}"
+        )));
+    }
+    Ok(())
 }
 
 fn supports_skills(peer: &Peer<RoleClient>) -> bool {

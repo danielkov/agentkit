@@ -147,6 +147,13 @@ async fn rpc(
             .into_response();
     }
     let result = match method {
+        "skills/list" if token == "Bearer skills-incomplete" => {
+            assert!(message["params"]["cursor"].is_null());
+            json!({"resultType":"unsupported","skills":[skill("first")],"nextCursor":"must-not-follow"})
+        }
+        "skills/get" if token == "Bearer skills-incomplete" => {
+            json!({"resultType":"unsupported","skill":skill("unlisted")})
+        }
         "skills/list" if token == "Bearer skills" => {
             assert_eq!(
                 message["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"],
@@ -195,7 +202,7 @@ async fn rpc(
                 capabilities.build()
             };
             let capabilities = match token {
-                "Bearer skills" | "Bearer skills-limited" => json!({
+                "Bearer skills" | "Bearer skills-limited" | "Bearer skills-incomplete" => json!({
                     "resources":{}, "completions":{},
                     "experimental":{"example":{"flag":true}},
                     "extensions":{"io.modelcontextprotocol/skills":{"directoryRead":true}}
@@ -438,6 +445,19 @@ async fn skills_are_available_on_an_initialize_based_connection() {
         assert_eq!(connection.get_skill(uri).await.unwrap().uri, uri);
     })
     .await;
+}
+
+#[tokio::test]
+async fn skill_requests_reject_explicit_non_complete_results() {
+    bounded(async {
+        let fixture = Fixture::start().await;
+        let connection = McpConnection::connect(&fixture.config).await.unwrap();
+        connection.resolve_auth(auth("skills-incomplete")).await.unwrap();
+        let uri = "skill://unlisted/SKILL.md";
+        for error in [connection.list_skills().await.unwrap_err(), connection.get_skill(uri).await.unwrap_err()] {
+            assert!(matches!(error, McpError::Protocol(message) if message.contains("unsupported resultType")));
+        }
+    }).await;
 }
 
 #[tokio::test]
