@@ -228,7 +228,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-mcp"
-version = "0.11.3"
+version = "0.11.4"
 dependencies = [
  "agentkit-capabilities",
  "agentkit-core",
