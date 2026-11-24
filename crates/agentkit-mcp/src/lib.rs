@@ -106,6 +106,10 @@ pub use rmcp::model::{
 /// [`McpHttpClient::post_message`].
 pub use rmcp::model::ClientJsonRpcMessage;
 
+/// Re-export of the typed `tools/call` request handed to
+/// [`McpRequestDecorator::decorate_call_tool`].
+pub use rmcp::model::CallToolRequest as McpCallToolRequest;
+
 /// Re-exports of the rmcp Streamable HTTP transport types used by
 /// [`McpHttpClient`] implementations.
 pub use rmcp::transport::streamable_http_client::{
@@ -1278,6 +1282,34 @@ pub struct McpHandlerConfig {
     /// Broadcast capacity for the [`McpServerEvent`] channel. Defaults to
     /// `DEFAULT_EVENTS_CAPACITY` when `None`.
     pub events_capacity: Option<usize>,
+    /// Decorates each outgoing `tools/call` request before it is sent. See
+    /// [`McpRequestDecorator`].
+    pub request_decorator: Option<Arc<dyn McpRequestDecorator>>,
+}
+
+/// Decorates outgoing MCP requests before they are sent.
+///
+/// [`McpConnection::call_tool`] builds each `tools/call` request and passes it
+/// here inside its `mcp.call_tool` tracing span, so
+/// [`tracing::Span::current`] is the span for that wire call. Each call gets
+/// its own request, and a retry or replay builds a new one.
+///
+/// Anything put in the request's `extensions` stays in memory and travels
+/// with the message to the transport: a custom [`McpHttpClient`] can read it
+/// in [`McpHttpClient::post_message`], for example to copy W3C trace context
+/// into HTTP headers, without agentkit depending on a tracing exporter.
+pub trait McpRequestDecorator: Send + Sync {
+    /// Called once per outgoing `tools/call` request.
+    fn decorate_call_tool(&self, request: &mut McpCallToolRequest);
+}
+
+impl<F> McpRequestDecorator for F
+where
+    F: Fn(&mut McpCallToolRequest) + Send + Sync,
+{
+    fn decorate_call_tool(&self, request: &mut McpCallToolRequest) {
+        self(request);
+    }
 }
 
 impl McpHandlerConfig {
@@ -1322,6 +1354,12 @@ impl McpHandlerConfig {
     /// Sets the broadcast capacity for [`McpServerEvent`] subscribers.
     pub fn with_events_capacity(mut self, capacity: usize) -> Self {
         self.events_capacity = Some(capacity);
+        self
+    }
+
+    /// Sets the decorator applied to each outgoing `tools/call` request.
+    pub fn with_request_decorator(mut self, decorator: Arc<dyn McpRequestDecorator>) -> Self {
+        self.request_decorator = Some(decorator);
         self
     }
 
@@ -2110,9 +2148,11 @@ impl McpConnection {
         );
         use tracing::Instrument;
         let result = async {
-            let request = rmcp_model::ClientRequest::CallToolRequest(
-                rmcp_model::CallToolRequest::new(params),
-            );
+            let mut call = rmcp_model::CallToolRequest::new(params);
+            if let Some(decorator) = &self.handler_config.request_decorator {
+                decorator.decorate_call_tool(&mut call);
+            }
+            let request = rmcp_model::ClientRequest::CallToolRequest(call);
             let handle = self
                 .peer()
                 .send_request_with_option(request, options)
