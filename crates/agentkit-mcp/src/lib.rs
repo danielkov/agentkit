@@ -106,6 +106,12 @@ pub use rmcp::model::{
 /// [`McpHttpClient::post_message`].
 pub use rmcp::model::ClientJsonRpcMessage;
 
+/// Re-exports of the types handed to
+/// [`McpRequestDecorator::decorate_call_tool`].
+pub use rmcp::model::{
+    CallToolRequestParams as McpCallToolRequestParams, Extensions as McpExtensions,
+};
+
 /// Re-exports of the rmcp Streamable HTTP transport types used by
 /// [`McpHttpClient`] implementations.
 pub use rmcp::transport::streamable_http_client::{
@@ -1280,6 +1286,44 @@ pub struct McpHandlerConfig {
     pub events_capacity: Option<usize>,
 }
 
+/// Attaches transport-local data to outgoing `tools/call` requests.
+///
+/// Install one with [`McpConnection::with_request_decorator`] or
+/// [`McpServerManager::with_request_decorator`].
+/// [`McpConnection::call_tool`] builds each request and calls the decorator
+/// once, just before sending it, with the call's parameters (read-only, so the
+/// call the server receives is the one reported to auth responders and
+/// traces) and its extensions. Each call gets its own extensions, and a retry
+/// or replay builds a new request.
+///
+/// The decorator runs inside the INFO-level `mcp.call_tool` span. When a
+/// subscriber filters that span out, [`tracing::Span::current`] is whatever
+/// enclosing span is enabled, or none, so a decorator that propagates trace
+/// context must not assume it is looking at the wire-call span.
+///
+/// Extensions stay in memory and travel with the message to the transport: a
+/// custom [`McpHttpClient`] can read them in [`McpHttpClient::post_message`],
+/// for example to copy W3C trace context into HTTP headers. The exception is
+/// rmcp's own `RequestMetaObject`, which rmcp serializes into `params._meta`;
+/// store transport-only data under a type of your own.
+pub trait McpRequestDecorator: Send + Sync {
+    /// Called once per outgoing `tools/call` request.
+    fn decorate_call_tool(&self, params: &McpCallToolRequestParams, extensions: &mut McpExtensions);
+}
+
+impl<F> McpRequestDecorator for F
+where
+    F: Fn(&McpCallToolRequestParams, &mut McpExtensions) + Send + Sync,
+{
+    fn decorate_call_tool(
+        &self,
+        params: &McpCallToolRequestParams,
+        extensions: &mut McpExtensions,
+    ) {
+        self(params, extensions);
+    }
+}
+
 impl McpHandlerConfig {
     /// Returns an empty handler config.
     pub fn new() -> Self {
@@ -1447,6 +1491,7 @@ pub struct McpConnection {
     events: broadcast::Sender<McpServerEvent>,
     handler_config: McpHandlerConfig,
     capabilities: RwLock<McpServerCapabilities>,
+    request_decorator: Option<Arc<dyn McpRequestDecorator>>,
 }
 
 /// The result of replaying an MCP operation after auth resolution.
@@ -1521,6 +1566,7 @@ impl McpConnection {
             events: events_tx,
             handler_config,
             capabilities: RwLock::new(capabilities),
+            request_decorator: None,
         };
         connection.ensure_subscriptions().await?;
         Ok(connection)
@@ -1611,7 +1657,15 @@ impl McpConnection {
             events,
             handler_config,
             capabilities: RwLock::new(capabilities),
+            request_decorator: None,
         }
+    }
+
+    /// Sets the decorator applied to each outgoing `tools/call` request on
+    /// this connection, across reconnects. See [`McpRequestDecorator`].
+    pub fn with_request_decorator(mut self, decorator: Arc<dyn McpRequestDecorator>) -> Self {
+        self.request_decorator = Some(decorator);
+        self
     }
 
     async fn reconnect_inner(&self, auth: Option<&MetadataMap>) -> Result<(), McpError> {
@@ -2110,9 +2164,11 @@ impl McpConnection {
         );
         use tracing::Instrument;
         let result = async {
-            let request = rmcp_model::ClientRequest::CallToolRequest(
-                rmcp_model::CallToolRequest::new(params),
-            );
+            let mut call = rmcp_model::CallToolRequest::new(params);
+            if let Some(decorator) = &self.request_decorator {
+                decorator.decorate_call_tool(&call.params, &mut call.extensions);
+            }
+            let request = rmcp_model::ClientRequest::CallToolRequest(call);
             let handle = self
                 .peer()
                 .send_request_with_option(request, options)
@@ -2743,6 +2799,7 @@ pub struct McpServerManager {
     server_tools: BTreeMap<McpServerId, BTreeSet<ToolName>>,
     catalog_publications: BTreeMap<McpServerId, McpCatalogPublication>,
     catalog_wake_tx: tokio::sync::watch::Sender<u64>,
+    request_decorator: Option<Arc<dyn McpRequestDecorator>>,
 }
 
 impl Default for McpServerManager {
@@ -2761,6 +2818,7 @@ impl Default for McpServerManager {
             server_tools: BTreeMap::new(),
             catalog_publications: BTreeMap::new(),
             catalog_wake_tx: tokio::sync::watch::channel(0).0,
+            request_decorator: None,
         }
     }
 }
@@ -2804,6 +2862,13 @@ impl McpServerManager {
     /// Returns the active [`McpHandlerConfig`].
     pub fn handler_config(&self) -> &McpHandlerConfig {
         &self.handler_config
+    }
+
+    /// Sets the [`McpRequestDecorator`] installed on every connection this
+    /// manager opens from now on.
+    pub fn with_request_decorator(mut self, decorator: Arc<dyn McpRequestDecorator>) -> Self {
+        self.request_decorator = Some(decorator);
+        self
     }
 
     /// Registers a server configuration. Returns `self` for chaining.
@@ -2882,11 +2947,14 @@ impl McpServerManager {
         config: &McpServerConfig,
         auth: Option<&MetadataMap>,
         handler_config: McpHandlerConfig,
+        request_decorator: Option<Arc<dyn McpRequestDecorator>>,
         options: &McpServerOptions,
     ) -> Result<(Arc<McpConnection>, McpDiscoverySnapshot), McpError> {
         let connect = async {
-            let connection =
-                Arc::new(McpConnection::connect_with_auth(config, auth, handler_config).await?);
+            let mut connection =
+                McpConnection::connect_with_auth(config, auth, handler_config).await?;
+            connection.request_decorator = request_decorator;
+            let connection = Arc::new(connection);
             let snapshot = connection.discover().await?;
             Ok((connection, snapshot))
         };
@@ -2918,6 +2986,7 @@ impl McpServerManager {
             &config,
             self.auth.get(server_id),
             self.handler_config.clone(),
+            self.request_decorator.clone(),
             &options,
         )
         .await?;
@@ -2971,15 +3040,22 @@ impl McpServerManager {
             })
             .collect();
         let handler_config = self.handler_config.clone();
+        let request_decorator = self.request_decorator.clone();
         let namespace = self.namespace.clone();
 
         let futures = plans.into_iter().map(|(server_id, config, options, auth)| {
             let handler_config = handler_config.clone();
+            let request_decorator = request_decorator.clone();
             let namespace = namespace.clone();
             async move {
-                let (connection, snapshot) =
-                    Self::connect_and_discover(&config, auth.as_ref(), handler_config, &options)
-                        .await?;
+                let (connection, snapshot) = Self::connect_and_discover(
+                    &config,
+                    auth.as_ref(),
+                    handler_config,
+                    request_decorator,
+                    &options,
+                )
+                .await?;
                 Ok::<(McpServerId, McpServerHandle), McpError>((
                     server_id,
                     McpServerHandle {
@@ -3078,10 +3154,12 @@ impl McpServerManager {
         }
 
         let handler_config = self.handler_config.clone();
+        let request_decorator = self.request_decorator.clone();
         let namespace = self.namespace.clone();
 
         let futures = plans.into_iter().map(|(server_id, config, options, auth)| {
             let handler_config = handler_config.clone();
+            let request_decorator = request_decorator.clone();
             let namespace = namespace.clone();
             async move {
                 let result = async {
@@ -3089,6 +3167,7 @@ impl McpServerManager {
                         &config,
                         auth.as_ref(),
                         handler_config,
+                        request_decorator,
                         &options,
                     )
                     .await?;

@@ -32,3 +32,4 @@ tokio = { workspace = true, features = ["sync", "time"] }
 axum = "0.8"
 rmcp = { version = "=3.5.1", default-features = false, features = ["client", "server", "transport-async-rw", "macros", "elicitation"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util", "time", "net"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry"] }
