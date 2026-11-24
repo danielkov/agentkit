@@ -1391,3 +1391,70 @@ async fn host_setup_does_not_count_against_the_script_budget() {
         "unexpected outcome: {outcome:?}"
     );
 }
+
+#[tokio::test]
+async fn expression_only_scripts_return_their_value() {
+    for script in ["20 + 22", "math.abs(-42)"] {
+        let outcome = execute_compose(
+            ComposeConfig::default(),
+            EchoTool::new(),
+            request(script, Value::Null),
+        )
+        .await;
+        match outcome {
+            ToolExecutionOutcome::Completed(result) => {
+                assert_eq!(result.result.output, ToolOutput::structured(json!(42)));
+            }
+            other => panic!("unexpected outcome for {script:?}: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn xpcall_handler_does_not_run_after_a_stop() {
+    let outcome = run_with_deadline(|| {
+        Box::pin(async {
+            execute_compose(
+                ComposeConfig::default().with_max_instruction_count(10_000),
+                EchoTool::new(),
+                request(
+                    "xpcall(function() while true do end end, function(err) while true do end end)",
+                    Value::Null,
+                ),
+            )
+            .await
+        })
+    });
+    match outcome {
+        ToolExecutionOutcome::Failed(ToolError::ExecutionFailed(message)) => {
+            assert!(
+                message.contains("Lua instructions"),
+                "unexpected: {message}"
+            );
+        }
+        other => panic!("unexpected outcome: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn xpcall_handler_still_runs_for_ordinary_errors() {
+    let outcome = execute_compose(
+        ComposeConfig::default(),
+        EchoTool::new(),
+        request(
+            "local ok, err = xpcall(function() error('boom', 0) end, function(err) return 'handled: ' .. err end) \
+             return { ok = ok, err = err }",
+            Value::Null,
+        ),
+    )
+    .await;
+    match outcome {
+        ToolExecutionOutcome::Completed(result) => {
+            assert_eq!(
+                result.result.output,
+                ToolOutput::structured(json!({ "ok": false, "err": "handled: boom" }))
+            );
+        }
+        other => panic!("unexpected outcome: {other:?}"),
+    }
+}

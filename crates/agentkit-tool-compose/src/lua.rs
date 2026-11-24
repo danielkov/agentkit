@@ -15,7 +15,7 @@ use mlua::{HookTriggers, Lua, LuaSerdeExt, Value as LuaValue, VmState};
 use serde_json::Value;
 
 use crate::{
-    BackendRun, CallKey, ComposeBackend, ComposeOutcome, DispatchError, render_catalog_shapes,
+    BackendRun, CallKey, ChildCallError, ComposeBackend, ComposeOutcome, render_catalog_shapes,
 };
 
 /// Executes compose scripts as sandboxed Lua with a synchronous-looking
@@ -122,7 +122,7 @@ impl ComposeBackend for LuaBackend {
                 async move {
                     let child_input = prepared?;
                     let stop = match dispatcher
-                        .call(CallKey::Sequential, ToolName::new(name), child_input)
+                        .call_tracked(CallKey::Sequential, ToolName::new(name), child_input)
                         .await
                     {
                         Ok(output) => {
@@ -133,16 +133,16 @@ impl ComposeBackend for LuaBackend {
                             })?;
                             return lua.to_value(&output);
                         }
-                        Err(DispatchError::Interrupted(interruption)) => {
+                        Err(ChildCallError::Interrupted(interruption)) => {
                             AttemptStop::Interrupted(interruption)
                         }
-                        Err(DispatchError::Failed(ToolError::Cancelled)) => {
+                        Err(ChildCallError::Failed(ToolError::Cancelled)) => {
                             AttemptStop::Failed(ToolError::Cancelled)
                         }
                         // The child history no longer matches; nothing the
                         // script does next can be trusted.
-                        Err(DispatchError::ReplayDiverged(error)) => AttemptStop::Failed(error),
-                        Err(DispatchError::Failed(error)) => {
+                        Err(ChildCallError::ReplayDiverged(error)) => AttemptStop::Failed(error),
+                        Err(ChildCallError::Failed(error)) => {
                             return Err(mlua::Error::external(ComposeFailure(error)));
                         }
                     };
@@ -169,10 +169,7 @@ impl ComposeBackend for LuaBackend {
         // The script runs on one host-owned thread, created after the hook so
         // it and every coroutine it starts inherit it. Only that thread may
         // call `tool()`.
-        let main_thread = lua
-            .load(run.script.as_str())
-            .set_name("compose")
-            .into_function()
+        let main_thread = compile_script(&lua, &run.script)
             .and_then(|script| lua.create_thread(script))
             .map_err(lua_error_to_outcome)?;
         main_thread_ptr.store(main_thread.to_pointer() as usize, Ordering::Relaxed);
@@ -220,6 +217,16 @@ impl ComposeBackend for LuaBackend {
             }
         }
     }
+}
+
+/// Compiles the script the way `Chunk::eval` does: first as an expression,
+/// so a bare `20 + 22` or `f(x)` returns its value, then as statements,
+/// keeping the statement form's diagnostic when both fail.
+fn compile_script(lua: &Lua, script: &str) -> Result<mlua::Function, mlua::Error> {
+    lua.load(format!("return {script}"))
+        .set_name("compose")
+        .into_function()
+        .or_else(|_| lua.load(script).set_name("compose").into_function())
 }
 
 /// Checks a `tool()` call and decodes its input before any child dispatch.
@@ -295,7 +302,19 @@ function tool(name, input)
 end
 
 function pcall(...) return unless_stopped(raw_pcall(...)) end
-function xpcall(...) return unless_stopped(raw_xpcall(...)) end
+-- Lua runs the message handler before the error unwinds, with the hook
+-- unable to interrupt it, so the handler is skipped once the attempt stops.
+function xpcall(f, handler, ...)
+  if type(handler) ~= "function" then
+    return unless_stopped(raw_xpcall(f, handler, ...))
+  end
+  return unless_stopped(raw_xpcall(f, function(err)
+    if is_stopped() then
+      return err
+    end
+    return handler(err)
+  end, ...))
+end
 coroutine.resume = function(...) return unless_stopped(raw_resume(...)) end
 coroutine.close = function(...) return unless_stopped(raw_close(...)) end
 "#;

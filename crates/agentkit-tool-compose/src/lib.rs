@@ -179,8 +179,17 @@ pub enum DispatchError {
     /// interruption and can be resumed once the approval is granted.
     Interrupted(ToolInterruption),
     Failed(ToolError),
+}
+
+/// [`DispatchError`] plus the replay-history violation the built-in Lua
+/// backend treats as terminal. Kept crate-private so the public enum stays
+/// unchanged for third-party backends.
+#[derive(Debug)]
+pub(crate) enum ChildCallError {
+    Interrupted(ToolInterruption),
+    Failed(ToolError),
     /// The call does not match the recorded child history of this compose
-    /// run. Unlike [`DispatchError::Failed`], the run cannot continue.
+    /// run. Unlike [`ChildCallError::Failed`], the run cannot continue.
     ReplayDiverged(ToolError),
 }
 
@@ -227,6 +236,28 @@ pub struct ChildDispatcher {
 }
 
 impl ChildDispatcher {
+    /// Dispatches one nested tool call, replaying it from a previous attempt
+    /// of this compose run when the same call already completed before an
+    /// approval interrupt. A call that diverges from the recorded history
+    /// fails with [`DispatchError::Failed`].
+    pub async fn call(
+        &self,
+        key: CallKey,
+        tool_name: ToolName,
+        child_input: Value,
+    ) -> Result<Value, DispatchError> {
+        self.call_tracked(key, tool_name, child_input)
+            .await
+            .map_err(|error| match error {
+                ChildCallError::Interrupted(interruption) => {
+                    DispatchError::Interrupted(interruption)
+                }
+                ChildCallError::Failed(error) | ChildCallError::ReplayDiverged(error) => {
+                    DispatchError::Failed(error)
+                }
+            })
+    }
+
     /// Exact compose call that owns this dispatcher, including approval replays.
     pub fn parent_call_id(&self) -> &ToolCallId {
         &self.parent_call_id
@@ -241,18 +272,18 @@ impl ChildDispatcher {
     /// Dispatches one nested tool call, replaying it from a previous attempt
     /// of this compose run when the same call already completed before an
     /// approval interrupt.
-    pub async fn call(
+    pub(crate) async fn call_tracked(
         &self,
         key: CallKey,
         tool_name: ToolName,
         child_input: Value,
-    ) -> Result<Value, DispatchError> {
+    ) -> Result<Value, ChildCallError> {
         if self.is_cancelled() {
-            return Err(DispatchError::Failed(ToolError::Cancelled));
+            return Err(ChildCallError::Failed(ToolError::Cancelled));
         }
         let ordinal = self.call_counter.fetch_add(1, Ordering::SeqCst);
         if ordinal >= self.config.max_nested_tool_calls {
-            return Err(DispatchError::Failed(ToolError::ExecutionFailed(format!(
+            return Err(ChildCallError::Failed(ToolError::ExecutionFailed(format!(
                 "compose exceeded {} nested tool calls",
                 self.config.max_nested_tool_calls
             ))));
@@ -277,9 +308,9 @@ impl ChildDispatcher {
         };
         if let Some((recorded_name, recorded_input, recorded_output)) = replayed {
             if recorded_name == tool_name && recorded_input == child_input {
-                return recorded_output.map_err(DispatchError::Failed);
+                return recorded_output.map_err(ChildCallError::Failed);
             }
-            return Err(DispatchError::ReplayDiverged(ToolError::ExecutionFailed(
+            return Err(ChildCallError::ReplayDiverged(ToolError::ExecutionFailed(
                 format!("compose replay diverged at nested tool call {record_key}"),
             )));
         }
@@ -336,7 +367,7 @@ impl ChildDispatcher {
 
         let outcome = if is_approved_pending {
             let approval = self.approved_request.as_ref().ok_or_else(|| {
-                DispatchError::Failed(ToolError::Internal(
+                ChildCallError::Failed(ToolError::Internal(
                     "missing compose approval request".into(),
                 ))
             })?;
@@ -392,7 +423,7 @@ impl ChildDispatcher {
                         },
                     );
                 }
-                Err(DispatchError::Interrupted(
+                Err(ChildCallError::Interrupted(
                     ToolInterruption::ApprovalRequired(approval),
                 ))
             }
@@ -422,7 +453,7 @@ impl ChildDispatcher {
         tool_name: ToolName,
         child_input: Value,
         error: ToolError,
-    ) -> DispatchError {
+    ) -> ChildCallError {
         if sequential
             && !matches!(error, ToolError::Cancelled)
             && let Err(append_error) = self
@@ -438,7 +469,7 @@ impl ChildDispatcher {
         {
             return append_error;
         }
-        DispatchError::Failed(error)
+        ChildCallError::Failed(error)
     }
 
     async fn append_record(
@@ -449,12 +480,12 @@ impl ChildDispatcher {
         tool_name: ToolName,
         child_input: Value,
         output: Result<Value, ToolError>,
-    ) -> Result<(), DispatchError> {
+    ) -> Result<(), ChildCallError> {
         let mut states = self.states.lock().await;
         let run_state = states.entry(self.parent_call_id.clone()).or_default();
         if sequential {
             if run_state.sequential_len != ordinal {
-                return Err(DispatchError::ReplayDiverged(ToolError::ExecutionFailed(
+                return Err(ChildCallError::ReplayDiverged(ToolError::ExecutionFailed(
                     format!("compose replay cannot append nested tool call {ordinal}"),
                 )));
             }
