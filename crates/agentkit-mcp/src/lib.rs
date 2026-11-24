@@ -63,6 +63,10 @@ use sse_stream::{Error as SseError, Sse};
 use thiserror::Error;
 use tokio::sync::{Mutex, broadcast, mpsc, watch};
 
+mod skills;
+pub use skills::{
+    MCP_SKILLS_EXTENSION_ID, McpSkill, McpSkillDynamic, McpSkillFile, McpSkillResources,
+};
 mod subscriptions;
 pub use subscriptions::McpSubscriptionStatus;
 
@@ -1779,6 +1783,14 @@ impl McpConnection {
             .read()
             .expect("MCP capabilities lock poisoned")
             .clone()
+    }
+
+    /// Returns the full wire capabilities of the current peer, including extension
+    /// settings, experimental capabilities, and completions.
+    pub fn wire_capabilities(&self) -> Option<rmcp_model::ServerCapabilities> {
+        self.peer()
+            .peer_info()
+            .map(|info| info.capabilities.clone())
     }
 
     /// Protocol selected by discovery or the legacy initialization handshake.
