@@ -807,3 +807,50 @@ async fn pcall_does_not_swallow_approval_interrupt() {
         other => panic!("approval must reach the host, got: {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn caught_approval_survives_a_later_script_error() {
+    let compose = ComposeTool::new(ComposeConfig::default());
+    let gated = ApprovalEchoTool::new();
+    let executor: Arc<dyn ToolExecutor> = Arc::new(BasicToolExecutor::from_registry(
+        ToolRegistry::new().with(compose).with(gated),
+    ));
+    let permissions: Arc<dyn PermissionChecker> = Arc::new(RequireApproval);
+    let req = request(
+        "pcall(tool, 'approval_echo', { value = 1 }); error('fallback failed')",
+        Value::Null,
+    );
+
+    let owned = owned_context(executor.clone(), permissions);
+    let mut ctx = owned.borrowed();
+    match executor.execute(req, &mut ctx).await {
+        ToolExecutionOutcome::Interrupted(ToolInterruption::ApprovalRequired(_)) => {}
+        other => panic!("approval must reach the host, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn caught_approval_blocks_later_child_calls() {
+    let compose = ComposeTool::new(ComposeConfig::default());
+    let fallback = EchoTool::new();
+    let gated = ApprovalEchoTool::new();
+    let fallback_calls = fallback.calls.clone();
+    let executor: Arc<dyn ToolExecutor> = Arc::new(BasicToolExecutor::from_registry(
+        ToolRegistry::new().with(compose).with(fallback).with(gated),
+    ));
+    let permissions: Arc<dyn PermissionChecker> = Arc::new(RequireApproval);
+    let req = request(
+        "if not pcall(tool, 'approval_echo', { value = 1 }) then \
+           return tool('echo', { value = 2 }) \
+         end",
+        Value::Null,
+    );
+
+    let owned = owned_context(executor.clone(), permissions);
+    let mut ctx = owned.borrowed();
+    match executor.execute(req, &mut ctx).await {
+        ToolExecutionOutcome::Interrupted(ToolInterruption::ApprovalRequired(_)) => {}
+        other => panic!("approval must reach the host, got: {other:?}"),
+    }
+    assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
+}
