@@ -192,7 +192,9 @@ struct ComposeRunState {
 struct ChildRecord {
     name: ToolName,
     input: Value,
-    output: Value,
+    /// A sequential child that failed still consumed its ordinal, so its
+    /// failure is recorded and replayed like an output.
+    output: Result<Value, ToolError>,
 }
 
 #[derive(Clone, Debug)]
@@ -252,16 +254,6 @@ impl ChildDispatcher {
                 self.config.max_nested_tool_calls
             ))));
         }
-        if !self.config.allows(&tool_name) {
-            return Err(DispatchError::Failed(ToolError::PermissionDenied(
-                PermissionDenial {
-                    code: PermissionCode::CustomPolicyDenied,
-                    message: format!("compose cannot call tool {}", tool_name.0),
-                    metadata: MetadataMap::new(),
-                },
-            )));
-        }
-
         let (record_key, sequential) = match &key {
             CallKey::Sequential => (format!("seq:{ordinal}"), true),
             CallKey::Operation(id) => (format!("op:{id}"), false),
@@ -282,11 +274,29 @@ impl ChildDispatcher {
         };
         if let Some((recorded_name, recorded_input, recorded_output)) = replayed {
             if recorded_name == tool_name && recorded_input == child_input {
-                return Ok(recorded_output);
+                return recorded_output.map_err(DispatchError::Failed);
             }
             return Err(DispatchError::Failed(ToolError::ExecutionFailed(format!(
                 "compose replay diverged at nested tool call {record_key}"
             ))));
+        }
+
+        if !self.config.allows(&tool_name) {
+            let error = ToolError::PermissionDenied(PermissionDenial {
+                code: PermissionCode::CustomPolicyDenied,
+                message: format!("compose cannot call tool {}", tool_name.0),
+                metadata: MetadataMap::new(),
+            });
+            return Err(self
+                .record_failure(
+                    ordinal,
+                    sequential,
+                    record_key,
+                    tool_name,
+                    child_input,
+                    error,
+                )
+                .await);
         }
 
         let child_suffix = match &key {
@@ -336,29 +346,30 @@ impl ChildDispatcher {
 
         match outcome {
             ToolExecutionOutcome::Completed(result) => {
-                let output =
-                    tool_output_to_json(result.result.output).map_err(DispatchError::Failed)?;
-                {
-                    let mut states = self.states.lock().await;
-                    let run_state = states.entry(self.parent_call_id.clone()).or_default();
-                    if sequential {
-                        if run_state.sequential_len != ordinal {
-                            return Err(DispatchError::Failed(ToolError::ExecutionFailed(
-                                format!("compose replay cannot append nested tool call {ordinal}"),
-                            )));
-                        }
-                        run_state.sequential_len += 1;
+                let output = match tool_output_to_json(result.result.output) {
+                    Ok(output) => output,
+                    Err(error) => {
+                        return Err(self
+                            .record_failure(
+                                ordinal,
+                                sequential,
+                                record_key,
+                                tool_name,
+                                child_input,
+                                error,
+                            )
+                            .await);
                     }
-                    run_state.records.insert(
-                        record_key.clone(),
-                        ChildRecord {
-                            name: tool_name,
-                            input: child_input,
-                            output: output.clone(),
-                        },
-                    );
-                    run_state.pending.remove(&record_key);
-                }
+                };
+                self.append_record(
+                    ordinal,
+                    sequential,
+                    record_key,
+                    tool_name,
+                    child_input,
+                    Ok(output.clone()),
+                )
+                .await?;
                 Ok(output)
             }
             ToolExecutionOutcome::Interrupted(ToolInterruption::ApprovalRequired(mut approval)) => {
@@ -383,8 +394,79 @@ impl ChildDispatcher {
                 ))
             }
             ToolExecutionOutcome::FailedBeforeInvocation(error)
-            | ToolExecutionOutcome::Failed(error) => Err(DispatchError::Failed(error)),
+            | ToolExecutionOutcome::Failed(error) => Err(self
+                .record_failure(
+                    ordinal,
+                    sequential,
+                    record_key,
+                    tool_name,
+                    child_input,
+                    error,
+                )
+                .await),
         }
+    }
+
+    /// Records an ordinary sequential failure at the ordinal it consumed, so a
+    /// script that catches it can keep appending children and a resumed run
+    /// replays the failure instead of invoking the child again. Cancellation
+    /// is never recorded.
+    async fn record_failure(
+        &self,
+        ordinal: usize,
+        sequential: bool,
+        record_key: String,
+        tool_name: ToolName,
+        child_input: Value,
+        error: ToolError,
+    ) -> DispatchError {
+        if sequential
+            && !matches!(error, ToolError::Cancelled)
+            && let Err(append_error) = self
+                .append_record(
+                    ordinal,
+                    sequential,
+                    record_key,
+                    tool_name,
+                    child_input,
+                    Err(error.clone()),
+                )
+                .await
+        {
+            return append_error;
+        }
+        DispatchError::Failed(error)
+    }
+
+    async fn append_record(
+        &self,
+        ordinal: usize,
+        sequential: bool,
+        record_key: String,
+        tool_name: ToolName,
+        child_input: Value,
+        output: Result<Value, ToolError>,
+    ) -> Result<(), DispatchError> {
+        let mut states = self.states.lock().await;
+        let run_state = states.entry(self.parent_call_id.clone()).or_default();
+        if sequential {
+            if run_state.sequential_len != ordinal {
+                return Err(DispatchError::Failed(ToolError::ExecutionFailed(format!(
+                    "compose replay cannot append nested tool call {ordinal}"
+                ))));
+            }
+            run_state.sequential_len += 1;
+        }
+        run_state.pending.remove(&record_key);
+        run_state.records.insert(
+            record_key,
+            ChildRecord {
+                name: tool_name,
+                input: child_input,
+                output,
+            },
+        );
+        Ok(())
     }
 }
 

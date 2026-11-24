@@ -854,3 +854,136 @@ async fn caught_approval_blocks_later_child_calls() {
     }
     assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
 }
+
+#[tokio::test]
+async fn caught_child_failure_does_not_hide_a_later_success() {
+    let compose = ComposeTool::new(ComposeConfig::default());
+    let echo = EchoTool::new();
+    let echo_calls = echo.calls.clone();
+    let executor: Arc<dyn ToolExecutor> = Arc::new(BasicToolExecutor::from_registry(
+        ToolRegistry::new()
+            .with(compose)
+            .with(FailingTool::new())
+            .with(echo),
+    ));
+    let owned = owned_context(executor.clone(), Arc::new(AllowAllPermissions));
+    let mut ctx = owned.borrowed();
+    let req = request(
+        "local _, err = pcall(tool, 'fail', {}) \
+         local ok, value = pcall(tool, 'echo', { value = 2 }) \
+         return { err = err, ok = ok, value = value }",
+        Value::Null,
+    );
+
+    match executor.execute(req, &mut ctx).await {
+        ToolExecutionOutcome::Completed(result) => {
+            let ToolOutput::Structured(value) = result.result.output else {
+                panic!("expected structured output");
+            };
+            assert_eq!(value["ok"], json!(true));
+            assert_eq!(value["value"]["value"], json!(2));
+            assert!(
+                value["err"]
+                    .as_str()
+                    .is_some_and(|err| err.contains("permission denied"))
+            );
+        }
+        other => panic!("unexpected outcome: {other:?}"),
+    }
+    assert_eq!(echo_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn caught_instruction_budget_stop_still_fails_compose() {
+    let outcome = execute_compose(
+        ComposeConfig::default().with_max_instruction_count(1_000),
+        EchoTool::new(),
+        request(
+            "local _, err = pcall(function() local x = 0 while true do x = x + 1 end end) \
+             return err",
+            Value::Null,
+        ),
+    )
+    .await;
+
+    match outcome {
+        ToolExecutionOutcome::Failed(ToolError::ExecutionFailed(message)) => {
+            assert!(
+                message.contains("Lua instructions"),
+                "unexpected: {message}"
+            );
+        }
+        other => panic!("unexpected outcome: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn approval_reaches_host_without_waiting_for_the_script() {
+    let compose = ComposeTool::new(ComposeConfig::default().with_max_instruction_count(0));
+    let executor: Arc<dyn ToolExecutor> = Arc::new(BasicToolExecutor::from_registry(
+        ToolRegistry::new()
+            .with(compose)
+            .with(ApprovalEchoTool::new()),
+    ));
+    let permissions: Arc<dyn PermissionChecker> = Arc::new(RequireApproval);
+    // With no instruction budget, this script never ends once it resumes.
+    let req = request(
+        "pcall(tool, 'approval_echo', { value = 1 }); while true do end",
+        Value::Null,
+    );
+
+    let owned = owned_context(executor.clone(), permissions);
+    let mut ctx = owned.borrowed();
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        executor.execute(req, &mut ctx),
+    )
+    .await
+    .expect("approval must not wait for the script to finish");
+    assert!(matches!(
+        outcome,
+        ToolExecutionOutcome::Interrupted(ToolInterruption::ApprovalRequired(_))
+    ));
+}
+
+/// Requires approval for every call, but first cancels the turn, as if the
+/// user stopped it while the approval was being raised.
+struct CancelThenRequireApproval(agentkit_core::CancellationController);
+
+impl PermissionChecker for CancelThenRequireApproval {
+    fn evaluate(&self, request: &dyn PermissionRequest) -> PermissionDecision {
+        self.0.interrupt();
+        RequireApproval.evaluate(request)
+    }
+}
+
+#[tokio::test]
+async fn cancellation_wins_over_a_recorded_approval() {
+    let compose = ComposeTool::new(ComposeConfig::default());
+    let states = compose.states.clone();
+    let executor: Arc<dyn ToolExecutor> = Arc::new(BasicToolExecutor::from_registry(
+        ToolRegistry::new()
+            .with(compose)
+            .with(ApprovalEchoTool::new()),
+    ));
+    let controller = agentkit_core::CancellationController::new();
+    let cancellation = agentkit_core::TurnCancellation::new(controller.handle());
+    let permissions: Arc<dyn PermissionChecker> = Arc::new(CancelThenRequireApproval(controller));
+    let mut owned = owned_context(executor.clone(), permissions);
+    owned.cancellation = Some(cancellation.clone());
+    if let Some(scope) = owned.execution_scope.as_mut() {
+        scope.cancellation = Some(cancellation);
+    }
+    let mut ctx = owned.borrowed();
+    let req = request(
+        "pcall(tool, 'approval_echo', { value = 1 }); return 1",
+        Value::Null,
+    );
+
+    let outcome = executor.execute(req, &mut ctx).await;
+    assert!(
+        matches!(outcome, ToolExecutionOutcome::Failed(ToolError::Cancelled)),
+        "unexpected outcome: {outcome:?}"
+    );
+    assert!(states.lock().await.is_empty());
+}

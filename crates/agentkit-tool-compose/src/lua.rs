@@ -3,8 +3,10 @@
 use std::collections::HashSet;
 use std::error::Error;
 use std::fmt;
+use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::task::Poll;
 
 use agentkit_core::TurnCancellation;
 use agentkit_tools_core::{ToolError, ToolInterruption, ToolName, ToolSpec};
@@ -88,9 +90,10 @@ impl ComposeBackend for LuaBackend {
             )
             .map_err(lua_error_to_outcome)?;
 
-        // The first interrupt `tool()` raises wins for the whole run: it must
-        // reach the host even if the script catches it with `pcall`, and no
-        // later child call may run before the host answers it.
+        // An approval interrupt ends the Lua attempt at the `tool()` call that
+        // raised it: the call records it here and never resumes the script, so
+        // `pcall` cannot catch it and no later script code or child call runs
+        // before the host answers it.
         let interrupted: Arc<OnceLock<ToolInterruption>> = Arc::new(OnceLock::new());
         let dispatcher = run.dispatcher.clone();
         let interrupted_slot = interrupted.clone();
@@ -99,11 +102,6 @@ impl ComposeBackend for LuaBackend {
                 let dispatcher = dispatcher.clone();
                 let interrupted_slot = interrupted_slot.clone();
                 async move {
-                    if let Some(interruption) = interrupted_slot.get() {
-                        return Err(mlua::Error::external(ComposeInterrupt(
-                            interruption.clone(),
-                        )));
-                    }
                     let child_input: Value = lua.from_value(lua_input)?;
                     match dispatcher
                         .call(CallKey::Sequential, ToolName::new(name), child_input)
@@ -111,8 +109,9 @@ impl ComposeBackend for LuaBackend {
                     {
                         Ok(output) => lua.to_value(&output),
                         Err(DispatchError::Interrupted(interruption)) => {
-                            let _ = interrupted_slot.set(interruption.clone());
-                            Err(mlua::Error::external(ComposeInterrupt(interruption)))
+                            let _ = interrupted_slot.set(interruption);
+                            std::future::pending::<()>().await;
+                            unreachable!("a pending future never resolves")
                         }
                         Err(DispatchError::Failed(error)) => {
                             Err(mlua::Error::external(ComposeFailure(error)))
@@ -123,14 +122,30 @@ impl ComposeBackend for LuaBackend {
             .map_err(lua_error_to_outcome)?;
         globals.set("tool", tool_fn).map_err(lua_error_to_outcome)?;
 
-        let evaluated = lua
-            .load(run.script.as_str())
-            .set_name("compose")
-            .eval_async::<LuaValue>()
-            .await;
-        if let Some(interruption) = interrupted.get() {
-            return Err(ComposeOutcome::Interrupted(interruption.clone()));
-        }
+        let mut evaluation = std::pin::pin!(
+            lua.load(run.script.as_str())
+                .set_name("compose")
+                .eval_async::<LuaValue>()
+        );
+        // Stop polling the script as soon as a child call records an approval.
+        let evaluated = std::future::poll_fn(|cx| match evaluation.as_mut().poll(cx) {
+            Poll::Ready(result) => Poll::Ready(Some(result)),
+            Poll::Pending if interrupted.get().is_some() => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        })
+        .await;
+        let Some(evaluated) = evaluated else {
+            // A cancelled turn must not surface an approval prompt.
+            if run.dispatcher.is_cancelled() {
+                return Err(ComposeOutcome::Failed(ToolError::Cancelled));
+            }
+            let interruption = interrupted.get().cloned().ok_or_else(|| {
+                ComposeOutcome::Failed(ToolError::Internal(
+                    "compose approval interrupt was not recorded".into(),
+                ))
+            })?;
+            return Err(ComposeOutcome::Interrupted(interruption));
+        };
         let result = evaluated.map_err(lua_error_to_outcome)?;
         match lua.from_value(result.clone()) {
             Ok(value) => Ok(value),
@@ -149,7 +164,8 @@ impl ComposeBackend for LuaBackend {
 /// Replaces child tool failures a script caught with `pcall` and returned
 /// (at the root or inside tables) with their message, so the result
 /// serializes. Other error values are left alone. Returns whether anything
-/// changed. A caught cancellation stays a typed cancellation.
+/// changed. A caught backend stop (cancellation or the instruction budget)
+/// fails the run instead of becoming data.
 fn normalize_caught_failures(
     lua: &Lua,
     value: LuaValue,
@@ -203,9 +219,12 @@ fn caught_failure_message(
     lua: &Lua,
     error: &mlua::Error,
 ) -> Result<Option<LuaValue>, Box<ComposeOutcome>> {
-    match compose_failure(error) {
-        Some(ToolError::Cancelled) => Err(Box::new(ComposeOutcome::Failed(ToolError::Cancelled))),
-        Some(failure) => lua
+    match compose_error(error) {
+        Some(ComposeError::Stop(stop)) => Err(Box::new(ComposeOutcome::Failed(stop.clone()))),
+        Some(ComposeError::Child(ToolError::Cancelled)) => {
+            Err(Box::new(ComposeOutcome::Failed(ToolError::Cancelled)))
+        }
+        Some(ComposeError::Child(failure)) => lua
             .create_string(failure.to_string())
             .map(|message| Some(LuaValue::String(message)))
             .map_err(|error| Box::new(lua_error_to_outcome(error))),
@@ -213,28 +232,29 @@ fn caught_failure_message(
     }
 }
 
-fn compose_failure(error: &mlua::Error) -> Option<&ToolError> {
+enum ComposeError<'a> {
+    Child(&'a ToolError),
+    Stop(&'a ToolError),
+}
+
+fn compose_error(error: &mlua::Error) -> Option<ComposeError<'_>> {
     match error {
         mlua::Error::CallbackError { cause, .. }
         | mlua::Error::BadArgument { cause, .. }
-        | mlua::Error::WithContext { cause, .. } => compose_failure(cause),
-        mlua::Error::ExternalError(inner) => inner
-            .downcast_ref::<ComposeFailure>()
-            .map(|failure| &failure.0),
+        | mlua::Error::WithContext { cause, .. } => compose_error(cause),
+        mlua::Error::ExternalError(inner) => {
+            if let Some(failure) = inner.downcast_ref::<ComposeFailure>() {
+                return Some(ComposeError::Child(&failure.0));
+            }
+            inner
+                .downcast_ref::<ComposeStop>()
+                .map(|stop| ComposeError::Stop(&stop.0))
+        }
         _ => None,
     }
 }
 
-#[derive(Debug)]
-struct ComposeInterrupt(ToolInterruption);
-
-impl fmt::Display for ComposeInterrupt {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "compose interrupted")
-    }
-}
-
-impl Error for ComposeInterrupt {}
+/// A child tool call failed. A script may catch and return it as data.
 
 #[derive(Debug)]
 struct ComposeFailure(ToolError);
@@ -246,6 +266,19 @@ impl fmt::Display for ComposeFailure {
 }
 
 impl Error for ComposeFailure {}
+
+/// The backend stopped the script (cancellation or the instruction budget).
+/// Unlike a child failure, it fails the run even if the script catches it.
+#[derive(Debug)]
+struct ComposeStop(ToolError);
+
+impl fmt::Display for ComposeStop {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl Error for ComposeStop {}
 
 fn install_sandbox(lua: &Lua) -> Result<(), mlua::Error> {
     let globals = lua.globals();
@@ -282,11 +315,11 @@ fn install_instruction_limit(
                 .as_ref()
                 .is_some_and(|cancellation| cancellation.is_cancelled())
             {
-                return Err(mlua::Error::external(ComposeFailure(ToolError::Cancelled)));
+                return Err(mlua::Error::external(ComposeStop(ToolError::Cancelled)));
             }
             let previous = seen.fetch_add(u64::from(step), Ordering::Relaxed);
             if previous.saturating_add(u64::from(step)) > max_instruction_count {
-                return Err(mlua::Error::external(ComposeFailure(
+                return Err(mlua::Error::external(ComposeStop(
                     ToolError::ExecutionFailed(format!(
                         "compose exceeded {max_instruction_count} Lua instructions"
                     )),
@@ -305,11 +338,11 @@ fn lua_error_to_outcome(error: mlua::Error) -> ComposeOutcome {
             return lua_error_to_outcome((**cause).clone());
         }
         mlua::Error::ExternalError(inner) => {
-            if let Some(interrupt) = inner.downcast_ref::<ComposeInterrupt>() {
-                return ComposeOutcome::Interrupted(interrupt.0.clone());
-            }
             if let Some(failure) = inner.downcast_ref::<ComposeFailure>() {
                 return ComposeOutcome::Failed(failure.0.clone());
+            }
+            if let Some(stop) = inner.downcast_ref::<ComposeStop>() {
+                return ComposeOutcome::Failed(stop.0.clone());
             }
         }
         _ => {}
