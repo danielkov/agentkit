@@ -7,7 +7,7 @@ use rmcp::service::{Peer, RoleClient};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value, json};
 
-use super::{McpConnection, McpError, rmcp_service_error};
+use super::{AuthOperation, McpConnection, McpError, McpServerId, operation_error};
 
 /// The extension identifier advertised in `server/discover`.
 pub const MCP_SKILLS_EXTENSION_ID: &str = "io.modelcontextprotocol/skills";
@@ -96,7 +96,7 @@ impl McpConnection {
         let mut seen = BTreeSet::new();
         let mut params = json!({});
         loop {
-            let page: ListPage = request(&peer, "skills/list", params).await?;
+            let page: ListPage = request(&peer, self.server_id(), "skills/list", params).await?;
             skills.extend(page.skills);
             let Some(cursor) = page.next_cursor else {
                 return Ok(skills);
@@ -115,7 +115,8 @@ impl McpConnection {
         if !supports_skills(&peer) {
             return Err(McpError::Protocol("server did not advertise skills".into()));
         }
-        let result: GetResult = request(&peer, "skills/get", json!({"uri": uri})).await?;
+        let result: GetResult =
+            request(&peer, self.server_id(), "skills/get", json!({"uri": uri})).await?;
         if result.skill.uri != uri {
             return Err(McpError::Protocol(
                 "skills/get returned a different URI".into(),
@@ -139,16 +140,24 @@ fn supports_skills(peer: &Peer<RoleClient>) -> bool {
 
 async fn request<T: DeserializeOwned>(
     peer: &Peer<RoleClient>,
+    server_id: &McpServerId,
     method: &str,
     params: Value,
 ) -> Result<T, McpError> {
     let result = peer
         .send_request(ClientRequest::CustomRequest(CustomRequest::new(
             method,
-            Some(params),
+            Some(params.clone()),
         )))
         .await
-        .map_err(rmcp_service_error)?;
+        .map_err(|error| {
+            operation_error(server_id, method, error, || AuthOperation::McpOther {
+                server_id: server_id.to_string(),
+                method: method.to_string(),
+                params,
+                metadata: Default::default(),
+            })
+        })?;
     let ServerResult::CustomResult(result) = result else {
         return Err(McpError::Protocol(format!("unexpected {method} response")));
     };

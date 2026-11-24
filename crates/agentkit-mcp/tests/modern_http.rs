@@ -10,9 +10,9 @@ use std::{
 };
 
 use agentkit_mcp::{
-    AuthOperation, AuthRequest, AuthResolution, McpConnection, McpServerConfig, McpServerEvent,
-    McpServerId, McpServerManager, McpSkillResources, McpSubscriptionStatus, McpTransportBinding,
-    StreamableHttpTransportConfig,
+    AuthOperation, AuthRequest, AuthResolution, McpConnection, McpError, McpServerConfig,
+    McpServerEvent, McpServerId, McpServerManager, McpSkillResources, McpSubscriptionStatus,
+    McpTransportBinding, StreamableHttpTransportConfig,
 };
 use axum::{
     Json, Router,
@@ -135,7 +135,18 @@ async fn rpc(
             }
         })
     };
-    let result = match message["method"].as_str().unwrap_or_default() {
+    let method = message["method"].as_str().unwrap_or_default();
+    if token == "Bearer skills-limited" && method.starts_with("skills/") {
+        return (
+            StatusCode::FORBIDDEN,
+            [(
+                "www-authenticate",
+                "Bearer error=\"insufficient_scope\", scope=\"skills:read\"",
+            )],
+        )
+            .into_response();
+    }
+    let result = match method {
         "skills/list" if token == "Bearer skills" => {
             assert_eq!(
                 message["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"],
@@ -180,7 +191,7 @@ async fn rpc(
                 capabilities.build()
             };
             let capabilities = match token {
-                "Bearer skills" => json!({
+                "Bearer skills" | "Bearer skills-limited" => json!({
                     "resources":{}, "completions":{},
                     "experimental":{"example":{"flag":true}},
                     "extensions":{"io.modelcontextprotocol/skills":{"directoryRead":true}}
@@ -394,6 +405,49 @@ async fn skill_inventory_uses_advertised_extension_on_current_connection() {
                 .iter()
                 .all(|(_, message)| { message["method"] != "resources/read" })
         );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn skill_requests_preserve_runtime_scope_challenges() {
+    bounded(async {
+        let fixture = Fixture::start().await;
+        let connection = McpConnection::connect(&fixture.config).await.unwrap();
+        connection
+            .resolve_auth(auth("skills-limited"))
+            .await
+            .unwrap();
+        let uri = "skill://unlisted/SKILL.md";
+        for (error, expected_method, expected_params) in [
+            (
+                connection.list_skills().await.unwrap_err(),
+                "skills/list",
+                json!({}),
+            ),
+            (
+                connection.get_skill(uri).await.unwrap_err(),
+                "skills/get",
+                json!({"uri":uri}),
+            ),
+        ] {
+            let McpError::AuthRequired(request) = error else {
+                panic!("{error}")
+            };
+            assert_eq!(request.challenge["required_scope"], "skills:read");
+            let AuthOperation::McpOther {
+                server_id,
+                method,
+                params,
+                ..
+            } = request.operation
+            else {
+                panic!("expected a Skills auth operation")
+            };
+            assert_eq!(server_id, "http-modern");
+            assert_eq!(method, expected_method);
+            assert_eq!(params, expected_params);
+        }
     })
     .await;
 }

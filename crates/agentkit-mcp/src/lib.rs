@@ -4162,10 +4162,22 @@ fn rmcp_operation_error(
     method: McpMethod,
     error: ServiceError,
 ) -> McpError {
+    operation_error(server_id, method.method_name(), error, || {
+        method.into_auth_operation(server_id)
+    })
+}
+
+fn operation_error(
+    server_id: &McpServerId,
+    method_name: &str,
+    error: ServiceError,
+    operation: impl FnOnce() -> AuthOperation,
+) -> McpError {
     if let Some(signal) = service_auth_signal(&error) {
-        return McpError::AuthRequired(Box::new(auth_request_from_signal(
+        return McpError::AuthRequired(Box::new(build_auth_request(
             server_id,
-            method,
+            method_name,
+            operation(),
             signal,
             &error.to_string(),
         )));
@@ -4229,7 +4241,22 @@ fn auth_request_from_signal(
     signal: AuthSignal,
     message: &str,
 ) -> AuthRequest {
-    let method_name = method.method_name();
+    build_auth_request(
+        server_id,
+        method.method_name(),
+        method.into_auth_operation(server_id),
+        signal,
+        message,
+    )
+}
+
+fn build_auth_request(
+    server_id: &McpServerId,
+    method_name: &str,
+    operation: AuthOperation,
+    signal: AuthSignal,
+    message: &str,
+) -> AuthRequest {
     let mut challenge = MetadataMap::new();
     challenge.insert("server_id".into(), Value::String(server_id.to_string()));
     challenge.insert("method".into(), Value::String(method_name.into()));
@@ -4257,7 +4284,7 @@ fn auth_request_from_signal(
     AuthRequest {
         id: format!("mcp:{}:{}", server_id, method_name),
         provider: format!("mcp.{}", server_id),
-        operation: method.into_auth_operation(server_id),
+        operation,
         challenge,
     }
 }
