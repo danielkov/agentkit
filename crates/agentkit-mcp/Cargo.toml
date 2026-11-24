@@ -20,7 +20,7 @@ async-trait.workspace = true
 futures-util.workspace = true
 http = "1"
 reqwest.workspace = true
-rmcp = { version = "=3.5.1", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest", "auth"] }
+rmcp = { version = "=3.9.0", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest", "auth"] }
 serde.workspace = true
 serde_json.workspace = true
 sse-stream = "0.2"
@@ -30,6 +30,6 @@ tokio = { workspace = true, features = ["sync", "time"] }
 
 [dev-dependencies]
 axum = "0.8"
-rmcp = { version = "=3.5.1", default-features = false, features = ["client", "server", "transport-async-rw", "macros", "elicitation"] }
+rmcp = { version = "=3.9.0", default-features = false, features = ["client", "server", "transport-async-rw", "macros", "elicitation"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util", "time", "net"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry"] }

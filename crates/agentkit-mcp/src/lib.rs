@@ -65,7 +65,7 @@ use tokio::sync::{Mutex, broadcast, mpsc, watch};
 
 mod skills;
 pub use skills::{
-    MCP_SKILLS_EXTENSION_ID, McpSkill, McpSkillDynamic, McpSkillFile, McpSkillResources,
+    MCP_SKILLS_EXTENSION_ID, McpSkill, McpSkillFile, McpSkillFrontmatter, McpSkillResources,
 };
 mod subscriptions;
 pub use subscriptions::McpSubscriptionStatus;

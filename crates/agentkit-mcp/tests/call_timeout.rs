@@ -68,9 +68,13 @@ impl ServerHandler for ControlledServer {
         while let Some(command) = rx.recv().await {
             match command {
                 Command::Probe(result) => {
-                    // Run inside the original handler scope so the server's
-                    // outbound association check allows this request.
-                    let _ = result.send(context.peer.list_roots().await);
+                    // Exercise the modern client's receive-side association check
+                    // with a test peer that deliberately sends a legacy request.
+                    // Leave the modern incoming request's task-local scope.
+                    let peer = context.peer.clone();
+                    tokio::spawn(async move {
+                        let _ = result.send(peer.list_roots().await);
+                    });
                 }
                 Command::Reply(result) => {
                     let _ = finished.send(());
@@ -202,7 +206,9 @@ impl Fixture {
         let (responses_tx, responses) = mpsc::unbounded_channel();
         let server_info = handler.get_info();
         let mut client_info = ClientInfo::default();
-        client_info.protocol_version = ProtocolVersion::V_2026_07_28;
+        // Let the test server send the legacy probe outside a handler. The
+        // client still sees a modern server and checks association.
+        client_info.protocol_version = ProtocolVersion::V_2025_11_25;
         let (server_io, client_io) = tokio::io::duplex(8192);
         let (read, write) = tokio::io::split(server_io);
         let server = serve_directly(
@@ -318,7 +324,7 @@ async fn expiry_cleans_pending_state_before_late_success_or_error() {
     // rather than merely proving that a cancellation notification was received.
     let control = fixture.call("control", None);
     let pending = fixture.next_call().await;
-    assert!(probe(&pending).await.is_ok());
+    probe(&pending).await.unwrap();
     pending
         .commands
         .send(Command::Reply(Ok(CallToolResult::success(vec![]))))
@@ -430,7 +436,7 @@ async fn cancellation_send_completion_gates_timeout_and_cleanup_even_on_send_err
             .unwrap();
         // This is the RMCP 3.1.2 limitation, NOT a hard-deadline guarantee:
         // after expiry, cancellation I/O still holds up local abandonment.
-        assert!(probe(&pending).await.is_ok());
+        probe(&pending).await.unwrap();
         assert!(!call.is_finished());
         gate.release.notify_one();
         assert_timeout(outcome(call).await);

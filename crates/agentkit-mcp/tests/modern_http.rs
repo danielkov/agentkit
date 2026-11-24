@@ -153,10 +153,12 @@ async fn rpc(
                 "2026-07-28"
             );
             match message["params"]["cursor"].as_str() {
-                None => json!({"resultType":"complete","ttlMs":30000,"cacheScope":"private",
-                    "skills":[skill("first")], "nextCursor":"page-2"}),
+                None => {
+                    json!({"resultType":"complete","ttlMs":30000,"cacheScope":"private","_meta":{"example":"inventory"},
+                    "skills":[skill("first")], "nextCursor":"page-2"})
+                }
                 Some("page-2") => {
-                    json!({"resultType":"complete","ttlMs":30000,"cacheScope":"public",
+                    json!({"resultType":"complete","ttlMs":30000,"cacheScope":"public","_meta":{"example":"inventory"},
                     "skills":[skill("second")]})
                 }
                 cursor => panic!("unexpected cursor: {cursor:?}"),
@@ -164,8 +166,10 @@ async fn rpc(
         }
         "skills/get" if token == "Bearer skills" => {
             assert_eq!(message["params"]["uri"], "skill://unlisted/SKILL.md");
-            json!({"resultType":"complete","skill":skill("unlisted")})
+            json!({"resultType":"complete","_meta":{"example":"lookup"},"skill":skill("unlisted")})
         }
+        "skills/list" if token == "Bearer legacy-skills" => json!({"skills":[skill("first")]}),
+        "skills/get" if token == "Bearer legacy-skills" => json!({"skill":skill("unlisted")}),
         "server/discover" => {
             if token.starts_with("Bearer legacy") {
                 return Json(json!({"jsonrpc":"2.0", "id":id, "error":{
@@ -261,9 +265,13 @@ async fn rpc(
                 }}))
                 .into_response();
             }
+            let mut capabilities = json!({"tools":{}, "resources":{"subscribe":true}});
+            if token == "Bearer legacy-skills" {
+                capabilities["extensions"] = json!({"io.modelcontextprotocol/skills":{}});
+            }
             json!({
                 "protocolVersion":"2024-11-05",
-                "capabilities":{"tools":{}, "resources":{"subscribe":true}},
+                "capabilities":capabilities,
                 "serverInfo":{"name":"legacy-http-test", "version":"1"}
             })
         }
@@ -388,13 +396,13 @@ async fn skill_inventory_uses_advertised_extension_on_current_connection() {
             skills.iter().map(|s| s.uri.as_str()).collect::<Vec<_>>(),
             ["skill://first/SKILL.md", "skill://second/SKILL.md"]
         );
-        assert_eq!(skills[0].frontmatter["custom"], json!({"x": true}));
-        let McpSkillResources::Manifest(files) = &skills[0].resources else {
+        assert_eq!(skills[0].frontmatter.extra["custom"], json!({"x": true}));
+        let McpSkillResources::Files(files) = &skills[0].resources else {
             panic!("expected a skill file manifest");
         };
         assert_eq!(files[0].uri, skills[0].uri);
         assert_eq!(files[0].size, 149);
-        assert!(matches!(skills[1].resources, McpSkillResources::Dynamic(_)));
+        assert!(matches!(skills[1].resources, McpSkillResources::Dynamic));
         let uri = "skill://unlisted/SKILL.md";
         assert_eq!(connection.get_skill(uri).await.unwrap().uri, uri);
         assert!(
@@ -405,6 +413,29 @@ async fn skill_inventory_uses_advertised_extension_on_current_connection() {
                 .iter()
                 .all(|(_, message)| { message["method"] != "resources/read" })
         );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn skills_are_available_on_an_initialize_based_connection() {
+    bounded(async {
+        let fixture = Fixture::start().await;
+        let connection = McpConnection::connect(&fixture.config).await.unwrap();
+        connection
+            .resolve_auth(auth("legacy-skills"))
+            .await
+            .unwrap();
+        assert_eq!(
+            connection.protocol_version(),
+            Some(ProtocolVersion::V_2024_11_05)
+        );
+        assert_eq!(
+            connection.list_skills().await.unwrap()[0].frontmatter.name,
+            "first"
+        );
+        let uri = "skill://unlisted/SKILL.md";
+        assert_eq!(connection.get_skill(uri).await.unwrap().uri, uri);
     })
     .await;
 }
