@@ -664,12 +664,14 @@ mod runlet;
 #[derive(Clone)]
 struct FailingTool {
     spec: ToolSpec,
+    calls: Arc<AtomicUsize>,
 }
 
 impl FailingTool {
     fn new() -> Self {
         Self {
             spec: ToolSpec::new("fail", "always fails", json!({"type": "object"})),
+            calls: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
@@ -685,6 +687,7 @@ impl Tool for FailingTool {
         _request: ToolRequest,
         _ctx: &mut ToolContext<'_>,
     ) -> Result<ToolResult, ToolError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
         Err(ToolError::ExecutionFailed("permission denied".into()))
     }
 }
@@ -1156,4 +1159,114 @@ async fn coroutines_cannot_call_tools() {
     }
     // Only the main-script call ran.
     assert_eq!(echo_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn approval_resume_replays_a_caught_failure_without_rerunning_it() {
+    let compose = ComposeTool::new(ComposeConfig::default());
+    let failing = FailingTool::new();
+    let gated = ApprovalEchoTool::new();
+    let failing_calls = failing.calls.clone();
+    let gated_calls = gated.calls.clone();
+    let executor: Arc<dyn ToolExecutor> = Arc::new(BasicToolExecutor::from_registry(
+        ToolRegistry::new().with(compose).with(failing).with(gated),
+    ));
+    let permissions: Arc<dyn PermissionChecker> = Arc::new(RequireApproval);
+    let req = request(
+        "local _, err = pcall(tool, 'fail', {}) \
+         local b = tool('approval_echo', { value = 1 }) \
+         return { err = err, b = b }",
+        Value::Null,
+    );
+
+    let owned = owned_context(executor.clone(), permissions.clone());
+    let mut ctx = owned.borrowed();
+    let approval = match executor.execute(req.clone(), &mut ctx).await {
+        ToolExecutionOutcome::Interrupted(ToolInterruption::ApprovalRequired(approval)) => approval,
+        other => panic!("unexpected first outcome: {other:?}"),
+    };
+    assert_eq!(failing_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(gated_calls.load(Ordering::SeqCst), 0);
+
+    let owned = owned_context(executor.clone(), permissions);
+    match executor.execute_approved_owned(req, &approval, owned).await {
+        ToolExecutionOutcome::Completed(result) => {
+            let ToolOutput::Structured(value) = result.result.output else {
+                panic!("expected structured output");
+            };
+            assert!(
+                value["err"]
+                    .as_str()
+                    .is_some_and(|err| err.contains("permission denied"))
+            );
+            assert_eq!(value["b"]["value"], json!(1));
+        }
+        other => panic!("unexpected approved outcome: {other:?}"),
+    }
+    assert_eq!(failing_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(gated_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn interrupted_attempt_releases_its_state() {
+    let compose = ComposeTool::new(ComposeConfig::default());
+    let states = compose.states.clone();
+    let executor: Arc<dyn ToolExecutor> = Arc::new(BasicToolExecutor::from_registry(
+        ToolRegistry::new()
+            .with(compose)
+            .with(ApprovalEchoTool::new()),
+    ));
+    let permissions: Arc<dyn PermissionChecker> = Arc::new(RequireApproval);
+    let before = Arc::strong_count(&states);
+    // The script keeps a reference to its own thread, so Lua still reaches
+    // the parked call when the attempt is dropped.
+    let req = request(
+        "keep = coroutine.running(); return tool('approval_echo', { value = 1 })",
+        Value::Null,
+    );
+
+    let owned = owned_context(executor.clone(), permissions);
+    let mut ctx = owned.borrowed();
+    assert!(matches!(
+        executor.execute(req, &mut ctx).await,
+        ToolExecutionOutcome::Interrupted(_)
+    ));
+    // The dispatcher held by the parked call must be gone.
+    assert_eq!(Arc::strong_count(&states), before);
+}
+
+#[tokio::test]
+async fn tool_calls_from_non_yieldable_frames_are_refused() {
+    let echo = EchoTool::new();
+    let echo_calls = echo.calls.clone();
+    let outcome = execute_compose(
+        ComposeConfig::default(),
+        echo,
+        request(
+            "local ok, err = pcall(table.sort, { 3, 1, 2 }, function(a, b) \
+               tool('echo', { value = 1 }) \
+               return a < b \
+             end) \
+             return { ok = ok, err = err }",
+            Value::Null,
+        ),
+    )
+    .await;
+
+    match outcome {
+        ToolExecutionOutcome::Completed(result) => {
+            let ToolOutput::Structured(value) = result.result.output else {
+                panic!("expected structured output");
+            };
+            assert_eq!(value["ok"], json!(false));
+            assert!(
+                value["err"]
+                    .as_str()
+                    .is_some_and(|err| err.contains("cannot be called here")),
+                "unexpected: {value}"
+            );
+        }
+        other => panic!("unexpected outcome: {other:?}"),
+    }
+    assert_eq!(echo_calls.load(Ordering::SeqCst), 0);
 }

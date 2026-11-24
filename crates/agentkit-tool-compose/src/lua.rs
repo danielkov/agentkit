@@ -43,6 +43,8 @@ impl ComposeBackend for LuaBackend {
              return value enters the conversation, so intermediate results never consume \
              context. The script sees a global `input` (the JSON value passed alongside the \
              script) and may call `tools()` to enumerate the visible tool catalog at runtime. \
+             Call tool() from the main script body or plain functions it calls, not from inside \
+             coroutines, metamethods, iterators or sort comparators. \
              Return any Lua value to make it the compose result.\n\n\
              Example — scan every page, drill into matches, return only the summary:\n\
              local page, hits = 1, {}\n\
@@ -116,33 +118,31 @@ impl ComposeBackend for LuaBackend {
         // during teardown) is refused before it reaches the dispatcher.
         let dispatcher = run.dispatcher.clone();
         let stopped_slot = stopped.clone();
-        let tool_fn = lua
+        let raw_tool = lua
             .create_async_function(move |lua, (name, lua_input): (String, LuaValue)| {
+                // Everything that needs the VM happens before the dispatch
+                // future exists: the future keeps only a weak handle, so a
+                // parked call does not keep the VM (and with it this
+                // dispatcher) alive after the attempt is dropped.
+                let prepared = prepare_dispatch(&lua, &stopped_slot, main_thread_ptr, lua_input);
+                let weak_lua = lua.weak();
+                drop(lua);
                 let dispatcher = dispatcher.clone();
                 let stopped_slot = stopped_slot.clone();
                 async move {
-                    if stopped_slot.get().is_some() {
-                        return Err(mlua::Error::external(ComposeStop(ToolError::Internal(
-                            "compose attempt already stopped".into(),
-                        ))));
-                    }
-                    // A coroutine could hold or abandon a call after it used a
-                    // sequential ordinal, so calls are refused there before
-                    // they use one.
-                    if lua.current_thread().to_pointer() as usize != main_thread_ptr {
-                        return Err(mlua::Error::external(ComposeFailure(
-                            ToolError::ExecutionFailed(
-                                "tool() must be called from the main compose script, not from a coroutine"
-                                    .into(),
-                            ),
-                        )));
-                    }
-                    let child_input: Value = lua.from_value(lua_input)?;
+                    let child_input = prepared?;
                     let stop = match dispatcher
                         .call(CallKey::Sequential, ToolName::new(name), child_input)
                         .await
                     {
-                        Ok(output) => return lua.to_value(&output),
+                        Ok(output) => {
+                            let lua = weak_lua.try_upgrade().ok_or_else(|| {
+                                mlua::Error::external(ComposeStop(ToolError::Internal(
+                                    "compose attempt already dropped".into(),
+                                )))
+                            })?;
+                            return lua.to_value(&output);
+                        }
                         Err(DispatchError::Interrupted(interruption)) => {
                             AttemptStop::Interrupted(interruption)
                         }
@@ -158,6 +158,28 @@ impl ComposeBackend for LuaBackend {
                     unreachable!("a pending future never resolves")
                 }
             })
+            .map_err(lua_error_to_outcome)?;
+        // A child call may suspend the script, so it must start from a frame
+        // that can yield; otherwise it could use a sequential ordinal and then
+        // fail to suspend. The wrapper checks with the original
+        // `coroutine.isyieldable` and keeps the raw dispatcher out of reach.
+        let is_yieldable: mlua::Function = globals
+            .get::<mlua::Table>("coroutine")
+            .and_then(|coroutine| coroutine.get("isyieldable"))
+            .map_err(lua_error_to_outcome)?;
+        let tool_fn: mlua::Function = lua
+            .load(
+                "local raw, is_yieldable = ... \
+                 return function(name, input) \
+                   if not is_yieldable() then \
+                     error('tool() cannot be called here: call it from the main compose script, \
+                            not from a metamethod, iterator or sort comparator', 2) \
+                   end \
+                   return raw(name, input) \
+                 end",
+            )
+            .set_name("compose_tool")
+            .call((raw_tool, is_yieldable))
             .map_err(lua_error_to_outcome)?;
         globals.set("tool", tool_fn).map_err(lua_error_to_outcome)?;
 
@@ -204,6 +226,30 @@ impl ComposeBackend for LuaBackend {
             }
         }
     }
+}
+
+/// Checks a `tool()` call and decodes its input before any child dispatch.
+fn prepare_dispatch(
+    lua: &Lua,
+    stopped: &OnceLock<AttemptStop>,
+    main_thread_ptr: usize,
+    lua_input: LuaValue,
+) -> Result<Value, mlua::Error> {
+    if stopped.get().is_some() {
+        return Err(mlua::Error::external(ComposeStop(ToolError::Internal(
+            "compose attempt already stopped".into(),
+        ))));
+    }
+    // A coroutine could hold or abandon a call after it used a sequential
+    // ordinal, so calls are refused there before they use one.
+    if lua.current_thread().to_pointer() as usize != main_thread_ptr {
+        return Err(mlua::Error::external(ComposeFailure(
+            ToolError::ExecutionFailed(
+                "tool() must be called from the main compose script, not from a coroutine".into(),
+            ),
+        )));
+    }
+    lua.from_value(lua_input)
 }
 
 /// Replaces child tool failures a script caught with `pcall` and returned
