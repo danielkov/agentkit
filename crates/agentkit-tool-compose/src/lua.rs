@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::task::Poll;
 
@@ -43,8 +43,9 @@ impl ComposeBackend for LuaBackend {
              return value enters the conversation, so intermediate results never consume \
              context. The script sees a global `input` (the JSON value passed alongside the \
              script) and may call `tools()` to enumerate the visible tool catalog at runtime. \
-             Call tool() from the main script body or plain functions it calls, not from inside \
-             coroutines, metamethods, iterators or sort comparators. \
+             Call tool() from the main script, including loop bodies and plain functions it \
+             calls, not from coroutines or from callbacks Lua cannot suspend, such as a \
+             table.sort comparator. \
              Return any Lua value to make it the compose result.\n\n\
              Example — scan every page, drill into matches, return only the summary:\n\
              local page, hits = 1, {}\n\
@@ -67,30 +68,13 @@ impl ComposeBackend for LuaBackend {
 
     async fn execute(&self, run: BackendRun) -> Result<Value, ComposeOutcome> {
         let lua = Lua::new();
-        // Why the attempt ended, recorded by a `tool()` call (approval or a
-        // child's own cancellation) or by the VM hook (turn cancellation or the
-        // instruction budget). It wins over whatever the script does next.
+        // Why the attempt ended, recorded by a `tool()` call (approval, a
+        // child's own cancellation, or a replay divergence) or by the VM hook
+        // (turn cancellation or the instruction budget). It wins over whatever
+        // the script does next.
         let stopped: Arc<OnceLock<AttemptStop>> = Arc::new(OnceLock::new());
-        let hook_main_thread = Arc::new(AtomicUsize::new(0));
-        install_attempt_hook(
-            &lua,
-            run.config.max_instruction_count,
-            run.cancellation.clone(),
-            stopped.clone(),
-            hook_main_thread.clone(),
-        )
-        .map_err(lua_error_to_outcome)?;
-        // The script runs on one host-owned thread, created after the hook so
-        // it inherits it. Only that thread may call `tool()`, and the hook
-        // hands control back to the host from it.
-        let main_thread = lua
-            .load(run.script.as_str())
-            .set_name("compose")
-            .into_function()
-            .and_then(|script| lua.create_thread(script))
-            .map_err(lua_error_to_outcome)?;
-        let main_thread_ptr = main_thread.to_pointer() as usize;
-        hook_main_thread.store(main_thread_ptr, Ordering::Relaxed);
+        // The host-owned thread the script runs on; set once it exists.
+        let main_thread_ptr = Arc::new(AtomicUsize::new(0));
         install_sandbox(&lua).map_err(lua_error_to_outcome)?;
         let globals = lua.globals();
         globals
@@ -118,13 +102,19 @@ impl ComposeBackend for LuaBackend {
         // during teardown) is refused before it reaches the dispatcher.
         let dispatcher = run.dispatcher.clone();
         let stopped_slot = stopped.clone();
+        let dispatch_thread = main_thread_ptr.clone();
         let raw_tool = lua
             .create_async_function(move |lua, (name, lua_input): (String, LuaValue)| {
                 // Everything that needs the VM happens before the dispatch
                 // future exists: the future keeps only a weak handle, so a
                 // parked call does not keep the VM (and with it this
                 // dispatcher) alive after the attempt is dropped.
-                let prepared = prepare_dispatch(&lua, &stopped_slot, main_thread_ptr, lua_input);
+                let prepared = prepare_dispatch(
+                    &lua,
+                    &stopped_slot,
+                    dispatch_thread.load(Ordering::Relaxed),
+                    lua_input,
+                );
                 let weak_lua = lua.weak();
                 drop(lua);
                 let dispatcher = dispatcher.clone();
@@ -149,6 +139,9 @@ impl ComposeBackend for LuaBackend {
                         Err(DispatchError::Failed(ToolError::Cancelled)) => {
                             AttemptStop::Failed(ToolError::Cancelled)
                         }
+                        // The child history no longer matches; nothing the
+                        // script does next can be trusted.
+                        Err(DispatchError::ReplayDiverged(error)) => AttemptStop::Failed(error),
                         Err(DispatchError::Failed(error)) => {
                             return Err(mlua::Error::external(ComposeFailure(error)));
                         }
@@ -159,29 +152,30 @@ impl ComposeBackend for LuaBackend {
                 }
             })
             .map_err(lua_error_to_outcome)?;
-        // A child call may suspend the script, so it must start from a frame
-        // that can yield; otherwise it could use a sequential ordinal and then
-        // fail to suspend. The wrapper checks with the original
-        // `coroutine.isyieldable` and keeps the raw dispatcher out of reach.
-        let is_yieldable: mlua::Function = globals
-            .get::<mlua::Table>("coroutine")
-            .and_then(|coroutine| coroutine.get("isyieldable"))
+        let stop_check = stopped.clone();
+        let is_stopped = lua
+            .create_function(move |_, ()| Ok(stop_check.get().is_some()))
             .map_err(lua_error_to_outcome)?;
-        let tool_fn: mlua::Function = lua
-            .load(
-                "local raw, is_yieldable = ... \
-                 return function(name, input) \
-                   if not is_yieldable() then \
-                     error('tool() cannot be called here: call it from the main compose script, \
-                            not from a metamethod, iterator or sort comparator', 2) \
-                   end \
-                   return raw(name, input) \
-                 end",
-            )
-            .set_name("compose_tool")
-            .call((raw_tool, is_yieldable))
+        // Host setup runs before the instruction hook is armed, so it never
+        // counts against the script's budget.
+        install_attempt_guards(&lua, raw_tool, is_stopped).map_err(lua_error_to_outcome)?;
+        install_attempt_hook(
+            &lua,
+            run.config.max_instruction_count,
+            run.cancellation.clone(),
+            stopped.clone(),
+        )
+        .map_err(lua_error_to_outcome)?;
+        // The script runs on one host-owned thread, created after the hook so
+        // it and every coroutine it starts inherit it. Only that thread may
+        // call `tool()`.
+        let main_thread = lua
+            .load(run.script.as_str())
+            .set_name("compose")
+            .into_function()
+            .and_then(|script| lua.create_thread(script))
             .map_err(lua_error_to_outcome)?;
-        globals.set("tool", tool_fn).map_err(lua_error_to_outcome)?;
+        main_thread_ptr.store(main_thread.to_pointer() as usize, Ordering::Relaxed);
 
         let mut evaluation = std::pin::pin!(
             main_thread
@@ -249,8 +243,62 @@ fn prepare_dispatch(
             ),
         )));
     }
-    lua.from_value(lua_input)
+    lua.from_value(lua_input).map_err(|error| {
+        mlua::Error::external(ComposeFailure(ToolError::InvalidInput(format!(
+            "tool() input cannot be converted to JSON: {error}"
+        ))))
+    })
 }
+
+/// Lua-side guards installed before the script runs:
+///
+/// - `tool` is a wrapper that checks its arguments and that the calling frame
+///   can yield before it reaches the raw dispatcher, which the script cannot
+///   reach. A child call may suspend the script, so starting one from a frame
+///   that cannot yield could use a sequential ordinal and then fail to
+///   suspend.
+/// - `pcall`, `xpcall`, `coroutine.resume` and `coroutine.close` re-raise once
+///   the attempt has stopped, so no frame can catch a stop and keep running.
+fn install_attempt_guards(
+    lua: &Lua,
+    raw_tool: mlua::Function,
+    is_stopped: mlua::Function,
+) -> Result<(), mlua::Error> {
+    lua.load(ATTEMPT_GUARDS)
+        .set_name("compose_guards")
+        .call::<()>((raw_tool, is_stopped))
+}
+
+const ATTEMPT_GUARDS: &str = r#"
+local raw_tool, is_stopped = ...
+local is_yieldable = coroutine.isyieldable
+local raw_pcall, raw_xpcall = pcall, xpcall
+local raw_resume, raw_close = coroutine.resume, coroutine.close
+local error, type = error, type
+
+local function unless_stopped(...)
+  if is_stopped() then
+    error("compose attempt stopped", 0)
+  end
+  return ...
+end
+
+function tool(name, input)
+  if type(name) ~= "string" then
+    error("tool() expects a tool name string as its first argument, got " .. type(name), 2)
+  end
+  if not is_yieldable() then
+    error("tool() cannot be called here: call it from a frame that can yield on the main " ..
+          "compose script, not from a coroutine or a callback such as a sort comparator", 2)
+  end
+  return raw_tool(name, input)
+end
+
+function pcall(...) return unless_stopped(raw_pcall(...)) end
+function xpcall(...) return unless_stopped(raw_xpcall(...)) end
+coroutine.resume = function(...) return unless_stopped(raw_resume(...)) end
+coroutine.close = function(...) return unless_stopped(raw_close(...)) end
+"#;
 
 /// Replaces child tool failures a script caught with `pcall` and returned
 /// (at the root or inside tables) with their message, so the result
@@ -397,21 +445,20 @@ fn install_sandbox(lua: &Lua) -> Result<(), mlua::Error> {
 }
 
 /// How often the hook runs when no instruction budget is set, so a recorded
-/// stop or a turn cancellation still reaches the host.
+/// stop or a turn cancellation still ends the script.
 const STOP_CHECK_INSTRUCTIONS: u32 = 1_000;
 
 /// Installs the VM hook that ends an attempt. Turn cancellation and the
 /// instruction budget are recorded in `stopped` before control leaves the
-/// hook, so a script that catches the resulting error cannot turn them into a
-/// result. Once a stop is recorded, the hook hands control back to the host:
-/// it yields the main thread where Lua allows it, and raises an error to
-/// unwind frames that cannot yield (a coroutine, a metamethod, a C call).
+/// hook, so a script cannot turn them into a result. Once any stop is
+/// recorded, the hook raises on every check; the attempt guards re-raise
+/// through `pcall` and friends, so the error unwinds every frame, including
+/// ones that cannot yield, and the host's poll returns.
 fn install_attempt_hook(
     lua: &Lua,
     max_instruction_count: u64,
     cancellation: Option<TurnCancellation>,
     stopped: Arc<OnceLock<AttemptStop>>,
-    main_thread_ptr: Arc<AtomicUsize>,
 ) -> Result<(), mlua::Error> {
     let step = if max_instruction_count == 0 {
         STOP_CHECK_INSTRUCTIONS
@@ -419,12 +466,9 @@ fn install_attempt_hook(
         max_instruction_count.min(u64::from(STOP_CHECK_INSTRUCTIONS)) as u32
     };
     let seen = Arc::new(AtomicU64::new(0));
-    // A yield the VM ignored (non-yieldable frame) leaves the hook running;
-    // the next check raises instead, then yields again, and so on.
-    let raise_next = Arc::new(AtomicBool::new(false));
     lua.set_global_hook(
         HookTriggers::new().every_nth_instruction(step),
-        move |lua, _debug| {
+        move |_lua, _debug| {
             if stopped.get().is_none() {
                 if cancellation
                     .as_ref()
@@ -440,24 +484,15 @@ fn install_attempt_hook(
                     }
                 }
             }
-            let Some(stop) = stopped.get() else {
-                return Ok(VmState::Continue);
-            };
-            // Only a yield of the script's own thread reaches the host; a
-            // script coroutine's yield would just return to the script.
-            let on_main = lua.current_thread().to_pointer() as usize
-                == main_thread_ptr.load(Ordering::Relaxed);
-            if on_main && !raise_next.swap(true, Ordering::Relaxed) {
-                return Ok(VmState::Yield);
-            }
-            raise_next.store(false, Ordering::Relaxed);
-            let error = match stop {
-                AttemptStop::Failed(error) => error.clone(),
-                AttemptStop::Interrupted(_) => {
-                    ToolError::Internal("compose attempt already stopped".into())
+            match stopped.get() {
+                None => Ok(VmState::Continue),
+                Some(AttemptStop::Failed(error)) => {
+                    Err(mlua::Error::external(ComposeStop(error.clone())))
                 }
-            };
-            Err(mlua::Error::external(ComposeStop(error)))
+                Some(AttemptStop::Interrupted(_)) => Err(mlua::Error::external(ComposeStop(
+                    ToolError::Internal("compose attempt stopped".into()),
+                ))),
+            }
         },
     )
 }

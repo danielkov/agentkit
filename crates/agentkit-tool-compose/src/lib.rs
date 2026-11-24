@@ -179,6 +179,9 @@ pub enum DispatchError {
     /// interruption and can be resumed once the approval is granted.
     Interrupted(ToolInterruption),
     Failed(ToolError),
+    /// The call does not match the recorded child history of this compose
+    /// run. Unlike [`DispatchError::Failed`], the run cannot continue.
+    ReplayDiverged(ToolError),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -276,9 +279,9 @@ impl ChildDispatcher {
             if recorded_name == tool_name && recorded_input == child_input {
                 return recorded_output.map_err(DispatchError::Failed);
             }
-            return Err(DispatchError::Failed(ToolError::ExecutionFailed(format!(
-                "compose replay diverged at nested tool call {record_key}"
-            ))));
+            return Err(DispatchError::ReplayDiverged(ToolError::ExecutionFailed(
+                format!("compose replay diverged at nested tool call {record_key}"),
+            )));
         }
 
         if !self.config.allows(&tool_name) {
@@ -451,9 +454,9 @@ impl ChildDispatcher {
         let run_state = states.entry(self.parent_call_id.clone()).or_default();
         if sequential {
             if run_state.sequential_len != ordinal {
-                return Err(DispatchError::Failed(ToolError::ExecutionFailed(format!(
-                    "compose replay cannot append nested tool call {ordinal}"
-                ))));
+                return Err(DispatchError::ReplayDiverged(ToolError::ExecutionFailed(
+                    format!("compose replay cannot append nested tool call {ordinal}"),
+                )));
             }
             run_state.sequential_len += 1;
         }

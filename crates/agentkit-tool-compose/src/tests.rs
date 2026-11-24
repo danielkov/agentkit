@@ -1270,3 +1270,124 @@ async fn tool_calls_from_non_yieldable_frames_are_refused() {
     }
     assert_eq!(echo_calls.load(Ordering::SeqCst), 0);
 }
+
+#[tokio::test]
+async fn caught_replay_divergence_still_fails_compose() {
+    let compose = ComposeTool::new(ComposeConfig::default());
+    let states = compose.states.clone();
+    let executor: Arc<dyn ToolExecutor> = Arc::new(BasicToolExecutor::from_registry(
+        ToolRegistry::new()
+            .with(compose)
+            .with(EchoTool::new())
+            .with(ApprovalEchoTool::new()),
+    ));
+    let permissions: Arc<dyn PermissionChecker> = Arc::new(RequireApproval);
+    let req = request(
+        "local ok, err = pcall(tool, 'echo', { value = 1 }) \
+         return { ok = ok, err = err, b = tool('approval_echo', { value = 2 }) }",
+        Value::Null,
+    );
+
+    let owned = owned_context(executor.clone(), permissions.clone());
+    let mut ctx = owned.borrowed();
+    let approval = match executor.execute(req.clone(), &mut ctx).await {
+        ToolExecutionOutcome::Interrupted(ToolInterruption::ApprovalRequired(approval)) => approval,
+        other => panic!("unexpected first outcome: {other:?}"),
+    };
+    // Make the recorded first child disagree with what the resumed script
+    // will ask for.
+    for state in states.lock().await.values_mut() {
+        if let Some(record) = state.records.get_mut("seq:0") {
+            record.input = json!({ "value": 99 });
+        }
+    }
+
+    let owned = owned_context(executor.clone(), permissions);
+    match executor.execute_approved_owned(req, &approval, owned).await {
+        ToolExecutionOutcome::Failed(ToolError::ExecutionFailed(message)) => {
+            assert!(message.contains("diverged"), "unexpected: {message}");
+        }
+        other => panic!("unexpected outcome: {other:?}"),
+    }
+}
+
+#[test]
+fn stops_unwind_nested_and_non_yieldable_frames() {
+    for script in [
+        // A coroutine that keeps catching the stop.
+        "coroutine.wrap(function() while true do pcall(function() while true do end end) end end)()",
+        // A sort comparator (cannot yield) that keeps catching the stop.
+        "table.sort({ 3, 2, 1 }, function(a, b) \
+           while true do pcall(function() while true do end end) end \
+         end)",
+        // Resuming a coroutine that dies to the stop, forever.
+        "while true do coroutine.resume(coroutine.create(function() while true do end end)) end",
+    ] {
+        let outcome = run_with_deadline(move || {
+            Box::pin(async move {
+                execute_compose(
+                    ComposeConfig::default().with_max_instruction_count(10_000),
+                    EchoTool::new(),
+                    request(script, Value::Null),
+                )
+                .await
+            })
+        });
+        match outcome {
+            ToolExecutionOutcome::Failed(ToolError::ExecutionFailed(message)) => {
+                assert!(
+                    message.contains("Lua instructions"),
+                    "unexpected: {message}"
+                );
+            }
+            other => panic!("unexpected outcome for {script:?}: {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn caught_tool_argument_errors_keep_their_message() {
+    for (script, expected) in [
+        (
+            "local _, err = pcall(tool, 'echo', { value = function() end }); return err",
+            "cannot be converted to JSON",
+        ),
+        (
+            "local _, err = pcall(tool, 42, {}); return err",
+            "expects a tool name string",
+        ),
+    ] {
+        let outcome = execute_compose(
+            ComposeConfig::default(),
+            EchoTool::new(),
+            request(script, Value::Null),
+        )
+        .await;
+        match outcome {
+            ToolExecutionOutcome::Completed(result) => {
+                let ToolOutput::Structured(value) = result.result.output else {
+                    panic!("expected structured output");
+                };
+                assert!(
+                    value.as_str().is_some_and(|err| err.contains(expected)),
+                    "unexpected for {script:?}: {value}"
+                );
+            }
+            other => panic!("unexpected outcome for {script:?}: {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn host_setup_does_not_count_against_the_script_budget() {
+    let outcome = execute_compose(
+        ComposeConfig::default().with_max_instruction_count(2),
+        EchoTool::new(),
+        request("return 1", Value::Null),
+    )
+    .await;
+    assert!(
+        matches!(outcome, ToolExecutionOutcome::Completed(_)),
+        "unexpected outcome: {outcome:?}"
+    );
+}

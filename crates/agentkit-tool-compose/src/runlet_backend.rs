@@ -525,7 +525,9 @@ impl RunletBackend {
                             "compose run is suspended awaiting approval",
                         ))
                     }
-                    Err(DispatchError::Failed(error)) => Err(bridge.record_failure(error)),
+                    Err(DispatchError::Failed(error) | DispatchError::ReplayDiverged(error)) => {
+                        Err(bridge.record_failure(error))
+                    }
                 }
             });
         }
