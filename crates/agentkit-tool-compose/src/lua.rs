@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::task::Poll;
 
@@ -65,12 +65,30 @@ impl ComposeBackend for LuaBackend {
 
     async fn execute(&self, run: BackendRun) -> Result<Value, ComposeOutcome> {
         let lua = Lua::new();
-        install_instruction_limit(
+        // Why the attempt ended, recorded by a `tool()` call (approval or a
+        // child's own cancellation) or by the VM hook (turn cancellation or the
+        // instruction budget). It wins over whatever the script does next.
+        let stopped: Arc<OnceLock<AttemptStop>> = Arc::new(OnceLock::new());
+        let hook_main_thread = Arc::new(AtomicUsize::new(0));
+        install_attempt_hook(
             &lua,
             run.config.max_instruction_count,
             run.cancellation.clone(),
+            stopped.clone(),
+            hook_main_thread.clone(),
         )
         .map_err(lua_error_to_outcome)?;
+        // The script runs on one host-owned thread, created after the hook so
+        // it inherits it. Only that thread may call `tool()`, and the hook
+        // hands control back to the host from it.
+        let main_thread = lua
+            .load(run.script.as_str())
+            .set_name("compose")
+            .into_function()
+            .and_then(|script| lua.create_thread(script))
+            .map_err(lua_error_to_outcome)?;
+        let main_thread_ptr = main_thread.to_pointer() as usize;
+        hook_main_thread.store(main_thread_ptr, Ordering::Relaxed);
         install_sandbox(&lua).map_err(lua_error_to_outcome)?;
         let globals = lua.globals();
         globals
@@ -90,13 +108,12 @@ impl ComposeBackend for LuaBackend {
             )
             .map_err(lua_error_to_outcome)?;
 
-        // An approval interrupt or a child's own cancellation ends the Lua
-        // attempt at the `tool()` call that hit it: the call records it here and
-        // never resumes the script, so `pcall` cannot catch it. The latch also
-        // refuses any later dispatch (from a coroutine or during teardown)
-        // before it reaches the dispatcher, so no child side effect runs while
-        // an approval is pending.
-        let stopped: Arc<OnceLock<AttemptStop>> = Arc::new(OnceLock::new());
+        // An approval interrupt or a child's own cancellation ends the attempt
+        // at the `tool()` call that hit it: the call records the stop and never
+        // resumes, so `pcall` cannot catch it. Because only the main thread may
+        // dispatch, parking that call suspends the whole script and the host
+        // sees the stop on the same poll. Any later dispatch (for example
+        // during teardown) is refused before it reaches the dispatcher.
         let dispatcher = run.dispatcher.clone();
         let stopped_slot = stopped.clone();
         let tool_fn = lua
@@ -109,6 +126,17 @@ impl ComposeBackend for LuaBackend {
                             "compose attempt already stopped".into(),
                         ))));
                     }
+                    // A coroutine could hold or abandon a call after it used a
+                    // sequential ordinal, so calls are refused there before
+                    // they use one.
+                    if lua.current_thread().to_pointer() as usize != main_thread_ptr {
+                        return Err(mlua::Error::external(ComposeFailure(
+                            ToolError::ExecutionFailed(
+                                "tool() must be called from the main compose script, not from a coroutine"
+                                    .into(),
+                            ),
+                        )));
+                    }
                     let child_input: Value = lua.from_value(lua_input)?;
                     let stop = match dispatcher
                         .call(CallKey::Sequential, ToolName::new(name), child_input)
@@ -118,7 +146,9 @@ impl ComposeBackend for LuaBackend {
                         Err(DispatchError::Interrupted(interruption)) => {
                             AttemptStop::Interrupted(interruption)
                         }
-                        Err(DispatchError::Failed(ToolError::Cancelled)) => AttemptStop::Cancelled,
+                        Err(DispatchError::Failed(ToolError::Cancelled)) => {
+                            AttemptStop::Failed(ToolError::Cancelled)
+                        }
                         Err(DispatchError::Failed(error)) => {
                             return Err(mlua::Error::external(ComposeFailure(error)));
                         }
@@ -132,9 +162,9 @@ impl ComposeBackend for LuaBackend {
         globals.set("tool", tool_fn).map_err(lua_error_to_outcome)?;
 
         let mut evaluation = std::pin::pin!(
-            lua.load(run.script.as_str())
-                .set_name("compose")
-                .eval_async::<LuaValue>()
+            main_thread
+                .into_async::<LuaValue>(())
+                .map_err(lua_error_to_outcome)?
         );
         // A recorded stop wins over whatever the poll returned, including a
         // finished script.
@@ -155,7 +185,7 @@ impl ComposeBackend for LuaBackend {
                 Some(AttemptStop::Interrupted(interruption)) => {
                     ComposeOutcome::Interrupted(interruption)
                 }
-                Some(AttemptStop::Cancelled) => ComposeOutcome::Failed(ToolError::Cancelled),
+                Some(AttemptStop::Failed(error)) => ComposeOutcome::Failed(error),
                 None => ComposeOutcome::Failed(ToolError::Internal(
                     "compose attempt stop was not recorded".into(),
                 )),
@@ -273,7 +303,7 @@ fn compose_error(error: &mlua::Error) -> Option<ComposeError<'_>> {
 #[derive(Clone, Debug)]
 enum AttemptStop {
     Interrupted(ToolInterruption),
-    Cancelled,
+    Failed(ToolError),
 }
 
 /// A child tool call failed. A script may catch and return it as data.
@@ -320,34 +350,68 @@ fn install_sandbox(lua: &Lua) -> Result<(), mlua::Error> {
     Ok(())
 }
 
-fn install_instruction_limit(
+/// How often the hook runs when no instruction budget is set, so a recorded
+/// stop or a turn cancellation still reaches the host.
+const STOP_CHECK_INSTRUCTIONS: u32 = 1_000;
+
+/// Installs the VM hook that ends an attempt. Turn cancellation and the
+/// instruction budget are recorded in `stopped` before control leaves the
+/// hook, so a script that catches the resulting error cannot turn them into a
+/// result. Once a stop is recorded, the hook hands control back to the host:
+/// it yields the main thread where Lua allows it, and raises an error to
+/// unwind frames that cannot yield (a coroutine, a metamethod, a C call).
+fn install_attempt_hook(
     lua: &Lua,
     max_instruction_count: u64,
     cancellation: Option<TurnCancellation>,
+    stopped: Arc<OnceLock<AttemptStop>>,
+    main_thread_ptr: Arc<AtomicUsize>,
 ) -> Result<(), mlua::Error> {
-    if max_instruction_count == 0 {
-        return Ok(());
-    }
-    let step = max_instruction_count.min(1_000) as u32;
+    let step = if max_instruction_count == 0 {
+        STOP_CHECK_INSTRUCTIONS
+    } else {
+        max_instruction_count.min(u64::from(STOP_CHECK_INSTRUCTIONS)) as u32
+    };
     let seen = Arc::new(AtomicU64::new(0));
+    // A yield the VM ignored (non-yieldable frame) leaves the hook running;
+    // the next check raises instead, then yields again, and so on.
+    let raise_next = Arc::new(AtomicBool::new(false));
     lua.set_global_hook(
         HookTriggers::new().every_nth_instruction(step),
-        move |_lua, _debug| {
-            if cancellation
-                .as_ref()
-                .is_some_and(|cancellation| cancellation.is_cancelled())
-            {
-                return Err(mlua::Error::external(ComposeStop(ToolError::Cancelled)));
+        move |lua, _debug| {
+            if stopped.get().is_none() {
+                if cancellation
+                    .as_ref()
+                    .is_some_and(|cancellation| cancellation.is_cancelled())
+                {
+                    let _ = stopped.set(AttemptStop::Failed(ToolError::Cancelled));
+                } else if max_instruction_count > 0 {
+                    let previous = seen.fetch_add(u64::from(step), Ordering::Relaxed);
+                    if previous.saturating_add(u64::from(step)) > max_instruction_count {
+                        let _ = stopped.set(AttemptStop::Failed(ToolError::ExecutionFailed(
+                            format!("compose exceeded {max_instruction_count} Lua instructions"),
+                        )));
+                    }
+                }
             }
-            let previous = seen.fetch_add(u64::from(step), Ordering::Relaxed);
-            if previous.saturating_add(u64::from(step)) > max_instruction_count {
-                return Err(mlua::Error::external(ComposeStop(
-                    ToolError::ExecutionFailed(format!(
-                        "compose exceeded {max_instruction_count} Lua instructions"
-                    )),
-                )));
+            let Some(stop) = stopped.get() else {
+                return Ok(VmState::Continue);
+            };
+            // Only a yield of the script's own thread reaches the host; a
+            // script coroutine's yield would just return to the script.
+            let on_main = lua.current_thread().to_pointer() as usize
+                == main_thread_ptr.load(Ordering::Relaxed);
+            if on_main && !raise_next.swap(true, Ordering::Relaxed) {
+                return Ok(VmState::Yield);
             }
-            Ok(VmState::Continue)
+            raise_next.store(false, Ordering::Relaxed);
+            let error = match stop {
+                AttemptStop::Failed(error) => error.clone(),
+                AttemptStop::Interrupted(_) => {
+                    ToolError::Internal("compose attempt already stopped".into())
+                }
+            };
+            Err(mlua::Error::external(ComposeStop(error)))
         },
     )
 }

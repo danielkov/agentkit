@@ -893,67 +893,143 @@ async fn caught_child_failure_does_not_hide_a_later_success() {
     assert_eq!(echo_calls.load(Ordering::SeqCst), 1);
 }
 
-#[tokio::test]
-async fn caught_instruction_budget_stop_still_fails_compose() {
-    let outcome = execute_compose(
-        ComposeConfig::default().with_max_instruction_count(1_000),
-        EchoTool::new(),
-        request(
-            "local _, err = pcall(function() local x = 0 while true do x = x + 1 end end) \
-             return err",
-            Value::Null,
-        ),
-    )
-    .await;
-
-    match outcome {
-        ToolExecutionOutcome::Failed(ToolError::ExecutionFailed(message)) => {
-            assert!(
-                message.contains("Lua instructions"),
-                "unexpected: {message}"
-            );
-        }
-        other => panic!("unexpected outcome: {other:?}"),
-    }
-}
-
-#[test]
-fn approval_reaches_host_without_waiting_for_the_script() {
-    // With no instruction budget, this script never yields again once it
-    // resumes, so a regression would block the runtime thread forever. Run it
-    // on its own thread so the deadline below still fails the test.
+/// Runs a compose call on its own thread and fails the test if it does not
+/// finish in time. A Lua loop that never yields would block a Tokio timeout's
+/// own thread, so the deadline lives outside the runtime.
+fn run_with_deadline(
+    run: impl FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolExecutionOutcome>>>
+    + Send
+    + 'static,
+) -> ToolExecutionOutcome {
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("test runtime");
-        let outcome = runtime.block_on(async {
+        let _ = sender.send(runtime.block_on(run()));
+    });
+    receiver
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("compose must hand control back to the host")
+}
+
+#[test]
+fn approval_reaches_host_without_waiting_for_the_script() {
+    // With no instruction budget, this script never ends once it resumes.
+    let outcome = run_with_deadline(|| {
+        Box::pin(async {
             let compose = ComposeTool::new(ComposeConfig::default().with_max_instruction_count(0));
             let executor: Arc<dyn ToolExecutor> = Arc::new(BasicToolExecutor::from_registry(
                 ToolRegistry::new()
                     .with(compose)
                     .with(ApprovalEchoTool::new()),
             ));
-            let permissions: Arc<dyn PermissionChecker> = Arc::new(RequireApproval);
+            let owned = owned_context(executor.clone(), Arc::new(RequireApproval));
+            let mut ctx = owned.borrowed();
             let req = request(
                 "pcall(tool, 'approval_echo', { value = 1 }); while true do end",
                 Value::Null,
             );
-            let owned = owned_context(executor.clone(), permissions);
-            let mut ctx = owned.borrowed();
             executor.execute(req, &mut ctx).await
-        });
-        let _ = sender.send(outcome);
+        })
     });
-
-    let outcome = receiver
-        .recv_timeout(std::time::Duration::from_secs(5))
-        .expect("approval must not wait for the script to finish");
     assert!(matches!(
         outcome,
         ToolExecutionOutcome::Interrupted(ToolInterruption::ApprovalRequired(_))
     ));
+}
+
+#[test]
+fn caught_budget_stop_cannot_become_a_result() {
+    for script in [
+        // Catch the stop and return success.
+        "pcall(function() while true do end end); return 'ok'",
+        // Keep catching it forever.
+        "while true do pcall(function() while true do end end) end",
+    ] {
+        let outcome = run_with_deadline(move || {
+            Box::pin(async move {
+                execute_compose(
+                    ComposeConfig::default().with_max_instruction_count(10_000),
+                    EchoTool::new(),
+                    request(script, Value::Null),
+                )
+                .await
+            })
+        });
+        match outcome {
+            ToolExecutionOutcome::Failed(ToolError::ExecutionFailed(message)) => {
+                assert!(
+                    message.contains("Lua instructions"),
+                    "unexpected: {message}"
+                );
+            }
+            other => panic!("unexpected outcome for {script:?}: {other:?}"),
+        }
+    }
+}
+
+/// Cancels the turn when invoked, then succeeds.
+struct CancelTurnTool {
+    spec: ToolSpec,
+    controller: agentkit_core::CancellationController,
+}
+
+#[async_trait]
+impl Tool for CancelTurnTool {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    async fn invoke(
+        &self,
+        request: ToolRequest,
+        _ctx: &mut ToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
+        self.controller.interrupt();
+        Ok(ToolResult::new(ToolResultPart::success(
+            request.call_id,
+            ToolOutput::structured(json!(null)),
+        )))
+    }
+}
+
+#[test]
+fn turn_cancellation_stops_a_script_without_an_instruction_budget() {
+    let outcome = run_with_deadline(|| {
+        Box::pin(async {
+            let controller = agentkit_core::CancellationController::new();
+            let cancellation = agentkit_core::TurnCancellation::new(controller.handle());
+            let compose = ComposeTool::new(ComposeConfig::default().with_max_instruction_count(0));
+            let executor: Arc<dyn ToolExecutor> = Arc::new(BasicToolExecutor::from_registry(
+                ToolRegistry::new().with(compose).with(CancelTurnTool {
+                    spec: ToolSpec::new(
+                        "cancel_turn",
+                        "cancels the turn",
+                        json!({"type": "object"}),
+                    ),
+                    controller,
+                }),
+            ));
+            let mut owned = owned_context(executor.clone(), Arc::new(AllowAllPermissions));
+            owned.cancellation = Some(cancellation.clone());
+            if let Some(scope) = owned.execution_scope.as_mut() {
+                scope.cancellation = Some(cancellation);
+            }
+            let mut ctx = owned.borrowed();
+            let req = request(
+                "tool('cancel_turn', {}) \
+                 while true do pcall(function() while true do end end) end",
+                Value::Null,
+            );
+            executor.execute(req, &mut ctx).await
+        })
+    });
+    assert!(
+        matches!(outcome, ToolExecutionOutcome::Failed(ToolError::Cancelled)),
+        "unexpected outcome: {outcome:?}"
+    );
 }
 
 #[derive(Clone)]
@@ -1048,36 +1124,36 @@ async fn cancellation_wins_over_a_recorded_approval() {
 }
 
 #[tokio::test]
-async fn approval_raised_in_a_coroutine_survives_the_script_finishing() {
-    let compose = ComposeTool::new(ComposeConfig::default());
+async fn coroutines_cannot_call_tools() {
     let echo = EchoTool::new();
     let echo_calls = echo.calls.clone();
-    let executor: Arc<dyn ToolExecutor> = Arc::new(BasicToolExecutor::from_registry(
-        ToolRegistry::new()
-            .with(compose)
-            .with(echo)
-            .with(ApprovalEchoTool::new()),
-    ));
-    let permissions: Arc<dyn PermissionChecker> = Arc::new(RequireApproval);
-    // The coroutine parks at the gated call, but the root script keeps going:
-    // it tries another child and then finishes.
-    let req = request(
-        "local co = coroutine.wrap(function() return tool('approval_echo', { value = 1 }) end) \
-         pcall(co) \
-         pcall(tool, 'echo', { value = 2 }) \
-         return 'done'",
-        Value::Null,
-    );
-
-    let owned = owned_context(executor.clone(), permissions);
-    let mut ctx = owned.borrowed();
-    let outcome = executor.execute(req, &mut ctx).await;
-    assert!(
-        matches!(
-            outcome,
-            ToolExecutionOutcome::Interrupted(ToolInterruption::ApprovalRequired(_))
+    let outcome = execute_compose(
+        ComposeConfig::default(),
+        echo,
+        request(
+            "local co = coroutine.wrap(function() return tool('echo', { value = 1 }) end) \
+             local ok, err = pcall(co) \
+             return { ok = ok, err = err, after = tool('echo', { value = 2 }) }",
+            Value::Null,
         ),
-        "unexpected outcome: {outcome:?}"
-    );
-    assert_eq!(echo_calls.load(Ordering::SeqCst), 0);
+    )
+    .await;
+
+    match outcome {
+        ToolExecutionOutcome::Completed(result) => {
+            let ToolOutput::Structured(value) = result.result.output else {
+                panic!("expected structured output");
+            };
+            assert_eq!(value["ok"], json!(false));
+            assert!(
+                value["err"]
+                    .as_str()
+                    .is_some_and(|err| err.contains("coroutine"))
+            );
+            assert_eq!(value["after"]["value"], json!(2));
+        }
+        other => panic!("unexpected outcome: {other:?}"),
+    }
+    // Only the main-script call ran.
+    assert_eq!(echo_calls.load(Ordering::SeqCst), 1);
 }
