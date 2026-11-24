@@ -147,6 +147,15 @@ async fn rpc(
             .into_response();
     }
     let result = match method {
+        "skills/list" if token == "Bearer skills-duplicate" => {
+            if message["params"]["cursor"].is_null() {
+                json!({"resultType":"complete","skills":[skill("first")],"nextCursor":"page-2"})
+            } else {
+                let mut duplicate = skill("first");
+                duplicate["frontmatter"]["description"] = json!("Conflicting workflow");
+                json!({"resultType":"complete","skills":[duplicate]})
+            }
+        }
         "skills/list" if token == "Bearer skills-incomplete" => {
             assert!(message["params"]["cursor"].is_null());
             json!({"resultType":"unsupported","skills":[skill("first")],"nextCursor":"must-not-follow"})
@@ -202,7 +211,10 @@ async fn rpc(
                 capabilities.build()
             };
             let capabilities = match token {
-                "Bearer skills" | "Bearer skills-limited" | "Bearer skills-incomplete" => json!({
+                "Bearer skills"
+                | "Bearer skills-limited"
+                | "Bearer skills-incomplete"
+                | "Bearer skills-duplicate" => json!({
                     "resources":{}, "completions":{},
                     "experimental":{"example":{"flag":true}},
                     "extensions":{"io.modelcontextprotocol/skills":{"directoryRead":true}}
@@ -445,6 +457,16 @@ async fn skills_are_available_on_an_initialize_based_connection() {
         assert_eq!(connection.get_skill(uri).await.unwrap().uri, uri);
     })
     .await;
+}
+
+#[tokio::test]
+async fn skill_inventory_rejects_duplicate_uris_across_pages() {
+    bounded(async {
+        let fixture = Fixture::start().await;
+        let connection = McpConnection::connect(&fixture.config).await.unwrap();
+        connection.resolve_auth(auth("skills-duplicate")).await.unwrap();
+        assert!(matches!(connection.list_skills().await, Err(McpError::Protocol(message)) if message.contains("repeated a skill URI")));
+    }).await;
 }
 
 #[tokio::test]

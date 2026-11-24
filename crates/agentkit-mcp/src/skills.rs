@@ -23,7 +23,8 @@ impl McpConnection {
             return Ok(Vec::new());
         }
         let mut skills = Vec::new();
-        let mut seen = BTreeSet::new();
+        let mut seen_cursors = BTreeSet::new();
+        let mut seen_uris = BTreeSet::new();
         let mut cursor = None;
         loop {
             let page = peer
@@ -39,11 +40,18 @@ impl McpConnection {
                     })
                 })?;
             require_complete("skills/list", page.result_type.as_ref())?;
-            skills.extend(page.skills);
+            for skill in page.skills {
+                if !seen_uris.insert(skill.uri.clone()) {
+                    return Err(McpError::Protocol(
+                        "skills/list repeated a skill URI".into(),
+                    ));
+                }
+                skills.push(skill);
+            }
             let Some(next) = page.next_cursor else {
                 return Ok(skills);
             };
-            if !seen.insert(next.clone()) {
+            if !seen_cursors.insert(next.clone()) {
                 return Err(McpError::Protocol("skills/list repeated a cursor".into()));
             }
             cursor = Some(next);
