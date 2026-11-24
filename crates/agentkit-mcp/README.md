@@ -29,6 +29,12 @@ Re-exporting [`rmcp::model`](https://docs.rs/rmcp/latest/rmcp/model/index.html) 
 
 The same applies to transports: any future rmcp transport is reachable through `McpConnection::from_running_service_with_events` without touching the built-in `McpTransportBinding` enum.
 
+## Upgrading from 0.11
+
+If your crate also depends on `rmcp` directly, update its pin to `=3.9.0` when upgrading to `agentkit-mcp` 0.12. Stay on `agentkit-mcp` 0.11 if you need to keep an `rmcp = "=3.5.1"` pin. The two exact SDK pins cannot resolve together.
+
+Stdio replies are limited to 16 MiB per line, including the newline. The connection closes if a line exceeds that budget. Set `StdioTransportConfig::with_max_line_length` if a trusted server needs to send larger replies.
+
 ## Configuring and connecting MCP servers
 
 Register one or more MCP server configurations with `McpServerManager`, then connect them. Each connected server is represented by an `McpServerHandle` that holds the live connection and the discovery snapshot.

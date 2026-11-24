@@ -10,9 +10,9 @@ use std::{
 };
 
 use agentkit_mcp::{
-    AuthOperation, AuthRequest, AuthResolution, McpConnection, McpServerConfig, McpServerEvent,
-    McpServerId, McpServerManager, McpSubscriptionStatus, McpTransportBinding,
-    StreamableHttpTransportConfig,
+    AuthOperation, AuthRequest, AuthResolution, McpConnection, McpError, McpServerConfig,
+    McpServerEvent, McpServerId, McpServerManager, McpSkillResources, McpSubscriptionStatus,
+    McpTransportBinding, StreamableHttpTransportConfig,
 };
 use axum::{
     Json, Router,
@@ -123,7 +123,69 @@ async fn rpc(
         )
             .into_response();
     }
-    let result = match message["method"].as_str().unwrap_or_default() {
+    let skill = |name: &str| {
+        json!({
+            "uri": format!("skill://{name}/SKILL.md"),
+            "frontmatter": {"name":name, "description":"Server workflow", "custom":{"x":true}},
+            "resources": if name == "first" {
+                json!([{"uri":"skill://first/SKILL.md", "size":149,
+                    "digest":"sha256:d2489d6c182e8df9c178563ff9f2eac7998a0c1bb1278c52a7fd5306e4259160"}])
+            } else {
+                json!("dynamic")
+            }
+        })
+    };
+    let method = message["method"].as_str().unwrap_or_default();
+    if token == "Bearer skills-limited" && method.starts_with("skills/") {
+        return (
+            StatusCode::FORBIDDEN,
+            [(
+                "www-authenticate",
+                "Bearer error=\"insufficient_scope\", scope=\"skills:read\"",
+            )],
+        )
+            .into_response();
+    }
+    let result = match method {
+        "skills/list" if token == "Bearer skills-duplicate" => {
+            if message["params"]["cursor"].is_null() {
+                json!({"resultType":"complete","skills":[skill("first")],"nextCursor":"page-2"})
+            } else {
+                let mut duplicate = skill("first");
+                duplicate["frontmatter"]["description"] = json!("Conflicting workflow");
+                json!({"resultType":"complete","skills":[duplicate]})
+            }
+        }
+        "skills/list" if token == "Bearer skills-incomplete" => {
+            assert!(message["params"]["cursor"].is_null());
+            json!({"resultType":"unsupported","skills":[skill("first")],"nextCursor":"must-not-follow"})
+        }
+        "skills/get" if token == "Bearer skills-incomplete" => {
+            json!({"resultType":"unsupported","skill":skill("unlisted")})
+        }
+        "skills/list" if token == "Bearer skills" => {
+            assert_eq!(
+                message["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"],
+                "2026-07-28"
+            );
+            match message["params"]["cursor"].as_str() {
+                None => {
+                    json!({"resultType":"complete","ttlMs":30000,"cacheScope":"private","_meta":{"example":"inventory"},
+                    "skills":[skill("first")], "nextCursor":"page-2"})
+                }
+                Some("page-2") => {
+                    json!({"resultType":"complete","ttlMs":30000,"cacheScope":"public","_meta":{"example":"inventory"},
+                    "skills":[skill("second")]})
+                }
+                cursor => panic!("unexpected cursor: {cursor:?}"),
+            }
+        }
+        "skills/get" if token == "Bearer skills" => {
+            assert_eq!(message["params"]["uri"], "skill://unlisted/SKILL.md");
+            json!({"resultType":"complete","_meta":{"example":"lookup"},"skill":skill("unlisted")})
+        }
+        "skills/list" if token == "Bearer legacy-skills" => json!({"skills":[skill("first")]}),
+        "skills/get" if token == "Bearer legacy-skills" => json!({"skill":skill("unlisted")}),
         "server/discover" => {
             if token.starts_with("Bearer legacy") {
                 return Json(json!({"jsonrpc":"2.0", "id":id, "error":{
@@ -149,6 +211,14 @@ async fn rpc(
                 capabilities.build()
             };
             let capabilities = match token {
+                "Bearer skills"
+                | "Bearer skills-limited"
+                | "Bearer skills-incomplete"
+                | "Bearer skills-duplicate" => json!({
+                    "resources":{}, "completions":{},
+                    "experimental":{"example":{"flag":true}},
+                    "extensions":{"io.modelcontextprotocol/skills":{"directoryRead":true}}
+                }),
                 "Bearer caps-missing" => json!({}),
                 "Bearer caps-empty" => json!({"tools":{},"resources":{},"prompts":{}}),
                 "Bearer caps-false" => {
@@ -214,9 +284,13 @@ async fn rpc(
                 }}))
                 .into_response();
             }
+            let mut capabilities = json!({"tools":{}, "resources":{"subscribe":true}});
+            if token == "Bearer legacy-skills" {
+                capabilities["extensions"] = json!({"io.modelcontextprotocol/skills":{}});
+            }
             json!({
                 "protocolVersion":"2024-11-05",
-                "capabilities":{"tools":{}, "resources":{"subscribe":true}},
+                "capabilities":capabilities,
                 "serverInfo":{"name":"legacy-http-test", "version":"1"}
             })
         }
@@ -308,6 +382,147 @@ fn auth(token: &str) -> AuthResolution {
             .into_iter()
             .collect(),
     }
+}
+
+#[tokio::test]
+async fn skill_inventory_uses_advertised_extension_on_current_connection() {
+    bounded(async {
+        let fixture = Fixture::start().await;
+        let connection = McpConnection::connect(&fixture.config).await.unwrap();
+        assert!(connection.list_skills().await.unwrap().is_empty());
+        assert!(
+            connection
+                .get_skill("skill://unlisted/SKILL.md")
+                .await
+                .is_err()
+        );
+        assert!(
+            fixture.requests.lock().await.iter().all(|(_, message)| {
+                !message["method"].as_str().unwrap().starts_with("skills/")
+            })
+        );
+
+        connection.resolve_auth(auth("skills")).await.unwrap();
+        let caps = connection.wire_capabilities().unwrap();
+        assert!(caps.completions.is_some());
+        assert_eq!(caps.experimental.unwrap()["example"]["flag"], true);
+        assert_eq!(
+            caps.extensions.unwrap()["io.modelcontextprotocol/skills"]["directoryRead"],
+            true
+        );
+        let skills = connection.list_skills().await.unwrap();
+        assert_eq!(
+            skills.iter().map(|s| s.uri.as_str()).collect::<Vec<_>>(),
+            ["skill://first/SKILL.md", "skill://second/SKILL.md"]
+        );
+        assert_eq!(skills[0].frontmatter.extra["custom"], json!({"x": true}));
+        let McpSkillResources::Files(files) = &skills[0].resources else {
+            panic!("expected a skill file manifest");
+        };
+        assert_eq!(files[0].uri, skills[0].uri);
+        assert_eq!(files[0].size, 149);
+        assert!(matches!(skills[1].resources, McpSkillResources::Dynamic));
+        let uri = "skill://unlisted/SKILL.md";
+        assert_eq!(connection.get_skill(uri).await.unwrap().uri, uri);
+        assert!(
+            fixture
+                .requests
+                .lock()
+                .await
+                .iter()
+                .all(|(_, message)| { message["method"] != "resources/read" })
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn skills_are_available_on_an_initialize_based_connection() {
+    bounded(async {
+        let fixture = Fixture::start().await;
+        let connection = McpConnection::connect(&fixture.config).await.unwrap();
+        connection
+            .resolve_auth(auth("legacy-skills"))
+            .await
+            .unwrap();
+        assert_eq!(
+            connection.protocol_version(),
+            Some(ProtocolVersion::V_2024_11_05)
+        );
+        assert_eq!(
+            connection.list_skills().await.unwrap()[0].frontmatter.name,
+            "first"
+        );
+        let uri = "skill://unlisted/SKILL.md";
+        assert_eq!(connection.get_skill(uri).await.unwrap().uri, uri);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn skill_inventory_rejects_duplicate_uris_across_pages() {
+    bounded(async {
+        let fixture = Fixture::start().await;
+        let connection = McpConnection::connect(&fixture.config).await.unwrap();
+        connection.resolve_auth(auth("skills-duplicate")).await.unwrap();
+        assert!(matches!(connection.list_skills().await, Err(McpError::Protocol(message)) if message.contains("repeated a skill URI")));
+    }).await;
+}
+
+#[tokio::test]
+async fn skill_requests_reject_explicit_non_complete_results() {
+    bounded(async {
+        let fixture = Fixture::start().await;
+        let connection = McpConnection::connect(&fixture.config).await.unwrap();
+        connection.resolve_auth(auth("skills-incomplete")).await.unwrap();
+        let uri = "skill://unlisted/SKILL.md";
+        for error in [connection.list_skills().await.unwrap_err(), connection.get_skill(uri).await.unwrap_err()] {
+            assert!(matches!(error, McpError::Protocol(message) if message.contains("unsupported resultType")));
+        }
+    }).await;
+}
+
+#[tokio::test]
+async fn skill_requests_preserve_runtime_scope_challenges() {
+    bounded(async {
+        let fixture = Fixture::start().await;
+        let connection = McpConnection::connect(&fixture.config).await.unwrap();
+        connection
+            .resolve_auth(auth("skills-limited"))
+            .await
+            .unwrap();
+        let uri = "skill://unlisted/SKILL.md";
+        for (error, expected_method, expected_params) in [
+            (
+                connection.list_skills().await.unwrap_err(),
+                "skills/list",
+                json!({}),
+            ),
+            (
+                connection.get_skill(uri).await.unwrap_err(),
+                "skills/get",
+                json!({"uri":uri}),
+            ),
+        ] {
+            let McpError::AuthRequired(request) = error else {
+                panic!("{error}")
+            };
+            assert_eq!(request.challenge["required_scope"], "skills:read");
+            let AuthOperation::McpOther {
+                server_id,
+                method,
+                params,
+                ..
+            } = request.operation
+            else {
+                panic!("expected a Skills auth operation")
+            };
+            assert_eq!(server_id, "http-modern");
+            assert_eq!(method, expected_method);
+            assert_eq!(params, expected_params);
+        }
+    })
+    .await;
 }
 
 #[tokio::test]

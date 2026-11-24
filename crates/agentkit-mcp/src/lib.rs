@@ -54,15 +54,18 @@ use rmcp::transport::streamable_http_client::{
     StreamableHttpClientTransportConfig as RmcpStreamableHttpClientTransportConfig,
     StreamableHttpError, StreamableHttpPostResponse,
 };
-use rmcp::transport::{
-    ConfigureCommandExt, DynamicTransportError, StreamableHttpClientTransport, TokioChildProcess,
-};
+use rmcp::transport::{DynamicTransportError, StreamableHttpClientTransport};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sse_stream::{Error as SseError, Sse};
 use thiserror::Error;
 use tokio::sync::{Mutex, broadcast, mpsc, watch};
 
+mod skills;
+pub use skills::{
+    MCP_SKILLS_EXTENSION_ID, McpSkill, McpSkillFile, McpSkillFrontmatter, McpSkillResources,
+};
+mod stdio;
 mod subscriptions;
 pub use subscriptions::McpSubscriptionStatus;
 
@@ -489,6 +492,10 @@ pub struct StdioTransportConfig {
     pub env: Vec<(String, String)>,
     /// Optional working directory for the child process.
     pub cwd: Option<std::path::PathBuf>,
+    /// Maximum bytes in an incoming JSON-RPC line, including the newline (default: 16 MiB).
+    ///
+    /// An oversized line closes the connection and fails pending requests.
+    pub max_line_length: usize,
 }
 
 impl StdioTransportConfig {
@@ -499,7 +506,16 @@ impl StdioTransportConfig {
             args: Vec::new(),
             env: Vec::new(),
             cwd: None,
+            max_line_length: rmcp::transport::async_rw::DEFAULT_MAX_LINE_LENGTH,
         }
+    }
+
+    /// Sets a finite maximum byte length for incoming lines, including the newline.
+    ///
+    /// Zero and `usize::MAX` are rejected when connecting.
+    pub fn with_max_line_length(mut self, max_line_length: usize) -> Self {
+        self.max_line_length = max_line_length;
+        self
     }
 
     /// Appends a command-line argument. Returns `self` for chaining.
@@ -1781,6 +1797,14 @@ impl McpConnection {
             .clone()
     }
 
+    /// Returns the full wire capabilities of the current peer, including extension
+    /// settings, experimental capabilities, and completions.
+    pub fn wire_capabilities(&self) -> Option<rmcp_model::ServerCapabilities> {
+        self.peer()
+            .peer_info()
+            .map(|info| info.capabilities.clone())
+    }
+
     /// Protocol selected by discovery or the legacy initialization handshake.
     pub fn protocol_version(&self) -> Option<McpProtocolVersion> {
         self.peer()
@@ -2310,18 +2334,7 @@ async fn connect_rmcp_stdio(
     binding: &StdioTransportConfig,
     handler: McpClientHandler,
 ) -> Result<(RmcpClientService, McpServerCapabilities), McpError> {
-    let transport = TokioChildProcess::new(
-        tokio::process::Command::new(&binding.command).configure(|command| {
-            command.args(&binding.args);
-            if let Some(cwd) = &binding.cwd {
-                command.current_dir(cwd);
-            }
-            for (key, value) in &binding.env {
-                command.env(key, value);
-            }
-        }),
-    )
-    .map_err(McpError::Io)?;
+    let transport = stdio::StdioTransport::spawn(binding).map_err(McpError::Io)?;
 
     let service = handler
         .serve_with_lifecycle(transport, client_lifecycle())
@@ -4150,10 +4163,22 @@ fn rmcp_operation_error(
     method: McpMethod,
     error: ServiceError,
 ) -> McpError {
+    operation_error(server_id, method.method_name(), error, || {
+        method.into_auth_operation(server_id)
+    })
+}
+
+fn operation_error(
+    server_id: &McpServerId,
+    method_name: &str,
+    error: ServiceError,
+    operation: impl FnOnce() -> AuthOperation,
+) -> McpError {
     if let Some(signal) = service_auth_signal(&error) {
-        return McpError::AuthRequired(Box::new(auth_request_from_signal(
+        return McpError::AuthRequired(Box::new(build_auth_request(
             server_id,
-            method,
+            method_name,
+            operation(),
             signal,
             &error.to_string(),
         )));
@@ -4217,7 +4242,22 @@ fn auth_request_from_signal(
     signal: AuthSignal,
     message: &str,
 ) -> AuthRequest {
-    let method_name = method.method_name();
+    build_auth_request(
+        server_id,
+        method.method_name(),
+        method.into_auth_operation(server_id),
+        signal,
+        message,
+    )
+}
+
+fn build_auth_request(
+    server_id: &McpServerId,
+    method_name: &str,
+    operation: AuthOperation,
+    signal: AuthSignal,
+    message: &str,
+) -> AuthRequest {
     let mut challenge = MetadataMap::new();
     challenge.insert("server_id".into(), Value::String(server_id.to_string()));
     challenge.insert("method".into(), Value::String(method_name.into()));
@@ -4245,7 +4285,7 @@ fn auth_request_from_signal(
     AuthRequest {
         id: format!("mcp:{}:{}", server_id, method_name),
         provider: format!("mcp.{}", server_id),
-        operation: method.into_auth_operation(server_id),
+        operation,
         challenge,
     }
 }
