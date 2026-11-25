@@ -18,7 +18,8 @@ pub use rmcp::model::{
 ///
 /// Byte limits are checked after rmcp decodes a response. They charge decoded
 /// strings, containers, and item storage, not wire bytes or exact allocator
-/// usage. rmcp's transport limits still bound the initial response read.
+/// usage. They do not cap the initial read or decode. Use a transport that
+/// enforces a response-size limit if you need to bound that allocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct McpSkillScanLimits {
     /// Maximum number of skills passed to the visitor.
