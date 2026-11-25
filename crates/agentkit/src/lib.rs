@@ -30,6 +30,7 @@
 //! | `provider-anthropic` | [`provider_anthropic`] | Anthropic Messages API [`loop_::ModelAdapter`] implementation |
 //! | `provider-baseten` | [`provider_baseten`] | Baseten Model API [`loop_::ModelAdapter`] implementation |
 //! | `provider-cerebras` | [`provider_cerebras`] | Cerebras Inference API [`loop_::ModelAdapter`] implementation |
+//! | `provider-gemini` | [`provider_gemini`] | Google Gemini API [`loop_::ModelAdapter`] implementation |
 //! | `provider-openrouter` | [`provider_openrouter`] | OpenRouter [`loop_::ModelAdapter`] implementation |
 //! | `task-manager` | [`task_manager`] | Tool task scheduling: [`task_manager::SimpleTaskManager`], [`task_manager::AsyncTaskManager`] |
 //! | `tool-compose` | [`tool_compose`] | Lua tool composition tool (`compose`) |
@@ -285,6 +286,23 @@ pub use agentkit_provider_anthropic as provider_anthropic;
 #[cfg(feature = "provider-cerebras")]
 pub use agentkit_provider_cerebras as provider_cerebras;
 
+/// Google Gemini API [`loop_::ModelAdapter`] implementation.
+///
+/// Provides [`provider_gemini::GeminiAdapter`] and
+/// [`provider_gemini::GeminiConfig`] for connecting the agent loop to Google's
+/// Gemini Developer API or Vertex AI (`generateContent` /
+/// `streamGenerateContent?alt=sse`). Supports streaming (default), thinking
+/// configs and thought-signature round-tripping, structured JSON Schema
+/// outputs, multimodal inputs, built-in server tools (Google Search, code
+/// execution, URL context), shared HTTP resilience, and typed retry
+/// observability. Like `provider-anthropic` this crate implements
+/// `ModelAdapter` directly rather than going through `adapter-completions`, so
+/// the feature depends on `loop` directly.
+///
+/// Requires the `provider-gemini` feature.
+#[cfg(feature = "provider-gemini")]
+pub use agentkit_provider_gemini as provider_gemini;
+
 /// OpenAI [`loop_::ModelAdapter`] implementation.
 ///
 /// Requires the `provider-openai` feature.
@@ -386,6 +404,8 @@ pub mod prelude {
     pub use crate::provider_baseten::*;
     #[cfg(feature = "provider-cerebras")]
     pub use crate::provider_cerebras;
+    #[cfg(feature = "provider-gemini")]
+    pub use crate::provider_gemini;
     #[cfg(feature = "provider-groq")]
     pub use crate::provider_groq::*;
     #[cfg(feature = "provider-mistral")]

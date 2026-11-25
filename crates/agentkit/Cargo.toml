@@ -22,6 +22,7 @@ agentkit-adapter-completions = { version = "0.11.0", path = "../agentkit-adapter
 agentkit-provider-anthropic = { version = "0.11.0", path = "../agentkit-provider-anthropic", optional = true }
 agentkit-provider-baseten = { version = "0.11.0", path = "../agentkit-provider-baseten", optional = true }
 agentkit-provider-cerebras = { version = "0.11.0", path = "../agentkit-provider-cerebras", optional = true }
+agentkit-provider-gemini = { version = "0.10.5", path = "../agentkit-provider-gemini", optional = true }
 agentkit-provider-groq = { version = "0.11.0", path = "../agentkit-provider-groq", optional = true }
 agentkit-provider-mistral = { version = "0.11.0", path = "../agentkit-provider-mistral", optional = true }
 agentkit-provider-ollama = { version = "0.11.0", path = "../agentkit-provider-ollama", optional = true }
@@ -53,6 +54,7 @@ adapter-completions = ["dep:agentkit-adapter-completions", "loop"]
 provider-anthropic = ["dep:agentkit-provider-anthropic", "loop"]
 provider-baseten = ["dep:agentkit-provider-baseten", "adapter-completions"]
 provider-cerebras = ["dep:agentkit-provider-cerebras", "loop"]
+provider-gemini = ["dep:agentkit-provider-gemini", "loop"]
 provider-groq = ["dep:agentkit-provider-groq", "adapter-completions"]
 provider-mistral = ["dep:agentkit-provider-mistral", "adapter-completions"]
 provider-ollama = ["dep:agentkit-provider-ollama", "adapter-completions"]

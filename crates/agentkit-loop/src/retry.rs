@@ -13,6 +13,7 @@ pub enum ProviderRoute {
     Unknown,
     OpenAiResponses,
     OpenAiChatGptResponses,
+    Gemini,
 }
 
 /// Allowlisted provider type/code values. Unknown strings are never retained.

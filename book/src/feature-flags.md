@@ -22,6 +22,7 @@ The umbrella crate `agentkit` re-exports subcrates behind feature flags.
 - `provider-anthropic` — `agentkit-provider-anthropic`
 - `provider-baseten` — `agentkit-provider-baseten`
 - `provider-cerebras` — `agentkit-provider-cerebras`
+- `provider-gemini` — `agentkit-provider-gemini`
 - `provider-groq` — `agentkit-provider-groq`
 - `provider-mistral` — `agentkit-provider-mistral`
 - `provider-ollama` — `agentkit-provider-ollama`
