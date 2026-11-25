@@ -1408,7 +1408,7 @@ where
             if entry.active_prompt.load(Ordering::Acquire) != 0 {
                 pending.retry(request, request_cancellation)?
             } else {
-                let response = pending.enqueue(request, request_cancellation)?;
+                let response = pending.admit_ordinary(request, request_cancellation)?;
                 let mut owner = entry.next_prompt_owner.fetch_add(1, Ordering::Relaxed);
                 if owner == 0 {
                     owner = entry.next_prompt_owner.fetch_add(1, Ordering::Relaxed);
@@ -1787,6 +1787,13 @@ async fn session_worker<S>(
             tracing::debug!(%error, "failed to flush ACP v2 output");
         }
         prefer_loop_update = true;
+    }
+    {
+        let _lifecycle = lifecycle.lock().unwrap_or_else(|error| error.into_inner());
+        session.session.pending_prompts.close();
+        active_prompt.store(0, Ordering::Release);
+        driving_prompt.store(0, Ordering::Release);
+        cancelled_prompt.store(0, Ordering::Release);
     }
 }
 

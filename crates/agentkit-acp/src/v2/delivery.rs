@@ -232,7 +232,17 @@ impl PendingPrompts {
         request: wire::PromptRequest,
         cancellation: RequestCancellation,
     ) -> Result<PendingPromptResponse, Error> {
-        self.admit_inner(request, Some(cancellation), false)
+        self.admit_inner(request, Some(cancellation), false, true)
+    }
+
+    // Ordinary single-turn headless admission preserves cancellation and
+    // idempotency without applying the host delivery queue's byte budget.
+    pub(super) fn admit_ordinary(
+        &self,
+        request: wire::PromptRequest,
+        cancellation: RequestCancellation,
+    ) -> Result<PendingPromptResponse, Error> {
+        self.admit_inner(request, Some(cancellation), false, false)
     }
 
     // A single-turn host may accept retries while rejecting unrelated work.
@@ -241,7 +251,7 @@ impl PendingPrompts {
         request: wire::PromptRequest,
         cancellation: RequestCancellation,
     ) -> Result<PendingPromptResponse, Error> {
-        self.admit_inner(request, Some(cancellation), true)
+        self.admit_inner(request, Some(cancellation), true, false)
     }
 
     #[cfg(all(test, feature = "unstable-prompt-delivery"))]
@@ -250,7 +260,7 @@ impl PendingPrompts {
         request: wire::PromptRequest,
         cancellation: Option<RequestCancellation>,
     ) -> Result<PendingPromptResponse, Error> {
-        self.admit_inner(request, cancellation, false)
+        self.admit_inner(request, cancellation, false, true)
     }
 
     fn admit_inner(
@@ -258,6 +268,7 @@ impl PendingPrompts {
         request: wire::PromptRequest,
         cancellation: Option<RequestCancellation>,
         retry_only: bool,
+        enforce_budget: bool,
     ) -> Result<PendingPromptResponse, Error> {
         if request.session_id != self.session_id || request.prompt.is_empty() {
             return Err(Error::new(
@@ -326,11 +337,16 @@ impl PendingPrompts {
                 if queue.groups.len() >= MAX_PENDING_PROMPTS {
                     return Err(prompt_budget_error());
                 }
-                let bytes = measure_prompt(&request)?;
-                let new_bytes = queue.bytes.saturating_add(bytes);
-                if new_bytes.exceeds_budget() {
-                    return Err(prompt_budget_error());
-                }
+                let (bytes, new_bytes) = if enforce_budget {
+                    let bytes = measure_prompt(&request)?;
+                    let new_bytes = queue.bytes.saturating_add(bytes);
+                    if new_bytes.exceeds_budget() {
+                        return Err(prompt_budget_error());
+                    }
+                    (bytes, new_bytes)
+                } else {
+                    (PromptBytes::default(), queue.bytes)
+                };
                 let items = content_blocks_to_items(&request.prompt)
                     .map_err(|err| Error::new(-32602, err.to_string()))?;
                 let id = queue.next_group;

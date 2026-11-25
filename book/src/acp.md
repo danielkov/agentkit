@@ -22,8 +22,8 @@ agentkit-acp = { version = "0.10.11", features = ["protocol-v2"] }
 `agentkit_acp::wire` continue to expose stable v1 behavior. Experimental v2
 runtime APIs and v2 wire types are isolated under
 `agentkit_acp::v2` and `agentkit_acp::v2::wire`; v1 wire types are not part of
-that namespace. The additive `unstable-inject` feature implies `protocol-v2`
-and enables the unstable session-injection methods.
+that namespace. The additive `unstable-prompt-delivery` feature implies `protocol-v2`
+and enables host-owned prompt-delivery primitives.
 
 Build a v2 server with `agentkit_acp::v2::AcpHeadlessRuntime`. Its factory is
 called once for each `session/new` and receives a v2 session ID, an agentkit
@@ -48,20 +48,19 @@ progress concurrently, while a second prompt for a running session is rejected.
 work and drops the session worker. `session/list` and `session/resume` cover
 active in-memory sessions; replay is not supported.
 
-Session injection is steer-only and finishes an in-flight model stream rather
-than interrupting it. Acceptance follows response-frame enqueue, including for
-JSON-RPC batches; the full `ContentBlock` list is emitted unchanged at the next
-safe model/tool boundary. Request or session cancellation cannot remove a
-response-committed steer, so it carries to the next valid boundary when the
-current turn is cancelled. Close may discard it. Revoke is serialized with
-acknowledged user-message forwarding. With `pending.replace` advertised,
-`session/replace_inject` atomically replaces a pending steer's full content while
-preserving its ID, mode, and queue position. It applies the same validation and
-pending-byte budget as injection. Replacement waits for in-flight delivery;
-delivered IDs return `already_delivered` (`-32010`), and revoked or unknown IDs
-return `unknown_message_id` (`-32002`). Queueing is not supported. Delivered IDs
-retain their classification for the session lifetime; a 4,096-accept lifetime
-cap bounds that history.
+With `unstable-prompt-delivery`, a host-owned turn actor can use
+`v2::delivery::PendingPrompts` through its session handle. Hosts enqueue
+`session/prompt` requests without responding immediately, claim and insert them
+at model-loop safe points or the start of a new turn, and only then complete the
+original request with its `messageId`. Request cancellation can withdraw pending
+work without stopping the active turn; session cancellation drops pending
+ordinary prompts while preserving explicit steer and queue requests; close
+rejects all pending requests. Steers take precedence in receive order, and
+queued prompts each start a separate turn, subject to per-session pending
+content and inline media budgets. `v2::agent_capabilities()` reports the base
+headless capabilities and advertises no delivery mode; hosts that wire
+`PendingPrompts` into their actor advertise the modes they implement under
+`session.prompt.delivery`.
 
 The initial v2 foundation routes text, reasoning, and tool lifecycle updates.
 ACP v2 permission callbacks are intentionally deferred; unsupported approval

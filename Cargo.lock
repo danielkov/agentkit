@@ -20,7 +20,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit"
-version = "0.13.2"
+version = "0.14.0"
 dependencies = [
  "agentkit-acp",
  "agentkit-adapter-completions",
@@ -52,7 +52,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-acp"
-version = "0.13.0"
+version = "0.13.1"
 dependencies = [
  "agentkit-acp-sdk",
  "agentkit-core",

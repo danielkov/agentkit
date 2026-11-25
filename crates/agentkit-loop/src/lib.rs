@@ -2848,6 +2848,39 @@ where
             ApprovalDecision::Approve => {
                 use tracing::Instrument;
                 self.emit(AgentEvent::ToolExecutionStarted(pending.call.clone()));
+                if cancellation
+                    .as_ref()
+                    .is_some_and(TurnCancellation::is_cancelled)
+                {
+                    let presentation_turn_id = pending.presentation_turn_id.clone();
+                    let originating_turn = pending.tool_request.turn_id.clone();
+                    self.active_tool_round = None;
+                    let mut seen_turns = HashSet::from([originating_turn.clone()]);
+                    let mut originating_turns = vec![originating_turn];
+                    for other in self.pending_approvals.values() {
+                        let turn = other.tool_request.turn_id.clone();
+                        if seen_turns.insert(turn.clone()) {
+                            originating_turns.push(turn);
+                        }
+                    }
+                    let mut drained = vec![pending];
+                    drained.extend(self.drain_pending_approval_items());
+                    let mut cleanup_error = None;
+                    for turn in originating_turns {
+                        if let Err(error) = self.task_manager.on_turn_interrupted(&turn).await
+                            && cleanup_error.is_none()
+                        {
+                            cleanup_error =
+                                Some(LoopError::Tool(ToolError::Internal(error.to_string())));
+                        }
+                    }
+                    self.reject_drained_approvals(drained);
+                    if let Some(error) = cleanup_error {
+                        self.close_interrupted_tool_calls();
+                        return Err(error);
+                    }
+                    return self.finish_cancelled(presentation_turn_id, Vec::new());
+                }
                 let dispatch_span = self.execute_tool_span(
                     &pending.tool_request,
                     &pending.presentation_turn_id,

@@ -1,16 +1,15 @@
 # agentkit-acp design
 
 > **Implementation status:** Root APIs and default features implement stable ACP
-> v1. Version 0.10.11 also provides an opt-in ACP v2 runtime foundation under
-> `agentkit_acp::v2`; enable it with `protocol-v2`. It currently uses a workspace-
-> patched `agent-client-protocol` fork with `unstable_protocol_v2`. The additive
-> `unstable-inject` feature enables steer-only injection and mandatory revoke.
-> Receipt-committed injections survive cancellation for the next valid boundary;
-> close may discard them. Delivered-ID history is lifetime-capped at 4,096
-> accepts per session. V2 running/idle state follows loop turn lifecycle, and
-> autonomous task wakeups, cancellation, and logical prompt cleanup use that
-> same authoritative state. See the crate README or book chapter for the
-> supported v2 lifecycle and current limits.
+> v1. Version 0.13.x also provides an opt-in ACP v2 runtime foundation under
+> `agentkit_acp::v2`; enable it with `protocol-v2`. It uses the published
+> `agentkit-acp-sdk` fork with `unstable_protocol_v2`. The additive
+> `unstable-prompt-delivery` feature enables host-owned `PendingPrompts`
+> delivery primitives (steer and queue) for hosts with their own turn actor;
+> the headless runtime advertises no delivery mode. V2 running/idle state
+> follows loop turn lifecycle, and autonomous task wakeups, cancellation, and
+> logical prompt cleanup use that same authoritative state. See the crate README
+> or book chapter for the supported v2 lifecycle and current limits.
 
 ## Purpose
 
@@ -82,9 +81,9 @@ default = ["stdio"]
 stdio = []
 unstable-acp = ["agent-client-protocol/unstable"]
 protocol-v2 = ["agent-client-protocol/unstable_protocol_v2"]
-unstable-inject = [
+unstable-prompt-delivery = [
     "protocol-v2",
-    "agent-client-protocol/unstable_session_inject",
+    "agent-client-protocol/unstable_prompt_delivery",
 ]
 ```
 
