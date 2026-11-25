@@ -141,7 +141,10 @@ enum TurnInner {
 }
 
 type StreamReplay = Box<
-    dyn FnMut() -> BoxFuture<'static, Result<(BodyStream, TruncatedStreamDetector), LoopError>>
+    dyn FnMut(
+            LoopError,
+        )
+            -> BoxFuture<'static, Result<(BodyStream, TruncatedStreamDetector), LoopError>>
         + Send,
 >;
 
@@ -195,7 +198,7 @@ impl ReplayRequest {
             "authentication",
         )
         .await
-        .map_err(|error| map_http_error(&error, ProviderFailureReason::Authentication))?;
+        .map_err(|error| map_auth_error(&error))?;
         *self
             .authentication_attempt
             .lock()
@@ -212,7 +215,7 @@ impl ReplayRequest {
             "reauthentication",
         )
         .await
-        .map_err(|error| map_http_error(&error, ProviderFailureReason::Authentication))?;
+        .map_err(|error| map_auth_error(&error))?;
         *self
             .authentication_attempt
             .lock()
@@ -300,17 +303,32 @@ impl ReplayRequest {
         .await
     }
 
-    async fn read_bounded_body(&self, response: HttpResponse, max_bytes: usize) -> Option<String> {
+    async fn read_bounded_body(
+        &self,
+        response: HttpResponse,
+        max_bytes: usize,
+    ) -> Result<Option<String>, LoopError> {
         let timeout = self
             .resilience
             .as_ref()
             .and_then(|config| config.attempt_timeout)
             .unwrap_or(Duration::from_secs(2))
             .min(Duration::from_secs(2));
+        let max_attempt = self.config.limits.max_attempt_bytes;
+        let max_wire = self.config.limits.max_wire_bytes;
+        let wire_bytes = self.wire_bytes.clone();
         let inspect = async {
             let mut body = response.bytes_stream();
             let mut bytes = Vec::new();
+            let mut attempt_bytes: usize = 0;
             while let Some(chunk) = next_body_chunk_bounded(&mut body, None, None).await? {
+                attempt_bytes = attempt_bytes.saturating_add(chunk.len());
+                let prev_wire = wire_bytes.fetch_add(chunk.len(), Ordering::SeqCst);
+                if attempt_bytes > max_attempt || prev_wire.saturating_add(chunk.len()) > max_wire {
+                    return Err(HttpError::Other(
+                        "Gemini error response exceeded configured byte limit".into(),
+                    ));
+                }
                 if bytes.len().saturating_add(chunk.len()) > max_bytes {
                     return Ok(None);
                 }
@@ -318,15 +336,18 @@ impl ReplayRequest {
             }
             Ok(String::from_utf8(bytes).ok())
         };
-        run_bounded(
+        match run_bounded(
             inspect,
             Some(timeout),
             self.deadline.as_ref(),
             "HTTP error body",
         )
         .await
-        .ok()
-        .flatten()
+        {
+            Ok(body) => Ok(body),
+            Err(HttpError::Other(_)) => Err(local_error(ProviderFailureReason::Protocol)),
+            Err(_) => Ok(None),
+        }
     }
 
     async fn read_response_text(&self, response: HttpResponse) -> Result<String, HttpError> {
@@ -364,7 +385,10 @@ impl ReplayRequest {
 
     async fn rejection_error(&self, response: HttpResponse) -> LoopError {
         let status = response.status();
-        let body = self.read_bounded_body(response, MAX_ERROR_BODY_BYTES).await;
+        let body = match self.read_bounded_body(response, MAX_ERROR_BODY_BYTES).await {
+            Ok(body) => body,
+            Err(limit_err) => return limit_err,
+        };
         if status == StatusCode::BAD_REQUEST
             && let Some(text) = body.as_deref()
             && let Some(ctx_err) = context_length_error(text, Some(400))
@@ -411,20 +435,18 @@ impl ReplayRequest {
                     if status == StatusCode::UNAUTHORIZED
                         && !self.reauthenticated.swap(true, Ordering::SeqCst)
                     {
-                        let auth_err = provider_error(
-                            ProviderFailureReason::Authentication,
-                            classify_http_body(None, 401),
-                        );
                         drop(response);
                         if let Ok(mut tracker) = self.tracker.lock() {
-                            tracker.scheduled(&auth_err, Duration::ZERO);
+                            tracker.scheduled_reauth(classify_http_body(None, 401));
                         }
                         self.reauthenticate(authentication).await?;
                         continue;
                     }
                     if is_retryable_status(status) {
                         let headers = response.headers().clone();
-                        let body = self.read_bounded_body(response, MAX_ERROR_BODY_BYTES).await;
+                        let body = self
+                            .read_bounded_body(response, MAX_ERROR_BODY_BYTES)
+                            .await?;
                         let classification = classify_http_body(body.as_deref(), status.as_u16());
                         let attempt_err =
                             provider_error(ProviderFailureReason::HttpStatus, classification);
@@ -489,6 +511,17 @@ impl ReplayRequest {
         }
         let integrity = TruncatedStreamDetector::from_headers(response.headers());
         Ok((response.bytes_stream(), integrity))
+    }
+}
+
+fn map_auth_error(error: &HttpError) -> LoopError {
+    match error {
+        HttpError::Timeout {
+            operation: "logical request retry budget",
+            ..
+        } => local_error(ProviderFailureReason::RetryBudget),
+        HttpError::Timeout { .. } => local_error(ProviderFailureReason::AttemptTimeout),
+        _ => local_error(ProviderFailureReason::Authentication),
     }
 }
 
@@ -601,15 +634,10 @@ impl ModelSession for GeminiSession {
                     let replay = self.resilience.as_ref().and_then(|resilience| {
                         (resilience.max_retries > 0).then(|| {
                             let replay_request = replay_request.clone();
-                            Box::new(move || {
+                            Box::new(move |cause: LoopError| {
                                 let replay_request = replay_request.clone();
-                                Box::pin(async move {
-                                    replay_request
-                                        .replay_stream(local_error(
-                                            ProviderFailureReason::Transport,
-                                        ))
-                                        .await
-                                }) as BoxFuture<'static, _>
+                                Box::pin(async move { replay_request.replay_stream(cause).await })
+                                    as BoxFuture<'static, _>
                             }) as StreamReplay
                         })
                     });
@@ -662,8 +690,7 @@ impl ModelSession for GeminiSession {
                     }
                 };
 
-                let events = response::build_turn_from_response(&body_text)
-                    .map_err(|_| local_error(ProviderFailureReason::Protocol))?;
+                let events = response::build_turn_from_response(&body_text)?;
                 if let Ok(mut guard) = tracker.lock() {
                     guard.succeed();
                 }
@@ -822,18 +849,34 @@ async fn next_streaming_event(
             }
             Ok(None) => {
                 state.eof = true;
-                let tail_events = state
-                    .decoder
-                    .finish()
-                    .map_err(|_| local_error(ProviderFailureReason::Protocol))?;
+                let tail_events = match state.decoder.finish() {
+                    Ok(events) => events,
+                    Err(utf8_err) if utf8_err.error_len().is_none() => {
+                        // Incomplete multi-byte UTF-8 sequence at EOF -> truncated stream
+                        Vec::new()
+                    }
+                    Err(_) => return Err(local_error(ProviderFailureReason::Protocol)),
+                };
+                let mut truncated_tail = false;
                 for sse in tail_events {
+                    let trimmed = sse.data.trim();
+                    if !trimmed.is_empty()
+                        && serde_json::from_str::<serde_json::Value>(trimmed)
+                            .is_err_and(|e| e.is_eof())
+                    {
+                        // Stream cut off mid-JSON frame -> treat as truncated stream
+                        truncated_tail = true;
+                        break;
+                    }
                     for produced in state.translator.handle(&sse)? {
                         state.pending.push_back(produced);
                     }
                 }
 
                 let integrity_ok = state.integrity.finish();
-                let complete = state.translator.saw_terminal_signal() && integrity_ok.is_ok();
+                let complete = !truncated_tail
+                    && state.translator.saw_terminal_signal()
+                    && integrity_ok.is_ok();
                 if complete {
                     for produced in state.translator.finalize() {
                         state.pending.push_back(produced);
@@ -879,7 +922,7 @@ async fn next_streaming_event(
         if let Ok(mut guard) = state.tracker.lock() {
             guard.note_failure(&failure);
         }
-        let replay_future = replay();
+        let replay_future = replay(failure);
         futures_util::pin_mut!(replay_future);
         let replayed = if let Some(cancellation) = cancellation.as_ref() {
             let cancelled = cancellation.cancelled();
@@ -1312,6 +1355,121 @@ mod tests {
         assert_eq!(
             err.provider_failure().unwrap().reason,
             ProviderFailureReason::RetryBudget
+        );
+    }
+
+    #[tokio::test]
+    async fn replays_pre_output_stream_cut_off_inside_sse_frame() {
+        let mid_json = Ok(HttpResponse::new(
+            StatusCode::OK,
+            HeaderMap::new(),
+            "https://example.test".into(),
+            Box::pin(stream::once(async {
+                Ok(Bytes::from_static(b"data: {\"candidates\":[{\"content\":"))
+            })),
+        ));
+        let complete = ok_response(
+            br#"data: {"candidates":[{"content":{"role":"model","parts":[{"text":"ok"}]},"finishReason":"STOP"}]}
+
+"#,
+        );
+        let client = Arc::new(SequenceClient::new(vec![mid_json, complete]));
+        let config = GeminiConfig::new("k", "gemini-2.5-flash")
+            .unwrap()
+            .with_resilience(fast_resilience(2));
+        let adapter = GeminiAdapter::with_client(config, Http::from_arc(client.clone()));
+        let mut session = adapter
+            .start_session(SessionConfig::new("s1"))
+            .await
+            .unwrap();
+        let mut turn = session
+            .begin_turn(sample_turn_request(), None)
+            .await
+            .unwrap();
+        let mut finished = false;
+        while let Some(ev) = turn.next_event(None).await.unwrap() {
+            if matches!(ev, ModelTurnEvent::Finished(_)) {
+                finished = true;
+            }
+        }
+        assert!(finished);
+        assert_eq!(client.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn invalid_credential_header_maps_to_authentication_failure() {
+        let client = Arc::new(SequenceClient::new(vec![]));
+        let config = GeminiConfig::new("bad\nkey", "gemini-2.5-flash").unwrap();
+        let adapter = GeminiAdapter::with_client(config, Http::from_arc(client));
+        let mut session = adapter
+            .start_session(SessionConfig::new("s1"))
+            .await
+            .unwrap();
+        let err = match session.begin_turn(sample_turn_request(), None).await {
+            Err(e) => e,
+            Ok(_) => panic!("expected auth error"),
+        };
+        assert_eq!(
+            err.provider_failure().unwrap().reason,
+            ProviderFailureReason::Authentication
+        );
+    }
+
+    #[tokio::test]
+    async fn recovered_401_does_not_label_subsequent_transport_failure() {
+        let client = Arc::new(SequenceClient::new(vec![
+            status_response(
+                StatusCode::UNAUTHORIZED,
+                br#"{"error":{"code":401,"status":"UNAUTHENTICATED"}}"#,
+            ),
+            Err(HttpError::request(std::io::Error::other(
+                "connection reset",
+            ))),
+        ]));
+        let config = GeminiConfig::new("k", "gemini-2.5-flash")
+            .unwrap()
+            .with_streaming(false);
+        let adapter = GeminiAdapter::with_client(config, Http::from_arc(client));
+        let mut session = adapter
+            .start_session(SessionConfig::new("s1"))
+            .await
+            .unwrap();
+        let err = match session.begin_turn(sample_turn_request(), None).await {
+            Err(e) => e,
+            Ok(_) => panic!("expected transport error"),
+        };
+        let failure = *err.provider_failure().unwrap();
+        assert_eq!(failure.reason, ProviderFailureReason::Transport);
+        assert_eq!(failure.upstream.http_status, None);
+        assert_eq!(failure.upstream.error_type, UpstreamErrorKind::Unknown);
+    }
+
+    #[tokio::test]
+    async fn inspected_error_bodies_count_toward_wire_byte_limits() {
+        let client = Arc::new(SequenceClient::new(vec![status_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            b"0123456789abcdef0123456789abcdef",
+        )]));
+        let config = GeminiConfig::new("k", "gemini-2.5-flash")
+            .unwrap()
+            .with_resilience(fast_resilience(2))
+            .with_limits(GeminiLimits {
+                max_request_bytes: 1024 * 1024,
+                max_attempt_bytes: 16,
+                max_wire_bytes: 16,
+            });
+        let adapter = GeminiAdapter::with_client(config, Http::from_arc(client));
+        let mut session = adapter
+            .start_session(SessionConfig::new("s1"))
+            .await
+            .unwrap();
+        let err = match session.begin_turn(sample_turn_request(), None).await {
+            Err(e) => e,
+            Ok(_) => panic!("expected byte limit failure"),
+        };
+        assert_eq!(
+            err.provider_failure().unwrap().reason,
+            ProviderFailureReason::Protocol
         );
     }
 }

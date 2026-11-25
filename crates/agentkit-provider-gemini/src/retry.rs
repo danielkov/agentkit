@@ -82,6 +82,27 @@ impl RetryTracker {
         self.scheduled_at(error, delay, self.started_at.elapsed());
     }
 
+    /// Emits a nonterminal reactive-refresh notification without mutating the
+    /// retained terminal upstream classification, so a recovered 401 does not
+    /// label a later transport failure.
+    pub(crate) fn scheduled_reauth(&mut self, upstream: ProviderClassification) {
+        let elapsed = self.started_at.elapsed();
+        if self
+            .last_progress
+            .is_some_and(|last| elapsed.saturating_sub(last) < Duration::from_millis(250))
+        {
+            return;
+        }
+        self.last_progress = Some(elapsed);
+        self.emit(ProviderRetryEvent::Scheduled(RetryProgress {
+            route: ProviderRoute::Gemini,
+            reason: ProviderFailureReason::Authentication,
+            upstream,
+            accounting: self.snapshot_at(elapsed),
+            next_delay: Duration::ZERO,
+        }));
+    }
+
     fn scheduled_at(&mut self, error: &LoopError, delay: Duration, elapsed: Duration) {
         if self
             .last_progress

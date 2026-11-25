@@ -12,7 +12,7 @@ use agentkit_core::{
 use agentkit_loop::{LoopError, ModelTurnEvent, ModelTurnResult, set_provider_finish_reasons};
 use serde_json::Value;
 
-use crate::response::{map_finish_reason, next_synthetic_turn_id, parse_part};
+use crate::response::{map_finish_reason, next_synthetic_turn_namespace, parse_part};
 pub(crate) use crate::sse::{SseDecoder, SseEvent};
 use crate::usage::UsageSnapshot;
 
@@ -25,7 +25,7 @@ pub(crate) struct EventTranslator {
     active: Option<ActivePart>,
     committed_parts: Vec<Part>,
     next_part_index: usize,
-    synthetic_turn_id: u64,
+    synthetic_turn_ns: String,
     call_counter: usize,
     usage: Option<UsageSnapshot>,
     metadata: MetadataMap,
@@ -43,7 +43,7 @@ impl EventTranslator {
             active: None,
             committed_parts: Vec::new(),
             next_part_index: 0,
-            synthetic_turn_id: next_synthetic_turn_id(),
+            synthetic_turn_ns: next_synthetic_turn_namespace(),
             call_counter: 0,
             usage: None,
             metadata: MetadataMap::new(),
@@ -292,7 +292,7 @@ impl EventTranslator {
         // Signed text/reasoning or non-streaming part (functionCall, inlineData,
         // toolCall/toolResponse, executableCode, redacted thought, etc.)
         self.flush_active(events);
-        if let Some(part) = parse_part(raw_part, self.synthetic_turn_id, &mut self.call_counter)
+        if let Some(part) = parse_part(raw_part, &self.synthetic_turn_ns, &mut self.call_counter)
             .map_err(|e| LoopError::Provider(e.to_string()))?
         {
             match &part {

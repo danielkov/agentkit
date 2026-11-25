@@ -131,10 +131,28 @@ pub(crate) fn build_request_body(
 
     let mut body = Map::new();
 
-    // When explicit `cachedContent` is active, omit cache-owned fields
-    // (`systemInstruction`, `tools`, `toolConfig`) so Vertex/Gemini do not
-    // reject redeclared context while keeping registered tools locally executable.
+    // When explicit `cachedContent` is active, reject live system/context
+    // instructions or undeclared function tools rather than silently dropping
+    // them; tools listed in `config.cached_tool_names` stay locally executable
+    // without being redeclared on the wire.
     if let Some(cached) = active_cached_content {
+        if !system_parts.is_empty() {
+            return Err(BuildError::CacheViolation(
+                "cannot attach cachedContent when the turn includes live system, developer, or context instructions; disable caching for this turn or omit live system items".into(),
+            ));
+        }
+        let uncovered: Vec<String> = request
+            .available_tools
+            .iter()
+            .filter(|spec| !config.cached_tool_names.contains(&spec.name.to_string()))
+            .map(|spec| spec.name.to_string())
+            .collect();
+        if !uncovered.is_empty() {
+            return Err(BuildError::CacheViolation(format!(
+                "cannot attach cachedContent with live tools not declared in cached_tool_names: {}",
+                uncovered.join(", ")
+            )));
+        }
         body.insert("cachedContent".into(), Value::String(cached.to_string()));
     } else {
         if !system_parts.is_empty() {
@@ -869,15 +887,15 @@ mod tests {
     }
 
     #[test]
-    fn honors_cache_disablement_and_omits_cache_owned_fields() {
+    fn honors_cache_disablement_and_validates_cache_owned_fields() {
         let cfg = GeminiConfig::new("k", "gemini-2.5-flash")
             .unwrap()
-            .with_cached_content("cachedContents/example");
+            .with_cached_content("cachedContents/example")
+            .with_cached_tool_names(["local_fn"]);
+
+        // Covered local tool + no live system instructions -> attaches cache and omits wire tools
         let mut req = empty_turn(
-            vec![
-                Item::text(ItemKind::System, "sys"),
-                Item::text(ItemKind::User, "Hello"),
-            ],
+            vec![Item::text(ItemKind::User, "Hello")],
             vec![ToolSpec::new(
                 "local_fn",
                 "desc",
@@ -890,6 +908,32 @@ mod tests {
         assert!(cached_body.get("tools").is_none());
         assert!(cached_body.get("toolConfig").is_none());
 
+        // Live Context/System item not covered by cache -> rejected instead of silently dropped
+        let live_ctx = empty_turn(
+            vec![
+                Item::text(ItemKind::Context, "compaction summary"),
+                Item::text(ItemKind::User, "Hello"),
+            ],
+            vec![],
+        );
+        assert!(matches!(
+            build_request_body(&cfg, &live_ctx),
+            Err(BuildError::CacheViolation(_))
+        ));
+
+        // Uncovered live tool -> rejected instead of silently dropped
+        let uncovered_tool = empty_turn(
+            vec![Item::text(ItemKind::User, "Hello")],
+            vec![ToolSpec::new("new_fn", "desc", json!({ "type": "object" }))],
+        );
+        assert!(matches!(
+            build_request_body(&cfg, &uncovered_tool),
+            Err(BuildError::CacheViolation(_))
+        ));
+
+        // Disabling cache on the turn omits cachedContent and restores live fields
+        req.transcript
+            .insert(0, Item::text(ItemKind::System, "sys"));
         req.cache = Some(agentkit_loop::PromptCacheRequest::disabled());
         let uncached_body = build_request_body(&cfg, &req).unwrap();
         assert!(uncached_body.get("cachedContent").is_none());

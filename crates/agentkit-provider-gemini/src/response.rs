@@ -1,21 +1,35 @@
 use std::collections::VecDeque;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use agentkit_core::{
     CustomPart, DataRef, Delta, FinishReason, Item, ItemKind, MediaPart, MetadataMap, Modality,
     Part, ReasoningPart, TextPart, ToolCallPart,
 };
-use agentkit_loop::{ModelTurnEvent, ModelTurnResult, set_provider_finish_reasons};
+use agentkit_loop::{
+    LoopError, ModelTurnEvent, ModelTurnResult, ProviderFailureReason, set_provider_finish_reasons,
+};
 use base64::Engine;
 use serde_json::Value;
 use thiserror::Error;
 
+use crate::retry::{classify_value, context_length_error, local_error, provider_error};
 use crate::usage::UsageSnapshot;
 
 static NEXT_SYNTHETIC_TURN_ID: AtomicU64 = AtomicU64::new(1);
+static PROCESS_NAMESPACE: OnceLock<u64> = OnceLock::new();
 
-pub(crate) fn next_synthetic_turn_id() -> u64 {
-    NEXT_SYNTHETIC_TURN_ID.fetch_add(1, Ordering::Relaxed)
+pub(crate) fn next_synthetic_turn_namespace() -> String {
+    let epoch = *PROCESS_NAMESPACE.get_or_init(|| {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        nanos ^ (std::process::id() as u64).rotate_left(32)
+    });
+    let seq = NEXT_SYNTHETIC_TURN_ID.fetch_add(1, Ordering::Relaxed);
+    format!("{epoch:x}_{seq}")
 }
 
 #[derive(Debug, Error)]
@@ -25,11 +39,19 @@ pub(crate) enum ResponseError {
 }
 
 /// Parses a buffered `generateContent` JSON response into `ModelTurnEvent`s.
-pub(crate) fn build_turn_from_response(
-    body: &str,
-) -> Result<VecDeque<ModelTurnEvent>, ResponseError> {
-    let raw: Value = serde_json::from_str(body)
-        .map_err(|e| ResponseError::Protocol(format!("parse error: {e}")))?;
+pub(crate) fn build_turn_from_response(body: &str) -> Result<VecDeque<ModelTurnEvent>, LoopError> {
+    let raw: Value =
+        serde_json::from_str(body).map_err(|_| local_error(ProviderFailureReason::Protocol))?;
+
+    if raw.get("error").is_some() {
+        if let Some(err) = context_length_error(body, None) {
+            return Err(err);
+        }
+        return Err(provider_error(
+            ProviderFailureReason::ResponseFailed,
+            classify_value(&raw, None),
+        ));
+    }
 
     let usage = UsageSnapshot::parse(raw.get("usageMetadata")).map(|u| u.to_usage());
     let response_id = raw
@@ -53,9 +75,16 @@ pub(crate) fn build_turn_from_response(
         .get("candidates")
         .and_then(Value::as_array)
         .and_then(|arr| arr.first());
+    let prompt_block_reason = raw
+        .pointer("/promptFeedback/blockReason")
+        .and_then(Value::as_str);
+
+    if candidate.is_none() && prompt_block_reason.is_none() {
+        return Err(local_error(ProviderFailureReason::Protocol));
+    }
 
     let mut parts: Vec<Part> = Vec::new();
-    let synthetic_turn_id = next_synthetic_turn_id();
+    let synthetic_turn_ns = next_synthetic_turn_namespace();
     let mut call_counter: usize = 0;
     let mut provider_finish_reason: Option<String> = None;
 
@@ -79,15 +108,14 @@ pub(crate) fn build_turn_from_response(
             .and_then(Value::as_array)
         {
             for raw_part in raw_parts {
-                if let Some(part) = parse_part(raw_part, synthetic_turn_id, &mut call_counter)? {
+                if let Some(part) = parse_part(raw_part, &synthetic_turn_ns, &mut call_counter)
+                    .map_err(|_| local_error(ProviderFailureReason::Protocol))?
+                {
                     parts.push(part);
                 }
             }
         }
-    } else if let Some(block_reason) = raw
-        .pointer("/promptFeedback/blockReason")
-        .and_then(Value::as_str)
-    {
+    } else if let Some(block_reason) = prompt_block_reason {
         provider_finish_reason = Some(block_reason.to_string());
         metadata.insert(
             "gemini.block_reason".into(),
@@ -164,7 +192,7 @@ pub(crate) fn build_turn_from_response(
 
 pub(crate) fn parse_part(
     part: &Value,
-    synthetic_turn_id: u64,
+    synthetic_turn_ns: &str,
     call_counter: &mut usize,
 ) -> Result<Option<Part>, ResponseError> {
     let thought = part
@@ -185,7 +213,7 @@ pub(crate) fn parse_part(
         let (id, has_provider_id) = match fc.get("id").and_then(Value::as_str) {
             Some(id) if !id.is_empty() => (id.to_string(), true),
             _ => {
-                let synth = format!("gemini_call_{synthetic_turn_id}_{}", *call_counter);
+                let synth = format!("gemini_call_{synthetic_turn_ns}_{}", *call_counter);
                 *call_counter += 1;
                 (synth, false)
             }
@@ -484,6 +512,34 @@ mod tests {
         assert!(matches!(&parts[1], Part::Custom(c) if c.kind == "gemini.toolResponse"));
         assert!(
             matches!(&parts[2], Part::Media(m) if m.metadata["gemini.thought_signature"] == "img-sig")
+        );
+    }
+
+    #[test]
+    fn rejects_empty_buffered_response_and_classifies_http_200_error_envelopes() {
+        let empty_err = build_turn_from_response("{}").unwrap_err();
+        assert_eq!(
+            empty_err.provider_failure().unwrap().reason,
+            ProviderFailureReason::Protocol
+        );
+
+        let err_envelope = json!({
+            "error": {
+                "code": 503,
+                "status": "UNAVAILABLE",
+                "message": "backend unavailable"
+            }
+        })
+        .to_string();
+        let failure = build_turn_from_response(&err_envelope)
+            .unwrap_err()
+            .provider_failure()
+            .copied()
+            .unwrap();
+        assert_eq!(failure.reason, ProviderFailureReason::ResponseFailed);
+        assert_eq!(
+            failure.upstream.error_type,
+            agentkit_loop::UpstreamErrorKind::ServiceUnavailableError
         );
     }
 }

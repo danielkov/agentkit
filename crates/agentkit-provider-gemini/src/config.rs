@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::Arc;
 
@@ -361,6 +362,12 @@ pub struct GeminiConfig {
     pub safety_settings: Vec<SafetySetting>,
     /// Explicit cached content resource name (`cachedContents/{id}` or full Vertex path).
     pub cached_content: Option<String>,
+    /// Function tool names already declared inside `cached_content`.
+    ///
+    /// When `cached_content` is active, registered tools whose names appear in
+    /// this set remain locally executable without being redeclared on the wire;
+    /// any live tool not listed here is rejected rather than silently dropped.
+    pub cached_tool_names: BTreeSet<String>,
     /// Additional HTTP headers attached to every request.
     pub extra_headers: HeaderMap,
     /// Whether to request SSE streaming via `:streamGenerateContent?alt=sse`. Defaults to `true`.
@@ -391,6 +398,7 @@ impl fmt::Debug for GeminiConfig {
             .field("output_format", &self.output_format)
             .field("safety_settings", &self.safety_settings)
             .field("cached_content", &self.cached_content)
+            .field("cached_tool_names", &self.cached_tool_names)
             .field(
                 "extra_header_names",
                 &self.extra_headers.keys().collect::<Vec<_>>(),
@@ -470,6 +478,7 @@ impl GeminiConfig {
             output_format: None,
             safety_settings: Vec::new(),
             cached_content: None,
+            cached_tool_names: BTreeSet::new(),
             extra_headers: HeaderMap::new(),
             streaming: true,
             resilience: None,
@@ -642,6 +651,16 @@ impl GeminiConfig {
     /// Sets an explicit cached content resource name.
     pub fn with_cached_content(mut self, resource_name: impl Into<String>) -> Self {
         self.cached_content = Some(resource_name.into());
+        self
+    }
+
+    /// Declares the function tool names already embedded inside `cached_content`.
+    pub fn with_cached_tool_names<I, S>(mut self, names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.cached_tool_names = names.into_iter().map(Into::into).collect();
         self
     }
 
