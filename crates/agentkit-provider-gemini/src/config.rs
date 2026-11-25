@@ -364,10 +364,17 @@ pub struct GeminiConfig {
     pub cached_content: Option<String>,
     /// Function tool names already declared inside `cached_content`.
     ///
-    /// When `cached_content` is active, registered tools whose names appear in
-    /// this set remain locally executable without being redeclared on the wire;
-    /// any live tool not listed here is rejected rather than silently dropped.
+    /// When `cached_content` is active, registered tools must match this set
+    /// exactly: covered tools remain locally executable without being
+    /// redeclared on the wire, while uncovered live tools or unavailable cached
+    /// tools are rejected rather than silently dropped or misrouted.
     pub cached_tool_names: BTreeSet<String>,
+    /// System/developer/context instruction texts already embedded inside `cached_content`.
+    ///
+    /// When `cached_content` is active, transcript system parts must match
+    /// these instructions exactly; matching instructions are omitted from the
+    /// wire payload while new or modified instructions are rejected.
+    pub cached_system_instructions: Vec<String>,
     /// Additional HTTP headers attached to every request.
     pub extra_headers: HeaderMap,
     /// Whether to request SSE streaming via `:streamGenerateContent?alt=sse`. Defaults to `true`.
@@ -399,6 +406,10 @@ impl fmt::Debug for GeminiConfig {
             .field("safety_settings", &self.safety_settings)
             .field("cached_content", &self.cached_content)
             .field("cached_tool_names", &self.cached_tool_names)
+            .field(
+                "cached_system_instructions_len",
+                &self.cached_system_instructions.len(),
+            )
             .field(
                 "extra_header_names",
                 &self.extra_headers.keys().collect::<Vec<_>>(),
@@ -479,6 +490,7 @@ impl GeminiConfig {
             safety_settings: Vec::new(),
             cached_content: None,
             cached_tool_names: BTreeSet::new(),
+            cached_system_instructions: Vec::new(),
             extra_headers: HeaderMap::new(),
             streaming: true,
             resilience: None,
@@ -661,6 +673,16 @@ impl GeminiConfig {
         S: Into<String>,
     {
         self.cached_tool_names = names.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Declares the exact system instruction texts already embedded inside `cached_content`.
+    pub fn with_cached_system_instructions<I, S>(mut self, instructions: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.cached_system_instructions = instructions.into_iter().map(Into::into).collect();
         self
     }
 

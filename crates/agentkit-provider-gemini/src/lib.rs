@@ -435,11 +435,20 @@ impl ReplayRequest {
                     if status == StatusCode::UNAUTHORIZED
                         && !self.reauthenticated.swap(true, Ordering::SeqCst)
                     {
+                        let auth_401 = classify_http_body(None, 401);
                         drop(response);
                         if let Ok(mut tracker) = self.tracker.lock() {
-                            tracker.scheduled_reauth(classify_http_body(None, 401));
+                            tracker.scheduled_reauth(auth_401);
                         }
-                        self.reauthenticate(authentication).await?;
+                        if let Err(refresh_err) = self.reauthenticate(authentication).await {
+                            if let Ok(mut tracker) = self.tracker.lock() {
+                                tracker.note_failure(&provider_error(
+                                    ProviderFailureReason::Authentication,
+                                    auth_401,
+                                ));
+                            }
+                            return Err(refresh_err);
+                        }
                         continue;
                     }
                     if is_retryable_status(status) {
@@ -679,6 +688,9 @@ impl ModelSession for GeminiSession {
                                 .await?;
                             continue;
                         }
+                        if let Ok(mut guard) = tracker.lock() {
+                            guard.note_failure(&attempt_err);
+                        }
                         return Err(if self.resilience.is_some() {
                             local_error(ProviderFailureReason::RetryExhausted)
                         } else {
@@ -849,15 +861,16 @@ async fn next_streaming_event(
             }
             Ok(None) => {
                 state.eof = true;
+                let mut truncated_tail = false;
                 let tail_events = match state.decoder.finish() {
                     Ok(events) => events,
                     Err(utf8_err) if utf8_err.error_len().is_none() => {
                         // Incomplete multi-byte UTF-8 sequence at EOF -> truncated stream
+                        truncated_tail = true;
                         Vec::new()
                     }
                     Err(_) => return Err(local_error(ProviderFailureReason::Protocol)),
                 };
-                let mut truncated_tail = false;
                 for sse in tail_events {
                     let trimmed = sse.data.trim();
                     if !trimmed.is_empty()
@@ -1471,5 +1484,86 @@ mod tests {
             err.provider_failure().unwrap().reason,
             ProviderFailureReason::Protocol
         );
+    }
+
+    #[tokio::test]
+    async fn failed_refresh_after_401_retains_http_401_status() {
+        struct FailingRefresh(AtomicUsize);
+
+        #[async_trait]
+        impl AuthenticationProvider for FailingRefresh {
+            async fn authenticate(
+                &self,
+                previous: Option<&AuthenticationAttempt>,
+            ) -> Result<AuthenticationAttempt, HttpError> {
+                if previous.is_some() {
+                    return Err(HttpError::Other("refresh failed".into()));
+                }
+                let _ = self.0.fetch_add(1, Ordering::SeqCst);
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    agentkit_http::header::AUTHORIZATION,
+                    HeaderValue::from_static("Bearer initial"),
+                );
+                Ok(AuthenticationAttempt::stateless(headers))
+            }
+        }
+
+        let client = Arc::new(SequenceClient::new(vec![status_response(
+            StatusCode::UNAUTHORIZED,
+            br#"{"error":{"code":401,"status":"UNAUTHENTICATED"}}"#,
+        )]));
+        let config = GeminiConfig::new("unused", "gemini-2.5-flash")
+            .unwrap()
+            .with_streaming(false)
+            .with_authentication_provider(FailingRefresh(AtomicUsize::new(0)));
+        let adapter = GeminiAdapter::with_client(config, Http::from_arc(client));
+        let mut session = adapter
+            .start_session(SessionConfig::new("s1"))
+            .await
+            .unwrap();
+        let err = match session.begin_turn(sample_turn_request(), None).await {
+            Err(e) => e,
+            Ok(_) => panic!("expected auth failure"),
+        };
+        let failure = *err.provider_failure().unwrap();
+        assert_eq!(failure.reason, ProviderFailureReason::Authentication);
+        assert_eq!(failure.upstream.http_status, Some(401));
+    }
+
+    #[tokio::test]
+    async fn trailing_sse_cut_inside_utf8_after_finish_reason_is_rejected() {
+        // Complete chunk with finishReason followed by an incomplete UTF-8 byte sequence at EOF
+        let mut raw = br#"data: {"candidates":[{"content":{"role":"model","parts":[{"text":"hi"}]},"finishReason":"STOP"}]}
+
+data: {"candidates":[{"content":{"role":"model","parts":[{"text":""#.to_vec();
+        raw.extend_from_slice(&[0xE3, 0x81]); // incomplete 3-byte UTF-8 char
+        let response = Ok(HttpResponse::new(
+            StatusCode::OK,
+            HeaderMap::new(),
+            "https://example.test".into(),
+            Box::pin(stream::once(async move { Ok(Bytes::from(raw)) })),
+        ));
+        let client = Arc::new(SequenceClient::new(vec![response]));
+        let config = GeminiConfig::new("k", "gemini-2.5-flash").unwrap();
+        let adapter = GeminiAdapter::with_client(config, Http::from_arc(client));
+        let mut session = adapter
+            .start_session(SessionConfig::new("s1"))
+            .await
+            .unwrap();
+        let mut turn = session
+            .begin_turn(sample_turn_request(), None)
+            .await
+            .unwrap();
+        loop {
+            match turn.next_event(None).await {
+                Ok(Some(ModelTurnEvent::Finished(_))) => {
+                    panic!("truncated UTF-8 tail must not emit Finished")
+                }
+                Ok(Some(_)) => continue,
+                Ok(None) => panic!("truncated UTF-8 tail must fail"),
+                Err(_) => break,
+            }
+        }
     }
 }

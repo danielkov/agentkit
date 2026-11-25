@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use agentkit_core::{Item, ItemKind, Part, PartKind, ToolOutput};
 use agentkit_loop::{LoopError, PromptCacheMode, PromptCacheStrategy, TurnRequest};
@@ -131,26 +131,45 @@ pub(crate) fn build_request_body(
 
     let mut body = Map::new();
 
-    // When explicit `cachedContent` is active, reject live system/context
-    // instructions or undeclared function tools rather than silently dropping
-    // them; tools listed in `config.cached_tool_names` stay locally executable
-    // without being redeclared on the wire.
+    // When explicit `cachedContent` is active, verify that transcript system
+    // instructions and live function declarations match what the cache owns in
+    // both directions before omitting those wire fields.
     if let Some(cached) = active_cached_content {
-        if !system_parts.is_empty() {
+        let expected_system: Vec<Value> = config
+            .cached_system_instructions
+            .iter()
+            .map(|text| json!({ "text": text }))
+            .collect();
+        if system_parts != expected_system {
             return Err(BuildError::CacheViolation(
-                "cannot attach cachedContent when the turn includes live system, developer, or context instructions; disable caching for this turn or omit live system items".into(),
+                "transcript system/developer/context instructions do not match cached_system_instructions; update cached_system_instructions or disable caching for this turn".into(),
             ));
         }
-        let uncovered: Vec<String> = request
+        let live_tools: BTreeSet<String> = request
             .available_tools
             .iter()
-            .filter(|spec| !config.cached_tool_names.contains(&spec.name.to_string()))
             .map(|spec| spec.name.to_string())
             .collect();
+        let uncovered: Vec<&String> = live_tools.difference(&config.cached_tool_names).collect();
         if !uncovered.is_empty() {
             return Err(BuildError::CacheViolation(format!(
                 "cannot attach cachedContent with live tools not declared in cached_tool_names: {}",
-                uncovered.join(", ")
+                uncovered
+                    .into_iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+        let unavailable: Vec<&String> = config.cached_tool_names.difference(&live_tools).collect();
+        if !unavailable.is_empty() {
+            return Err(BuildError::CacheViolation(format!(
+                "cannot attach cachedContent advertising functions unavailable in this turn: {}",
+                unavailable
+                    .into_iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
             )));
         }
         body.insert("cachedContent".into(), Value::String(cached.to_string()));
@@ -891,11 +910,15 @@ mod tests {
         let cfg = GeminiConfig::new("k", "gemini-2.5-flash")
             .unwrap()
             .with_cached_content("cachedContents/example")
+            .with_cached_system_instructions(["sys"])
             .with_cached_tool_names(["local_fn"]);
 
-        // Covered local tool + no live system instructions -> attaches cache and omits wire tools
+        // Matching system instructions + exact matching tool set -> attaches cache and omits wire fields
         let mut req = empty_turn(
-            vec![Item::text(ItemKind::User, "Hello")],
+            vec![
+                Item::text(ItemKind::System, "sys"),
+                Item::text(ItemKind::User, "Hello"),
+            ],
             vec![ToolSpec::new(
                 "local_fn",
                 "desc",
@@ -908,32 +931,54 @@ mod tests {
         assert!(cached_body.get("tools").is_none());
         assert!(cached_body.get("toolConfig").is_none());
 
-        // Live Context/System item not covered by cache -> rejected instead of silently dropped
+        // Live Context item not covered by cache -> rejected instead of silently dropped
         let live_ctx = empty_turn(
             vec![
+                Item::text(ItemKind::System, "sys"),
                 Item::text(ItemKind::Context, "compaction summary"),
                 Item::text(ItemKind::User, "Hello"),
             ],
-            vec![],
+            vec![ToolSpec::new(
+                "local_fn",
+                "desc",
+                json!({ "type": "object" }),
+            )],
         );
         assert!(matches!(
             build_request_body(&cfg, &live_ctx),
             Err(BuildError::CacheViolation(_))
         ));
 
-        // Uncovered live tool -> rejected instead of silently dropped
+        // Uncovered live tool -> rejected
         let uncovered_tool = empty_turn(
-            vec![Item::text(ItemKind::User, "Hello")],
-            vec![ToolSpec::new("new_fn", "desc", json!({ "type": "object" }))],
+            vec![
+                Item::text(ItemKind::System, "sys"),
+                Item::text(ItemKind::User, "Hello"),
+            ],
+            vec![
+                ToolSpec::new("local_fn", "desc", json!({ "type": "object" })),
+                ToolSpec::new("new_fn", "desc", json!({ "type": "object" })),
+            ],
         );
         assert!(matches!(
             build_request_body(&cfg, &uncovered_tool),
             Err(BuildError::CacheViolation(_))
         ));
 
+        // Cache advertising a function unavailable in this turn -> rejected
+        let missing_cached_tool = empty_turn(
+            vec![
+                Item::text(ItemKind::System, "sys"),
+                Item::text(ItemKind::User, "Hello"),
+            ],
+            vec![],
+        );
+        assert!(matches!(
+            build_request_body(&cfg, &missing_cached_tool),
+            Err(BuildError::CacheViolation(_))
+        ));
+
         // Disabling cache on the turn omits cachedContent and restores live fields
-        req.transcript
-            .insert(0, Item::text(ItemKind::System, "sys"));
         req.cache = Some(agentkit_loop::PromptCacheRequest::disabled());
         let uncached_body = build_request_body(&cfg, &req).unwrap();
         assert!(uncached_body.get("cachedContent").is_none());
