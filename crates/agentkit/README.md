@@ -38,6 +38,7 @@ Feature-gated umbrella crate for assembling agent applications from the agentkit
 | `provider-anthropic`  | `provider_anthropic`  | Anthropic Messages API adapter (streaming, prompt caching, extended thinking, server tools)    |
 | `provider-baseten`    | `provider_baseten`    | Baseten OpenAI-compatible Model API adapter                                                    |
 | `provider-cerebras`   | `provider_cerebras`   | Cerebras Inference API adapter (streaming, reasoning, compression, Files + Batch)              |
+| `provider-gemini`     | `provider_gemini`     | Google Gemini API adapter (Developer API & Vertex AI, streaming, thinking, grounding, resilience) |
 | `provider-openai`     | `provider_openai`     | OpenAI `/v1/chat/completions` adapter                                                          |
 | `provider-openrouter` | `provider_openrouter` | OpenRouter `/v1/chat/completions` adapter                                                      |
 | `provider-groq`       | `provider_groq`       | Groq adapter                                                                                   |

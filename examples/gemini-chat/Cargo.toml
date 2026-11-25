@@ -1,0 +1,15 @@
+[package]
+name = "gemini-chat"
+publish = false
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+agentkit-core = { path = "../../crates/agentkit-core" }
+agentkit-http = { path = "../../crates/agentkit-http" }
+agentkit-loop = { path = "../../crates/agentkit-loop" }
+agentkit-provider-gemini = { path = "../../crates/agentkit-provider-gemini" }
+dotenvy.workspace = true
+tokio = { workspace = true, features = ["signal"] }

@@ -34,6 +34,7 @@ dependencies = [
  "agentkit-provider-anthropic",
  "agentkit-provider-baseten",
  "agentkit-provider-cerebras",
+ "agentkit-provider-gemini",
  "agentkit-provider-groq",
  "agentkit-provider-mistral",
  "agentkit-provider-ollama",
@@ -306,6 +307,24 @@ dependencies = [
  "reqwest",
  "rmp-serde",
  "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "agentkit-provider-gemini"
+version = "0.10.5"
+dependencies = [
+ "agentkit-core",
+ "agentkit-http",
+ "agentkit-loop",
+ "agentkit-tools-core",
+ "async-trait",
+ "base64 0.22.1",
+ "bytes",
+ "futures-util",
+ "reqwest",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
@@ -1490,6 +1509,18 @@ dependencies = [
  "memchr",
  "pin-project-lite",
  "slab",
+]
+
+[[package]]
+name = "gemini-chat"
+version = "0.10.5"
+dependencies = [
+ "agentkit-core",
+ "agentkit-http",
+ "agentkit-loop",
+ "agentkit-provider-gemini",
+ "dotenvy",
+ "tokio",
 ]
 
 [[package]]
