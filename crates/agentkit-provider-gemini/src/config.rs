@@ -365,10 +365,12 @@ pub struct GeminiConfig {
     pub cached_content: Option<String>,
     /// Function tool specifications already declared inside `cached_content`, keyed by tool name.
     ///
-    /// When `cached_content` is active, advertised tools must match both name
-    /// and wire declaration (description + `parametersJsonSchema`) unless
-    /// [`Self::allow_unadvertised_cached_tools`] is enabled for dispatch-only
-    /// tool sources (`ToolSource::unadvertised()`).
+    /// When `cached_content` is active, every advertised tool in
+    /// `TurnRequest::available_tools` must match both its name and its wire
+    /// declaration (description + `parametersJsonSchema`) in this map.
+    /// Enabling [`Self::allow_unadvertised_cached_tools`] separately permits
+    /// this map to also contain dispatch-only tools absent from
+    /// `available_tools` (such as `ToolSource::unadvertised()`).
     pub cached_tools: BTreeMap<String, ToolSpec>,
     /// Permits `cached_tools` to contain dispatch-only tools not advertised
     /// in `TurnRequest::available_tools` (for example when using

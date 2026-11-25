@@ -16,6 +16,7 @@ pub(crate) struct RetryTracker {
     pub(crate) accounting: RetryAccounting,
     upstream: ProviderClassification,
     last_attempt_reason: Option<ProviderFailureReason>,
+    preserve_attempt_reason: bool,
     observer: Option<Arc<dyn RetryObserver>>,
     last_progress: Option<Duration>,
     finalized: bool,
@@ -28,6 +29,7 @@ impl RetryTracker {
             accounting: RetryAccounting::default(),
             upstream: ProviderClassification::default(),
             last_attempt_reason: None,
+            preserve_attempt_reason: false,
             observer,
             last_progress: None,
             finalized: false,
@@ -45,9 +47,14 @@ impl RetryTracker {
         }
     }
 
+    pub(crate) fn preserve_last_attempt_reason(&mut self) {
+        self.preserve_attempt_reason = true;
+    }
+
     pub(crate) fn note_failure(&mut self, error: &LoopError) {
         let reason = failure_reason(error);
-        if self.accounting.attempts > 0
+        if !self.preserve_attempt_reason
+            && self.accounting.attempts > 0
             && (matches!(
                 reason,
                 ProviderFailureReason::HttpStatus

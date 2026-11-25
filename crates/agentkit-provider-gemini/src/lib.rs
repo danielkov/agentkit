@@ -396,14 +396,19 @@ impl ReplayRequest {
             StatusCode::BAD_REQUEST => ProviderFailureReason::InvalidRequest,
             _ => ProviderFailureReason::HttpStatus,
         };
+        // Record the status-derived rejection before awaiting the body so
+        // cancellation or a local inspection stop retains the received attempt.
+        if let Ok(mut tracker) = self.tracker.lock() {
+            tracker.note_failure(&provider_error(
+                reason,
+                classify_http_body(None, status.as_u16()),
+            ));
+        }
         let body = match self.read_bounded_body(response, MAX_ERROR_BODY_BYTES).await {
             Ok(body) => body,
             Err(err) => {
                 if let Ok(mut tracker) = self.tracker.lock() {
-                    tracker.note_failure(&provider_error(
-                        reason,
-                        classify_http_body(None, status.as_u16()),
-                    ));
+                    tracker.preserve_last_attempt_reason();
                 }
                 return err;
             }
@@ -1646,6 +1651,37 @@ data: {"candidates":[{"content":{"role":"model","parts":[{"text":""#.to_vec();
         };
         let failure = *err.provider_failure().unwrap();
         assert_eq!(failure.reason, ProviderFailureReason::RetryBudget);
+        assert_eq!(
+            failure.last_attempt_reason,
+            Some(ProviderFailureReason::Authentication)
+        );
+        assert_eq!(failure.upstream.http_status, Some(403));
+    }
+
+    #[tokio::test]
+    async fn byte_limit_during_403_body_preserves_authentication_attempt_category() {
+        let client = Arc::new(SequenceClient::new(vec![status_response(
+            StatusCode::FORBIDDEN,
+            b"0123456789abcdef0123456789abcdef",
+        )]));
+        let config = GeminiConfig::new("k", "gemini-2.5-flash")
+            .unwrap()
+            .with_limits(GeminiLimits {
+                max_request_bytes: 1024 * 1024,
+                max_attempt_bytes: 16,
+                max_wire_bytes: 16,
+            });
+        let adapter = GeminiAdapter::with_client(config, Http::from_arc(client));
+        let mut session = adapter
+            .start_session(SessionConfig::new("s1"))
+            .await
+            .unwrap();
+        let err = match session.begin_turn(sample_turn_request(), None).await {
+            Err(e) => e,
+            Ok(_) => panic!("expected byte limit stop"),
+        };
+        let failure = *err.provider_failure().unwrap();
+        assert_eq!(failure.reason, ProviderFailureReason::Protocol);
         assert_eq!(
             failure.last_attempt_reason,
             Some(ProviderFailureReason::Authentication)
