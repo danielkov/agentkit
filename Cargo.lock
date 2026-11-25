@@ -20,7 +20,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit"
-version = "0.13.0"
+version = "0.13.1"
 dependencies = [
  "agentkit-acp",
  "agentkit-adapter-completions",
@@ -210,7 +210,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-loop"
-version = "0.11.0"
+version = "0.11.2"
 dependencies = [
  "agentkit-core",
  "agentkit-task-manager",
@@ -314,7 +314,7 @@ dependencies = [
 
 [[package]]
 name = "agentkit-provider-gemini"
-version = "0.10.5"
+version = "0.11.0"
 dependencies = [
  "agentkit-core",
  "agentkit-http",

@@ -42,6 +42,7 @@ CRATES=(
   agentkit-provider-anthropic
   agentkit-provider-baseten
   agentkit-provider-cerebras
+  agentkit-provider-gemini
   agentkit
   how-cli
 )
