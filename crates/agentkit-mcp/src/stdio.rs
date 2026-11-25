@@ -12,12 +12,12 @@ use tokio::io::{AsyncRead, ReadBuf};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::time::timeout;
 
-use crate::StdioTransportConfig;
+use crate::{McpError, StdioLineTooLong, StdioTransportConfig};
 
 pub(crate) struct StdioTransport {
     io: AsyncRwTransport<RoleClient, BoundedStdout, ChildStdin>,
     child: Child,
-    oversized: Arc<AtomicBool>,
+    line_limit: StdioLineLimit,
 }
 
 impl StdioTransport {
@@ -42,18 +42,46 @@ impl StdioTransport {
         let mut child = command.spawn()?;
         let stdin = child.stdin.take().expect("piped child stdin");
         let stdout = child.stdout.take().expect("piped child stdout");
-        let oversized = Arc::new(AtomicBool::new(false));
+        let line_limit = StdioLineLimit {
+            limit,
+            exceeded: Arc::new(AtomicBool::new(false)),
+        };
         let read = BoundedStdout {
             inner: stdout,
-            limit,
             remaining: limit,
-            oversized: oversized.clone(),
+            line_limit: line_limit.clone(),
         };
         Ok(Self {
             io: AsyncRwTransport::new_client(read, stdin).with_max_line_length(limit),
             child,
-            oversized,
+            line_limit,
         })
+    }
+
+    pub(crate) fn line_limit(&self) -> StdioLineLimit {
+        self.line_limit.clone()
+    }
+}
+
+// A sticky fault shared only by the reader, writer, and callers of this
+// transport. rmcp's receive interface reports a read error as EOF.
+#[derive(Clone)]
+pub(crate) struct StdioLineLimit {
+    limit: usize,
+    exceeded: Arc<AtomicBool>,
+}
+
+impl StdioLineLimit {
+    fn exceeded(&self) -> bool {
+        self.exceeded.load(Ordering::Acquire)
+    }
+
+    fn io_error(&self) -> io::Error {
+        StdioLineTooLong { limit: self.limit }.into_io_error()
+    }
+
+    pub(crate) fn error(&self) -> Option<McpError> {
+        self.exceeded().then(|| McpError::Io(self.io_error()))
     }
 }
 
@@ -64,12 +92,26 @@ impl Transport<RoleClient> for StdioTransport {
         &mut self,
         item: TxJsonRpcMessage<RoleClient>,
     ) -> impl Future<Output = io::Result<()>> + Send + 'static {
-        self.io.send(item)
+        let line_limit = self.line_limit.clone();
+        let send = self.io.send(item);
+        async move {
+            if line_limit.exceeded() {
+                return Err(line_limit.io_error());
+            }
+            send.await.map_err(|error| {
+                // The fatal read kills the child to release blocked writers.
+                if error.kind() == io::ErrorKind::BrokenPipe && line_limit.exceeded() {
+                    line_limit.io_error()
+                } else {
+                    error
+                }
+            })
+        }
     }
 
     async fn receive(&mut self) -> Option<RxJsonRpcMessage<RoleClient>> {
         let message = self.io.receive().await;
-        if self.oversized.load(Ordering::Relaxed) {
+        if self.line_limit.exceeded() {
             // Unblock any pending writes before rmcp drains the service. `close`
             // reaps the child; kill-on-drop also covers initialization failure.
             if let Err(error) = self.child.start_kill() {
@@ -80,7 +122,7 @@ impl Transport<RoleClient> for StdioTransport {
     }
 
     async fn close(&mut self) -> io::Result<()> {
-        if self.oversized.load(Ordering::Relaxed) {
+        if self.line_limit.exceeded() {
             // Do not await rmcp's stdin writer lock after a fatal read: an
             // in-flight write may still be blocked. Dropping the service drops it.
             return self.child.kill().await;
@@ -98,9 +140,8 @@ impl Transport<RoleClient> for StdioTransport {
 // line budget without a delimiter into an I/O error rather than a dropped line.
 struct BoundedStdout {
     inner: ChildStdout,
-    limit: usize,
     remaining: usize,
-    oversized: Arc<AtomicBool>,
+    line_limit: StdioLineLimit,
 }
 
 impl AsyncRead for BoundedStdout {
@@ -114,11 +155,8 @@ impl AsyncRead for BoundedStdout {
         }
         let this = &mut *self;
         if this.remaining == 0 {
-            this.oversized.store(true, Ordering::Relaxed);
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("stdio line exceeded the {}-byte limit", this.limit),
-            )));
+            this.line_limit.exceeded.store(true, Ordering::Release);
+            return Poll::Ready(Err(this.line_limit.io_error()));
         }
         let capacity = output.remaining().min(this.remaining);
         let mut limited = ReadBuf::new(output.initialize_unfilled_to(capacity));
@@ -126,7 +164,7 @@ impl AsyncRead for BoundedStdout {
         let bytes = limited.filled();
         let count = bytes.len();
         this.remaining = match bytes.iter().rposition(|&byte| byte == b'\n') {
-            Some(newline) => this.limit - (count - newline - 1),
+            Some(newline) => this.line_limit.limit - (count - newline - 1),
             None => this.remaining - count,
         };
         output.advance(count);

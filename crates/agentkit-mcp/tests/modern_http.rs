@@ -11,8 +11,9 @@ use std::{
 
 use agentkit_mcp::{
     AuthOperation, AuthRequest, AuthResolution, McpConnection, McpError, McpServerConfig,
-    McpServerEvent, McpServerId, McpServerManager, McpSkillResources, McpSubscriptionStatus,
-    McpTransportBinding, StreamableHttpTransportConfig,
+    McpServerEvent, McpServerId, McpServerManager, McpSkillResources, McpSkillScanLimit,
+    McpSkillScanLimits, McpSkillScanOutcome, McpSubscriptionStatus, McpTransportBinding,
+    StreamableHttpTransportConfig,
 };
 use axum::{
     Json, Router,
@@ -147,6 +148,50 @@ async fn rpc(
             .into_response();
     }
     let result = match method {
+        "skills/list" if token == "Bearer skills-cumulative" => {
+            let first = message["params"]["cursor"].is_null();
+            let mut page = json!({
+                "skills": [skill(if first { "first" } else { "second" })],
+                "_meta": {"example": "a".repeat(4096)},
+            });
+            if first {
+                page["nextCursor"] = json!("page-2");
+            }
+            page
+        }
+        "skills/list" if token == "Bearer skills-many-pages" => {
+            let page = message["params"]["cursor"]
+                .as_str()
+                .map_or(1, |cursor| cursor.parse::<usize>().unwrap());
+            let mut result = json!({"skills": [skill(&format!("skill-{page}"))]});
+            if page < 65 {
+                result["nextCursor"] = json!((page + 1).to_string());
+            }
+            result
+        }
+        "skills/list" if token == "Bearer skills-dense" => {
+            let mut entry = skill("first");
+            entry["frontmatter"]["custom"] = json!({"dense": vec![Value::Null; 32768]});
+            json!({"skills":[entry]})
+        }
+        "skills/list" if token == "Bearer skills-wide" => {
+            json!({"skills":[skill("first"), skill("second")]})
+        }
+        "skills/list" if token == "Bearer skills-cycle" => {
+            let next = if message["params"]["cursor"].is_null() {
+                "page-2"
+            } else {
+                "page-3"
+            };
+            json!({"skills":[], "nextCursor":next})
+        }
+        "skills/list" if token == "Bearer skills-slow" => {
+            if message["params"]["cursor"].is_null() {
+                json!({"skills":[skill("first")], "nextCursor":"slow"})
+            } else {
+                std::future::pending().await
+            }
+        }
         "skills/list" if token == "Bearer skills-duplicate" => {
             if message["params"]["cursor"].is_null() {
                 json!({"resultType":"complete","skills":[skill("first")],"nextCursor":"page-2"})
@@ -211,10 +256,7 @@ async fn rpc(
                 capabilities.build()
             };
             let capabilities = match token {
-                "Bearer skills"
-                | "Bearer skills-limited"
-                | "Bearer skills-incomplete"
-                | "Bearer skills-duplicate" => json!({
+                token if token == "Bearer skills" || token.starts_with("Bearer skills-") => json!({
                     "resources":{}, "completions":{},
                     "experimental":{"example":{"flag":true}},
                     "extensions":{"io.modelcontextprotocol/skills":{"directoryRead":true}}
@@ -432,6 +474,203 @@ async fn skill_inventory_uses_advertised_extension_on_current_connection() {
                 .iter()
                 .all(|(_, message)| { message["method"] != "resources/read" })
         );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn skill_inventory_collector_is_not_limited_to_the_default_scan_page_count() {
+    bounded(async {
+        let fixture = Fixture::start().await;
+        let connection = McpConnection::connect(&fixture.config).await.unwrap();
+        connection
+            .resolve_auth(auth("skills-many-pages"))
+            .await
+            .unwrap();
+
+        let names: Vec<_> = connection
+            .list_skills()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|skill| skill.frontmatter.name)
+            .collect();
+        assert_eq!(
+            names,
+            (1..=65)
+                .map(|page| format!("skill-{page}"))
+                .collect::<Vec<_>>()
+        );
+
+        let mut visited = 0;
+        let outcome = connection
+            .visit_skills(McpSkillScanLimits::default(), |_| visited += 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            McpSkillScanOutcome::Truncated(McpSkillScanLimit::PageCount)
+        );
+        assert_eq!(visited, 64);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn skill_scan_stops_at_entry_and_page_count_limits() {
+    use McpSkillScanLimit::{EntryCount, PageCount};
+    use McpSkillScanOutcome::{Complete, Truncated};
+
+    bounded(async {
+        let fixture = Fixture::start().await;
+        let connection = McpConnection::connect(&fixture.config).await.unwrap();
+        for (token, max_entries, max_pages, expected, entries, requests) in [
+            ("skills-wide", 2, 1, Complete, 2, 1),
+            ("skills-wide", 1, 1, Truncated(EntryCount), 1, 1),
+            ("skills", 1, 2, Truncated(EntryCount), 1, 1),
+            ("skills-cycle", 2, 2, Truncated(PageCount), 0, 2),
+        ] {
+            connection.resolve_auth(auth(token)).await.unwrap();
+            fixture.requests.lock().await.clear();
+            let mut names = Vec::new();
+            let limits = McpSkillScanLimits {
+                max_entries,
+                max_pages,
+                ..Default::default()
+            };
+            let outcome = connection
+                .visit_skills(limits, |skill| names.push(skill.frontmatter.name))
+                .await
+                .unwrap();
+            assert_eq!(outcome, expected);
+            assert_eq!(names, ["first", "second"][..entries]);
+            let actual_requests = fixture
+                .requests
+                .lock()
+                .await
+                .iter()
+                .filter(|(_, message)| message["method"] == "skills/list")
+                .count();
+            assert_eq!(actual_requests, requests);
+        }
+        let error = connection.list_skills().await.unwrap_err();
+        assert!(
+            matches!(error, McpError::Protocol(message) if message.contains("repeated a cursor"))
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn skill_scan_checks_decoded_entry_page_and_cumulative_budgets() {
+    use McpSkillScanLimit::{EntryDecodedBytes, PageDecodedBytes, TotalDecodedBytes};
+    use McpSkillScanOutcome::Truncated;
+
+    bounded(async {
+        let fixture = Fixture::start().await;
+        let connection = McpConnection::connect(&fixture.config).await.unwrap();
+        connection.resolve_auth(auth("skills-dense")).await.unwrap();
+        // The wire JSON fits in 256 KiB; the decoded null array does not.
+        let outcome = connection
+            .visit_skills(McpSkillScanLimits::default(), |_| {
+                panic!("oversized entry visited")
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome, Truncated(EntryDecodedBytes));
+        let skills = connection.list_skills().await.unwrap();
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].frontmatter.name, "first");
+
+        let limits = McpSkillScanLimits {
+            max_entry_decoded_bytes: 4 * 1024 * 1024,
+            max_page_decoded_bytes: 256 * 1024,
+            ..Default::default()
+        };
+        let outcome = connection
+            .visit_skills(limits, |_| panic!("oversized page visited"))
+            .await
+            .unwrap();
+        assert_eq!(outcome, Truncated(PageDecodedBytes));
+
+        // Two pages with small entries each fit on their own, but their page
+        // metadata and entries together exceed the total budget.
+        connection
+            .resolve_auth(auth("skills-cumulative"))
+            .await
+            .unwrap();
+        let mut names = Vec::new();
+        let limits = McpSkillScanLimits {
+            max_total_decoded_bytes: 8 * 1024,
+            ..Default::default()
+        };
+        let outcome = connection
+            .visit_skills(limits, |skill| names.push(skill.frontmatter.name))
+            .await
+            .unwrap();
+        assert_eq!(outcome, Truncated(TotalDecodedBytes));
+        assert_eq!(names, ["first"]);
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn skill_scan_does_not_send_an_old_cursor_to_a_replacement_peer() {
+    bounded(async {
+        let fixture = Fixture::start().await;
+        let connection = McpConnection::connect(&fixture.config).await.unwrap();
+        connection.resolve_auth(auth("skills")).await.unwrap();
+        let mut names = Vec::new();
+        let error = connection
+            .visit_skills(McpSkillScanLimits::default(), |skill| {
+                names.push(skill.frontmatter.name);
+                // Complete the auth swap before the visitor returns and the
+                // scan attempts to request the next page.
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current()
+                        .block_on(bounded(connection.resolve_auth(auth("skills-wide"))))
+                        .unwrap();
+                });
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, McpError::Transport(_)));
+        assert_eq!(names, ["first"]);
+        assert!(
+            fixture
+                .requests
+                .lock()
+                .await
+                .iter()
+                .all(|(headers, message)| {
+                    message["method"] != "skills/list"
+                        || headers["authorization"] == "Bearer skills"
+                })
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn skill_scan_times_out_a_stalled_later_page() {
+    bounded(async {
+        let fixture = Fixture::start().await;
+        let connection = McpConnection::connect(&fixture.config).await.unwrap();
+        connection.resolve_auth(auth("skills-slow")).await.unwrap();
+        let mut names = Vec::new();
+        let limits = McpSkillScanLimits {
+            page_timeout: Duration::from_millis(500),
+            ..Default::default()
+        };
+        let error = connection
+            .visit_skills(limits, |skill| names.push(skill.frontmatter.name))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            McpError::Timeout { operation: "skills/list", duration } if duration == limits.page_timeout
+        ));
+        assert_eq!(names, ["first"]);
     })
     .await;
 }
