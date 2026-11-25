@@ -354,7 +354,7 @@ async fn run_acp_client(
     let outputs = Arc::new(Mutex::new(HashMap::new()));
     let outputs_for_notifications = Arc::clone(&outputs);
     let result = agent_client_protocol::Client
-        .builder()
+        .v1()
         .on_receive_notification(
             async move |notification: agentkit_acp::SessionNotification, _cx| {
                 render_acp_update(role, &notification, &outputs_for_notifications);
@@ -381,7 +381,7 @@ async fn run_acp_client(
 
 async fn process_prompt_commands(
     role: Role,
-    cx: agent_client_protocol::ConnectionTo<agent_client_protocol::Agent>,
+    cx: agent_client_protocol::v1::ConnectionTo<agent_client_protocol::Agent>,
     session_id: agentkit_acp::SessionId,
     mut rx: mpsc::Receiver<PromptCommand>,
     outputs: SessionOutputMap,
@@ -406,7 +406,7 @@ async fn process_prompt_commands(
 
 async fn run_prompt_command(
     role: Role,
-    cx: agent_client_protocol::ConnectionTo<agent_client_protocol::Agent>,
+    cx: agent_client_protocol::v1::ConnectionTo<agent_client_protocol::Agent>,
     persistent_session_id: agentkit_acp::SessionId,
     command: PromptCommand,
     outputs: SessionOutputMap,

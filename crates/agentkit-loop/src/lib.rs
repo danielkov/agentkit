@@ -1478,6 +1478,7 @@ where
             transcript_observers: self.transcript_observers.clone(),
             transcript: self.transcript.clone(),
             pending_input: self.input.clone(),
+            committed_input: None,
             pending_approvals: BTreeMap::new(),
             pending_approval_order: VecDeque::new(),
             active_tool_round: None,
@@ -1765,6 +1766,9 @@ where
     transcript_observers: Vec<Arc<dyn TranscriptObserver>>,
     transcript: Vec<Item>,
     pending_input: Vec<Item>,
+    // A committed input already lives in the transcript. This checkpoint only
+    // controls whether it can initiate a turn; Stop never rolls back history.
+    committed_input: Option<TurnCancellation>,
     pending_approvals: BTreeMap<ToolCallId, PendingApprovalToolCall>,
     pending_approval_order: VecDeque<ToolCallId>,
     active_tool_round: Option<ActiveToolRound>,
@@ -2386,11 +2390,17 @@ where
         &mut self,
         turn_id: agentkit_core::TurnId,
         mutation_point: MutationPoint,
+        cancellation: Option<TurnCancellation>,
     ) -> Result<LoopStep, LoopError> {
-        let cancellation = self
-            .cancellation
+        // Any model continuation uses the committed input already in history,
+        // including an approval that preempted an AfterToolResult resume.
+        self.committed_input = None;
+        if cancellation
             .as_ref()
-            .map(CancellationHandle::checkpoint);
+            .is_some_and(TurnCancellation::is_cancelled)
+        {
+            return self.finish_cancelled(turn_id, interrupted_assistant_items());
+        }
         match self
             .run_mutators(mutation_point, Some(&turn_id), cancellation.clone())
             .await
@@ -2400,6 +2410,13 @@ where
                 return self.finish_cancelled(turn_id, interrupted_assistant_items());
             }
             Err(error) => return Err(error),
+        }
+
+        if cancellation
+            .as_ref()
+            .is_some_and(TurnCancellation::is_cancelled)
+        {
+            return self.finish_cancelled(turn_id, interrupted_assistant_items());
         }
 
         // A mutator may have removed the freshly-submitted input (e.g. a
@@ -2417,13 +2434,6 @@ where
             };
             self.finish_logical_turn(&turn_result);
             return Ok(LoopStep::Finished(turn_result));
-        }
-
-        if cancellation
-            .as_ref()
-            .is_some_and(TurnCancellation::is_cancelled)
-        {
-            return self.finish_cancelled(turn_id, interrupted_assistant_items());
         }
 
         let catalog_events = self.tool_executor.drain_catalog_events();
@@ -2509,6 +2519,12 @@ where
                                 CaptureOrder::NewestTail,
                             ),
                         );
+                    }
+                    if cancellation
+                        .as_ref()
+                        .is_some_and(TurnCancellation::is_cancelled)
+                    {
+                        return Err(LoopError::Cancelled);
                     }
                     self.session
                         .as_mut()
@@ -2821,6 +2837,7 @@ where
     async fn resume_after_approval(
         &mut self,
         pending: PendingApprovalToolCall,
+        cancellation: Option<TurnCancellation>,
     ) -> Result<LoopStep, LoopError> {
         let decision = pending
             .decision
@@ -2831,15 +2848,44 @@ where
             ApprovalDecision::Approve => {
                 use tracing::Instrument;
                 self.emit(AgentEvent::ToolExecutionStarted(pending.call.clone()));
+                if cancellation
+                    .as_ref()
+                    .is_some_and(TurnCancellation::is_cancelled)
+                {
+                    let presentation_turn_id = pending.presentation_turn_id.clone();
+                    let originating_turn = pending.tool_request.turn_id.clone();
+                    self.active_tool_round = None;
+                    let mut seen_turns = HashSet::from([originating_turn.clone()]);
+                    let mut originating_turns = vec![originating_turn];
+                    for other in self.pending_approvals.values() {
+                        let turn = other.tool_request.turn_id.clone();
+                        if seen_turns.insert(turn.clone()) {
+                            originating_turns.push(turn);
+                        }
+                    }
+                    let mut drained = vec![pending];
+                    drained.extend(self.drain_pending_approval_items());
+                    let mut cleanup_error = None;
+                    for turn in originating_turns {
+                        if let Err(error) = self.task_manager.on_turn_interrupted(&turn).await
+                            && cleanup_error.is_none()
+                        {
+                            cleanup_error =
+                                Some(LoopError::Tool(ToolError::Internal(error.to_string())));
+                        }
+                    }
+                    self.reject_drained_approvals(drained);
+                    if let Some(error) = cleanup_error {
+                        self.close_interrupted_tool_calls();
+                        return Err(error);
+                    }
+                    return self.finish_cancelled(presentation_turn_id, Vec::new());
+                }
                 let dispatch_span = self.execute_tool_span(
                     &pending.tool_request,
                     &pending.presentation_turn_id,
                     "approved",
                 );
-                let cancellation = self
-                    .cancellation
-                    .as_ref()
-                    .map(CancellationHandle::checkpoint);
                 self.register_tool_cancellation(&pending.call.id, cancellation.clone());
                 let start = self
                     .start_task_via_manager(
@@ -2893,7 +2939,7 @@ where
                         if let Some(step) = self.queue_resolution_interrupt(
                             &pending.presentation_turn_id,
                             resolution,
-                            cancellation,
+                            cancellation.clone(),
                         ) {
                             return Ok(step);
                         }
@@ -2944,8 +2990,12 @@ where
         } else if let Some(step) = self.next_unresolved_approval_interrupt() {
             Ok(step)
         } else {
-            self.drive_turn(pending.presentation_turn_id, MutationPoint::AfterToolResult)
-                .await
+            self.drive_turn(
+                pending.presentation_turn_id,
+                MutationPoint::AfterToolResult,
+                cancellation,
+            )
+            .await
         }
     }
 
@@ -2990,6 +3040,55 @@ where
         });
         self.pending_input.extend(input);
         Ok(())
+    }
+
+    /// Commit input to the transcript before advancing the loop.
+    ///
+    /// Calls transcript observers synchronously, but does not start a turn, run
+    /// mutators, poll the task manager, or dispatch a model request. An existing
+    /// staged input batch, if any, is appended ahead of this batch to preserve
+    /// submission order. Empty input is a no-op. As with any transcript append,
+    /// observers are responsible for persistence and cannot report errors here.
+    ///
+    /// Use the same checkpoint for all commits and
+    /// [`Self::next_with_cancellation`] calls within the host's turn. Cancellation
+    /// removes the ability of this batch to initiate inference, not the input
+    /// from history. A subsequent turn may see it as context.
+    ///
+    /// Returns [`LoopError::InvalidState`] if an interrupt requires resolution.
+    pub fn commit_input(
+        &mut self,
+        input: Vec<Item>,
+        cancellation: TurnCancellation,
+    ) -> Result<(), LoopError> {
+        if self.has_pending_interrupts() {
+            return Err(LoopError::InvalidState(
+                "cannot commit input while an interrupt is pending".into(),
+            ));
+        }
+        if !input.is_empty() {
+            self.emit(AgentEvent::InputAccepted {
+                session_id: self.session_id.clone(),
+                items: input.clone(),
+            });
+            let staged = std::mem::take(&mut self.pending_input);
+            self.extend_transcript(staged.into_iter().chain(input));
+            self.committed_input = Some(cancellation);
+        }
+        Ok(())
+    }
+
+    fn has_input_to_drive(&self) -> bool {
+        !self.pending_input.is_empty()
+            || self
+                .committed_input
+                .as_ref()
+                .is_some_and(|checkpoint| !checkpoint.is_cancelled())
+    }
+
+    fn append_staged_input(&mut self) {
+        let staged = std::mem::take(&mut self.pending_input);
+        self.extend_transcript(staged);
     }
 
     /// Override the prompt cache request for the next model turn.
@@ -3255,6 +3354,33 @@ where
     /// Returns [`LoopError::InvalidState`] if called while an unresolved
     /// interrupt is pending, or propagates provider / tool / compaction errors.
     pub async fn next(&mut self) -> Result<LoopStep, LoopError> {
+        let cancellation = self
+            .cancellation
+            .as_ref()
+            .map(CancellationHandle::checkpoint);
+        self.next_step(cancellation).await
+    }
+
+    /// Advance the loop using a checkpoint captured by the caller before
+    /// admitting work for this turn, including across task-manager awaits.
+    ///
+    /// If the checkpoint was already cancelled, returns [`LoopError::Cancelled`]
+    /// without changing driver state. Use the same checkpoint for subsequent
+    /// steps of the same turn rather than capturing a new generation.
+    pub async fn next_with_cancellation(
+        &mut self,
+        cancellation: TurnCancellation,
+    ) -> Result<LoopStep, LoopError> {
+        if cancellation.is_cancelled() {
+            return Err(LoopError::Cancelled);
+        }
+        self.next_step(Some(cancellation)).await
+    }
+
+    async fn next_step(
+        &mut self,
+        cancellation: Option<TurnCancellation>,
+    ) -> Result<LoopStep, LoopError> {
         if self.lifecycle.active_turn.is_none() {
             let continuation_turn = self
                 .pending_approval_order
@@ -3269,12 +3395,10 @@ where
                 .or_else(|| self.pending_round_resume.clone());
             if let Some(turn_id) = continuation_turn {
                 self.start_logical_turn_with(turn_id);
-            } else if !self.pending_input.is_empty() {
-                self.start_logical_turn();
             }
         }
 
-        let result = self.next_inner().await;
+        let result = self.next_inner(cancellation).await;
         match &result {
             Ok(LoopStep::Finished(turn)) => self.finish_logical_turn(turn),
             Err(_) => {
@@ -3333,9 +3457,12 @@ where
         }
     }
 
-    async fn next_inner(&mut self) -> Result<LoopStep, LoopError> {
+    async fn next_inner(
+        &mut self,
+        cancellation: Option<TurnCancellation>,
+    ) -> Result<LoopStep, LoopError> {
         if let Some(pending) = self.take_next_resolved_approval() {
-            return self.resume_after_approval(pending).await;
+            return self.resume_after_approval(pending, cancellation).await;
         }
 
         if let Some(step) = self.finish_cancelled_pending_approval().await? {
@@ -3358,15 +3485,14 @@ where
         // before unrelated background completions so a delayed approval cannot
         // bind itself to that turn's TurnStarted event. AfterToolResult resumes
         // remain ordered ahead of fresh input below.
-        if self.pending_round_resume.is_none() && !self.pending_input.is_empty() {
+        if self.pending_round_resume.is_none() && self.has_input_to_drive() {
+            let turn_id = self.start_logical_turn();
             // Take updates now to preserve the driver's once-per-step manager
             // handoff, but defer presenting them until this input turn ends.
             self.collect_pending_loop_updates().await?;
-            let turn_id = self.start_logical_turn();
-            let drained: Vec<Item> = std::mem::take(&mut self.pending_input);
-            self.extend_transcript(drained);
+            self.append_staged_input();
             return self
-                .drive_turn(turn_id, MutationPoint::AfterTurnEnded)
+                .drive_turn(turn_id, MutationPoint::AfterTurnEnded, cancellation)
                 .await;
         }
 
@@ -3380,14 +3506,13 @@ where
         // continuation turn; background task results drained just above are
         // already in the transcript.
         if let Some(turn_id) = self.pending_round_resume.take() {
-            let drained: Vec<Item> = std::mem::take(&mut self.pending_input);
-            self.extend_transcript(drained);
+            self.append_staged_input();
             return self
-                .drive_turn(turn_id, MutationPoint::AfterToolResult)
+                .drive_turn(turn_id, MutationPoint::AfterToolResult, cancellation)
                 .await;
         }
 
-        if self.pending_input.is_empty() && !had_loop_updates {
+        if !self.has_input_to_drive() && !had_loop_updates {
             return Ok(LoopStep::Interrupt(LoopInterrupt::AwaitingInput(
                 InputRequest {
                     session_id: self.session_id.clone(),
@@ -3397,9 +3522,8 @@ where
         }
 
         let turn_id = self.start_logical_turn();
-        let drained: Vec<Item> = std::mem::take(&mut self.pending_input);
-        self.extend_transcript(drained);
-        self.drive_turn(turn_id, MutationPoint::AfterTurnEnded)
+        self.append_staged_input();
+        self.drive_turn(turn_id, MutationPoint::AfterTurnEnded, cancellation)
             .await
     }
 
@@ -5329,6 +5453,7 @@ mod tests {
         approved_start_error: Option<&'static str>,
         pending_update_error: Option<(usize, &'static str)>,
         pending_update_calls: AtomicUsize,
+        pending_update_gate: Option<(StdArc<Notify>, StdArc<Notify>)>,
         interrupted: Option<StdArc<StdMutex<Vec<agentkit_core::TurnId>>>>,
         interrupt_error: Option<&'static str>,
     }
@@ -5341,6 +5466,7 @@ mod tests {
                 approved_start_error: None,
                 pending_update_error: None,
                 pending_update_calls: AtomicUsize::new(0),
+                pending_update_gate: None,
                 interrupted: None,
                 interrupt_error: None,
             }
@@ -5405,6 +5531,10 @@ mod tests {
                 && self.pending_update_calls.fetch_add(1, Ordering::SeqCst) == call
             {
                 return Err(TaskManagerError::Internal(message.into()));
+            }
+            if let Some((entered, release)) = &self.pending_update_gate {
+                entered.notify_one();
+                release.notified().await;
             }
             self.inner.take_pending_loop_updates().await
         }
@@ -10274,6 +10404,292 @@ mod tests {
         fn on_transcript_event(&self, event: TranscriptEvent<'_>) {
             self.items.lock().unwrap().push(event.item.clone());
         }
+    }
+
+    #[tokio::test]
+    async fn committed_input_is_observed_before_inference_and_drives_terminal_steer() {
+        let events = StdArc::new(StdMutex::new(Vec::new()));
+        let items = StdArc::new(StdMutex::new(Vec::new()));
+        let calls = StdArc::new(StdMutex::new(Vec::new()));
+        let controller = CancellationController::new();
+        let checkpoint = controller.handle().checkpoint();
+        let mut driver = Agent::builder()
+            .model(RecordingAdapter {
+                seen_descriptions: calls.clone(),
+                seen_caches: Default::default(),
+            })
+            .observer(RecordingObserver {
+                events: events.clone(),
+            })
+            .transcript_observer(RecordingTranscriptObserver {
+                items: items.clone(),
+            })
+            .build()
+            .unwrap()
+            .start(SessionConfig::new("commit-before-inference"))
+            .await
+            .unwrap();
+
+        let staged = Item::text(ItemKind::User, "staged");
+        let initial = Item::text(ItemKind::User, "initial");
+        driver.submit_input(vec![staged.clone()]).unwrap();
+        driver
+            .commit_input(vec![initial.clone()], checkpoint.clone())
+            .unwrap();
+        let snapshot = driver.snapshot();
+        assert!(snapshot.pending_input.is_empty());
+        assert_eq!(snapshot.transcript, *items.lock().unwrap());
+        assert_eq!(snapshot.transcript.len(), 2);
+        assert_eq!(snapshot.transcript[0].parts, staged.parts);
+        assert_eq!(snapshot.transcript[1].parts, initial.parts);
+        assert!(
+            snapshot
+                .transcript
+                .iter()
+                .all(|item| item.created_at.is_some())
+        );
+        assert!(calls.lock().unwrap().is_empty());
+        let observed = events.lock().unwrap().clone();
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::InputAccepted { .. }))
+                .count(),
+            2
+        );
+        assert!(turn_lifecycle_events(&observed).is_empty());
+
+        let LoopStep::Finished(first) = driver
+            .next_with_cancellation(checkpoint.clone())
+            .await
+            .unwrap()
+        else {
+            panic!("expected a terminal model result");
+        };
+        let steer = Item::text(ItemKind::User, "terminal steer");
+        driver
+            .commit_input(vec![steer.clone()], checkpoint.clone())
+            .unwrap();
+        assert_eq!(
+            driver.snapshot().transcript.last().unwrap().parts,
+            steer.parts
+        );
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        let LoopStep::Finished(second) = driver
+            .next_with_cancellation(checkpoint.clone())
+            .await
+            .unwrap()
+        else {
+            panic!("expected terminal steer to drive inference");
+        };
+        assert_ne!(first.turn_id, second.turn_id);
+        assert_eq!(calls.lock().unwrap().len(), 2);
+        assert!(matches!(
+            driver.next_with_cancellation(checkpoint).await.unwrap(),
+            LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_))
+        ));
+        let items = items.lock().unwrap();
+        assert_eq!(*items, driver.snapshot().transcript);
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| item.kind == ItemKind::User)
+                .count(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn committed_input_cannot_drive_inference_after_stop_during_manager_await() {
+        let calls = StdArc::new(AtomicUsize::new(0));
+        let entered = StdArc::new(Notify::new());
+        let release = StdArc::new(Notify::new());
+        let controller = CancellationController::new();
+        let handle = controller.handle();
+        let checkpoint = handle.checkpoint();
+        let mut manager = TestTaskManager::new(SimpleTaskManager::new());
+        manager.pending_update_gate = Some((entered.clone(), release.clone()));
+        let mut driver = Agent::builder()
+            .model(RetirementCountingAdapter(calls.clone()))
+            .task_manager(manager)
+            .cancellation(handle.clone())
+            .build()
+            .unwrap()
+            .start(SessionConfig::new("stop-during-manager-await"))
+            .await
+            .unwrap();
+        let input = Item::text(ItemKind::User, "accepted before Stop");
+        driver
+            .commit_input(vec![input.clone()], checkpoint.clone())
+            .unwrap();
+
+        let stop = async {
+            entered.notified().await;
+            controller.interrupt();
+            release.notify_one();
+        };
+        let (step, ()) = tokio::join!(driver.next_with_cancellation(checkpoint.clone()), stop);
+        let LoopStep::Finished(result) = step.unwrap() else {
+            panic!("expected an interrupted turn");
+        };
+        assert_eq!(result.finish_reason, FinishReason::Cancelled);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(driver.snapshot().transcript[0].parts, input.parts);
+        assert!(matches!(
+            driver.next_with_cancellation(checkpoint).await,
+            Err(LoopError::Cancelled)
+        ));
+        release.notify_one();
+        assert!(matches!(
+            driver
+                .next_with_cancellation(handle.checkpoint())
+                .await
+                .unwrap(),
+            LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_))
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn committed_input_stop_in_turn_started_retires_the_turn() {
+        struct StopOnTurnStarted(CancellationController);
+        impl LoopObserver for StopOnTurnStarted {
+            fn handle_event(&self, event: ObservedEvent) {
+                if matches!(event.event, AgentEvent::TurnStarted { .. }) {
+                    self.0.interrupt();
+                }
+            }
+        }
+
+        let calls = StdArc::new(AtomicUsize::new(0));
+        let events = StdArc::new(StdMutex::new(Vec::new()));
+        let controller = CancellationController::new();
+        let checkpoint = controller.handle().checkpoint();
+        let mut driver = Agent::builder()
+            .model(RetirementCountingAdapter(calls.clone()))
+            .observer(StopOnTurnStarted(controller))
+            .observer(RecordingObserver {
+                events: events.clone(),
+            })
+            .build()
+            .unwrap()
+            .start(SessionConfig::new("stop-in-turn-started"))
+            .await
+            .unwrap();
+        let input = Item::text(ItemKind::User, "accepted");
+        driver
+            .commit_input(vec![input.clone()], checkpoint.clone())
+            .unwrap();
+        let LoopStep::Finished(result) = driver.next_with_cancellation(checkpoint).await.unwrap()
+        else {
+            panic!("expected a cancelled turn");
+        };
+        assert_eq!(result.finish_reason, FinishReason::Cancelled);
+        assert!(driver.lifecycle.active_turn.is_none());
+        assert_eq!(driver.snapshot().transcript[0].parts, input.parts);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            turn_lifecycle_events(&events.lock().unwrap()),
+            vec![
+                (result.turn_id.clone(), None),
+                (result.turn_id, Some(FinishReason::Cancelled)),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn committed_input_is_consumed_when_background_approval_preempts_tool_resume() {
+        let calls = StdArc::new(AtomicUsize::new(0));
+        let checkpoint = TurnCancellation::default();
+        let mut driver = Agent::builder()
+            .model(RetirementCountingAdapter(calls.clone()))
+            .add_tool_source(ToolRegistry::new().with(EchoTool::default()))
+            .permissions(AllowAllPermissions)
+            .build()
+            .unwrap()
+            .start(SessionConfig::new("approval-preempts-commit"))
+            .await
+            .unwrap();
+        driver
+            .submit_input(vec![Item::text(ItemKind::User, "ping")])
+            .unwrap();
+        let LoopStep::Interrupt(LoopInterrupt::AfterToolResult(info)) =
+            driver.next().await.unwrap()
+        else {
+            panic!("expected a tool-round continuation");
+        };
+        // Stage the state for a background call that has a detachment
+        // placeholder and whose approval arrived at the tool-round boundary.
+        let call = ToolCallPart {
+            id: ToolCallId::new("background-call"),
+            name: "echo".into(),
+            input: json!({ "value": "background" }),
+            metadata: MetadataMap::new(),
+        };
+        let mut assistant = Item::text(ItemKind::Assistant, "background call");
+        assistant.parts = vec![Part::ToolCall(call.clone())];
+        driver.append_item(assistant);
+        driver.append_detach_placeholder(call.id.clone(), &call.name);
+        driver
+            .pending_loop_updates
+            .push_back(TaskResolution::Approval(TaskApproval {
+                task_id: agentkit_core::TaskId::new("background-task"),
+                tool_request: ToolRequest {
+                    call_id: call.id,
+                    tool_name: ToolName::new(call.name),
+                    input: call.input,
+                    session_id: driver.session_id.clone(),
+                    turn_id: info.turn_id.clone(),
+                    metadata: MetadataMap::new(),
+                },
+                approval: ApprovalRequest {
+                    task_id: None,
+                    call_id: None,
+                    id: "approve-background".into(),
+                    request_kind: "filesystem.read".into(),
+                    reason: agentkit_tools_core::ApprovalReason::SensitivePath,
+                    summary: "approve background work".into(),
+                    metadata: MetadataMap::new(),
+                },
+            }));
+        let steer = Item::text(ItemKind::User, "steer while waiting to resume");
+        driver
+            .commit_input(vec![steer.clone()], checkpoint.clone())
+            .unwrap();
+        let LoopStep::Interrupt(LoopInterrupt::ApprovalRequest(approval)) = driver
+            .next_with_cancellation(checkpoint.clone())
+            .await
+            .unwrap()
+        else {
+            panic!("expected approval to preempt resume");
+        };
+        assert!(matches!(
+            driver.commit_input(
+                vec![Item::text(ItemKind::User, "rejected")],
+                checkpoint.clone()
+            ),
+            Err(LoopError::InvalidState(_))
+        ));
+        assert_eq!(
+            driver.snapshot().transcript.last().unwrap().parts,
+            steer.parts
+        );
+        approval.deny(&mut driver).unwrap();
+        let LoopStep::Finished(result) = driver
+            .next_with_cancellation(checkpoint.clone())
+            .await
+            .unwrap()
+        else {
+            panic!("expected the approval continuation to finish");
+        };
+        assert_eq!(result.turn_id, info.turn_id);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(matches!(
+            driver.next_with_cancellation(checkpoint).await.unwrap(),
+            LoopStep::Interrupt(LoopInterrupt::AwaitingInput(_))
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        validate_transcript_invariants(&driver.snapshot().transcript).unwrap();
     }
 
     #[tokio::test]
