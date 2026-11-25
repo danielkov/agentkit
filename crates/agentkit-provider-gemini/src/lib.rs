@@ -479,6 +479,7 @@ impl ReplayRequest {
                                             ProviderFailureReason::HttpStatus,
                                             classify_http_body(None, status.as_u16()),
                                         ));
+                                        tracker.preserve_last_attempt_reason();
                                     }
                                     return Err(err);
                                 }
@@ -1507,10 +1508,13 @@ mod tests {
             Err(e) => e,
             Ok(_) => panic!("expected byte limit failure"),
         };
+        let failure = *err.provider_failure().unwrap();
+        assert_eq!(failure.reason, ProviderFailureReason::Protocol);
         assert_eq!(
-            err.provider_failure().unwrap().reason,
-            ProviderFailureReason::Protocol
+            failure.last_attempt_reason,
+            Some(ProviderFailureReason::HttpStatus)
         );
+        assert_eq!(failure.upstream.http_status, Some(429));
     }
 
     #[tokio::test]
