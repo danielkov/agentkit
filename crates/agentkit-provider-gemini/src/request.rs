@@ -161,16 +161,19 @@ pub(crate) fn build_request_body(
                     .join(", ")
             )));
         }
-        let unavailable: Vec<&String> = config.cached_tool_names.difference(&live_tools).collect();
-        if !unavailable.is_empty() {
-            return Err(BuildError::CacheViolation(format!(
-                "cannot attach cachedContent advertising functions unavailable in this turn: {}",
-                unavailable
-                    .into_iter()
-                    .map(String::as_str)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )));
+        if !config.allow_unadvertised_cached_tools {
+            let unavailable: Vec<&String> =
+                config.cached_tool_names.difference(&live_tools).collect();
+            if !unavailable.is_empty() {
+                return Err(BuildError::CacheViolation(format!(
+                    "cannot attach cachedContent advertising functions unavailable in this turn: {} (set with_unadvertised_cached_tools(true) if backed by dispatch-only tools)",
+                    unavailable
+                        .into_iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            }
         }
         body.insert("cachedContent".into(), Value::String(cached.to_string()));
     } else {
@@ -965,7 +968,7 @@ mod tests {
             Err(BuildError::CacheViolation(_))
         ));
 
-        // Cache advertising a function unavailable in this turn -> rejected
+        // Cache advertising a function unavailable in this turn -> rejected by default
         let missing_cached_tool = empty_turn(
             vec![
                 Item::text(ItemKind::System, "sys"),
@@ -977,6 +980,16 @@ mod tests {
             build_request_body(&cfg, &missing_cached_tool),
             Err(BuildError::CacheViolation(_))
         ));
+
+        // Dispatch-only tools opted in -> permitted without wire redeclaration
+        let dispatch_only_cfg = cfg.clone().with_unadvertised_cached_tools(true);
+        let dispatch_only_body =
+            build_request_body(&dispatch_only_cfg, &missing_cached_tool).unwrap();
+        assert_eq!(
+            dispatch_only_body["cachedContent"],
+            "cachedContents/example"
+        );
+        assert!(dispatch_only_body.get("tools").is_none());
 
         // Disabling cache on the turn omits cachedContent and restores live fields
         req.cache = Some(agentkit_loop::PromptCacheRequest::disabled());

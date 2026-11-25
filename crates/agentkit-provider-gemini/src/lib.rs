@@ -345,6 +345,10 @@ impl ReplayRequest {
         .await
         {
             Ok(body) => Ok(body),
+            Err(HttpError::Timeout {
+                operation: "logical request retry budget",
+                ..
+            }) => Err(local_error(ProviderFailureReason::RetryBudget)),
             Err(HttpError::Other(_)) => Err(local_error(ProviderFailureReason::Protocol)),
             Err(_) => Ok(None),
         }
@@ -387,7 +391,15 @@ impl ReplayRequest {
         let status = response.status();
         let body = match self.read_bounded_body(response, MAX_ERROR_BODY_BYTES).await {
             Ok(body) => body,
-            Err(limit_err) => return limit_err,
+            Err(err) => {
+                if let Ok(mut tracker) = self.tracker.lock() {
+                    tracker.note_failure(&provider_error(
+                        ProviderFailureReason::HttpStatus,
+                        classify_http_body(None, status.as_u16()),
+                    ));
+                }
+                return err;
+            }
         };
         if status == StatusCode::BAD_REQUEST
             && let Some(text) = body.as_deref()
@@ -453,9 +465,19 @@ impl ReplayRequest {
                     }
                     if is_retryable_status(status) {
                         let headers = response.headers().clone();
-                        let body = self
-                            .read_bounded_body(response, MAX_ERROR_BODY_BYTES)
-                            .await?;
+                        let body =
+                            match self.read_bounded_body(response, MAX_ERROR_BODY_BYTES).await {
+                                Ok(body) => body,
+                                Err(err) => {
+                                    if let Ok(mut tracker) = self.tracker.lock() {
+                                        tracker.note_failure(&provider_error(
+                                            ProviderFailureReason::HttpStatus,
+                                            classify_http_body(None, status.as_u16()),
+                                        ));
+                                    }
+                                    return Err(err);
+                                }
+                            };
                         let classification = classify_http_body(body.as_deref(), status.as_u16());
                         let attempt_err =
                             provider_error(ProviderFailureReason::HttpStatus, classification);
@@ -1565,5 +1587,35 @@ data: {"candidates":[{"content":{"role":"model","parts":[{"text":""#.to_vec();
                 Err(_) => break,
             }
         }
+    }
+
+    #[tokio::test]
+    async fn logical_deadline_during_error_body_inspection_preserves_retry_budget_and_status() {
+        let response = HttpResponse::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            HeaderMap::new(),
+            "https://example.test".into(),
+            Box::pin(stream::pending()),
+        );
+        let client = Arc::new(SequenceClient::new(vec![Ok(response)]));
+        let resilience = ResilienceConfig {
+            retry_budget: Duration::from_millis(80),
+            ..fast_resilience(0)
+        };
+        let config = GeminiConfig::new("k", "gemini-2.5-flash")
+            .unwrap()
+            .with_resilience(resilience);
+        let adapter = GeminiAdapter::with_client(config, Http::from_arc(client));
+        let mut session = adapter
+            .start_session(SessionConfig::new("s1"))
+            .await
+            .unwrap();
+        let err = match session.begin_turn(sample_turn_request(), None).await {
+            Err(e) => e,
+            Ok(_) => panic!("expected retry budget timeout"),
+        };
+        let failure = *err.provider_failure().unwrap();
+        assert_eq!(failure.reason, ProviderFailureReason::RetryBudget);
+        assert_eq!(failure.upstream.http_status, Some(503));
     }
 }

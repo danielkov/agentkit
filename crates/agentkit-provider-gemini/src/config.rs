@@ -365,10 +365,13 @@ pub struct GeminiConfig {
     /// Function tool names already declared inside `cached_content`.
     ///
     /// When `cached_content` is active, registered tools must match this set
-    /// exactly: covered tools remain locally executable without being
-    /// redeclared on the wire, while uncovered live tools or unavailable cached
-    /// tools are rejected rather than silently dropped or misrouted.
+    /// unless [`Self::allow_unadvertised_cached_tools`] is enabled for
+    /// dispatch-only tool sources (`ToolSource::unadvertised()`).
     pub cached_tool_names: BTreeSet<String>,
+    /// Permits `cached_tool_names` to contain dispatch-only tools not advertised
+    /// in `TurnRequest::available_tools` (for example when using
+    /// `ToolSource::unadvertised()`). Defaults to `false`.
+    pub allow_unadvertised_cached_tools: bool,
     /// System/developer/context instruction texts already embedded inside `cached_content`.
     ///
     /// When `cached_content` is active, transcript system parts must match
@@ -406,6 +409,10 @@ impl fmt::Debug for GeminiConfig {
             .field("safety_settings", &self.safety_settings)
             .field("cached_content", &self.cached_content)
             .field("cached_tool_names", &self.cached_tool_names)
+            .field(
+                "allow_unadvertised_cached_tools",
+                &self.allow_unadvertised_cached_tools,
+            )
             .field(
                 "cached_system_instructions_len",
                 &self.cached_system_instructions.len(),
@@ -490,6 +497,7 @@ impl GeminiConfig {
             safety_settings: Vec::new(),
             cached_content: None,
             cached_tool_names: BTreeSet::new(),
+            allow_unadvertised_cached_tools: false,
             cached_system_instructions: Vec::new(),
             extra_headers: HeaderMap::new(),
             streaming: true,
@@ -673,6 +681,13 @@ impl GeminiConfig {
         S: Into<String>,
     {
         self.cached_tool_names = names.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Allows `cached_tool_names` to include dispatch-only tools omitted from
+    /// `TurnRequest::available_tools` (e.g. `ToolSource::unadvertised()`).
+    pub fn with_unadvertised_cached_tools(mut self, allow: bool) -> Self {
+        self.allow_unadvertised_cached_tools = allow;
         self
     }
 
