@@ -44,7 +44,9 @@ RPC response arrives before that update. Session updates are emitted in order:
 5. an `idle` state update with the final stop reason.
 
 Each session has its own worker and loop driver. Independent sessions can make
-progress concurrently, while a second prompt for a running session is rejected.
+progress concurrently, while a second unrelated prompt for a running session is
+rejected; retries with a matching `idempotencyKey` return the original
+`messageId` without inserting another prompt.
 `session/cancel` interrupts only the selected session and produces an idle
 `cancelled` update after loop cleanup. `session/close` cooperatively cancels
 work and drops the session worker. `session/list` and `session/resume` cover
