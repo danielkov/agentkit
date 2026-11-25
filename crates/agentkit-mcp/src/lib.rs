@@ -64,6 +64,7 @@ use tokio::sync::{Mutex, broadcast, mpsc, watch};
 mod skills;
 pub use skills::{
     MCP_SKILLS_EXTENSION_ID, McpSkill, McpSkillFile, McpSkillFrontmatter, McpSkillResources,
+    McpSkillScanLimit, McpSkillScanLimits, McpSkillScanOutcome,
 };
 mod stdio;
 mod subscriptions;
@@ -494,7 +495,8 @@ pub struct StdioTransportConfig {
     pub cwd: Option<std::path::PathBuf>,
     /// Maximum bytes in an incoming JSON-RPC line, including the newline (default: 16 MiB).
     ///
-    /// An oversized line closes the connection and fails pending requests.
+    /// An oversized line closes the connection and fails pending requests with
+    /// [`StdioLineTooLong`].
     pub max_line_length: usize,
 }
 
@@ -1490,13 +1492,68 @@ impl McpNotificationSink {
     }
 }
 
+// Snapshot the peer and its read fault together so an in-flight call never
+// diagnoses a disconnect using the state of an auth replacement transport.
+#[derive(Clone)]
+struct ConnectedPeer {
+    peer: Peer<RoleClient>,
+    line_limit: Option<stdio::StdioLineLimit>,
+}
+
+impl ConnectedPeer {
+    fn service_error(&self, error: ServiceError) -> McpError {
+        self.stdio_error(&error)
+            .unwrap_or_else(|| rmcp_service_error(error))
+    }
+
+    fn operation_error(
+        &self,
+        server_id: &McpServerId,
+        method: McpMethod,
+        error: ServiceError,
+    ) -> McpError {
+        self.stdio_error(&error)
+            .unwrap_or_else(|| rmcp_operation_error(server_id, method, error))
+    }
+
+    fn stdio_error(&self, error: &ServiceError) -> Option<McpError> {
+        if matches!(error, ServiceError::TransportClosed) {
+            return self.line_limit.as_ref()?.error();
+        }
+        None
+    }
+
+    fn subscription_error(&self, error: McpError) -> McpError {
+        // The controller already translates rmcp errors to McpError. Do not
+        // upgrade its separate "controller closed" error: it can be closed
+        // even while the transport is healthy (e.g. unsupported listen).
+        if let McpError::Transport(message) = &error
+            && let Some(error) = self.line_limit.as_ref().and_then(|limit| limit.error())
+            && message == &ServiceError::TransportClosed.to_string()
+        {
+            return error;
+        }
+        error
+    }
+
+    async fn start_subscriptions(
+        &self,
+        filter: McpSubscriptionFilter,
+        sink: McpNotificationSink,
+    ) -> Result<subscriptions::SubscriptionController, McpError> {
+        subscriptions::SubscriptionController::start(self.peer.clone(), filter, sink)
+            .await
+            .map_err(|error| self.subscription_error(error))
+    }
+}
+
 /// A live connection to a single MCP server, wrapping an
 /// [`rmcp::service::RunningService`].
 pub struct McpConnection {
     server_id: McpServerId,
     config: Option<McpServerConfig>,
     inner: Mutex<RmcpClientService>,
-    peer: RwLock<Peer<RoleClient>>,
+    peer: RwLock<ConnectedPeer>,
     auth: Mutex<Option<MetadataMap>>,
     sink: McpNotificationSink,
     subscriptions: Mutex<Option<subscriptions::SubscriptionController>>,
@@ -1550,7 +1607,7 @@ impl McpConnection {
             notifications: notification_rx,
             events: events_tx,
         } = channels;
-        let (service, capabilities) = match &config.transport {
+        let (service, capabilities, peer) = match &config.transport {
             McpTransportBinding::Stdio(binding) => {
                 connect_rmcp_stdio(config, binding, handler).await?
             }
@@ -1559,7 +1616,6 @@ impl McpConnection {
             }
         };
 
-        let peer = service.peer().clone();
         let revision = service.service().revision.clone();
         let sink = McpNotificationSink {
             revision,
@@ -1650,7 +1706,10 @@ impl McpConnection {
             .peer_info()
             .map(|info| rmcp_server_capabilities_to_agentkit(&info.capabilities))
             .unwrap_or_default();
-        let peer = service.peer().clone();
+        let peer = ConnectedPeer {
+            peer: service.peer().clone(),
+            line_limit: None,
+        };
         let revision = service.service().revision.clone();
         let sink = McpNotificationSink {
             revision,
@@ -1697,7 +1756,7 @@ impl McpConnection {
         handler.active = Arc::new(AtomicBool::new(false));
         let mut candidate_sink = self.sink.clone();
         candidate_sink.active = handler.active.clone();
-        let (service, capabilities) = match &config.transport {
+        let (service, capabilities, new_peer) = match &config.transport {
             McpTransportBinding::Stdio(binding) => {
                 connect_rmcp_stdio(&config, binding, handler).await?
             }
@@ -1705,8 +1764,8 @@ impl McpConnection {
                 connect_rmcp_streamable_http(&config, binding, auth, handler).await?
             }
         };
-        let new_peer = service.peer().clone();
         let modern = new_peer
+            .peer
             .peer_info()
             .is_some_and(|info| !info.protocol_version.has_initialize());
         let resources = match self.subscriptions.lock().await.as_ref() {
@@ -1722,12 +1781,9 @@ impl McpConnection {
                 None
             } else {
                 Some(
-                    subscriptions::SubscriptionController::start(
-                        new_peer.clone(),
-                        filter,
-                        candidate_sink.clone(),
-                    )
-                    .await?,
+                    new_peer
+                        .start_subscriptions(filter, candidate_sink.clone())
+                        .await?,
                 )
             }
         } else {
@@ -1736,9 +1792,10 @@ impl McpConnection {
             for uri in &resources {
                 #[allow(deprecated)]
                 new_peer
+                    .peer
                     .subscribe(rmcp_model::SubscribeRequestParams::new(uri.clone()))
                     .await
-                    .map_err(rmcp_service_error)?;
+                    .map_err(|error| new_peer.service_error(error))?;
             }
             None
         };
@@ -1754,7 +1811,7 @@ impl McpConnection {
             .checked_add(1)
             .filter(|epoch| *epoch < u64::MAX)
             .ok_or_else(|| McpError::Transport("MCP connection generation exhausted".into()))?;
-        let (mut previous, old_controller) = {
+        let (mut previous, old_controller, old_peer) = {
             let mut peer = self.peer.write().expect("MCP peer lock poisoned");
             let mut current_capabilities = self
                 .capabilities
@@ -1764,14 +1821,19 @@ impl McpConnection {
             inner.service().active.store(false, Ordering::Release);
             let previous = std::mem::replace(&mut *inner, service);
             candidate_sink.active.store(true, Ordering::Release);
-            *peer = new_peer;
+            let old_peer = std::mem::replace(&mut *peer, new_peer);
             *current_capabilities = capabilities;
             *desired_resources = resources;
-            (previous, std::mem::replace(&mut *active, controller))
+            (
+                previous,
+                std::mem::replace(&mut *active, controller),
+                old_peer,
+            )
         };
         drop(desired_resources);
         drop(active);
         drop(inner);
+        drop(old_peer);
         self.mark_catalog_dirty();
         if let Some(mut controller) = old_controller {
             controller.shutdown().await;
@@ -1780,7 +1842,7 @@ impl McpConnection {
         Ok(())
     }
 
-    fn peer(&self) -> Peer<RoleClient> {
+    fn peer(&self) -> ConnectedPeer {
         self.peer.read().expect("MCP peer lock poisoned").clone()
     }
 
@@ -1801,6 +1863,7 @@ impl McpConnection {
     /// settings, experimental capabilities, and completions.
     pub fn wire_capabilities(&self) -> Option<rmcp_model::ServerCapabilities> {
         self.peer()
+            .peer
             .peer_info()
             .map(|info| info.capabilities.clone())
     }
@@ -1808,6 +1871,7 @@ impl McpConnection {
     /// Protocol selected by discovery or the legacy initialization handshake.
     pub fn protocol_version(&self) -> Option<McpProtocolVersion> {
         self.peer()
+            .peer
             .peer_info()
             .map(|info| info.protocol_version.clone())
     }
@@ -1858,8 +1922,7 @@ impl McpConnection {
             }
             let mut sink = self.sink.clone();
             sink.active = self.inner.lock().await.service().active.clone();
-            let controller =
-                subscriptions::SubscriptionController::start(self.peer(), filter, sink).await?;
+            let controller = self.peer().start_subscriptions(filter, sink).await?;
             *subscriptions = Some(controller);
         }
         Ok(())
@@ -1894,7 +1957,11 @@ impl McpConnection {
         self.ensure_subscriptions().await?;
         let _lifecycle = self.lifecycle.lock().await;
         if let Some(controller) = self.subscriptions.lock().await.as_ref() {
-            return controller.subscribe_resource(uri).await;
+            let peer = self.peer();
+            return controller
+                .subscribe_resource(uri)
+                .await
+                .map_err(|error| peer.subscription_error(error));
         }
         if self.modern() {
             // Resource-only servers have no catalog stream to extend. Start a
@@ -1903,16 +1970,16 @@ impl McpConnection {
             filter.resource_subscriptions = Some(vec![uri]);
             let mut sink = self.sink.clone();
             sink.active = self.inner.lock().await.service().active.clone();
-            let controller =
-                subscriptions::SubscriptionController::start(self.peer(), filter, sink).await?;
+            let controller = self.peer().start_subscriptions(filter, sink).await?;
             *self.subscriptions.lock().await = Some(controller);
             return Ok(());
         }
-        self.peer()
+        let peer = self.peer();
+        peer.peer
             .subscribe(rmcp_model::SubscribeRequestParams::new(uri.clone()))
             .await
             .map_err(|error| {
-                rmcp_operation_error(
+                peer.operation_error(
                     &self.server_id,
                     McpMethod::ResourcesSubscribe { uri: uri.clone() },
                     error,
@@ -1929,17 +1996,22 @@ impl McpConnection {
         self.ensure_subscriptions().await?;
         let _lifecycle = self.lifecycle.lock().await;
         if let Some(controller) = self.subscriptions.lock().await.as_ref() {
-            return controller.unsubscribe_resource(uri).await;
+            let peer = self.peer();
+            return controller
+                .unsubscribe_resource(uri)
+                .await
+                .map_err(|error| peer.subscription_error(error));
         }
         if self.modern() {
             // No modern controller means no resource subscription exists.
             return Ok(());
         }
-        self.peer()
+        let peer = self.peer();
+        peer.peer
             .unsubscribe(rmcp_model::UnsubscribeRequestParams::new(uri.clone()))
             .await
             .map_err(|error| {
-                rmcp_operation_error(
+                peer.operation_error(
                     &self.server_id,
                     McpMethod::ResourcesUnsubscribe { uri: uri.clone() },
                     error,
@@ -1953,11 +2025,12 @@ impl McpConnection {
     /// `notifications/message`. Surfaced as [`McpServerEvent::Logging`].
     #[allow(deprecated)]
     pub async fn set_logging_level(&self, level: McpLoggingLevel) -> Result<(), McpError> {
-        self.peer()
+        let peer = self.peer();
+        peer.peer
             .set_level(rmcp_model::SetLevelRequestParams::new(level))
             .await
             .map_err(|error| {
-                rmcp_operation_error(
+                peer.operation_error(
                     &self.server_id,
                     McpMethod::LoggingSetLevel {
                         level: format!("{level:?}"),
@@ -1973,19 +2046,21 @@ impl McpConnection {
         &self,
         params: McpCancelledNotificationParam,
     ) -> Result<(), McpError> {
-        self.peer()
+        let peer = self.peer();
+        peer.peer
             .notify_cancelled(params)
             .await
-            .map_err(rmcp_service_error)
+            .map_err(|error| peer.service_error(error))
     }
 
     /// Notifies the server that the client's roots list has changed; servers
     /// may respond by re-issuing `roots/list`.
     pub async fn notify_roots_list_changed(&self) -> Result<(), McpError> {
-        self.peer()
+        let peer = self.peer();
+        peer.peer
             .notify_roots_list_changed()
             .await
-            .map_err(rmcp_service_error)
+            .map_err(|error| peer.service_error(error))
     }
 
     /// Current acknowledged modern subscription, or `None` for legacy peers.
@@ -2091,26 +2166,29 @@ impl McpConnection {
 
     /// Lists all tools advertised by the connected MCP server.
     pub async fn list_tools(&self) -> Result<Vec<McpTool>, McpError> {
-        self.peer()
+        let peer = self.peer();
+        peer.peer
             .list_all_tools()
             .await
-            .map_err(rmcp_service_error)
+            .map_err(|error| peer.service_error(error))
     }
 
     /// Lists all resources advertised by the connected MCP server.
     pub async fn list_resources(&self) -> Result<Vec<McpResource>, McpError> {
-        self.peer()
+        let peer = self.peer();
+        peer.peer
             .list_all_resources()
             .await
-            .map_err(rmcp_service_error)
+            .map_err(|error| peer.service_error(error))
     }
 
     /// Lists all prompts advertised by the connected MCP server.
     pub async fn list_prompts(&self) -> Result<Vec<McpPrompt>, McpError> {
-        self.peer()
+        let peer = self.peer();
+        peer.peer
             .list_all_prompts()
             .await
-            .map_err(rmcp_service_error)
+            .map_err(|error| peer.service_error(error))
     }
 
     /// Invokes a tool on the MCP server.
@@ -2187,20 +2265,22 @@ impl McpConnection {
             "error.type" = tracing::field::Empty,
         );
         use tracing::Instrument;
-        let result = async {
+        let (peer, result) = async {
             let mut call = rmcp_model::CallToolRequest::new(params);
             if let Some(decorator) = &self.request_decorator {
                 decorator.decorate_call_tool(&call.params, &mut call.extensions);
             }
             let request = rmcp_model::ClientRequest::CallToolRequest(call);
-            let handle = self
-                .peer()
-                .send_request_with_option(request, options)
-                .await?;
-            match handle.await_response().await? {
-                rmcp_model::ServerResult::CallToolResult(result) => Ok(result),
-                _ => Err(ServiceError::UnexpectedResponse),
+            let peer = self.peer();
+            let result = async {
+                let handle = peer.peer.send_request_with_option(request, options).await?;
+                match handle.await_response().await? {
+                    rmcp_model::ServerResult::CallToolResult(result) => Ok(result),
+                    _ => Err(ServiceError::UnexpectedResponse),
+                }
             }
+            .await;
+            (peer, result)
         }
         .instrument(span.clone())
         .await;
@@ -2220,7 +2300,7 @@ impl McpConnection {
             }
             Err(error) => {
                 span.record("error.type", "mcp_error");
-                Err(rmcp_operation_error(
+                Err(peer.operation_error(
                     &self.server_id,
                     McpMethod::ToolsCall {
                         name: name_owned,
@@ -2240,11 +2320,12 @@ impl McpConnection {
     /// [`ResourceProvider`] view that collapses to a single inline `DataRef`.
     pub async fn read_resource(&self, uri: &str) -> Result<ReadResourceResult, McpError> {
         let uri_owned = uri.to_string();
-        self.peer()
+        let peer = self.peer();
+        peer.peer
             .read_resource(rmcp_model::ReadResourceRequestParams::new(uri))
             .await
             .map_err(|error| {
-                rmcp_operation_error(
+                peer.operation_error(
                     &self.server_id,
                     McpMethod::ResourcesRead { uri: uri_owned },
                     error,
@@ -2271,8 +2352,9 @@ impl McpConnection {
             params =
                 params.with_arguments(value_to_json_object(arguments, "prompts/get arguments")?);
         }
-        self.peer().get_prompt(params).await.map_err(|error| {
-            rmcp_operation_error(
+        let peer = self.peer();
+        peer.peer.get_prompt(params).await.map_err(|error| {
+            peer.operation_error(
                 &self.server_id,
                 McpMethod::PromptsGet {
                     name: name_owned,
@@ -2333,19 +2415,27 @@ async fn connect_rmcp_stdio(
     config: &McpServerConfig,
     binding: &StdioTransportConfig,
     handler: McpClientHandler,
-) -> Result<(RmcpClientService, McpServerCapabilities), McpError> {
+) -> Result<(RmcpClientService, McpServerCapabilities, ConnectedPeer), McpError> {
     let transport = stdio::StdioTransport::spawn(binding).map_err(McpError::Io)?;
+    let line_limit = transport.line_limit();
 
     let service = handler
         .serve_with_lifecycle(transport, client_lifecycle())
         .await
-        .map_err(|error| rmcp_initialize_error(config, error))?;
+        .map_err(|error| {
+            stdio_initialize_error(&error, &line_limit)
+                .unwrap_or_else(|| rmcp_initialize_error(config, error))
+        })?;
     let capabilities = service
         .peer_info()
         .map(|info| rmcp_server_capabilities_to_agentkit(&info.capabilities))
         .unwrap_or_default();
 
-    Ok((service, capabilities))
+    let peer = ConnectedPeer {
+        peer: service.peer().clone(),
+        line_limit: Some(line_limit),
+    };
+    Ok((service, capabilities, peer))
 }
 
 async fn connect_rmcp_streamable_http(
@@ -2353,7 +2443,7 @@ async fn connect_rmcp_streamable_http(
     binding: &StreamableHttpTransportConfig,
     auth: Option<&MetadataMap>,
     handler: McpClientHandler,
-) -> Result<(RmcpClientService, McpServerCapabilities), McpError> {
+) -> Result<(RmcpClientService, McpServerCapabilities, ConnectedPeer), McpError> {
     let auth_header = auth
         .and_then(bearer_token_from_metadata)
         .or_else(|| binding.bearer_token.clone());
@@ -2386,7 +2476,11 @@ async fn connect_rmcp_streamable_http(
         .map(|info| rmcp_server_capabilities_to_agentkit(&info.capabilities))
         .unwrap_or_default();
 
-    Ok((service, capabilities))
+    let peer = ConnectedPeer {
+        peer: service.peer().clone(),
+        line_limit: None,
+    };
+    Ok((service, capabilities, peer))
 }
 
 /// Adapter exposing a single MCP resource as a [`ResourceProvider`].
@@ -4137,6 +4231,29 @@ fn bearer_token_from_metadata(metadata: &MetadataMap) -> Option<String> {
         .find_map(|key| metadata.get(key).and_then(Value::as_str).map(str::to_owned))
 }
 
+fn stdio_send_error(error: &DynamicTransportError) -> Option<McpError> {
+    if error.transport_type_id != std::any::TypeId::of::<stdio::StdioTransport>() {
+        return None;
+    }
+    let io_error = error.error.downcast_ref::<std::io::Error>()?;
+    let oversize = StdioLineTooLong::from_io_error(io_error)?;
+    Some(McpError::Io(oversize.into_io_error()))
+}
+
+fn stdio_initialize_error(
+    error: &ClientInitializeError,
+    line_limit: &stdio::StdioLineLimit,
+) -> Option<McpError> {
+    match error {
+        ClientInitializeError::ConnectionClosed(_) => line_limit.error(),
+        ClientInitializeError::TransportError { error, .. } => stdio_send_error(error),
+        ClientInitializeError::LegacyFallbackFailed { fallback, .. } => {
+            stdio_initialize_error(fallback, line_limit)
+        }
+        _ => None,
+    }
+}
+
 fn rmcp_initialize_error(config: &McpServerConfig, error: ClientInitializeError) -> McpError {
     if let Some(signal) = match &error {
         ClientInitializeError::TransportError { error: dyn_err, .. } => {
@@ -4187,6 +4304,11 @@ fn operation_error(
 }
 
 fn service_error_to_mcp_error(error: ServiceError) -> McpError {
+    if let ServiceError::TransportSend(send_error) = &error
+        && let Some(oversize) = stdio_send_error(send_error)
+    {
+        return oversize;
+    }
     match error {
         ServiceError::McpError(data) => {
             McpError::Invocation(McpInvocationError::from_error_data(data))
@@ -4403,6 +4525,26 @@ impl McpMethod {
     }
 }
 
+/// A stdio peer exhausted its configured stdout line budget before a newline.
+///
+/// Returned in [`McpError::Io`] with [`std::io::ErrorKind::InvalidData`].
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+#[error("stdio line exceeded the {limit}-byte limit")]
+pub struct StdioLineTooLong {
+    /// Configured limit in bytes, including the newline delimiter.
+    pub limit: usize,
+}
+
+impl StdioLineTooLong {
+    fn from_io_error(error: &std::io::Error) -> Option<&Self> {
+        error.get_ref()?.downcast_ref()
+    }
+
+    fn into_io_error(self) -> std::io::Error {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, self)
+    }
+}
+
 /// Errors produced by MCP transport, protocol, and lifecycle operations.
 #[derive(Debug, Error)]
 pub enum McpError {
@@ -4438,6 +4580,16 @@ pub enum McpError {
     /// The referenced server ID is not registered in the [`McpServerManager`].
     #[error("unknown MCP server: {0}")]
     UnknownServer(String),
+}
+
+impl McpError {
+    /// Returns the stdout line limit violation, if it caused this error.
+    pub fn stdio_line_too_long(&self) -> Option<&StdioLineTooLong> {
+        match self {
+            Self::Io(error) => StdioLineTooLong::from_io_error(error),
+            _ => None,
+        }
+    }
 }
 
 impl From<&str> for McpServerId {
