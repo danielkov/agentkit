@@ -70,18 +70,11 @@ pub enum McpSkillScanOutcome {
 impl McpConnection {
     /// Lists all skill metadata without reading any skill files.
     /// Returns an empty list without sending a request if skills are not advertised.
-    /// Returns an error rather than a partial inventory if the default scan limits are exceeded.
+    /// Use [`Self::visit_skills`] to opt in to scan limits.
     pub async fn list_skills(&self) -> Result<Vec<McpSkill>, McpError> {
         let mut skills = Vec::new();
-        match self
-            .visit_skills(McpSkillScanLimits::default(), |skill| skills.push(skill))
-            .await?
-        {
-            McpSkillScanOutcome::Complete => Ok(skills),
-            McpSkillScanOutcome::Truncated(limit) => Err(McpError::Protocol(format!(
-                "skills/list truncated at the {limit:?} limit"
-            ))),
-        }
+        self.scan_skills(None, |skill| skills.push(skill)).await?;
+        Ok(skills)
     }
 
     /// Visits decoded skill metadata one page at a time, in server order, on
@@ -93,6 +86,14 @@ impl McpConnection {
     pub async fn visit_skills(
         &self,
         limits: McpSkillScanLimits,
+        visit: impl FnMut(McpSkill),
+    ) -> Result<McpSkillScanOutcome, McpError> {
+        self.scan_skills(Some(limits), visit).await
+    }
+
+    async fn scan_skills(
+        &self,
+        mut budget: Option<McpSkillScanLimits>,
         mut visit: impl FnMut(McpSkill),
     ) -> Result<McpSkillScanOutcome, McpError> {
         use McpSkillScanLimit as Limit;
@@ -102,44 +103,58 @@ impl McpConnection {
         if !supports_skills(&peer.peer) {
             return Ok(Complete);
         }
-        if limits.max_entries == 0 {
-            return Ok(Truncated(Limit::EntryCount));
-        }
         let mut seen_cursors = BTreeSet::new();
         let mut seen_uris = BTreeSet::new();
         let mut cursor = None;
-        let mut remaining_entries = limits.max_entries;
-        let mut remaining_bytes = limits.max_total_decoded_bytes;
-        for _ in 0..limits.max_pages {
-            if remaining_bytes < size_of::<ListSkillsResult>() {
-                return Ok(Truncated(Limit::TotalDecodedBytes));
+        loop {
+            if let Some(budget) = &mut budget {
+                if budget.max_entries == 0 {
+                    return Ok(Truncated(Limit::EntryCount));
+                }
+                if budget.max_pages == 0 {
+                    return Ok(Truncated(Limit::PageCount));
+                }
+                if budget.max_total_decoded_bytes < size_of::<ListSkillsResult>() {
+                    return Ok(Truncated(Limit::TotalDecodedBytes));
+                }
+                budget.max_pages -= 1;
             }
             let params = PaginatedRequestParams::default().with_cursor(cursor.clone());
-            let page =
-                tokio::time::timeout(limits.page_timeout, peer.peer.list_skills(Some(params)))
+            let request = peer.peer.list_skills(Some(params));
+            let result = if let Some(budget) = &budget {
+                tokio::time::timeout(budget.page_timeout, request)
                     .await
                     .map_err(|_| McpError::Timeout {
                         operation: "skills/list",
-                        duration: limits.page_timeout,
+                        duration: budget.page_timeout,
                     })?
-                    .map_err(|error| {
-                        skill_error(&peer, self.server_id(), "skills/list", error, || {
-                            cursor
-                                .as_ref()
-                                .map_or_else(|| json!({}), |cursor| json!({"cursor":cursor}))
-                        })
-                    })?;
+            } else {
+                request.await
+            };
+            let page = result.map_err(|error| {
+                skill_error(&peer, self.server_id(), "skills/list", error, || {
+                    cursor
+                        .as_ref()
+                        .map_or_else(|| json!({}), |cursor| json!({"cursor":cursor}))
+                })
+            })?;
             require_complete("skills/list", page.result_type.as_ref())?;
-            let charge = match page_charge(&page, &limits) {
-                Ok(charge) => charge,
-                Err(limit) => return Ok(Truncated(limit)),
+            let count = if let Some(budget) = &mut budget {
+                let count = page.skills.len().min(budget.max_entries);
+                let charge = match page_charge(&page, count, budget) {
+                    Ok(charge) => charge,
+                    Err(limit) => return Ok(Truncated(limit)),
+                };
+                let Some(bytes_left) = budget.max_total_decoded_bytes.checked_sub(charge) else {
+                    return Ok(Truncated(Limit::TotalDecodedBytes));
+                };
+                budget.max_total_decoded_bytes = bytes_left;
+                budget.max_entries -= count;
+                count
+            } else {
+                page.skills.len()
             };
-            let Some(bytes_left) = remaining_bytes.checked_sub(charge) else {
-                return Ok(Truncated(Limit::TotalDecodedBytes));
-            };
-            remaining_bytes = bytes_left;
 
-            let count = page.skills.len().min(remaining_entries);
             for skill in page.skills.iter().take(count) {
                 if !seen_uris.insert(skill.uri.clone()) {
                     return Err(McpError::Protocol(
@@ -162,13 +177,8 @@ impl McpConnection {
             let Some(next) = page.next_cursor else {
                 return Ok(Complete);
             };
-            remaining_entries -= count;
-            if remaining_entries == 0 {
-                return Ok(Truncated(Limit::EntryCount));
-            }
             cursor = Some(next);
         }
-        Ok(Truncated(Limit::PageCount))
     }
 
     /// Retrieves metadata for a known skill URI, including unlisted skills.
@@ -205,6 +215,7 @@ impl McpConnection {
 // amplification of dense arrays/objects and would traverse or copy data again.
 fn page_charge(
     page: &ListSkillsResult,
+    eligible_entries: usize,
     limits: &McpSkillScanLimits,
 ) -> Result<usize, McpSkillScanLimit> {
     let mut bytes = size_of::<ListSkillsResult>()
@@ -219,13 +230,15 @@ fn page_charge(
         .next_cursor
         .as_ref()
         .map_or(0, |cursor| key_charge(cursor));
-    for skill in &page.skills {
+    for (index, skill) in page.skills.iter().enumerate() {
         let heap = skill_heap_bytes(skill);
         if size_of::<McpSkill>().saturating_add(heap) > limits.max_entry_decoded_bytes {
             return Err(McpSkillScanLimit::EntryDecodedBytes);
         }
         bytes = bytes.saturating_add(heap);
-        key_bytes = key_bytes.saturating_add(key_charge(&skill.uri));
+        if index < eligible_entries {
+            key_bytes = key_bytes.saturating_add(key_charge(&skill.uri));
+        }
     }
     if bytes > limits.max_page_decoded_bytes {
         return Err(McpSkillScanLimit::PageDecodedBytes);
@@ -311,4 +324,30 @@ fn skill_error(
         params: params(),
         metadata: Default::default(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn page_charge_counts_only_eligible_uri_keys() {
+        let page: ListSkillsResult = serde_json::from_value(json!({
+            "skills": [
+                {"uri":"skill://first/SKILL.md", "frontmatter":{"name":"first", "description":"first"}, "resources":"dynamic"},
+                {"uri":"skill://second/SKILL.md", "frontmatter":{"name":"second", "description":"second"}, "resources":"dynamic"}
+            ]
+        }))
+        .unwrap();
+        let limits = McpSkillScanLimits::default();
+        let decoded = size_of::<ListSkillsResult>()
+            + page.skills.capacity() * size_of::<McpSkill>()
+            + page.skills.iter().map(skill_heap_bytes).sum::<usize>();
+        let prefix = decoded + key_charge(&page.skills[0].uri);
+        assert_eq!(page_charge(&page, 1, &limits), Ok(prefix));
+        assert_eq!(
+            page_charge(&page, 2, &limits),
+            Ok(prefix + key_charge(&page.skills[1].uri))
+        );
+    }
 }

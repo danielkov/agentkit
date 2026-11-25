@@ -35,6 +35,10 @@ If your crate also depends on `rmcp` directly, update its pin to `=3.9.0` when u
 
 Stdio replies are limited to 16 MiB per line, including the newline. The connection closes if a line exceeds that budget. Set `StdioTransportConfig::with_max_line_length` if a trusted server needs to send larger replies.
 
+## Upgrading from 0.12
+
+Oversized stdio frames now return `McpError::Io` instead of a generic `McpError::Transport`. If you match on transport errors to reconnect, handle `McpError::stdio_line_too_long()` as a connection failure too. Reduce the size of server replies or raise `StdioTransportConfig::with_max_line_length` for that server before reconnecting.
+
 ## Configuring and connecting MCP servers
 
 Register one or more MCP server configurations with `McpServerManager`, then connect them. Each connected server is represented by an `McpServerHandle` that holds the live connection and the discovery snapshot.

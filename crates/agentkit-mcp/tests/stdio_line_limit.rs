@@ -3,8 +3,9 @@ use std::time::Duration;
 
 use agentkit_mcp::{
     AuthOperation, AuthRequest, AuthResolution, McpConnection, McpError, McpServerConfig,
-    McpTransportBinding, StdioLineTooLong, StdioTransportConfig,
+    McpSubscriptionStatus, McpTransportBinding, StdioLineTooLong, StdioTransportConfig,
 };
+use rmcp::model::{DiscoverResult, ProtocolVersion, ServerCapabilities};
 use serde_json::{Value, json};
 use tokio::time::timeout;
 
@@ -28,6 +29,24 @@ fn stdio_peer() {
             return;
         }
         let mut response = match method {
+            "server/discover" if mode.starts_with("modern-") => json!({
+                "jsonrpc": "2.0", "id": id,
+                "result": DiscoverResult::new(
+                    vec![ProtocolVersion::V_2026_07_28],
+                    ServerCapabilities::builder().enable_tools().enable_tool_list_changed().build(),
+                )
+            }),
+            "subscriptions/listen" if mode == "modern-unsupported" => json!({
+                "jsonrpc": "2.0", "id": id,
+                "error": {"code": -32601, "message": "Method not found"}
+            }),
+            "subscriptions/listen" => json!({
+                "jsonrpc": "2.0", "method": "notifications/subscriptions/acknowledged",
+                "params": {
+                    "notifications": request["params"]["notifications"],
+                    "_meta": {"io.modelcontextprotocol/subscriptionId": id}
+                }
+            }),
             "server/discover" => json!({
                 "jsonrpc": "2.0", "id": id,
                 "error": {"code": -32601, "message": "Method not found"}
@@ -127,6 +146,57 @@ async fn break_with_oversize(connection: &McpConnection, limit: usize) {
     .expect("oversized reply left calls pending");
     assert_oversize(first.unwrap_err(), limit);
     assert_oversize(second.unwrap_err(), limit);
+}
+
+#[tokio::test]
+async fn queued_subscription_update_reports_stdout_oversize() {
+    let limit = 4096;
+    let connection = connect(limit, "modern-subscription").await;
+    let mut status = connection.subscription_changes().await.unwrap();
+    assert!(matches!(
+        *status.borrow(),
+        McpSubscriptionStatus::Active { .. }
+    ));
+
+    break_with_oversize(&connection, limit).await;
+    timeout(
+        WATCHDOG,
+        status.wait_for(|s| matches!(s, McpSubscriptionStatus::Pending)),
+    )
+    .await
+    .expect("subscription did not enter recovery")
+    .unwrap();
+
+    let update = connection.subscribe_resource("file:///queued");
+    tokio::pin!(update);
+    assert!(futures_util::poll!(&mut update).is_pending());
+    let error = timeout(WATCHDOG, update)
+        .await
+        .expect("queued update did not complete")
+        .unwrap_err();
+    assert_oversize(error, limit);
+    assert_oversize(
+        connection
+            .unsubscribe_resource("file:///queued")
+            .await
+            .unwrap_err(),
+        limit,
+    );
+}
+
+#[tokio::test]
+async fn unrelated_subscription_closure_is_not_reclassified_after_stdout_oversize() {
+    let limit = 4096;
+    let connection = connect(limit, "modern-unsupported").await;
+    assert!(matches!(
+        connection.subscription_status().await,
+        Some(McpSubscriptionStatus::Closed { .. })
+    ));
+    break_with_oversize(&connection, limit).await;
+    assert!(matches!(
+        connection.subscribe_resource("file:///unavailable").await,
+        Err(McpError::Transport(message)) if message == "subscription controller closed"
+    ));
 }
 
 #[tokio::test]

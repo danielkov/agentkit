@@ -159,6 +159,16 @@ async fn rpc(
             }
             page
         }
+        "skills/list" if token == "Bearer skills-many-pages" => {
+            let page = message["params"]["cursor"]
+                .as_str()
+                .map_or(1, |cursor| cursor.parse::<usize>().unwrap());
+            let mut result = json!({"skills": [skill(&format!("skill-{page}"))]});
+            if page < 65 {
+                result["nextCursor"] = json!((page + 1).to_string());
+            }
+            result
+        }
         "skills/list" if token == "Bearer skills-dense" => {
             let mut entry = skill("first");
             entry["frontmatter"]["custom"] = json!({"dense": vec![Value::Null; 32768]});
@@ -469,6 +479,44 @@ async fn skill_inventory_uses_advertised_extension_on_current_connection() {
 }
 
 #[tokio::test]
+async fn skill_inventory_collector_is_not_limited_to_the_default_scan_page_count() {
+    bounded(async {
+        let fixture = Fixture::start().await;
+        let connection = McpConnection::connect(&fixture.config).await.unwrap();
+        connection
+            .resolve_auth(auth("skills-many-pages"))
+            .await
+            .unwrap();
+
+        let names: Vec<_> = connection
+            .list_skills()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|skill| skill.frontmatter.name)
+            .collect();
+        assert_eq!(
+            names,
+            (1..=65)
+                .map(|page| format!("skill-{page}"))
+                .collect::<Vec<_>>()
+        );
+
+        let mut visited = 0;
+        let outcome = connection
+            .visit_skills(McpSkillScanLimits::default(), |_| visited += 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            McpSkillScanOutcome::Truncated(McpSkillScanLimit::PageCount)
+        );
+        assert_eq!(visited, 64);
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn skill_scan_stops_at_entry_and_page_count_limits() {
     use McpSkillScanLimit::{EntryCount, PageCount};
     use McpSkillScanOutcome::{Complete, Truncated};
@@ -530,10 +578,9 @@ async fn skill_scan_checks_decoded_entry_page_and_cumulative_budgets() {
             .await
             .unwrap();
         assert_eq!(outcome, Truncated(EntryDecodedBytes));
-        let error = connection.list_skills().await.unwrap_err();
-        assert!(
-            matches!(error, McpError::Protocol(message) if message.contains("EntryDecodedBytes"))
-        );
+        let skills = connection.list_skills().await.unwrap();
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].frontmatter.name, "first");
 
         let limits = McpSkillScanLimits {
             max_entry_decoded_bytes: 4 * 1024 * 1024,

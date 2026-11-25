@@ -1,16 +1,20 @@
 //! Connection-owned subscriptions. Only the worker commits desired state.
-use std::{collections::BTreeSet, time::Duration};
+use std::{
+    collections::BTreeSet,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
 use rmcp::{
     model::SubscriptionFilter,
-    service::{Peer, RoleClient, Subscription, SubscriptionEnd},
+    service::{Subscription, SubscriptionEnd},
 };
 use tokio::{
     sync::{mpsc, oneshot, watch},
     task::JoinHandle,
 };
 
-use crate::{McpError, McpNotificationSink};
+use crate::{ConnectedPeer, McpError, McpNotificationSink, StdioLineTooLong};
 
 const ESTABLISHMENT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_RETRIES: u32 = 5;
@@ -53,13 +57,14 @@ pub(super) struct SubscriptionController {
     status: watch::Receiver<McpSubscriptionStatus>,
     requested: watch::Receiver<BTreeSet<String>>,
     stop: watch::Sender<bool>,
+    terminal_fault: Arc<OnceLock<StdioLineTooLong>>,
     worker: Option<JoinHandle<()>>,
 }
 
 impl SubscriptionController {
     /// Return only after the initial stream has been acknowledged.
     pub(super) async fn start(
-        peer: Peer<RoleClient>,
+        peer: ConnectedPeer,
         base_filter: SubscriptionFilter,
         sink: McpNotificationSink,
     ) -> Result<Self, McpError> {
@@ -83,6 +88,7 @@ impl SubscriptionController {
                     status,
                     requested,
                     stop,
+                    terminal_fault: Arc::default(),
                     worker: None,
                 });
             }
@@ -92,14 +98,28 @@ impl SubscriptionController {
         let initial = active_status(&base_filter, &subscription);
         let (status_tx, status) = watch::channel(initial);
         let (requested_tx, requested) = watch::channel(resource_set(&base_filter));
-        let (commands, updates) = mpsc::channel(32);
+        let (commands, mut updates) = mpsc::channel(32);
         let (stop, mut stopped) = watch::channel(false);
+        let terminal_fault = Arc::new(OnceLock::new());
+        let worker_fault = terminal_fault.clone();
         let worker = tokio::spawn(async move {
             // Dropping run drops every in-flight RMCP request/stream, which
             // unregisters it and sends best-effort cancellation in RMCP.
             tokio::select! {
-                result = run(peer, base_filter, subscription, sink, updates, &status_tx, &requested_tx) => {
-                    status_tx.send_replace(result);
+                result = run(peer, base_filter, subscription, sink, &mut updates, &status_tx, &requested_tx) => {
+                    let status = match result {
+                        Ok(status) => status,
+                        Err(fault) => {
+                            // Publish the cause before dropping the command receiver:
+                            // queued replies and blocked sends use it when they wake.
+                            let _ = worker_fault.set(fault);
+                            McpSubscriptionStatus::Closed {
+                                graceful: false,
+                                error: Some(fault.to_string()),
+                            }
+                        }
+                    };
+                    status_tx.send_replace(status);
                 }
                 _ = stopped.changed() => {
                     status_tx.send_replace(McpSubscriptionStatus::Closed {
@@ -113,6 +133,7 @@ impl SubscriptionController {
             status,
             requested,
             stop,
+            terminal_fault,
             worker: Some(worker),
         })
     }
@@ -151,8 +172,15 @@ impl SubscriptionController {
         self.commands
             .send(Update { change, reply })
             .await
-            .map_err(|_| closed_error())?;
-        response.await.map_err(|_| closed_error())?
+            .map_err(|_| self.closed_error())?;
+        response.await.map_err(|_| self.closed_error())?
+    }
+
+    fn closed_error(&self) -> McpError {
+        match self.terminal_fault.get() {
+            Some(fault) => McpError::Io(fault.into_io_error()),
+            None => McpError::Transport("subscription controller closed".into()),
+        }
     }
 
     /// Cancel all outstanding establishment/receive work and join the task.
@@ -196,21 +224,17 @@ fn resource_set(filter: &SubscriptionFilter) -> BTreeSet<String> {
         .collect()
 }
 
-fn closed_error() -> McpError {
-    McpError::Transport("subscription controller closed".into())
-}
-
 async fn establish(
-    peer: &Peer<RoleClient>,
+    peer: &ConnectedPeer,
     filter: SubscriptionFilter,
 ) -> Result<Subscription, McpError> {
-    tokio::time::timeout(ESTABLISHMENT_TIMEOUT, peer.listen(filter))
+    tokio::time::timeout(ESTABLISHMENT_TIMEOUT, peer.peer.listen(filter))
         .await
         .map_err(|_| McpError::Timeout {
             operation: "subscriptions/listen acknowledgment",
             duration: ESTABLISHMENT_TIMEOUT,
         })?
-        .map_err(crate::rmcp_service_error)
+        .map_err(|error| peer.service_error(error))
 }
 
 fn verify_resources(
@@ -261,19 +285,19 @@ fn terminal(subscription: &Subscription) -> Option<McpSubscriptionStatus> {
 }
 
 async fn run(
-    peer: Peer<RoleClient>,
+    peer: ConnectedPeer,
     mut filter: SubscriptionFilter,
     mut active: Subscription,
     sink: McpNotificationSink,
-    mut commands: mpsc::Receiver<Update>,
+    commands: &mut mpsc::Receiver<Update>,
     status: &watch::Sender<McpSubscriptionStatus>,
     requested: &watch::Sender<BTreeSet<String>>,
-) -> McpSubscriptionStatus {
+) -> Result<McpSubscriptionStatus, StdioLineTooLong> {
     loop {
         tokio::select! {
             command = commands.recv() => {
                 let Some(command) = command else {
-                    return McpSubscriptionStatus::Closed { graceful: false, error: None };
+                    return Ok(McpSubscriptionStatus::Closed { graceful: false, error: None });
                 };
                 let mut resources = resource_set(&filter);
                 match command.change {
@@ -328,7 +352,7 @@ async fn run(
                     Ok(Some(notification)) => sink.dispatch(notification),
                     outcome => {
                         if let Some(terminal) = terminal(&active) {
-                            return terminal;
+                            return Ok(terminal);
                         }
                         sink.mark_catalog_dirty();
                         status.send_replace(McpSubscriptionStatus::Pending);
@@ -344,11 +368,18 @@ async fn run(
                                 Ok(stream)
                             }) {
                                 Ok(stream) => { recovered = Some(stream); break; }
-                                Err(error) => last_error = error.to_string(),
+                                Err(error) => {
+                                    // This transport is torn down; retrying the same
+                                    // peer cannot recover from a fatal line-limit fault.
+                                    if let Some(fault) = error.stdio_line_too_long() {
+                                        return Err(*fault);
+                                    }
+                                    last_error = error.to_string();
+                                }
                             }
                         }
                         let Some(stream) = recovered else {
-                            return McpSubscriptionStatus::Closed { graceful: false, error: Some(last_error) };
+                            return Ok(McpSubscriptionStatus::Closed { graceful: false, error: Some(last_error) });
                         };
                         active = stream;
                         // A host may have refreshed during backoff. Reconcile the
@@ -364,6 +395,8 @@ async fn run(
 
 #[cfg(test)]
 mod tests {
+    use rmcp::service::RoleClient;
+
     use super::*;
 
     #[test]
@@ -446,7 +479,10 @@ mod tests {
             events,
         };
         let controller = SubscriptionController::start(
-            client.peer().clone(),
+            ConnectedPeer {
+                peer: client.peer().clone(),
+                line_limit: None,
+            },
             SubscriptionFilter::default(),
             sink,
         )

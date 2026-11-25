@@ -1523,27 +1523,12 @@ impl ConnectedPeer {
         None
     }
 
-    fn subscription_error(&self, error: McpError) -> McpError {
-        // The controller already translates rmcp errors to McpError. Do not
-        // upgrade its separate "controller closed" error: it can be closed
-        // even while the transport is healthy (e.g. unsupported listen).
-        if let McpError::Transport(message) = &error
-            && let Some(error) = self.line_limit.as_ref().and_then(|limit| limit.error())
-            && message == &ServiceError::TransportClosed.to_string()
-        {
-            return error;
-        }
-        error
-    }
-
     async fn start_subscriptions(
         &self,
         filter: McpSubscriptionFilter,
         sink: McpNotificationSink,
     ) -> Result<subscriptions::SubscriptionController, McpError> {
-        subscriptions::SubscriptionController::start(self.peer.clone(), filter, sink)
-            .await
-            .map_err(|error| self.subscription_error(error))
+        subscriptions::SubscriptionController::start(self.clone(), filter, sink).await
     }
 }
 
@@ -1881,6 +1866,12 @@ impl McpConnection {
         self.sink.revision.subscribe()
     }
 
+    /// Returns whether the current peer's transport has terminated.
+    /// This does not probe the server or predict transport health.
+    pub fn is_transport_closed(&self) -> bool {
+        self.peer().peer.is_transport_closed()
+    }
+
     /// Changes whenever authentication replaces the transport or the connection closes.
     pub fn connection_epoch(&self) -> u64 {
         self.epoch.load(Ordering::Acquire)
@@ -1957,11 +1948,7 @@ impl McpConnection {
         self.ensure_subscriptions().await?;
         let _lifecycle = self.lifecycle.lock().await;
         if let Some(controller) = self.subscriptions.lock().await.as_ref() {
-            let peer = self.peer();
-            return controller
-                .subscribe_resource(uri)
-                .await
-                .map_err(|error| peer.subscription_error(error));
+            return controller.subscribe_resource(uri).await;
         }
         if self.modern() {
             // Resource-only servers have no catalog stream to extend. Start a
@@ -1996,11 +1983,7 @@ impl McpConnection {
         self.ensure_subscriptions().await?;
         let _lifecycle = self.lifecycle.lock().await;
         if let Some(controller) = self.subscriptions.lock().await.as_ref() {
-            let peer = self.peer();
-            return controller
-                .unsubscribe_resource(uri)
-                .await
-                .map_err(|error| peer.subscription_error(error));
+            return controller.unsubscribe_resource(uri).await;
         }
         if self.modern() {
             // No modern controller means no resource subscription exists.
