@@ -10,8 +10,9 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
-use agent_client_protocol::schema::v1 as acp;
-use agent_client_protocol::{Client, ConnectionTo, Handled};
+use agent_client_protocol::v1::ConnectionTo;
+use agent_client_protocol::v1::schema as acp;
+use agent_client_protocol::{Client, Handled};
 use agentkit_core::{
     CancellationController, CancellationHandle, DataRef, Delta, FilePart, FinishReason, Item,
     ItemKind, MediaPart, MetadataMap, Modality, Part, PartId, PartKind,
@@ -31,14 +32,14 @@ use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
 /// Re-export of the upstream ACP SDK.
 pub use agent_client_protocol as sdk;
 /// Stable upstream ACP v1 wire types.
-pub use agent_client_protocol::schema::v1::*;
+pub use agent_client_protocol::v1::schema::*;
 
 /// Re-exports of the stable upstream ACP v1 wire types.
 ///
 /// Use these types directly for JSON-RPC payloads, content blocks, session
 /// updates, tool call payloads, and client callback payloads.
 pub mod wire {
-    pub use agent_client_protocol::schema::v1::*;
+    pub use agent_client_protocol::v1::schema::*;
 }
 
 /// Opt-in ACP protocol v2 runtime and upstream wire types.
@@ -51,7 +52,7 @@ const REJECT_ONCE_OPTION: &str = "reject_once";
 const REJECT_ALWAYS_OPTION: &str = "reject_always";
 
 fn sdk_error(error: AcpRuntimeError) -> agent_client_protocol::Error {
-    agent_client_protocol::util::internal_error(error.to_string())
+    agent_client_protocol::Error::internal_error().data(error.to_string())
 }
 
 /// Error type for ACP integration state, conversion, and client callback
@@ -1221,7 +1222,7 @@ where
     ) -> Result<(), AcpRuntimeError> {
         let state = Arc::new(AcpHeadlessRuntimeState::<M>::new(factory, integration));
         agent_client_protocol::Agent
-            .builder()
+            .v1()
             .name(state.integration.name())
             .on_receive_request(
                 {
@@ -2169,7 +2170,7 @@ mod tests {
         });
 
         let client = agent_client_protocol::Client
-            .builder()
+            .v1()
             .on_receive_notification(
                 {
                     let notifications = Arc::clone(&notifications);
@@ -2384,31 +2385,31 @@ mod tests {
             }
         });
 
-        let client = agent_client_protocol::Client.builder().connect_with(
-            client_transport,
-            async move |cx| {
-                let cwd = std::env::current_dir()
-                    .map_err(agent_client_protocol::Error::into_internal_error)?;
-                cx.send_request(acp::InitializeRequest::new(ProtocolVersion::V1))
-                    .block_task()
-                    .await?;
-                let error = cx
-                    .send_request(acp::NewSessionRequest::new(cwd))
-                    .block_task()
-                    .await
-                    .err()
-                    .expect("session creation should fail");
-                assert!(
-                    error
-                        .data
-                        .as_ref()
-                        .and_then(serde_json::Value::as_str)
-                        .is_some_and(|message| message.contains("factory failed")),
-                    "unexpected error: {error:?}"
-                );
-                Ok(())
-            },
-        );
+        let client =
+            agent_client_protocol::Client
+                .v1()
+                .connect_with(client_transport, async move |cx| {
+                    let cwd = std::env::current_dir()
+                        .map_err(agent_client_protocol::Error::into_internal_error)?;
+                    cx.send_request(acp::InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    let error = cx
+                        .send_request(acp::NewSessionRequest::new(cwd))
+                        .block_task()
+                        .await
+                        .err()
+                        .expect("session creation should fail");
+                    assert!(
+                        error
+                            .data
+                            .as_ref()
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|message| message.contains("factory failed")),
+                        "unexpected error: {error:?}"
+                    );
+                    Ok(())
+                });
         tokio::time::timeout(std::time::Duration::from_secs(5), client)
             .await
             .expect("client timed out")
@@ -2460,7 +2461,7 @@ mod tests {
         });
 
         let client = agent_client_protocol::Client
-            .builder()
+            .v1()
             .on_receive_notification(
                 async move |notification: acp::SessionNotification, _cx| {
                     let _ = notification;
@@ -2560,7 +2561,7 @@ mod tests {
         });
 
         let client = agent_client_protocol::Client
-            .builder()
+            .v1()
             .on_receive_notification(
                 async move |notification: acp::SessionNotification, _cx| {
                     let _ = notification;
@@ -2661,7 +2662,7 @@ mod tests {
         });
 
         let client = agent_client_protocol::Client
-            .builder()
+            .v1()
             .on_receive_notification(
                 async move |notification: acp::SessionNotification, _cx| {
                     let _ = notification;
@@ -2777,7 +2778,7 @@ mod tests {
         });
 
         let client = agent_client_protocol::Client
-            .builder()
+            .v1()
             .on_receive_notification(
                 async move |notification: acp::SessionNotification, _cx| {
                     let _ = notification;
@@ -2853,38 +2854,38 @@ mod tests {
             }
         });
 
-        let client = agent_client_protocol::Client.builder().connect_with(
-            client_transport,
-            async move |cx| {
-                cx.send_request(acp::InitializeRequest::new(ProtocolVersion::V1))
-                    .block_task()
-                    .await?;
-                let cwd = std::env::current_dir()
-                    .map_err(agent_client_protocol::Error::into_internal_error)?;
-                let new_session = cx
-                    .send_request(acp::NewSessionRequest::new(cwd))
-                    .block_task()
-                    .await?;
-                let error = cx
-                    .send_request(acp::PromptRequest::new(
-                        new_session.session_id.clone(),
-                        vec![acp::ContentBlock::Text(acp::TextContent::new("fail"))],
-                    ))
-                    .block_task()
-                    .await
-                    .err()
-                    .expect("failed turn should return JSON-RPC error");
-                assert!(
-                    error
-                        .to_string()
-                        .contains("agent turn finished with an error")
-                );
-                cx.send_request(acp::CloseSessionRequest::new(new_session.session_id))
-                    .block_task()
-                    .await?;
-                Ok(())
-            },
-        );
+        let client =
+            agent_client_protocol::Client
+                .v1()
+                .connect_with(client_transport, async move |cx| {
+                    cx.send_request(acp::InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    let cwd = std::env::current_dir()
+                        .map_err(agent_client_protocol::Error::into_internal_error)?;
+                    let new_session = cx
+                        .send_request(acp::NewSessionRequest::new(cwd))
+                        .block_task()
+                        .await?;
+                    let error = cx
+                        .send_request(acp::PromptRequest::new(
+                            new_session.session_id.clone(),
+                            vec![acp::ContentBlock::Text(acp::TextContent::new("fail"))],
+                        ))
+                        .block_task()
+                        .await
+                        .err()
+                        .expect("failed turn should return JSON-RPC error");
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("agent turn finished with an error")
+                    );
+                    cx.send_request(acp::CloseSessionRequest::new(new_session.session_id))
+                        .block_task()
+                        .await?;
+                    Ok(())
+                });
         tokio::time::timeout(std::time::Duration::from_secs(5), client)
             .await
             .expect("client timed out")
@@ -2932,7 +2933,7 @@ mod tests {
         });
 
         let client = agent_client_protocol::Client
-            .builder()
+            .v1()
             .on_receive_notification(
                 async move |notification: acp::SessionNotification, _cx| {
                     let _ = notification;
