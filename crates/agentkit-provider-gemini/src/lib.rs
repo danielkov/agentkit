@@ -389,12 +389,19 @@ impl ReplayRequest {
 
     async fn rejection_error(&self, response: HttpResponse) -> LoopError {
         let status = response.status();
+        let reason = match status {
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+                ProviderFailureReason::Authentication
+            }
+            StatusCode::BAD_REQUEST => ProviderFailureReason::InvalidRequest,
+            _ => ProviderFailureReason::HttpStatus,
+        };
         let body = match self.read_bounded_body(response, MAX_ERROR_BODY_BYTES).await {
             Ok(body) => body,
             Err(err) => {
                 if let Ok(mut tracker) = self.tracker.lock() {
                     tracker.note_failure(&provider_error(
-                        ProviderFailureReason::HttpStatus,
+                        reason,
                         classify_http_body(None, status.as_u16()),
                     ));
                 }
@@ -408,13 +415,6 @@ impl ReplayRequest {
             return ctx_err;
         }
         let classification = classify_http_body(body.as_deref(), status.as_u16());
-        let reason = match status {
-            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
-                ProviderFailureReason::Authentication
-            }
-            StatusCode::BAD_REQUEST => ProviderFailureReason::InvalidRequest,
-            _ => ProviderFailureReason::HttpStatus,
-        };
         provider_error(reason, classification)
     }
 
@@ -1617,5 +1617,39 @@ data: {"candidates":[{"content":{"role":"model","parts":[{"text":""#.to_vec();
         let failure = *err.provider_failure().unwrap();
         assert_eq!(failure.reason, ProviderFailureReason::RetryBudget);
         assert_eq!(failure.upstream.http_status, Some(503));
+    }
+
+    #[tokio::test]
+    async fn logical_deadline_during_403_rejection_body_preserves_authentication_category() {
+        let response = HttpResponse::new(
+            StatusCode::FORBIDDEN,
+            HeaderMap::new(),
+            "https://example.test".into(),
+            Box::pin(stream::pending()),
+        );
+        let client = Arc::new(SequenceClient::new(vec![Ok(response)]));
+        let resilience = ResilienceConfig {
+            retry_budget: Duration::from_millis(80),
+            ..fast_resilience(0)
+        };
+        let config = GeminiConfig::new("k", "gemini-2.5-flash")
+            .unwrap()
+            .with_resilience(resilience);
+        let adapter = GeminiAdapter::with_client(config, Http::from_arc(client));
+        let mut session = adapter
+            .start_session(SessionConfig::new("s1"))
+            .await
+            .unwrap();
+        let err = match session.begin_turn(sample_turn_request(), None).await {
+            Err(e) => e,
+            Ok(_) => panic!("expected retry budget timeout"),
+        };
+        let failure = *err.provider_failure().unwrap();
+        assert_eq!(failure.reason, ProviderFailureReason::RetryBudget);
+        assert_eq!(
+            failure.last_attempt_reason,
+            Some(ProviderFailureReason::Authentication)
+        );
+        assert_eq!(failure.upstream.http_status, Some(403));
     }
 }

@@ -1,11 +1,12 @@
 use std::borrow::Cow;
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
 use agentkit_http::{
     Authentication, AuthenticationProvider, HeaderMap, HeaderName, HeaderValue, ResilienceConfig,
 };
+use agentkit_tools_core::ToolSpec;
 use serde_json::{Value, json};
 
 use crate::error::GeminiError;
@@ -362,13 +363,14 @@ pub struct GeminiConfig {
     pub safety_settings: Vec<SafetySetting>,
     /// Explicit cached content resource name (`cachedContents/{id}` or full Vertex path).
     pub cached_content: Option<String>,
-    /// Function tool names already declared inside `cached_content`.
+    /// Function tool specifications already declared inside `cached_content`, keyed by tool name.
     ///
-    /// When `cached_content` is active, registered tools must match this set
-    /// unless [`Self::allow_unadvertised_cached_tools`] is enabled for
-    /// dispatch-only tool sources (`ToolSource::unadvertised()`).
-    pub cached_tool_names: BTreeSet<String>,
-    /// Permits `cached_tool_names` to contain dispatch-only tools not advertised
+    /// When `cached_content` is active, advertised tools must match both name
+    /// and wire declaration (description + `parametersJsonSchema`) unless
+    /// [`Self::allow_unadvertised_cached_tools`] is enabled for dispatch-only
+    /// tool sources (`ToolSource::unadvertised()`).
+    pub cached_tools: BTreeMap<String, ToolSpec>,
+    /// Permits `cached_tools` to contain dispatch-only tools not advertised
     /// in `TurnRequest::available_tools` (for example when using
     /// `ToolSource::unadvertised()`). Defaults to `false`.
     pub allow_unadvertised_cached_tools: bool,
@@ -408,7 +410,10 @@ impl fmt::Debug for GeminiConfig {
             .field("output_format", &self.output_format)
             .field("safety_settings", &self.safety_settings)
             .field("cached_content", &self.cached_content)
-            .field("cached_tool_names", &self.cached_tool_names)
+            .field(
+                "cached_tool_names",
+                &self.cached_tools.keys().collect::<Vec<_>>(),
+            )
             .field(
                 "allow_unadvertised_cached_tools",
                 &self.allow_unadvertised_cached_tools,
@@ -496,7 +501,7 @@ impl GeminiConfig {
             output_format: None,
             safety_settings: Vec::new(),
             cached_content: None,
-            cached_tool_names: BTreeSet::new(),
+            cached_tools: BTreeMap::new(),
             allow_unadvertised_cached_tools: false,
             cached_system_instructions: Vec::new(),
             extra_headers: HeaderMap::new(),
@@ -674,17 +679,19 @@ impl GeminiConfig {
         self
     }
 
-    /// Declares the function tool names already embedded inside `cached_content`.
-    pub fn with_cached_tool_names<I, S>(mut self, names: I) -> Self
+    /// Declares the exact function tool specifications already embedded inside `cached_content`.
+    pub fn with_cached_tools<I>(mut self, tools: I) -> Self
     where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
+        I: IntoIterator<Item = ToolSpec>,
     {
-        self.cached_tool_names = names.into_iter().map(Into::into).collect();
+        self.cached_tools = tools
+            .into_iter()
+            .map(|spec| (spec.name.to_string(), spec))
+            .collect();
         self
     }
 
-    /// Allows `cached_tool_names` to include dispatch-only tools omitted from
+    /// Allows `cached_tools` to include dispatch-only tools omitted from
     /// `TurnRequest::available_tools` (e.g. `ToolSource::unadvertised()`).
     pub fn with_unadvertised_cached_tools(mut self, allow: bool) -> Self {
         self.allow_unadvertised_cached_tools = allow;

@@ -150,20 +150,39 @@ pub(crate) fn build_request_body(
             .iter()
             .map(|spec| spec.name.to_string())
             .collect();
-        let uncovered: Vec<&String> = live_tools.difference(&config.cached_tool_names).collect();
+        let mut uncovered = Vec::new();
+        let mut schema_mismatches = Vec::new();
+        for spec in &request.available_tools {
+            let name = spec.name.to_string();
+            match config.cached_tools.get(&name) {
+                None => uncovered.push(name),
+                Some(cached_spec)
+                    if build_function_declaration(spec)
+                        != build_function_declaration(cached_spec) =>
+                {
+                    schema_mismatches.push(name);
+                }
+                Some(_) => {}
+            }
+        }
         if !uncovered.is_empty() {
             return Err(BuildError::CacheViolation(format!(
-                "cannot attach cachedContent with live tools not declared in cached_tool_names: {}",
-                uncovered
-                    .into_iter()
-                    .map(String::as_str)
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                "cannot attach cachedContent with live tools not declared in cached_tools: {}",
+                uncovered.join(", ")
+            )));
+        }
+        if !schema_mismatches.is_empty() {
+            return Err(BuildError::CacheViolation(format!(
+                "cannot attach cachedContent because tool declarations differ from cached_tools: {}",
+                schema_mismatches.join(", ")
             )));
         }
         if !config.allow_unadvertised_cached_tools {
-            let unavailable: Vec<&String> =
-                config.cached_tool_names.difference(&live_tools).collect();
+            let unavailable: Vec<&String> = config
+                .cached_tools
+                .keys()
+                .filter(|name| !live_tools.contains(*name))
+                .collect();
             if !unavailable.is_empty() {
                 return Err(BuildError::CacheViolation(format!(
                     "cannot attach cachedContent advertising functions unavailable in this turn: {} (set with_unadvertised_cached_tools(true) if backed by dispatch-only tools)",
@@ -910,14 +929,29 @@ mod tests {
 
     #[test]
     fn honors_cache_disablement_and_validates_cache_owned_fields() {
+        let local_spec = ToolSpec::new("local_fn", "desc", json!({ "type": "object" }));
         let cfg = GeminiConfig::new("k", "gemini-2.5-flash")
             .unwrap()
             .with_cached_content("cachedContents/example")
             .with_cached_system_instructions(["sys"])
-            .with_cached_tool_names(["local_fn"]);
+            .with_cached_tools([local_spec.clone()]);
 
-        // Matching system instructions + exact matching tool set -> attaches cache and omits wire fields
+        // Matching system instructions + exact matching tool declaration -> attaches cache
         let mut req = empty_turn(
+            vec![
+                Item::text(ItemKind::System, "sys"),
+                Item::text(ItemKind::User, "Hello"),
+            ],
+            vec![local_spec.clone()],
+        );
+        let cached_body = build_request_body(&cfg, &req).unwrap();
+        assert_eq!(cached_body["cachedContent"], "cachedContents/example");
+        assert!(cached_body.get("systemInstruction").is_none());
+        assert!(cached_body.get("tools").is_none());
+        assert!(cached_body.get("toolConfig").is_none());
+
+        // Same tool name with changed schema -> rejected instead of serving stale schema
+        let updated_schema_req = empty_turn(
             vec![
                 Item::text(ItemKind::System, "sys"),
                 Item::text(ItemKind::User, "Hello"),
@@ -925,14 +959,17 @@ mod tests {
             vec![ToolSpec::new(
                 "local_fn",
                 "desc",
-                json!({ "type": "object" }),
+                json!({
+                    "type": "object",
+                    "properties": { "required_param": { "type": "string" } },
+                    "required": ["required_param"]
+                }),
             )],
         );
-        let cached_body = build_request_body(&cfg, &req).unwrap();
-        assert_eq!(cached_body["cachedContent"], "cachedContents/example");
-        assert!(cached_body.get("systemInstruction").is_none());
-        assert!(cached_body.get("tools").is_none());
-        assert!(cached_body.get("toolConfig").is_none());
+        assert!(matches!(
+            build_request_body(&cfg, &updated_schema_req),
+            Err(BuildError::CacheViolation(_))
+        ));
 
         // Live Context item not covered by cache -> rejected instead of silently dropped
         let live_ctx = empty_turn(
