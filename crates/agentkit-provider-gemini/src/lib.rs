@@ -77,8 +77,12 @@ pub struct GeminiAdapter {
 
 impl GeminiAdapter {
     /// Creates a new adapter from the given configuration with a default reqwest HTTP client.
+    ///
+    /// Redirects are disabled on the adapter-owned client so `x-goog-api-key`
+    /// authentication headers cannot be forwarded across origins.
     pub fn new(config: GeminiConfig) -> Result<Self, GeminiError> {
         let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map(Http::new)
             .map_err(|error| GeminiError::HttpClient(HttpError::request(error)))?;
@@ -86,6 +90,10 @@ impl GeminiAdapter {
     }
 
     /// Creates a new adapter using a pre-configured [`Http`] client.
+    ///
+    /// Callers supplying a custom client should disable redirects or restrict
+    /// them to the same origin so `x-goog-api-key` headers cannot leak across
+    /// origins.
     pub fn with_client(config: GeminiConfig, client: Http) -> Self {
         Self {
             client,
@@ -144,7 +152,6 @@ struct StreamingState {
     pending: VecDeque<ModelTurnEvent>,
     eof: bool,
     visible_output: bool,
-    detect_truncation: bool,
     idle_timeout: Option<Duration>,
     deadline: Option<LogicalDeadline>,
     integrity: TruncatedStreamDetector,
@@ -614,7 +621,6 @@ impl ModelSession for GeminiSession {
                             pending: VecDeque::new(),
                             eof: false,
                             visible_output: false,
-                            detect_truncation: self.resilience.is_some(),
                             idle_timeout,
                             deadline: deadline.clone(),
                             integrity,
@@ -632,6 +638,12 @@ impl ModelSession for GeminiSession {
                     Ok(body) => body,
                     Err(error) if is_retryable_body_read(status, &error) => {
                         let attempt_err = map_http_error(&error, ProviderFailureReason::Transport);
+                        if matches!(
+                            attempt_err.provider_failure().map(|f| f.reason),
+                            Some(ProviderFailureReason::RetryBudget)
+                        ) {
+                            return Err(attempt_err);
+                        }
                         if let Some(retry_number) = replay_request.reserve_retry() {
                             let delay = replay_request.retry_delay(retry_number, None, None);
                             replay_request
@@ -822,7 +834,7 @@ async fn next_streaming_event(
 
                 let integrity_ok = state.integrity.finish();
                 let complete = state.translator.saw_terminal_signal() && integrity_ok.is_ok();
-                if complete || !state.detect_truncation {
+                if complete {
                     for produced in state.translator.finalize() {
                         state.pending.push_back(produced);
                     }
@@ -1219,5 +1231,87 @@ mod tests {
         let adapter = GeminiAdapter::new(cfg).unwrap();
         assert_eq!(adapter.provider_name(), Some("gemini"));
         let _ = json!({});
+    }
+
+    #[tokio::test]
+    async fn rejects_incomplete_sse_even_when_resilience_is_disabled() {
+        let incomplete = Ok(HttpResponse::new(
+            StatusCode::OK,
+            HeaderMap::new(),
+            "https://example.test".into(),
+            Box::pin(stream::once(async {
+                Ok(Bytes::from_static(
+                    br#"data: {"candidates":[{"content":{"role":"model","parts":[{"text":"cut off"}]}}]}
+
+"#,
+                ))
+            })),
+        ));
+        let client = Arc::new(SequenceClient::new(vec![incomplete]));
+        let config = GeminiConfig::new("k", "gemini-2.5-flash").unwrap();
+        let adapter = GeminiAdapter::with_client(config, Http::from_arc(client));
+        let mut session = adapter
+            .start_session(SessionConfig::new("s1"))
+            .await
+            .unwrap();
+        let mut turn = session
+            .begin_turn(sample_turn_request(), None)
+            .await
+            .unwrap();
+        loop {
+            match turn.next_event(None).await {
+                Ok(Some(ModelTurnEvent::Finished(_))) => {
+                    panic!("incomplete stream must not emit Finished")
+                }
+                Ok(Some(_)) => continue,
+                Ok(None) => panic!("incomplete stream must not succeed on EOF"),
+                Err(_) => break,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn buffered_logical_deadline_preserves_retry_budget_reason() {
+        struct SlowBodyClient;
+
+        #[async_trait]
+        impl HttpClient for SlowBodyClient {
+            async fn execute(&self, request: HttpRequest) -> Result<HttpResponse, HttpError> {
+                Ok(HttpResponse::new(
+                    StatusCode::OK,
+                    HeaderMap::new(),
+                    request.url,
+                    Box::pin(stream::once(async {
+                        agentkit_http::sleep(Duration::from_millis(80)).await;
+                        Ok(Bytes::from_static(b"{}"))
+                    })),
+                ))
+            }
+        }
+
+        let config = GeminiConfig::new("k", "gemini-2.5-flash")
+            .unwrap()
+            .with_streaming(false)
+            .with_resilience(ResilienceConfig {
+                max_retries: 0,
+                retry_budget: Duration::from_millis(20),
+                attempt_timeout: Some(Duration::from_secs(5)),
+                stream_idle_timeout: Some(Duration::from_secs(5)),
+                initial_backoff: Duration::from_millis(1),
+                max_backoff: Duration::from_millis(5),
+            });
+        let adapter = GeminiAdapter::with_client(config, Http::from_arc(Arc::new(SlowBodyClient)));
+        let mut session = adapter
+            .start_session(SessionConfig::new("s1"))
+            .await
+            .unwrap();
+        let err = match session.begin_turn(sample_turn_request(), None).await {
+            Err(e) => e,
+            Ok(_) => panic!("expected retry budget timeout"),
+        };
+        assert_eq!(
+            err.provider_failure().unwrap().reason,
+            ProviderFailureReason::RetryBudget
+        );
     }
 }

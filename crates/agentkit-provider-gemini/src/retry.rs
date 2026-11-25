@@ -48,7 +48,7 @@ impl RetryTracker {
     pub(crate) fn note_failure(&mut self, error: &LoopError) {
         let reason = failure_reason(error);
         if self.accounting.attempts > 0
-            && matches!(
+            && (matches!(
                 reason,
                 ProviderFailureReason::HttpStatus
                     | ProviderFailureReason::Transport
@@ -57,17 +57,21 @@ impl RetryTracker {
                     | ProviderFailureReason::AttemptTimeout
                     | ProviderFailureReason::IdleTimeout
                     | ProviderFailureReason::InvalidRequest
-            )
+            ) || (reason == ProviderFailureReason::Authentication
+                && error
+                    .provider_failure()
+                    .is_some_and(|failure| failure.upstream.http_status.is_some())))
         {
             self.last_attempt_reason = Some(reason);
         }
         if let Some(failure) = error.provider_failure()
-            && matches!(
+            && (matches!(
                 failure.reason,
                 ProviderFailureReason::HttpStatus
                     | ProviderFailureReason::ResponseFailed
                     | ProviderFailureReason::InvalidRequest
-            )
+            ) || (failure.reason == ProviderFailureReason::Authentication
+                && failure.upstream.http_status.is_some()))
         {
             self.upstream = failure.upstream;
         }
@@ -395,5 +399,33 @@ mod tests {
         let events = events.lock().unwrap();
         assert_eq!(events.len(), 4); // 3 scheduled (0, 250, 500) + 1 stopped
         assert!(matches!(events[3], ProviderRetryEvent::Stopped(_)));
+    }
+
+    #[test]
+    fn terminal_http_auth_rejection_replaces_prior_upstream_status() {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let capture = events.clone();
+        let mut tracker = RetryTracker::new(Some(Arc::new(move |event| {
+            capture.lock().unwrap().push(event);
+        })));
+        tracker.accounting.attempts = 1;
+        let prior = provider_error(
+            ProviderFailureReason::HttpStatus,
+            classify_http_body(None, 429),
+        );
+        tracker.scheduled(&prior, Duration::from_secs(1));
+        tracker.accounting.attempts = 2;
+        let terminal = tracker.finish(provider_error(
+            ProviderFailureReason::Authentication,
+            classify_http_body(None, 403),
+        ));
+        assert_eq!(
+            terminal.provider_failure().unwrap().upstream.http_status,
+            Some(403)
+        );
+        assert!(matches!(
+            events.lock().unwrap().last(),
+            Some(ProviderRetryEvent::Stopped(f)) if f.upstream.http_status == Some(403)
+        ));
     }
 }

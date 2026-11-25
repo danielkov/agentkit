@@ -30,6 +30,14 @@ impl From<BuildError> for LoopError {
     }
 }
 
+#[derive(Clone)]
+struct CallOrigin {
+    name: String,
+    has_provider_id: bool,
+    batch_id: usize,
+    call_index: usize,
+}
+
 /// Builds the Gemini `generateContent` / `streamGenerateContent` JSON request body.
 pub(crate) fn build_request_body(
     config: &GeminiConfig,
@@ -37,9 +45,29 @@ pub(crate) fn build_request_body(
 ) -> Result<Value, BuildError> {
     validate_prompt_cache(request)?;
 
-    // Track call_id -> (tool_name, had_provider_id) from assistant tool calls so
-    // subsequent Tool items can populate Gemini's required `functionResponse.name`.
-    let mut call_lookup: HashMap<String, (String, bool)> = HashMap::new();
+    let cache_disabled = matches!(
+        request.cache.as_ref().map(|c| c.mode),
+        Some(PromptCacheMode::Disabled)
+    );
+    let active_cached_content = if cache_disabled {
+        None
+    } else {
+        config.cached_content.as_deref()
+    };
+
+    if active_cached_content.is_some()
+        && (!config.server_tools.is_empty() || config.tool_choice.is_some())
+    {
+        return Err(BuildError::CacheViolation(
+            "cannot combine cachedContent with live server_tools or tool_choice; define tool declarations and toolConfig in the cached content resource".into(),
+        ));
+    }
+
+    // Track call_id -> CallOrigin from assistant tool calls so subsequent Tool
+    // items can populate Gemini's required `functionResponse.name` and restore
+    // parallel invocation order.
+    let mut call_lookup: HashMap<String, CallOrigin> = HashMap::new();
+    let mut next_batch_id: usize = 0;
     let mut system_parts: Vec<Value> = Vec::new();
     let mut contents: Vec<ContentMessage> = Vec::new();
 
@@ -50,22 +78,44 @@ pub(crate) fn build_request_body(
             }
             ItemKind::User => {
                 let parts = build_user_parts(&item.parts)?;
-                append_content(&mut contents, "user", parts);
+                append_content(
+                    &mut contents,
+                    "user",
+                    parts.into_iter().map(ContentPart::plain).collect(),
+                );
             }
             ItemKind::Assistant => {
+                let mut call_index: usize = 0;
+                let batch_id = next_batch_id;
                 for part in &item.parts {
                     if let Part::ToolCall(call) = part {
-                        let has_id = call
+                        let has_provider_id = call
                             .metadata
                             .get("gemini.has_call_id")
                             .and_then(Value::as_bool)
                             .unwrap_or(false);
-                        call_lookup.insert(call.id.0.clone(), (call.name.clone(), has_id));
+                        call_lookup.insert(
+                            call.id.0.clone(),
+                            CallOrigin {
+                                name: call.name.clone(),
+                                has_provider_id,
+                                batch_id,
+                                call_index,
+                            },
+                        );
+                        call_index += 1;
                     }
+                }
+                if call_index > 0 {
+                    next_batch_id += 1;
                 }
                 let parts = build_model_parts(&item.parts)?;
                 if !parts.is_empty() {
-                    append_content(&mut contents, "model", parts);
+                    append_content(
+                        &mut contents,
+                        "model",
+                        parts.into_iter().map(ContentPart::plain).collect(),
+                    );
                 }
             }
             ItemKind::Tool => {
@@ -74,15 +124,51 @@ pub(crate) fn build_request_body(
             }
             ItemKind::Notification => {
                 let part = build_notification_part(&item.parts)?;
-                append_content(&mut contents, "user", vec![part]);
+                append_content(&mut contents, "user", vec![ContentPart::plain(part)]);
             }
         }
     }
 
     let mut body = Map::new();
 
-    if !system_parts.is_empty() {
-        body.insert("systemInstruction".into(), json!({ "parts": system_parts }));
+    // When explicit `cachedContent` is active, omit cache-owned fields
+    // (`systemInstruction`, `tools`, `toolConfig`) so Vertex/Gemini do not
+    // reject redeclared context while keeping registered tools locally executable.
+    if let Some(cached) = active_cached_content {
+        body.insert("cachedContent".into(), Value::String(cached.to_string()));
+    } else {
+        if !system_parts.is_empty() {
+            body.insert("systemInstruction".into(), json!({ "parts": system_parts }));
+        }
+
+        // Tools: function declarations + built-in Gemini server tools
+        let mut tools: Vec<Value> = Vec::new();
+        if !request.available_tools.is_empty() {
+            let declarations: Vec<Value> = request
+                .available_tools
+                .iter()
+                .map(build_function_declaration)
+                .collect();
+            tools.push(json!({ "functionDeclarations": declarations }));
+        }
+        for server_tool in &config.server_tools {
+            tools.push(server_tool.to_json());
+        }
+        if !tools.is_empty() {
+            body.insert("tools".into(), Value::Array(tools));
+        }
+
+        let mixed_tools = !request.available_tools.is_empty() && !config.server_tools.is_empty();
+        let mut tool_config = match &config.tool_choice {
+            Some(choice) => choice.to_json().as_object().cloned().unwrap_or_default(),
+            None => Map::new(),
+        };
+        if mixed_tools {
+            tool_config.insert("includeServerSideToolInvocations".into(), Value::Bool(true));
+        }
+        if !tool_config.is_empty() {
+            body.insert("toolConfig".into(), Value::Object(tool_config));
+        }
     }
 
     body.insert(
@@ -95,36 +181,11 @@ pub(crate) fn build_request_body(
         ),
     );
 
-    // Tools: function declarations + built-in Gemini server tools
-    let mut tools: Vec<Value> = Vec::new();
-    if !request.available_tools.is_empty() {
-        let declarations: Vec<Value> = request
-            .available_tools
-            .iter()
-            .map(build_function_declaration)
-            .collect();
-        tools.push(json!({ "functionDeclarations": declarations }));
-    }
-    for server_tool in &config.server_tools {
-        tools.push(server_tool.to_json());
-    }
-    if !tools.is_empty() {
-        body.insert("tools".into(), Value::Array(tools));
-    }
-
-    if let Some(choice) = &config.tool_choice {
-        body.insert("toolConfig".into(), choice.to_json());
-    }
-
     if !config.safety_settings.is_empty() {
         body.insert(
             "safetySettings".into(),
             Value::Array(config.safety_settings.iter().map(|s| s.to_json()).collect()),
         );
-    }
-
-    if let Some(cached) = &config.cached_content {
-        body.insert("cachedContent".into(), Value::String(cached.clone()));
     }
 
     let generation_config = build_generation_config(config);
@@ -205,21 +266,58 @@ fn json_number(n: f64) -> Value {
     serde_json::Number::from_f64(n).map_or(Value::Null, Value::Number)
 }
 
+struct ContentPart {
+    value: Value,
+    /// Optional `(batch_id, call_index)` for `functionResponse` parts so
+    /// parallel responses are reordered to match their model invocation order.
+    tool_order: Option<(usize, usize)>,
+}
+
+impl ContentPart {
+    fn plain(value: Value) -> Self {
+        Self {
+            value,
+            tool_order: None,
+        }
+    }
+
+    fn tool_response(value: Value, order: Option<(usize, usize)>) -> Self {
+        Self {
+            value,
+            tool_order: order,
+        }
+    }
+}
+
 struct ContentMessage {
     role: &'static str,
-    parts: Vec<Value>,
+    parts: Vec<ContentPart>,
 }
 
 impl ContentMessage {
-    fn into_value(self) -> Value {
+    fn into_value(mut self) -> Value {
+        // Reorder contiguous runs of keyed `functionResponse` parts so parallel
+        // tool completions always arrive in original function-call order.
+        let mut i = 0;
+        while i < self.parts.len() {
+            if self.parts[i].tool_order.is_some() {
+                let start = i;
+                while i < self.parts.len() && self.parts[i].tool_order.is_some() {
+                    i += 1;
+                }
+                self.parts[start..i].sort_by_key(|p| p.tool_order.unwrap());
+            } else {
+                i += 1;
+            }
+        }
         json!({
             "role": self.role,
-            "parts": self.parts,
+            "parts": self.parts.into_iter().map(|p| p.value).collect::<Vec<_>>(),
         })
     }
 }
 
-fn append_content(contents: &mut Vec<ContentMessage>, role: &'static str, parts: Vec<Value>) {
+fn append_content(contents: &mut Vec<ContentMessage>, role: &'static str, parts: Vec<ContentPart>) {
     if parts.is_empty() {
         return;
     }
@@ -294,7 +392,18 @@ fn build_user_parts(parts: &[Part]) -> Result<Vec<Value>, BuildError> {
                     out.push(json!({ "text": summary }));
                 }
             }
-            Part::Media(media) => out.push(media_to_part(media)?),
+            Part::Media(media) => {
+                let mut part = media_to_part(media)?;
+                if let Some(sig) = media
+                    .metadata
+                    .get("gemini.thought_signature")
+                    .and_then(Value::as_str)
+                    && let Some(obj) = part.as_object_mut()
+                {
+                    obj.insert("thoughtSignature".into(), Value::String(sig.to_string()));
+                }
+                out.push(part);
+            }
             Part::File(file) => out.push(file_to_part(file)?),
             Part::ToolCall(_) | Part::ToolResult(_) | Part::Custom(_) => {
                 return Err(BuildError::UnsupportedPart {
@@ -373,7 +482,18 @@ fn build_model_parts(parts: &[Part]) -> Result<Vec<Value>, BuildError> {
                 }
                 out.push(Value::Object(obj));
             }
-            Part::Media(media) => out.push(media_to_part(media)?),
+            Part::Media(media) => {
+                let mut part = media_to_part(media)?;
+                if let Some(sig) = media
+                    .metadata
+                    .get("gemini.thought_signature")
+                    .and_then(Value::as_str)
+                    && let Some(obj) = part.as_object_mut()
+                {
+                    obj.insert("thoughtSignature".into(), Value::String(sig.to_string()));
+                }
+                out.push(part);
+            }
             Part::File(file) => out.push(file_to_part(file)?),
             Part::Custom(custom) => {
                 if let Some(raw_key) = custom.kind.strip_prefix("gemini.")
@@ -414,8 +534,8 @@ fn normalize_call_args(input: &Value) -> Value {
 
 fn build_tool_response_parts(
     parts: &[Part],
-    call_lookup: &HashMap<String, (String, bool)>,
-) -> Result<Vec<Value>, BuildError> {
+    call_lookup: &HashMap<String, CallOrigin>,
+) -> Result<Vec<ContentPart>, BuildError> {
     let mut out = Vec::new();
     for part in parts {
         let Part::ToolResult(result) = part else {
@@ -424,18 +544,23 @@ fn build_tool_response_parts(
                 part_kind: part_kind(part),
             });
         };
-        let (name, has_id) = call_lookup
-            .get(&result.call_id.0)
-            .cloned()
-            .or_else(|| {
-                result
+        let (name, has_id, order) = match call_lookup.get(&result.call_id.0) {
+            Some(origin) => (
+                origin.name.clone(),
+                origin.has_provider_id,
+                Some((origin.batch_id, origin.call_index)),
+            ),
+            None => {
+                let name = result
                     .metadata
                     .get("gemini.tool_name")
                     .or_else(|| result.metadata.get("tool_name"))
                     .and_then(Value::as_str)
-                    .map(|name| (name.to_string(), false))
-            })
-            .ok_or_else(|| BuildError::MissingToolName(result.call_id.0.clone()))?;
+                    .map(str::to_string)
+                    .ok_or_else(|| BuildError::MissingToolName(result.call_id.0.clone()))?;
+                (name, false, None)
+            }
+        };
 
         let (response_obj, multimodal_parts) =
             tool_output_to_gemini(&result.output, result.is_error)?;
@@ -450,9 +575,29 @@ fn build_tool_response_parts(
             fr.insert("parts".into(), Value::Array(multimodal_parts));
         }
 
-        out.push(json!({ "functionResponse": fr }));
+        out.push(ContentPart::tool_response(
+            json!({ "functionResponse": fr }),
+            order,
+        ));
     }
     Ok(out)
+}
+
+fn push_tool_file_part(
+    file: &agentkit_core::FilePart,
+    text_chunks: &mut Vec<String>,
+    multimodal: &mut Vec<Value>,
+) -> Result<(), BuildError> {
+    let encoded = file_to_part(file)?;
+    if let Some(text) = encoded.get("text").and_then(Value::as_str)
+        && encoded.get("inlineData").is_none()
+        && encoded.get("fileData").is_none()
+    {
+        text_chunks.push(text.to_string());
+    } else {
+        multimodal.push(encoded);
+    }
+    Ok(())
 }
 
 fn tool_output_to_gemini(
@@ -474,7 +619,7 @@ fn tool_output_to_gemini(
                     Part::Text(t) => text_chunks.push(t.text.clone()),
                     Part::Structured(s) => text_chunks.push(serde_json::to_string(&s.value)?),
                     Part::Media(m) => multimodal.push(media_to_part(m)?),
-                    Part::File(f) => multimodal.push(file_to_part(f)?),
+                    Part::File(f) => push_tool_file_part(f, &mut text_chunks, &mut multimodal)?,
                     _ => {
                         return Err(BuildError::UnsupportedPart {
                             role: ItemKind::Tool,
@@ -491,11 +636,17 @@ fn tool_output_to_gemini(
             Ok((response, multimodal))
         }
         ToolOutput::Files(files) => {
+            let mut text_chunks = Vec::new();
             let mut multimodal = Vec::new();
             for file in files {
-                multimodal.push(file_to_part(file)?);
+                push_tool_file_part(file, &mut text_chunks, &mut multimodal)?;
             }
-            Ok((json!({ key: "files_attached" }), multimodal))
+            let response = if text_chunks.is_empty() {
+                json!({ key: "files_attached" })
+            } else {
+                json!({ key: text_chunks.join("\n") })
+            };
+            Ok((response, multimodal))
         }
     }
 }
@@ -669,5 +820,133 @@ mod tests {
         assert_eq!(parts[1]["inlineData"]["data"], "AQID");
         assert_eq!(parts[2]["fileData"]["mimeType"], "audio/mp3");
         assert_eq!(parts[2]["fileData"]["fileUri"], "gs://bucket/clip.mp3");
+    }
+
+    #[test]
+    fn orders_parallel_tool_responses_by_function_call_order() {
+        let cfg = GeminiConfig::new("k", "gemini-2.5-flash").unwrap();
+        let call = |id, n| Part::ToolCall(ToolCallPart::new(id, "lookup", json!({ "n": n })));
+        let result = |id, text: &str| {
+            Item::new(
+                ItemKind::Tool,
+                vec![Part::ToolResult(ToolResultPart::success(
+                    id,
+                    ToolOutput::Text(text.into()),
+                ))],
+            )
+        };
+        let model = Item::new(ItemKind::Assistant, vec![call("a", 1), call("b", 2)]);
+        let req = empty_turn(
+            vec![model, result("b", "second"), result("a", "first")],
+            vec![],
+        );
+        let body = build_request_body(&cfg, &req).unwrap();
+        assert_eq!(
+            body["contents"][1]["parts"][0]["functionResponse"]["response"]["output"],
+            "first"
+        );
+        assert_eq!(
+            body["contents"][1]["parts"][1]["functionResponse"]["response"]["output"],
+            "second"
+        );
+    }
+
+    #[test]
+    fn enables_server_side_tool_invocations_for_mixed_tools() {
+        let cfg = GeminiConfig::new("k", "gemini-2.5-flash")
+            .unwrap()
+            .with_server_tool(GeminiServerTool::GoogleSearch);
+        let req = empty_turn(
+            vec![Item::text(ItemKind::User, "Hello")],
+            vec![ToolSpec::new(
+                "local_fn",
+                "desc",
+                json!({ "type": "object" }),
+            )],
+        );
+        let body = build_request_body(&cfg, &req).unwrap();
+        assert_eq!(body["toolConfig"]["includeServerSideToolInvocations"], true);
+    }
+
+    #[test]
+    fn honors_cache_disablement_and_omits_cache_owned_fields() {
+        let cfg = GeminiConfig::new("k", "gemini-2.5-flash")
+            .unwrap()
+            .with_cached_content("cachedContents/example");
+        let mut req = empty_turn(
+            vec![
+                Item::text(ItemKind::System, "sys"),
+                Item::text(ItemKind::User, "Hello"),
+            ],
+            vec![ToolSpec::new(
+                "local_fn",
+                "desc",
+                json!({ "type": "object" }),
+            )],
+        );
+        let cached_body = build_request_body(&cfg, &req).unwrap();
+        assert_eq!(cached_body["cachedContent"], "cachedContents/example");
+        assert!(cached_body.get("systemInstruction").is_none());
+        assert!(cached_body.get("tools").is_none());
+        assert!(cached_body.get("toolConfig").is_none());
+
+        req.cache = Some(agentkit_loop::PromptCacheRequest::disabled());
+        let uncached_body = build_request_body(&cfg, &req).unwrap();
+        assert!(uncached_body.get("cachedContent").is_none());
+        assert!(uncached_body.get("systemInstruction").is_some());
+        assert!(uncached_body.get("tools").is_some());
+    }
+
+    #[test]
+    fn keeps_plain_text_files_out_of_function_response_parts() {
+        let cfg = GeminiConfig::new("k", "gemini-2.5-flash").unwrap();
+        let file = agentkit_core::FilePart {
+            name: Some("note.txt".into()),
+            mime_type: Some("text/plain".into()),
+            data: DataRef::InlineText("hello from file".into()),
+            metadata: MetadataMap::new(),
+        };
+        let req = empty_turn(
+            vec![
+                Item::new(
+                    ItemKind::Assistant,
+                    vec![Part::ToolCall(ToolCallPart::new("c1", "read", json!({})))],
+                ),
+                Item::new(
+                    ItemKind::Tool,
+                    vec![Part::ToolResult(ToolResultPart::success(
+                        "c1",
+                        ToolOutput::Files(vec![file]),
+                    ))],
+                ),
+            ],
+            vec![],
+        );
+        let body = build_request_body(&cfg, &req).unwrap();
+        let fr = &body["contents"][1]["parts"][0]["functionResponse"];
+        assert_eq!(fr["response"]["output"], "hello from file");
+        assert!(fr.get("parts").is_none());
+    }
+
+    #[test]
+    fn round_trips_thought_signature_on_assistant_media() {
+        let cfg = GeminiConfig::new("k", "gemini-2.5-flash").unwrap();
+        let mut media = MediaPart::new(
+            Modality::Image,
+            "image/png",
+            DataRef::InlineBytes(vec![1, 2, 3]),
+        );
+        media
+            .metadata
+            .insert("gemini.thought_signature".into(), json!("img-sig-1"));
+        let req = empty_turn(
+            vec![Item::new(ItemKind::Assistant, vec![Part::Media(media)])],
+            vec![],
+        );
+        let body = build_request_body(&cfg, &req).unwrap();
+        assert_eq!(
+            body["contents"][0]["parts"][0]["thoughtSignature"],
+            "img-sig-1"
+        );
     }
 }

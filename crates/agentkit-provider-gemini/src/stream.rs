@@ -12,27 +12,20 @@ use agentkit_core::{
 use agentkit_loop::{LoopError, ModelTurnEvent, ModelTurnResult, set_provider_finish_reasons};
 use serde_json::Value;
 
-use crate::response::{map_finish_reason, parse_part};
+use crate::response::{map_finish_reason, next_synthetic_turn_id, parse_part};
 pub(crate) use crate::sse::{SseDecoder, SseEvent};
 use crate::usage::UsageSnapshot;
 
 enum ActivePart {
-    Text {
-        part_id: PartId,
-        buffer: String,
-        signature: Option<String>,
-    },
-    Reasoning {
-        part_id: PartId,
-        buffer: String,
-        signature: Option<String>,
-    },
+    Text { part_id: PartId, buffer: String },
+    Reasoning { part_id: PartId, buffer: String },
 }
 
 pub(crate) struct EventTranslator {
     active: Option<ActivePart>,
     committed_parts: Vec<Part>,
     next_part_index: usize,
+    synthetic_turn_id: u64,
     call_counter: usize,
     usage: Option<UsageSnapshot>,
     metadata: MetadataMap,
@@ -50,6 +43,7 @@ impl EventTranslator {
             active: None,
             committed_parts: Vec::new(),
             next_part_index: 0,
+            synthetic_turn_id: next_synthetic_turn_id(),
             call_counter: 0,
             usage: None,
             metadata: MetadataMap::new(),
@@ -234,8 +228,12 @@ impl EventTranslator {
             .and_then(Value::as_str)
             .map(str::to_string);
 
-        // Incremental reasoning text
-        if thought && let Some(chunk) = raw_part.get("text").and_then(Value::as_str) {
+        // Incremental unsigned reasoning text (coalesced into active part).
+        // Signed reasoning parts are kept separate to preserve exact part boundaries.
+        if thought
+            && signature.is_none()
+            && let Some(chunk) = raw_part.get("text").and_then(Value::as_str)
+        {
             if !matches!(self.active, Some(ActivePart::Reasoning { .. })) {
                 self.flush_active(events);
                 let part_id = self.alloc_part_id();
@@ -246,31 +244,24 @@ impl EventTranslator {
                 self.active = Some(ActivePart::Reasoning {
                     part_id,
                     buffer: String::new(),
-                    signature: None,
                 });
             }
-            if let Some(ActivePart::Reasoning {
-                part_id,
-                buffer,
-                signature: active_sig,
-            }) = &mut self.active
+            if let Some(ActivePart::Reasoning { part_id, buffer }) = &mut self.active
+                && !chunk.is_empty()
             {
-                if !chunk.is_empty() {
-                    buffer.push_str(chunk);
-                    events.push(ModelTurnEvent::Delta(Delta::AppendText {
-                        part_id: part_id.clone(),
-                        chunk: chunk.to_string(),
-                    }));
-                }
-                if signature.is_some() {
-                    *active_sig = signature;
-                }
+                buffer.push_str(chunk);
+                events.push(ModelTurnEvent::Delta(Delta::AppendText {
+                    part_id: part_id.clone(),
+                    chunk: chunk.to_string(),
+                }));
             }
             return Ok(());
         }
 
-        // Incremental visible text
+        // Incremental unsigned visible text (coalesced into active part).
+        // Signed text parts (including empty signed text) are committed separately.
         if !thought
+            && signature.is_none()
             && raw_part.get("functionCall").is_none()
             && let Some(chunk) = raw_part.get("text").and_then(Value::as_str)
         {
@@ -284,36 +275,59 @@ impl EventTranslator {
                 self.active = Some(ActivePart::Text {
                     part_id,
                     buffer: String::new(),
-                    signature: None,
                 });
             }
-            if let Some(ActivePart::Text {
-                part_id,
-                buffer,
-                signature: active_sig,
-            }) = &mut self.active
+            if let Some(ActivePart::Text { part_id, buffer }) = &mut self.active
+                && !chunk.is_empty()
             {
-                if !chunk.is_empty() {
-                    buffer.push_str(chunk);
-                    events.push(ModelTurnEvent::Delta(Delta::AppendText {
-                        part_id: part_id.clone(),
-                        chunk: chunk.to_string(),
-                    }));
-                }
-                if signature.is_some() {
-                    *active_sig = signature;
-                }
+                buffer.push_str(chunk);
+                events.push(ModelTurnEvent::Delta(Delta::AppendText {
+                    part_id: part_id.clone(),
+                    chunk: chunk.to_string(),
+                }));
             }
             return Ok(());
         }
 
-        // Non-streaming part (functionCall, inlineData, executableCode, redacted thought, etc.)
+        // Signed text/reasoning or non-streaming part (functionCall, inlineData,
+        // toolCall/toolResponse, executableCode, redacted thought, etc.)
         self.flush_active(events);
-        if let Some(part) = parse_part(raw_part, &mut self.call_counter)
+        if let Some(part) = parse_part(raw_part, self.synthetic_turn_id, &mut self.call_counter)
             .map_err(|e| LoopError::Provider(e.to_string()))?
         {
-            if let Part::ToolCall(call) = &part {
-                events.push(ModelTurnEvent::ToolCall(call.clone()));
+            match &part {
+                Part::Text(t) => {
+                    let part_id = self.alloc_part_id();
+                    events.push(ModelTurnEvent::Delta(Delta::BeginPart {
+                        part_id: part_id.clone(),
+                        kind: PartKind::Text,
+                    }));
+                    if !t.text.is_empty() {
+                        events.push(ModelTurnEvent::Delta(Delta::AppendText {
+                            part_id,
+                            chunk: t.text.clone(),
+                        }));
+                    }
+                }
+                Part::Reasoning(r) => {
+                    let part_id = self.alloc_part_id();
+                    events.push(ModelTurnEvent::Delta(Delta::BeginPart {
+                        part_id: part_id.clone(),
+                        kind: PartKind::Reasoning,
+                    }));
+                    if let Some(summary) = &r.summary
+                        && !summary.is_empty()
+                    {
+                        events.push(ModelTurnEvent::Delta(Delta::AppendText {
+                            part_id,
+                            chunk: summary.clone(),
+                        }));
+                    }
+                }
+                Part::ToolCall(call) => {
+                    events.push(ModelTurnEvent::ToolCall(call.clone()));
+                }
+                _ => {}
             }
             events.push(ModelTurnEvent::Delta(Delta::CommitPart {
                 part: part.clone(),
@@ -328,25 +342,8 @@ impl EventTranslator {
             return;
         };
         let part = match active {
-            ActivePart::Text {
-                buffer, signature, ..
-            } => {
-                let mut t = TextPart::new(buffer);
-                if let Some(sig) = signature {
-                    t.metadata
-                        .insert("gemini.thought_signature".into(), Value::String(sig));
-                }
-                Part::Text(t)
-            }
-            ActivePart::Reasoning {
-                buffer, signature, ..
-            } => {
-                let mut meta = MetadataMap::new();
-                if let Some(sig) = signature {
-                    meta.insert("gemini.thought_signature".into(), Value::String(sig));
-                }
-                Part::Reasoning(ReasoningPart::summary(buffer).with_metadata(meta))
-            }
+            ActivePart::Text { buffer, .. } => Part::Text(TextPart::new(buffer)),
+            ActivePart::Reasoning { buffer, .. } => Part::Reasoning(ReasoningPart::summary(buffer)),
         };
         events.push(ModelTurnEvent::Delta(Delta::CommitPart {
             part: part.clone(),
@@ -457,5 +454,41 @@ mod tests {
                 .reasoning_tokens,
             Some(8)
         );
+    }
+
+    #[test]
+    fn preserves_part_boundaries_for_streamed_thought_signatures() {
+        let mut translator = EventTranslator::new();
+        let mut events = Vec::new();
+        translator
+            .handle_part(&json!({ "text": "Answer" }), &mut events)
+            .unwrap();
+        translator
+            .handle_part(
+                &json!({ "text": "", "thoughtSignature": "sig-1" }),
+                &mut events,
+            )
+            .unwrap();
+        translator
+            .handle_part(
+                &json!({ "text": "", "thoughtSignature": "sig-2" }),
+                &mut events,
+            )
+            .unwrap();
+        translator.flush_active(&mut events);
+        let [Part::Text(answer), Part::Text(s1), Part::Text(s2)] =
+            translator.committed_parts.as_slice()
+        else {
+            panic!(
+                "expected three separate text parts, got {:?}",
+                translator.committed_parts
+            );
+        };
+        assert_eq!(answer.text, "Answer");
+        assert!(!answer.metadata.contains_key("gemini.thought_signature"));
+        assert!(s1.text.is_empty());
+        assert_eq!(s1.metadata["gemini.thought_signature"], "sig-1");
+        assert!(s2.text.is_empty());
+        assert_eq!(s2.metadata["gemini.thought_signature"], "sig-2");
     }
 }

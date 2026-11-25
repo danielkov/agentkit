@@ -135,7 +135,7 @@ let agent = Agent::builder()
 
 ## Available providers
 
-agentkit ships nine provider crates. Seven go through `CompletionsProvider` (Path 2), and two — Anthropic and Cerebras — implement `ModelAdapter` directly (Path 1):
+agentkit ships ten provider crates. Seven go through `CompletionsProvider` (Path 2), and three — Anthropic, Cerebras, and Gemini — implement `ModelAdapter` directly (Path 1):
 
 | Crate                                                                                                                 | Path       | Auth                  | Notes                                                                                                                                          |
 | --------------------------------------------------------------------------------------------------------------------- | ---------- | --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -150,7 +150,7 @@ agentkit ships nine provider crates. Seven go through `CompletionsProvider` (Pat
 | `agentkit-provider-groq`                                                                                              | 2 (hooks)  | Bearer                | `preprocess_request` for auth                                                                                                                  |
 | `agentkit-provider-mistral`                                                                                           | 2 (hooks)  | Bearer                | `preprocess_request` for auth                                                                                                                  |
 
-Ollama is the simplest Path-2 provider — no auth, no hooks. OpenRouter is the most complex Path-2 — auth headers, prompt-cache mapping, 200-with-error handling, response enrichment. Anthropic and Cerebras are the Path-1 providers: read Anthropic if your target API has a non-OpenAI shape, and read Cerebras if it is OpenAI-shaped on the wire but carries enough provider-specific surface — preview parameters, compression, versioning headers, out-of-band endpoints — that modelling it through hooks would be a squeeze.
+Ollama is the simplest Path-2 provider — no auth, no hooks. OpenRouter is the most complex Path-2 — auth headers, prompt-cache mapping, 200-with-error handling, response enrichment. Anthropic, Cerebras, and Gemini are the Path-1 providers: read Anthropic or Gemini if your target API has a non-OpenAI shape, and read Cerebras if it is OpenAI-shaped on the wire but carries enough provider-specific surface — preview parameters, compression, versioning headers, out-of-band endpoints — that modelling it through hooks would be a squeeze.
 
 ## When to implement ModelAdapter directly
 

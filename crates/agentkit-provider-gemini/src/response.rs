@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use agentkit_core::{
     CustomPart, DataRef, Delta, FinishReason, Item, ItemKind, MediaPart, MetadataMap, Modality,
@@ -10,6 +11,12 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::usage::UsageSnapshot;
+
+static NEXT_SYNTHETIC_TURN_ID: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn next_synthetic_turn_id() -> u64 {
+    NEXT_SYNTHETIC_TURN_ID.fetch_add(1, Ordering::Relaxed)
+}
 
 #[derive(Debug, Error)]
 pub(crate) enum ResponseError {
@@ -48,6 +55,7 @@ pub(crate) fn build_turn_from_response(
         .and_then(|arr| arr.first());
 
     let mut parts: Vec<Part> = Vec::new();
+    let synthetic_turn_id = next_synthetic_turn_id();
     let mut call_counter: usize = 0;
     let mut provider_finish_reason: Option<String> = None;
 
@@ -71,7 +79,7 @@ pub(crate) fn build_turn_from_response(
             .and_then(Value::as_array)
         {
             for raw_part in raw_parts {
-                if let Some(part) = parse_part(raw_part, &mut call_counter)? {
+                if let Some(part) = parse_part(raw_part, synthetic_turn_id, &mut call_counter)? {
                     parts.push(part);
                 }
             }
@@ -156,6 +164,7 @@ pub(crate) fn build_turn_from_response(
 
 pub(crate) fn parse_part(
     part: &Value,
+    synthetic_turn_id: u64,
     call_counter: &mut usize,
 ) -> Result<Option<Part>, ResponseError> {
     let thought = part
@@ -176,7 +185,7 @@ pub(crate) fn parse_part(
         let (id, has_provider_id) = match fc.get("id").and_then(Value::as_str) {
             Some(id) if !id.is_empty() => (id.to_string(), true),
             _ => {
-                let synth = format!("gemini_call_{}", *call_counter);
+                let synth = format!("gemini_call_{synthetic_turn_id}_{}", *call_counter);
                 *call_counter += 1;
                 (synth, false)
             }
@@ -238,15 +247,22 @@ pub(crate) fn parse_part(
             .decode(b64)
             .map_err(|e| ResponseError::Protocol(format!("invalid inlineData base64: {e}")))?;
         let modality = modality_from_mime(mime);
-        return Ok(Some(Part::Media(MediaPart::new(
-            modality,
-            mime,
-            DataRef::InlineBytes(bytes),
-        ))));
+        let mut media = MediaPart::new(modality, mime, DataRef::InlineBytes(bytes));
+        if let Some(sig) = signature {
+            media
+                .metadata
+                .insert("gemini.thought_signature".into(), Value::String(sig));
+        }
+        return Ok(Some(Part::Media(media)));
     }
 
-    // Executable code, code execution results, or any future Gemini part types
-    for key in ["executableCode", "codeExecutionResult"] {
+    // Server-side tool invocations, executable code, and code execution results
+    for key in [
+        "toolCall",
+        "toolResponse",
+        "executableCode",
+        "codeExecutionResult",
+    ] {
         if part.get(key).is_some() {
             return Ok(Some(Part::Custom(
                 CustomPart::new(format!("gemini.{key}")).with_value(part.clone()),
@@ -352,7 +368,7 @@ mod tests {
         let tokens = usage.tokens.as_ref().unwrap();
         assert_eq!(tokens.input_tokens, 100);
         assert_eq!(tokens.cached_input_tokens, Some(60));
-        assert_eq!(tokens.output_tokens, 12);
+        assert_eq!(tokens.output_tokens, 37);
         assert_eq!(tokens.reasoning_tokens, Some(25));
 
         let ModelTurnEvent::Finished(result) = events.last().unwrap() else {
@@ -414,5 +430,60 @@ mod tests {
         };
         assert_eq!(result.finish_reason, FinishReason::Blocked);
         assert!(result.output_items.is_empty());
+    }
+
+    #[test]
+    fn synthetic_call_ids_are_unique_across_model_turns() {
+        let body = json!({
+            "candidates": [{
+                "finishReason": "STOP",
+                "content": {
+                    "parts": [{ "functionCall": { "name": "lookup", "args": {} } }]
+                }
+            }]
+        })
+        .to_string();
+        let next_id = || {
+            build_turn_from_response(&body)
+                .unwrap()
+                .into_iter()
+                .find_map(|ev| match ev {
+                    ModelTurnEvent::ToolCall(call) => Some(call.id),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert_ne!(next_id(), next_id());
+    }
+
+    #[test]
+    fn preserves_thought_signature_on_generated_media_and_server_tool_parts() {
+        let body = json!({
+            "candidates": [{
+                "finishReason": "STOP",
+                "content": {
+                    "role": "model",
+                    "parts": [
+                        { "toolCall": { "id": "st_1", "toolType": "GOOGLE_SEARCH", "args": { "query": "rust" } } },
+                        { "toolResponse": { "id": "st_1", "toolType": "GOOGLE_SEARCH", "response": {} } },
+                        { "inlineData": { "mimeType": "image/png", "data": "AQID" }, "thoughtSignature": "img-sig" }
+                    ]
+                }
+            }]
+        })
+        .to_string();
+        let events: Vec<_> = build_turn_from_response(&body)
+            .unwrap()
+            .into_iter()
+            .collect();
+        let ModelTurnEvent::Finished(result) = events.last().unwrap() else {
+            panic!("expected Finished");
+        };
+        let parts = &result.output_items[0].parts;
+        assert!(matches!(&parts[0], Part::Custom(c) if c.kind == "gemini.toolCall"));
+        assert!(matches!(&parts[1], Part::Custom(c) if c.kind == "gemini.toolResponse"));
+        assert!(
+            matches!(&parts[2], Part::Media(m) if m.metadata["gemini.thought_signature"] == "img-sig")
+        );
     }
 }

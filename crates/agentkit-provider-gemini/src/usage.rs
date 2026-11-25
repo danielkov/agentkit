@@ -68,10 +68,17 @@ impl UsageSnapshot {
             .prompt_tokens
             .unwrap_or(0)
             .saturating_add(self.tool_use_prompt_tokens.unwrap_or(0));
+        // Gemini reports candidate output tokens and internal thought tokens
+        // separately; normalize `output_tokens` to their sum so `gen_ai.usage.output_tokens`
+        // includes reasoning while `reasoning_tokens` preserves the breakdown.
+        let output_tokens = self
+            .candidates_tokens
+            .unwrap_or(0)
+            .saturating_add(self.thoughts_tokens.unwrap_or(0));
         Usage {
             tokens: Some(TokenUsage {
                 input_tokens,
-                output_tokens: self.candidates_tokens.unwrap_or(0),
+                output_tokens,
                 reasoning_tokens: self.thoughts_tokens,
                 cached_input_tokens: self.cached_tokens,
                 cache_write_input_tokens: None,
@@ -101,7 +108,7 @@ mod tests {
             usage.tokens,
             Some(TokenUsage {
                 input_tokens: 1000,
-                output_tokens: 120,
+                output_tokens: 165,
                 reasoning_tokens: Some(45),
                 cached_input_tokens: Some(800),
                 cache_write_input_tokens: None,
@@ -126,7 +133,7 @@ mod tests {
         first.merge(second);
         let tokens = first.to_usage().tokens.unwrap();
         assert_eq!(tokens.input_tokens, 500);
-        assert_eq!(tokens.output_tokens, 40);
+        assert_eq!(tokens.output_tokens, 52);
         assert_eq!(tokens.reasoning_tokens, Some(12));
         assert_eq!(tokens.cached_input_tokens, Some(300));
     }
