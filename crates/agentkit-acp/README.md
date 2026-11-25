@@ -21,7 +21,7 @@ The crate root, default features, and `wire` module remain ACP v1. To use the
 experimental upstream ACP v2 protocol, enable the additive feature:
 
 ```toml
-agentkit-acp = { version = "0.10.11", features = ["protocol-v2"] }
+agentkit-acp = { version = "0.13.1", features = ["protocol-v2"] }
 ```
 
 The feature maps directly to the SDK's

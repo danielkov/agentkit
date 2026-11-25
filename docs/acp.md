@@ -42,7 +42,7 @@ There is already an official Rust ACP SDK:
 - `agent-client-protocol-schema`
 - `agent-client-protocol-rmcp`
 
-So agentkit should not build a parallel protocol crate by default. The current implementation uses `agentkit-acp-sdk`, a published fork of that SDK, for experimental session injection; it still re-exports the SDK wire types and owns only the lifecycle and conversion glue. A separate `racp` crate would make sense only if the SDK API became unsuitable.
+So agentkit should not build a parallel protocol crate by default. The current implementation uses `agentkit-acp-sdk`, a published fork of that SDK, for experimental ACP v2 and prompt-delivery support; it still re-exports the SDK wire types and owns only the lifecycle and conversion glue. A separate `racp` crate would make sense only if the SDK API became unsuitable.
 
 ## Non-goals
 

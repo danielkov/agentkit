@@ -4,7 +4,7 @@ The [Agent Client Protocol (ACP)](https://agentclientprotocol.com) standardizes 
 
 ## Built on the ACP Rust SDK
 
-Like `agentkit-mcp`, this crate does not define a parallel protocol vocabulary. It builds on [`agentkit-acp-sdk`](https://crates.io/crates/agentkit-acp-sdk), a published fork of the `agent-client-protocol` SDK that adds experimental session injection, and re-exports the stable v1 wire types (`SessionId`, `ContentBlock`, `SessionUpdate`, `ToolCallUpdate`, `StopReason`, …) at the crate root and under `agentkit_acp::wire`. The full SDK is available as `agentkit_acp::sdk`. Agentkit owns only the host-facing glue: session binding, observer routing, prompt conversion, cancellation handles, and approval resolution.
+Like `agentkit-mcp`, this crate does not define a parallel protocol vocabulary. It builds on [`agentkit-acp-sdk`](https://crates.io/crates/agentkit-acp-sdk), a published fork of the `agent-client-protocol` SDK that adds experimental ACP v2 and prompt-delivery support, and re-exports the stable v1 wire types (`SessionId`, `ContentBlock`, `SessionUpdate`, `ToolCallUpdate`, `StopReason`, …) at the crate root and under `agentkit_acp::wire`. The full SDK is available as `agentkit_acp::sdk`. Agentkit owns only the host-facing glue: session binding, observer routing, prompt conversion, cancellation handles, and approval resolution.
 
 - **Protocol docs:** [agentclientprotocol.com](https://agentclientprotocol.com/protocol/v1/overview)
 - **Rust SDK fork:** [`agentkit-acp-sdk`](https://crates.io/crates/agentkit-acp-sdk) ([source](https://github.com/danielkov/rust-sdk/tree/agentkit-acp-sdk))
@@ -14,7 +14,7 @@ Like `agentkit-mcp`, this crate does not define a parallel protocol vocabulary. 
 ACP v2 support is additive and disabled by default. Enable it explicitly:
 
 ```toml
-agentkit-acp = { version = "0.10.11", features = ["protocol-v2"] }
+agentkit-acp = { version = "0.13.1", features = ["protocol-v2"] }
 ```
 
 `protocol-v2` enables the fork's
@@ -64,9 +64,10 @@ headless capabilities and advertises no delivery mode; hosts that wire
 
 The initial v2 foundation routes text, reasoning, and tool lifecycle updates.
 ACP v2 permission callbacks are intentionally deferred; unsupported approval
-requests are denied while accepted steers remain pending for the next safe
-boundary. The SDK labels v2 unstable, so opt-in callers should expect the `v2`
-namespace to track the SDK fork.
+requests are denied while retaining a provider-valid transcript, so the prompt
+ends with the custom `_error` stop reason rather than `Refusal`. The SDK labels
+v2 unstable, so opt-in callers should expect the `v2` namespace to track the
+SDK fork.
 
 ## Two integration shapes
 
@@ -229,7 +230,7 @@ On the umbrella crate, ACP is behind the `acp` feature (implies `loop`):
 
 ```toml
 [dependencies]
-agentkit = { version = "0.10.11", features = ["acp"] }
+agentkit = { version = "0.14.0", features = ["acp"] }
 ```
 
 The `agentkit-acp` crate itself has a default `stdio` feature that gates `serve_stdio`, which uses the upstream SDK's built-in `Stdio` transport. Its `unstable-acp` feature forwards to the upstream SDK's unstable protocol surface.
