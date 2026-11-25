@@ -31,9 +31,11 @@ session ID, the v2 output observer, and a cancellation handle. Install the
 observer and cancellation handle on the returned agent loop in the same way as
 the v1 factory.
 
-The v2 prompt lifecycle differs from v1: `session/prompt` acknowledges
-acceptance immediately instead of waiting for the turn to finish. The runtime
-then emits, in order:
+The v2 prompt lifecycle differs from v1: `session/prompt` responds with its
+generated `messageId` once the driver appends the prompt to the transcript,
+without waiting for model work to complete. Because the runtime queues the
+`user_message` update when the prompt is inserted, clients should not assume the
+RPC response arrives before that update. Session updates are emitted in order:
 
 1. a `user_message` update with a generated stable message ID;
 2. a `running` state update;

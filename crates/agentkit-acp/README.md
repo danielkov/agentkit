@@ -2,7 +2,9 @@
 
 Agent Client Protocol integration for agentkit hosts.
 
-This crate re-exports ACP wire types from the upstream `agent-client-protocol` SDK
+This crate re-exports ACP wire types from [`agentkit-acp-sdk`](https://crates.io/crates/agentkit-acp-sdk)
+(a published `agent-client-protocol` fork aliased as `agent-client-protocol` in `Cargo.toml`;
+hosts should use `agentkit_acp::sdk` or depend on the matching `agentkit-acp-sdk` version)
 and adds agentkit-specific glue: session binding, observer routing, prompt
 conversion, cancellation handles, and approval resolver abstractions.
 

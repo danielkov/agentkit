@@ -65,20 +65,20 @@ Recommended initial crate:
 
 ```toml
 [dependencies]
-agent-client-protocol = { package = "agentkit-acp-sdk", version = "=2.2.0" }
+agent-client-protocol = { package = "agentkit-acp-sdk", version = "=5.4.0" }
 agentkit-core = { path = "../agentkit-core", version = "0.10.5" }
-agentkit-loop = { path = "../agentkit-loop", version = "0.10.7" }
+agentkit-loop = { path = "../agentkit-loop", version = "0.11.3" }
 agentkit-tools-core = { path = "../agentkit-tools-core", version = "0.10.5" }
 async-trait = { workspace = true }
-serde = { workspace = true }
+base64 = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["sync", "time"] }
 tracing = { workspace = true }
 
 [features]
 default = ["stdio"]
-stdio = []
+stdio = ["agent-client-protocol/stdio"]
 unstable-acp = ["agent-client-protocol/unstable"]
 protocol-v2 = ["agent-client-protocol/unstable_protocol_v2"]
 unstable-prompt-delivery = [
